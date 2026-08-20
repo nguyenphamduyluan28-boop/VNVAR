@@ -1,0 +1,130 @@
+import 'package:flutter/material.dart';
+
+import 'models/station_identity.dart';
+import 'screens/court_count_screen.dart';
+import 'screens/setup_screen.dart';
+import 'screens/station_screen.dart';
+import 'screens/station_splash_screen.dart';
+import 'services/station_config_service.dart';
+
+Future<void> main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+
+  StationIdentity? savedIdentity;
+  try {
+    savedIdentity = await StationConfigService().loadIdentity();
+  } catch (error, stackTrace) {
+    debugPrint('[BOOT] Không thể đọc cấu hình đã lưu: $error');
+    debugPrintStack(stackTrace: stackTrace);
+  }
+
+  runApp(VnvarCameraStationApp(savedIdentity: savedIdentity));
+}
+
+enum _StartupStep { splash, courtSetup, cameraSetup, station }
+
+class VnvarCameraStationApp extends StatefulWidget {
+  final StationIdentity? savedIdentity;
+
+  const VnvarCameraStationApp({super.key, this.savedIdentity});
+
+  @override
+  State<VnvarCameraStationApp> createState() => _VnvarCameraStationAppState();
+}
+
+class _VnvarCameraStationAppState extends State<VnvarCameraStationApp> {
+  late StationIdentity? _identity;
+  _StartupStep _step = _StartupStep.splash;
+
+  @override
+  void initState() {
+    super.initState();
+    _identity = widget.savedIdentity;
+  }
+
+  void _showCourtSetup() {
+    if (!mounted) return;
+    setState(() => _step = _StartupStep.courtSetup);
+  }
+
+  Future<void> _showCameraSetup(int _) async {
+    await StationConfigService().clearIdentity();
+    if (!mounted) return;
+    setState(() {
+      _identity = null;
+      _step = _StartupStep.cameraSetup;
+    });
+  }
+
+  void _startStation(StationIdentity identity) {
+    if (!mounted) return;
+    setState(() {
+      _identity = identity;
+      _step = _StartupStep.station;
+    });
+  }
+
+  void _updateStationIdentity(StationIdentity identity) {
+    if (!mounted) return;
+    setState(() => _identity = identity);
+  }
+
+  void _handleSystemBack(bool didPop) {
+    if (didPop || !mounted) return;
+    switch (_step) {
+      case _StartupStep.station:
+        setState(() => _step = _StartupStep.cameraSetup);
+        return;
+      case _StartupStep.cameraSetup:
+        setState(() => _step = _StartupStep.courtSetup);
+        return;
+      case _StartupStep.splash:
+      case _StartupStep.courtSetup:
+        break;
+    }
+  }
+
+  Widget _buildCurrentScreen() {
+    switch (_step) {
+      case _StartupStep.splash:
+        return StationSplashScreen(onFinished: _showCourtSetup);
+      case _StartupStep.courtSetup:
+        return CourtCountScreen(onSaved: _showCameraSetup);
+      case _StartupStep.cameraSetup:
+        return SetupScreen(
+          initialIdentity: _identity,
+          onConfigured: _startStation,
+          onBack: _showCourtSetup,
+        );
+      case _StartupStep.station:
+        final identity = _identity;
+        if (identity == null) {
+          // Bảo vệ trạng thái không hợp lệ; bình thường không thể xảy ra vì
+          // SetupScreen chỉ chuyển bước sau khi đã tạo StationIdentity.
+          return CourtCountScreen(onSaved: _showCameraSetup);
+        }
+        return StationScreen(
+          identity: identity,
+          onIdentityChanged: _updateStationIdentity,
+        );
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return MaterialApp(
+      title: 'VNVAR Camera Station',
+      debugShowCheckedModeBanner: false,
+      theme: ThemeData(
+        colorScheme: ColorScheme.fromSeed(seedColor: const Color(0xFF1565C0)),
+        useMaterial3: true,
+      ),
+      home: PopScope(
+        canPop:
+            _step == _StartupStep.splash || _step == _StartupStep.courtSetup,
+        onPopInvokedWithResult: (didPop, _) => _handleSystemBack(didPop),
+        child: _buildCurrentScreen(),
+      ),
+    );
+  }
+}
