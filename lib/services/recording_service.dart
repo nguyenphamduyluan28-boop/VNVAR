@@ -174,6 +174,7 @@ class RecordingService {
   bool _rotating = false;
 
   bool _stopping = false;
+  Future<void>? _stopOperation;
 
   bool get recording => _recording;
 
@@ -313,6 +314,9 @@ class RecordingService {
         '${root.path}${Platform.pathSeparator}$day'
         '${Platform.pathSeparator}AUTOMODE';
     final directory = Directory(
+      // Existing VNVAR storage contract: CAM1 owns the AUTOMODE root while
+      // CAM2+ use separate CAMn subfolders. Unknown/non-numbered camera IDs
+      // also get their own folder to prevent filename collisions.
       _cameraNumber == 1
           ? autoModePath
           : '$autoModePath${Platform.pathSeparator}$_cameraFolderName',
@@ -323,8 +327,10 @@ class RecordingService {
     return directory;
   }
 
-  int? get _cameraNumber =>
-      int.tryParse(cameraId.replaceAll(RegExp(r'[^0-9]'), ''));
+  int? get _cameraNumber {
+    final match = RegExp(r'(\d+)$').firstMatch(cameraId.trim());
+    return int.tryParse(match?.group(1) ?? '');
+  }
 
   String get _cameraFolderName =>
       _cameraNumber == null ? cameraId.toUpperCase() : 'CAM$_cameraNumber';
@@ -407,6 +413,9 @@ class RecordingService {
   // ============================================================
 
   Future<void> start({required MediaStreamTrack videoTrack}) async {
+    final stopping = _stopOperation;
+    if (stopping != null) await stopping;
+
     if (_recording) {
       developer.log('Recording already running', name: 'RecordingService');
 
@@ -965,11 +974,18 @@ class RecordingService {
   // STOP RECORDING
   // ============================================================
 
-  Future<void> stop() async {
-    if (_stopping) {
-      return;
-    }
+  Future<void> stop() {
+    final current = _stopOperation;
+    if (current != null) return current;
 
+    final operation = _stopInternal();
+    _stopOperation = operation;
+    return operation.whenComplete(() {
+      if (identical(_stopOperation, operation)) _stopOperation = null;
+    });
+  }
+
+  Future<void> _stopInternal() async {
     _stopping = true;
 
     try {
@@ -989,8 +1005,19 @@ class RecordingService {
 
       // Nếu rotation đang xảy ra,
       // chờ một chút cho nó kết thúc.
-      while (_rotating) {
+      final rotationDeadline = DateTime.now().add(const Duration(seconds: 10));
+      while (_rotating && DateTime.now().isBefore(rotationDeadline)) {
         await Future<void>.delayed(const Duration(milliseconds: 50));
+      }
+
+      if (_rotating) {
+        developer.log(
+          'Timed out waiting 10 seconds for segment rotation to finish. '
+          'The rotation will finish asynchronously.',
+          name: 'RecordingService',
+        );
+        _videoTrack = null;
+        return;
       }
 
       // ========================================================
@@ -1019,8 +1046,15 @@ class RecordingService {
 
     _segmentTimer = null;
 
-    if (_recording || _recorder != null) {
-      await stop();
+    try {
+      final stopping = _stopOperation;
+      if (stopping != null) {
+        await stopping;
+      } else if (_recording || _recorder != null) {
+        await stop();
+      }
+    } finally {
+      _stopOperation = null;
     }
 
     _videoTrack = null;

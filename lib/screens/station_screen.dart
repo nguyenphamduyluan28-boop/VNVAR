@@ -67,6 +67,8 @@ class _StationScreenState extends State<StationScreen> {
 
       await _runtime.setCameraEnabled(enableCamera);
 
+      if (enableCamera) _showRtspWarningIfNeeded();
+
       if (!enableCamera) {
         // The camera track has been released; remove the persistent
         // "camera active" notification as well.
@@ -88,6 +90,18 @@ class _StationScreenState extends State<StationScreen> {
     } finally {
       if (mounted) setState(() => _cameraSwitching = false);
     }
+  }
+
+  void _showRtspWarningIfNeeded() {
+    final error = _runtime.webRtcService?.rtspError;
+    if (!mounted || error == null) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text(
+          'Camera vẫn hoạt động nhưng RTSP không thể khởi động: $error',
+        ),
+      ),
+    );
   }
 
   Future<void> _switchCameraLens() async {
@@ -193,6 +207,8 @@ class _StationScreenState extends State<StationScreen> {
         deviceId: widget.identity.deviceId,
       );
 
+      _showRtspWarningIfNeeded();
+
       if (!mounted) {
         await _shutdownStation();
         return;
@@ -206,6 +222,12 @@ class _StationScreenState extends State<StationScreen> {
       debugPrint('[STATION] INIT ERROR: $error');
 
       debugPrintStack(stackTrace: stackTrace);
+
+      try {
+        await CameraStationForegroundService.stop();
+      } catch (stopError) {
+        debugPrint('[STATION] Không thể dừng foreground service: $stopError');
+      }
 
       if (!mounted) {
         return;
@@ -249,6 +271,12 @@ class _StationScreenState extends State<StationScreen> {
       debugPrint('[STATION] RETRY ERROR: $error');
 
       debugPrintStack(stackTrace: stackTrace);
+
+      try {
+        await CameraStationForegroundService.stop();
+      } catch (stopError) {
+        debugPrint('[STATION] Không thể dừng foreground service: $stopError');
+      }
 
       if (!mounted) {
         return;
@@ -402,6 +430,12 @@ class _StationScreenState extends State<StationScreen> {
       );
 
       debugPrintStack(stackTrace: stackTrace);
+
+      try {
+        await CameraStationForegroundService.stop();
+      } catch (stopError) {
+        debugPrint('[CONFIG] Không thể dừng foreground service: $stopError');
+      }
 
       if (!mounted) {
         return;

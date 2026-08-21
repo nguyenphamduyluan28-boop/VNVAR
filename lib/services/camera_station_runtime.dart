@@ -18,6 +18,8 @@ class CameraStationRuntime {
   CameraServer? _cameraServer;
   Future<void>? _initializing;
   String? _cameraId;
+  String? _courtId;
+  String? _deviceId;
   Timer? _healthTimer;
   bool _recovering = false;
   bool _stopping = false;
@@ -43,19 +45,34 @@ class CameraStationRuntime {
     required String cameraId,
     required String courtId,
     required String deviceId,
-  }) {
-    if (ready && _cameraId == cameraId) return Future<void>.value();
+  }) async {
+    while (true) {
+      if (ready &&
+          _cameraId == cameraId &&
+          _courtId == courtId &&
+          _deviceId == deviceId) {
+        return;
+      }
 
-    final current = _initializing;
-    if (current != null) return current;
+      final current = _initializing;
+      if (current != null) {
+        await current;
+        continue;
+      }
 
-    final operation = _initializeInternal(
-      cameraId: cameraId,
-      courtId: courtId,
-      deviceId: deviceId,
-    );
-    _initializing = operation;
-    return operation.whenComplete(() => _initializing = null);
+      final operation = _initializeInternal(
+        cameraId: cameraId,
+        courtId: courtId,
+        deviceId: deviceId,
+      );
+      _initializing = operation;
+      try {
+        await operation;
+        return;
+      } finally {
+        if (identical(_initializing, operation)) _initializing = null;
+      }
+    }
   }
 
   Future<void> _initializeInternal({
@@ -65,7 +82,14 @@ class CameraStationRuntime {
   }) async {
     _stopping = false;
     _cameraEnabled = true;
-    if (_cameraId != null && _cameraId != cameraId) await stop();
+    if (_cameraId != null &&
+        (_cameraId != cameraId ||
+            _courtId != courtId ||
+            _deviceId != deviceId)) {
+      await stop();
+      _stopping = false;
+      _cameraEnabled = true;
+    }
 
     developer.log(
       '[SERVICE] Initializing runtime: $cameraId / $courtId',
@@ -76,26 +100,25 @@ class CameraStationRuntime {
     final recording = _recordingService ?? RecordingService(cameraId: cameraId);
 
     webRtc.onCameraFailure = _scheduleRecovery;
-
-    await webRtc.initializeCamera();
-
-    final server =
-        _cameraServer ??
-        CameraServer(
-          courtId: courtId,
-          cameraId: cameraId,
-          deviceId: deviceId,
-          webRtcService: webRtc,
-          recordingService: recording,
-          onStateChanged: _emitState,
-        );
-
     _webRtcService = webRtc;
     _recordingService = recording;
-    _cameraServer = server;
     _cameraId = cameraId;
+    _courtId = courtId;
+    _deviceId = deviceId;
 
     try {
+      await webRtc.initializeCamera();
+
+      final server = CameraServer(
+        courtId: courtId,
+        cameraId: cameraId,
+        deviceId: deviceId,
+        webRtcService: webRtc,
+        recordingService: recording,
+        onStateChanged: _emitState,
+      );
+      _cameraServer = server;
+
       await server.start();
       await server.ensureRecording();
       _startHealthMonitor();
@@ -138,6 +161,9 @@ class CameraStationRuntime {
     _recordingService = null;
     _webRtcService = null;
     _cameraId = null;
+    _courtId = null;
+    _deviceId = null;
+    _cameraEnabled = false;
 
     try {
       await server?.stop();

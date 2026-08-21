@@ -42,6 +42,7 @@ class CameraServer {
   // ============================================================
 
   bool recording = false;
+  Future<void>? _ensureRecordingOperation;
 
   bool get running => _server != null;
 
@@ -95,8 +96,8 @@ class CameraServer {
     // Nạp lại video đã lưu trên điện thoại.
     await recordingService.cleanupOldTempFiles();
 
-    // Discovery để Tablet tự tìm camera.
-    await _discovery.startBroadcast(
+    // Legacy tablet discovery uses a short TCP request/response on port 40404.
+    await _discovery.startTcpDiscovery(
       courtId: courtId,
       cameraId: cameraId,
       deviceId: deviceId,
@@ -143,7 +144,7 @@ class CameraServer {
     developer.log('Camera Server stopped', name: 'CameraServer');
   }
 
-  void _viewerPage(HttpRequest request) {
+  Future<void> _viewerPage(HttpRequest request) async {
     request.response.headers.contentType = ContentType.html;
     request.response.write('''<!doctype html>
 <html lang="vi">
@@ -176,7 +177,7 @@ class CameraServer {
   }catch(error){state.textContent='Lỗi kết nối';document.body.insertAdjacentHTML('beforeend','<div style="position:fixed;left:16px;bottom:16px;color:#ff8a80">'+String(error)+'</div>')}
 })();
 </script></body></html>''');
-    request.response.close();
+    await request.response.close();
   }
 
   // ============================================================
@@ -192,7 +193,7 @@ class CameraServer {
 
     try {
       if ((path == '/' || path == '/viewer') && method == 'GET') {
-        _viewerPage(request);
+        await _viewerPage(request);
         return;
       }
 
@@ -201,7 +202,7 @@ class CameraServer {
       // ========================================================
 
       if (path == '/status' && method == 'GET') {
-        _status(request);
+        await _status(request);
         return;
       }
 
@@ -257,7 +258,7 @@ class CameraServer {
       // ========================================================
 
       if (path == '/segments' && method == 'GET') {
-        _segments(request);
+        await _segments(request);
         return;
       }
 
@@ -277,7 +278,7 @@ class CameraServer {
       // ========================================================
 
       if (path == '/videos' && method == 'GET') {
-        _videos(request);
+        await _videos(request);
         return;
       }
 
@@ -328,7 +329,7 @@ class CameraServer {
       // 404
       // ========================================================
 
-      _sendJson(request.response, HttpStatus.notFound, {
+      await _sendJson(request.response, HttpStatus.notFound, {
         'error': 'Not Found',
         'path': path,
       });
@@ -341,7 +342,7 @@ class CameraServer {
       );
 
       try {
-        _sendJson(request.response, HttpStatus.internalServerError, {
+        await _sendJson(request.response, HttpStatus.internalServerError, {
           'error': 'Internal Server Error',
           'message': error.toString(),
         });
@@ -355,10 +356,10 @@ class CameraServer {
   // STATUS
   // ============================================================
 
-  void _status(HttpRequest request) {
+  Future<void> _status(HttpRequest request) async {
     recording = recordingService.recording;
 
-    _sendJson(request.response, HttpStatus.ok, {
+    await _sendJson(request.response, HttpStatus.ok, {
       'type': 'VNVAR_CAMERA_STATUS_V1',
 
       'courtId': courtId,
@@ -396,7 +397,18 @@ class CameraServer {
       return;
     }
 
-    await _startRecorder();
+    final current = _ensureRecordingOperation;
+    if (current != null) return current;
+
+    final operation = _startRecorder();
+    _ensureRecordingOperation = operation;
+    try {
+      await operation;
+    } finally {
+      if (identical(_ensureRecordingOperation, operation)) {
+        _ensureRecordingOperation = null;
+      }
+    }
   }
 
   Future<void> _autoStartRecording(HttpRequest request) async {
@@ -405,7 +417,7 @@ class CameraServer {
 
       _discovery.updateStatus('RECORDING');
 
-      _sendJson(request.response, HttpStatus.ok, {
+      await _sendJson(request.response, HttpStatus.ok, {
         'success': true,
 
         'cameraId': cameraId,
@@ -420,7 +432,7 @@ class CameraServer {
 
     await ensureRecording();
 
-    _sendJson(request.response, HttpStatus.ok, {
+    await _sendJson(request.response, HttpStatus.ok, {
       'success': true,
 
       'cameraId': cameraId,
@@ -440,7 +452,7 @@ class CameraServer {
       await ensureRecording();
     }
 
-    _sendJson(request.response, HttpStatus.ok, {
+    await _sendJson(request.response, HttpStatus.ok, {
       'success': true,
 
       'courtId': courtId,
@@ -498,7 +510,7 @@ class CameraServer {
 
     onStateChanged?.call();
 
-    _sendJson(request.response, HttpStatus.ok, {
+    await _sendJson(request.response, HttpStatus.ok, {
       'success': true,
 
       'courtId': courtId,
@@ -522,14 +534,9 @@ class CameraServer {
   // ============================================================
 
   Future<void> _checkVar(HttpRequest request) async {
-    if (recordingService.recording) {
-      await recordingService.stop();
-      await _startRecorder();
-    } else {
-      await _startRecorder();
-    }
-    onStateChanged?.call();
-    _sendJson(request.response, HttpStatus.ok, {
+    // CheckVar is a read-only health probe. Cycling the recorder here raced
+    // with stop/rotation and could throw "RecordingService is stopping".
+    await _sendJson(request.response, HttpStatus.ok, {
       'success': true,
 
       'cameraId': cameraId,
@@ -546,7 +553,7 @@ class CameraServer {
   // SEGMENTS
   // ============================================================
 
-  void _segments(HttpRequest request) {
+  Future<void> _segments(HttpRequest request) async {
     final segments = recordingService.segments.map((segment) {
       return {
         ...segment.toJson(),
@@ -555,7 +562,7 @@ class CameraServer {
       };
     }).toList();
 
-    _sendJson(request.response, HttpStatus.ok, {
+    await _sendJson(request.response, HttpStatus.ok, {
       'type': 'VNVAR_SEGMENT_LIST_V1',
 
       'courtId': courtId,
@@ -592,7 +599,7 @@ class CameraServer {
     final parts = request.uri.pathSegments;
 
     if (parts.length != 3) {
-      _sendJson(request.response, HttpStatus.badRequest, {
+      await _sendJson(request.response, HttpStatus.badRequest, {
         'error': 'Invalid segment route',
       });
 
@@ -610,7 +617,7 @@ class CameraServer {
     final marked = await recordingService.markDownloadedAndDelete(segmentId);
 
     if (!marked) {
-      _sendJson(request.response, HttpStatus.notFound, {
+      await _sendJson(request.response, HttpStatus.notFound, {
         'success': false,
 
         'segmentId': segmentId,
@@ -621,7 +628,7 @@ class CameraServer {
       return;
     }
 
-    _sendJson(request.response, HttpStatus.ok, {
+    await _sendJson(request.response, HttpStatus.ok, {
       'success': true,
 
       'segmentId': segmentId,
@@ -636,12 +643,12 @@ class CameraServer {
   // OLD VIDEO LIST
   // ============================================================
 
-  void _videos(HttpRequest request) {
+  Future<void> _videos(HttpRequest request) async {
     final videos = recordingService.segments
         .map((segment) => segment.toJson())
         .toList();
 
-    _sendJson(request.response, HttpStatus.ok, {
+    await _sendJson(request.response, HttpStatus.ok, {
       'courtId': courtId,
 
       'cameraId': cameraId,
@@ -728,7 +735,7 @@ class CameraServer {
     final startMs = body['startMs'];
     final endMs = body['endMs'];
     if (segmentId is! String || startMs is! num || endMs is! num) {
-      _sendJson(request.response, HttpStatus.badRequest, {
+      await _sendJson(request.response, HttpStatus.badRequest, {
         'error': 'segmentId, startMs và endMs là bắt buộc',
       });
       return;
@@ -739,7 +746,7 @@ class CameraServer {
       endMs: endMs.toInt(),
     );
     onStateChanged?.call();
-    _sendJson(request.response, HttpStatus.ok, {
+    await _sendJson(request.response, HttpStatus.ok, {
       'success': true,
       'courtId': courtId,
       ...clip.toJson(),
@@ -862,7 +869,7 @@ class CameraServer {
     final type = body['type'] as String?;
 
     if (sdp == null || sdp.isEmpty || type == null || type.isEmpty) {
-      _sendJson(request.response, HttpStatus.badRequest, {
+      await _sendJson(request.response, HttpStatus.badRequest, {
         'error': 'Invalid WebRTC offer',
       });
 
@@ -877,7 +884,7 @@ class CameraServer {
       type: type,
     );
 
-    _sendJson(request.response, HttpStatus.ok, {
+    await _sendJson(request.response, HttpStatus.ok, {
       'sdp': answer.sdp,
 
       'type': answer.type,
@@ -896,7 +903,7 @@ class CameraServer {
     final candidate = body['candidate'] as String?;
 
     if (candidate == null || candidate.isEmpty) {
-      _sendJson(request.response, HttpStatus.badRequest, {
+      await _sendJson(request.response, HttpStatus.badRequest, {
         'error': 'Invalid ICE candidate',
       });
 
@@ -921,7 +928,7 @@ class CameraServer {
       sdpMLineIndex: index,
     );
 
-    _sendJson(request.response, HttpStatus.ok, {'success': true});
+    await _sendJson(request.response, HttpStatus.ok, {'success': true});
   }
 
   // ============================================================
@@ -962,7 +969,7 @@ class CameraServer {
   // SEND JSON
   // ============================================================
 
-  void _sendJson(
+  Future<void> _sendJson(
     HttpResponse response,
     int statusCode,
     Map<String, dynamic> data,
@@ -975,6 +982,6 @@ class CameraServer {
 
     response.write(jsonEncode(data));
 
-    response.close();
+    return response.close();
   }
 }

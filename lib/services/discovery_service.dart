@@ -25,7 +25,11 @@ class DiscoveryService {
   // START
   // ============================================================
 
-  Future<void> startBroadcast({
+  /// Starts the legacy VNVAR discovery protocol over TCP.
+  ///
+  /// Despite the old `startBroadcast` name, this has never been a UDP/LAN
+  /// broadcast: the tablet connects to TCP port 40404 and sends one line.
+  Future<void> startTcpDiscovery({
     required String courtId,
     required String cameraId,
     required String deviceId,

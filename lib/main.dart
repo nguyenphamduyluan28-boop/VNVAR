@@ -42,16 +42,23 @@ class _VnvarCameraStationAppState extends State<VnvarCameraStationApp> {
     _identity = widget.savedIdentity;
   }
 
+  void _onSplashFinished() {
+    if (!mounted) return;
+    if (_identity != null) {
+      setState(() => _step = _StartupStep.station);
+    } else {
+      _showCourtSetup();
+    }
+  }
+
   void _showCourtSetup() {
     if (!mounted) return;
     setState(() => _step = _StartupStep.courtSetup);
   }
 
-  Future<void> _showCameraSetup(int _) async {
-    await StationConfigService().clearIdentity();
+  void _showCameraSetup(int _) {
     if (!mounted) return;
     setState(() {
-      _identity = null;
       _step = _StartupStep.cameraSetup;
     });
   }
@@ -87,7 +94,7 @@ class _VnvarCameraStationAppState extends State<VnvarCameraStationApp> {
   Widget _buildCurrentScreen() {
     switch (_step) {
       case _StartupStep.splash:
-        return StationSplashScreen(onFinished: _showCourtSetup);
+        return StationSplashScreen(onFinished: _onSplashFinished);
       case _StartupStep.courtSetup:
         return CourtCountScreen(onSaved: _showCameraSetup);
       case _StartupStep.cameraSetup:

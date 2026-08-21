@@ -42,12 +42,15 @@ class WebRtcService {
   int _cameraLifecycleGeneration = 0;
   bool? _isEmulator;
   bool _rtspRunning = false;
+  String? _rtspError;
 
   // ============================================================
   // GETTERS
   // ============================================================
 
   bool get cameraInitialized => _cameraInitialized;
+
+  String? get rtspError => _rtspError;
 
   MediaStream? get localStream => _localStream;
 
@@ -173,24 +176,26 @@ class WebRtcService {
       name: 'WebRtcService',
     );
 
+    final videoConstraints = _isEmulator == true
+        ? <String, dynamic>{
+            'facingMode': facingMode,
+            'width': {'min': 320, 'ideal': 640, 'max': 640},
+            'height': {'min': 240, 'ideal': 480, 'max': 480},
+            'frameRate': {'min': 10, 'ideal': 15, 'max': 20},
+          }
+        : <String, dynamic>{
+            'facingMode': facingMode,
+            // 720p is broadly supported; capable phones may negotiate 1080p.
+            'width': {'min': 640, 'ideal': 1280, 'max': 1920},
+            'height': {'min': 360, 'ideal': 720, 'max': 1080},
+            // `ideal` is not mandatory: 30/24/15 FPS phones automatically use
+            // their highest supported capture mode.
+            'frameRate': {'min': 10, 'ideal': 60, 'max': 60},
+          };
+
     final streamFuture = navigator.mediaDevices.getUserMedia({
       'audio': false,
-
-      'video': {
-        'facingMode': facingMode,
-
-        // Camera2 của Android Emulator thường báo mở thành công nhưng đóng
-        // băng nếu WebRTC yêu cầu 1280x720@30. Giới hạn capture ở cấu hình
-        // phổ biến; luồng WebRTC vẫn có thể được renderer phóng đầy màn hình.
-        'width': {'min': 320, 'ideal': 640, 'max': 640},
-
-        'height': {'min': 240, 'ideal': 480, 'max': 480},
-
-        // `ideal` requests the highest commonly supported mobile rate without
-        // making 60 FPS mandatory. Devices limited to 30/24/15 FPS can still
-        // open the camera and WebRTC selects their best available mode.
-        'frameRate': {'min': 10, 'ideal': 60, 'max': 60},
-      },
+      'video': videoConstraints,
     });
 
     late final MediaStream stream;
@@ -323,12 +328,14 @@ class WebRtcService {
         'port': 8554,
       });
       _rtspRunning = true;
+      _rtspError = null;
       developer.log(
         '[RTSP] Running at rtsp://0.0.0.0:8554/camera',
         name: 'WebRtcService',
       );
     } catch (error, stackTrace) {
       _rtspRunning = false;
+      _rtspError = error.toString();
       developer.log(
         '[RTSP] Cannot start server',
         error: error,
