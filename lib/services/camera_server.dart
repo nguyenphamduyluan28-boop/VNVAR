@@ -277,18 +277,43 @@ class CameraServer {
       // VIDEO LIST CŨ
       // ========================================================
 
-      if (path == '/videos' && method == 'GET') {
+      if (path == '/video' && method == 'GET') {
         await _videos(request);
+        return;
+      }
+
+      // ========================================================
+      // TRIM VIDEO
+      //
+      // Route tĩnh phải được kiểm tra trước /video/{fileName}, nếu không
+      // GET /video/trim sẽ bị hiểu nhầm "trim" là tên một file video.
+      // ========================================================
+
+      if (path == '/video/trim') {
+        if (method == 'POST') {
+          await _trimVideo(request);
+        } else {
+          request.response.headers.set(HttpHeaders.allowHeader, 'POST');
+          await _sendJson(request.response, HttpStatus.methodNotAllowed, {
+            'error': 'API /video/trim chỉ hỗ trợ POST',
+            'requiredContentType': 'application/json',
+            'requiredBody': {
+              'segmentId': 'ID lấy từ GET /segments',
+              'startMs': 0,
+              'endMs': 10000,
+            },
+          });
+        }
         return;
       }
 
       // ========================================================
       // VIDEO FILE
       //
-      // GET /videos/file.mp4
+      // GET /video/file.mp4
       // ========================================================
 
-      if (path.startsWith('/videos/') && method == 'GET') {
+      if (path.startsWith('/video/') && method == 'GET') {
         await _serveVideo(request);
         return;
       }
@@ -297,13 +322,13 @@ class CameraServer {
       // DOWNLOAD CŨ
       // ========================================================
 
-      if (path.startsWith('/download/') && method == 'GET') {
-        await _downloadVideo(request);
+      if (path == '/download/session/close' && method == 'POST') {
+        await _closeDownloadSession(request);
         return;
       }
 
-      if (path == '/videos/process/trim' && method == 'POST') {
-        await _trimVideo(request);
+      if (path.startsWith('/download/') && method == 'GET') {
+        await _downloadVideo(request);
         return;
       }
 
@@ -448,7 +473,8 @@ class CameraServer {
   // ============================================================
 
   Future<void> _startRecording(HttpRequest request) async {
-    if (!recordingService.recording) {
+    final alreadyRunning = recordingService.recording;
+    if (!alreadyRunning) {
       await ensureRecording();
     }
 
@@ -465,7 +491,7 @@ class CameraServer {
 
       'recording': true,
 
-      'alreadyRunning': recordingService.recording,
+      'alreadyRunning': alreadyRunning,
     });
   }
 
@@ -528,24 +554,19 @@ class CameraServer {
   // ============================================================
   // CHECKVAR
   //
-  // Không làm thay đổi recorder.
-  //
-  // CheckVarPage sẽ đọc video đã tải trên Tablet.
+  // Chốt ngay file đang quay và mở file kế tiếp để ghi liên tục.
   // ============================================================
 
   Future<void> _checkVar(HttpRequest request) async {
-    // CheckVar is a read-only health probe. Cycling the recorder here raced
-    // with stop/rotation and could throw "RecordingService is stopping".
+    final segment = await recordingService.checkpointCurrentSegment();
     await _sendJson(request.response, HttpStatus.ok, {
       'success': true,
-
-      'cameraId': cameraId,
-
-      'recording': recordingService.recording,
-
-      'segmentCount': recordingService.segments.length,
-
-      'timestamp': DateTime.now().toIso8601String(),
+      'checkpointSegment': {
+        'id': segment.id,
+        'fileName': segment.fileName,
+        'durationMs': segment.durationMs,
+        'downloadUrl': '/video/${segment.fileName}',
+      },
     });
   }
 
@@ -555,11 +576,7 @@ class CameraServer {
 
   Future<void> _segments(HttpRequest request) async {
     final segments = recordingService.segments.map((segment) {
-      return {
-        ...segment.toJson(),
-
-        'downloadUrl': '/videos/${segment.fileName}',
-      };
+      return {...segment.toJson(), 'downloadUrl': '/video/${segment.fileName}'};
     }).toList();
 
     await _sendJson(request.response, HttpStatus.ok, {
@@ -710,7 +727,8 @@ class CameraServer {
 
     final fileName = request.uri.pathSegments.last;
 
-    final segment = _findVideo(fileName);
+    final segment =
+        recordingService.findExportByFileName(fileName) ?? _findVideo(fileName);
 
     if (segment == null) {
       await _sendNotFound(request.response);
@@ -727,6 +745,15 @@ class CameraServer {
     }
 
     await _sendVideoFile(request, file, attachment: true);
+  }
+
+  Future<void> _closeDownloadSession(HttpRequest request) async {
+    await recordingService.cleanupExportDownloads();
+    onStateChanged?.call();
+    await _sendJson(request.response, HttpStatus.ok, {
+      'success': true,
+      'downloadSession': 'closed',
+    });
   }
 
   Future<void> _trimVideo(HttpRequest request) async {
@@ -751,6 +778,8 @@ class CameraServer {
       'courtId': courtId,
       ...clip.toJson(),
       'downloadUrl': '/download/${clip.fileName}',
+      'cleanupUrl': '/download/session/close',
+      'cleanupMethod': 'POST',
     });
   }
 
@@ -813,28 +842,43 @@ class CameraServer {
     // RANGE
     // ==========================================================
 
-    final String rawRange = rangeHeader.substring(6);
-
+    final String rawRange = rangeHeader.substring(6).trim();
     final parts = rawRange.split('-');
 
-    int start = int.tryParse(parts.first) ?? 0;
+    int? start;
+    int? end;
+    var validRange =
+        fileLength > 0 &&
+        !rawRange.contains(',') &&
+        parts.length == 2 &&
+        (parts[0].isNotEmpty || parts[1].isNotEmpty);
 
-    int end = fileLength - 1;
-
-    if (parts.length > 1 && parts[1].isNotEmpty) {
-      end = int.tryParse(parts[1]) ?? end;
+    if (validRange && parts[0].isEmpty) {
+      // Suffix range, ví dụ bytes=-500: lấy 500 byte cuối file.
+      final suffixLength = int.tryParse(parts[1]);
+      if (suffixLength == null || suffixLength <= 0) {
+        validRange = false;
+      } else {
+        end = fileLength - 1;
+        start = suffixLength >= fileLength ? 0 : fileLength - suffixLength;
+      }
+    } else if (validRange) {
+      start = int.tryParse(parts[0]);
+      if (start == null || start < 0 || start >= fileLength) {
+        validRange = false;
+      } else if (parts[1].isEmpty) {
+        end = fileLength - 1;
+      } else {
+        end = int.tryParse(parts[1]);
+        if (end == null || end < start) {
+          validRange = false;
+        } else if (end >= fileLength) {
+          end = fileLength - 1;
+        }
+      }
     }
 
-    if (start < 0) {
-      start = 0;
-    }
-
-    if (end >= fileLength) {
-      end = fileLength - 1;
-    }
-
-    // Range không hợp lệ.
-    if (start > end || start >= fileLength) {
+    if (!validRange || start == null || end == null) {
       response.statusCode = 416;
 
       response.headers.set('Content-Range', 'bytes */$fileLength');

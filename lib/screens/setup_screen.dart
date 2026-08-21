@@ -25,16 +25,7 @@ class SetupScreen extends StatefulWidget {
 }
 
 class _SetupScreenState extends State<SetupScreen> {
-  static const List<String> _cameraIds = [
-    'CAM-01',
-    'CAM-02',
-    'CAM-03',
-    'CAM-04',
-    'CAM-05',
-    'CAM-06',
-    'CAM-07',
-    'CAM-08',
-  ];
+  static const List<String> _cameraIds = ['CAM-01', 'CAM-02', 'CAM-03'];
 
   static const List<String> _positions = [
     'Góc trái sân',
@@ -68,7 +59,15 @@ class _SetupScreenState extends State<SetupScreen> {
     super.initState();
     final identity = widget.initialIdentity;
 
-    _cameraId = identity?.cameraId ?? _cameraIds.first;
+    final savedCameraNumber = int.tryParse(
+      RegExp(r'(\d+)$').firstMatch(identity?.cameraId ?? '')?.group(1) ?? '',
+    );
+    _cameraId =
+        savedCameraNumber != null &&
+            savedCameraNumber >= 1 &&
+            savedCameraNumber <= _cameraIds.length
+        ? 'CAM-${savedCameraNumber.toString().padLeft(2, '0')}'
+        : _cameraIds.first;
     _courtId = identity?.courtId ?? 'COURT-01';
     _deviceId = identity?.deviceId ?? _generateDeviceId();
 

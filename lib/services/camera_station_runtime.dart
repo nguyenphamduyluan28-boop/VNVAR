@@ -21,6 +21,7 @@ class CameraStationRuntime {
   String? _courtId;
   String? _deviceId;
   Timer? _healthTimer;
+  Timer? _storageCleanupTimer;
   bool _recovering = false;
   bool _stopping = false;
   bool _cameraEnabled = true;
@@ -153,6 +154,8 @@ class CameraStationRuntime {
     _generation++;
     _healthTimer?.cancel();
     _healthTimer = null;
+    _storageCleanupTimer?.cancel();
+    _storageCleanupTimer = null;
 
     final server = _cameraServer;
     final webRtc = _webRtcService;
@@ -259,6 +262,13 @@ class CameraStationRuntime {
           !track.enabled) {
         _scheduleRecovery('health_check_failed');
       }
+    });
+
+    _storageCleanupTimer?.cancel();
+    _storageCleanupTimer = Timer.periodic(const Duration(seconds: 60), (_) {
+      final recording = _recordingService;
+      if (recording == null) return;
+      unawaited(recording.enforceStorageLimit());
     });
   }
 

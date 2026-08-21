@@ -6,6 +6,7 @@ import android.net.Uri
 import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Environment
+import android.os.StatFs
 import android.provider.DocumentsContract
 import android.provider.Settings
 import androidx.core.content.ContextCompat
@@ -69,6 +70,19 @@ class MainActivity : FlutterActivity() {
                 }
 
                 "selectVideoFolder" -> selectVideoFolder(result)
+
+                "getAvailableStorageBytes" -> {
+                    val path = call.argument<String>("path")
+                    if (path.isNullOrBlank()) {
+                        result.error("INVALID_STORAGE_PATH", "Thiếu đường dẫn bộ nhớ.", null)
+                    } else {
+                        try {
+                            result.success(StatFs(path).availableBytes)
+                        } catch (error: Exception) {
+                            result.error("STORAGE_STAT_FAILED", error.message, path)
+                        }
+                    }
+                }
 
                 else -> result.notImplemented()
             }

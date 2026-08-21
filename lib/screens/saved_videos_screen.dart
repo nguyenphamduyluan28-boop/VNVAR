@@ -123,7 +123,7 @@ class _SavedVideosScreenState extends State<SavedVideosScreen> {
                       LinearProgressIndicator(value: ratio),
                       const SizedBox(height: 7),
                       const Text(
-                        'Khi đầy, video ngày cũ nhất sẽ tự động bị xóa.',
+                        'Chỉ giữ dữ liệu hôm nay; khi đầy 20 GB sẽ xóa cuốn chiếu.',
                         style: TextStyle(fontSize: 12, color: Colors.black54),
                       ),
                     ],
