@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:developer' as developer;
+import 'dart:io';
 
 import 'package:flutter/services.dart';
 import 'package:flutter_webrtc/flutter_webrtc.dart';
@@ -51,6 +52,8 @@ class WebRtcService {
   bool get cameraInitialized => _cameraInitialized;
 
   String? get rtspError => _rtspError;
+
+  bool get rtspSupported => Platform.isAndroid;
 
   MediaStream? get localStream => _localStream;
 
@@ -310,6 +313,7 @@ class WebRtcService {
   }
 
   Future<bool> _detectEmulator() async {
+    if (!Platform.isAndroid) return false;
     try {
       return await _platformChannel.invokeMethod<bool>('isEmulator') ?? false;
     } catch (error) {
@@ -322,6 +326,15 @@ class WebRtcService {
   }
 
   Future<void> _startRtsp(MediaStreamTrack track) async {
+    if (!rtspSupported) {
+      _rtspRunning = false;
+      _rtspError = 'RTSP chỉ được hỗ trợ trên Android.';
+      developer.log(
+        '[RTSP] Unsupported on ${Platform.operatingSystem}.',
+        name: 'WebRtcService',
+      );
+      return;
+    }
     try {
       await _platformChannel.invokeMethod<Map<Object?, Object?>>('startRtsp', {
         'trackId': track.id,
@@ -346,6 +359,7 @@ class WebRtcService {
   }
 
   Future<void> _stopRtsp() async {
+    if (!Platform.isAndroid) return;
     if (!_rtspRunning) return;
     _rtspRunning = false;
     try {

@@ -30,7 +30,7 @@ subprojects {
         the<com.android.build.gradle.BaseExtension>().apply {
             compileSdkVersion(34)
             defaultConfig {
-                targetSdk(34)
+                targetSdkVersion(34)
             }
         }
     }

@@ -93,7 +93,9 @@ class _StationScreenState extends State<StationScreen> {
   }
 
   void _showRtspWarningIfNeeded() {
-    final error = _runtime.webRtcService?.rtspError;
+    final webRtc = _runtime.webRtcService;
+    if (webRtc == null || !webRtc.rtspSupported) return;
+    final error = webRtc.rtspError;
     if (!mounted || error == null) return;
     ScaffoldMessenger.of(context).showSnackBar(
       SnackBar(

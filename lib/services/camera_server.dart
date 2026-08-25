@@ -402,6 +402,10 @@ class CameraServer {
 
       'cameraReady': webRtcService.cameraInitialized,
 
+      'rtspSupported': webRtcService.rtspSupported,
+
+      'rtspError': webRtcService.rtspError,
+
       'segmentCount': recordingService.segments.length,
 
       'currentSegmentStartedAt': recordingService.currentSegmentStartedAt

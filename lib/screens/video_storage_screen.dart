@@ -2,7 +2,6 @@ import 'dart:async';
 import 'dart:io';
 
 import 'package:flutter/material.dart';
-import 'package:flutter/services.dart';
 import 'package:video_player/video_player.dart';
 
 import '../services/recording_service.dart';
@@ -22,7 +21,6 @@ class VideoStorageScreen extends StatefulWidget {
 }
 
 class _VideoStorageScreenState extends State<VideoStorageScreen> {
-  static const _platform = MethodChannel('vnvar/camera_station_service');
   bool _loading = true;
   int _totalBytes = 0;
   List<RecordedSegment> _videos = const [];
@@ -85,7 +83,7 @@ class _VideoStorageScreenState extends State<VideoStorageScreen> {
 
   Future<void> _chooseStorage() async {
     try {
-      final path = await _platform.invokeMethod<String>('selectVideoFolder');
+      final path = await widget.recordingService.selectStorageFolder();
       if (path == null || path.trim().isEmpty) return;
       if (!mounted) return;
       final finalPath =
@@ -215,7 +213,10 @@ class _VideoStorageScreenState extends State<VideoStorageScreen> {
                 segmentMinutes: _segmentMinutes,
                 storagePath: _storagePath,
                 onSegmentChanged: _changeSegmentMinutes,
-                onChooseStorage: _chooseStorage,
+                onChooseStorage:
+                    widget.recordingService.supportsStorageFolderSelection
+                    ? _chooseStorage
+                    : null,
               );
               final savedVideos = VideoList(
                 loading: _loading,
@@ -271,7 +272,7 @@ class _InformationPanel extends StatelessWidget {
   final int segmentMinutes;
   final String storagePath;
   final ValueChanged<int?> onSegmentChanged;
-  final VoidCallback onChooseStorage;
+  final VoidCallback? onChooseStorage;
 
   const _InformationPanel({
     required this.totalSize,
@@ -398,25 +399,27 @@ class _InformationPanel extends StatelessWidget {
                       ),
                     ),
                   ),
-                  const SizedBox(width: 8),
-                  FilledButton.icon(
-                    style: FilledButton.styleFrom(
-                      padding: const EdgeInsets.symmetric(
-                        horizontal: 10,
-                        vertical: 11,
+                  if (onChooseStorage != null) ...[
+                    const SizedBox(width: 8),
+                    FilledButton.icon(
+                      style: FilledButton.styleFrom(
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 10,
+                          vertical: 11,
+                        ),
+                        visualDensity: VisualDensity.compact,
                       ),
-                      visualDensity: VisualDensity.compact,
-                    ),
-                    onPressed: onChooseStorage,
-                    icon: const Icon(Icons.folder_open_rounded, size: 18),
-                    label: Text(
-                      storagePath.isEmpty ? 'CHỌN THƯ MỤC' : 'ĐỔI THƯ MỤC',
-                      style: const TextStyle(
-                        fontSize: 11,
-                        fontWeight: FontWeight.w900,
+                      onPressed: onChooseStorage,
+                      icon: const Icon(Icons.folder_open_rounded, size: 18),
+                      label: Text(
+                        storagePath.isEmpty ? 'CHỌN THƯ MỤC' : 'ĐỔI THƯ MỤC',
+                        style: const TextStyle(
+                          fontSize: 11,
+                          fontWeight: FontWeight.w900,
+                        ),
                       ),
                     ),
-                  ),
+                  ],
                 ],
               ),
 
@@ -438,7 +441,7 @@ class _InformationPanel extends StatelessWidget {
               _SettingLine(
                 icon: Icons.content_cut_rounded,
                 title: 'API cắt video',
-                value: '$apiBase/video/trim',
+                value: '$apiBase/trim',
                 last: true,
               ),
             ],
