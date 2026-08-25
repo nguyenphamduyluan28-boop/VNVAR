@@ -1,6 +1,8 @@
 import 'dart:async';
 import 'dart:developer' as developer;
 
+import 'package:wakelock_plus/wakelock_plus.dart';
+
 import 'camera_server.dart';
 import 'recording_service.dart';
 import 'webrtc_service.dart';
@@ -127,8 +129,14 @@ class CameraStationRuntime {
       await server.start();
       await server.ensureRecording();
       _startHealthMonitor();
+
+      // Giữ màn hình luôn sáng khi camera đang hoạt động.
+      // Trên iOS, điều này đảm bảo app luôn ở foreground và camera
+      // không bị hệ điều hành dừng khi màn hình tắt.
+      await WakelockPlus.enable();
+
       developer.log(
-        '[RECORDING] Automatic recording is active',
+        '[RECORDING] Automatic recording is active (wakelock enabled)',
         name: 'CameraStationRuntime',
       );
       _emitState();
@@ -179,6 +187,10 @@ class CameraStationRuntime {
       await webRtc?.dispose();
       _recovering = false;
       _stopping = false;
+
+      // Cho phép màn hình tắt bình thường khi dừng camera.
+      await WakelockPlus.disable();
+
       _emitState();
     }
 
@@ -219,6 +231,7 @@ class CameraStationRuntime {
         await webRtc.disposeCamera();
       }
 
+      await WakelockPlus.disable();
       developer.log('[CAMERA] Disabled by user', name: 'CameraStationRuntime');
       _emitState();
       return;
@@ -227,6 +240,7 @@ class CameraStationRuntime {
     try {
       await webRtc.initializeCamera();
       await server.ensureRecording();
+      await WakelockPlus.enable();
       developer.log('[CAMERA] Enabled by user', name: 'CameraStationRuntime');
     } catch (_) {
       _cameraEnabled = false;
