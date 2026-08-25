@@ -111,7 +111,7 @@ class RecordingService {
 
   static const int storageLimitBytes = 20 * 1024 * 1024 * 1024;
   static const int storageDays = 1;
-  static const int normalFreeSpaceThresholdBytes = 5 * 1024 * 1024 * 1024;
+  static const int normalFreeSpaceThresholdBytes = 1 * 1024 * 1024 * 1024;
   static const int matchFreeSpaceThresholdBytes = 1 * 1024 * 1024 * 1024;
   static const int autoCleanupMaxPasses = 50;
   static const int autoCleanupBatchSize = 10;

@@ -1,4 +1,4 @@
-package com.example.camera_station
+package vn.vnvar.cameraStation
 
 import android.media.MediaCodec
 import android.media.MediaCodecInfo

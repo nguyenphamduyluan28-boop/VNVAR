@@ -1,4 +1,4 @@
-package com.example.camera_station
+package vn.vnvar.cameraStation
 
 import android.app.Notification
 import android.app.NotificationChannel
@@ -34,7 +34,8 @@ class CameraStationForegroundService : Service() {
             startForeground(
                 NOTIFICATION_ID,
                 notification,
-                ServiceInfo.FOREGROUND_SERVICE_TYPE_CAMERA,
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_CAMERA or
+                    ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE,
             )
         } else {
             startForeground(NOTIFICATION_ID, notification)
@@ -101,8 +102,8 @@ class CameraStationForegroundService : Service() {
     }
 
     companion object {
-        const val ACTION_START = "com.example.camera_station.action.START"
-        const val ACTION_STOP = "com.example.camera_station.action.STOP"
+        const val ACTION_START = "vn.vnvar.cameraStation.action.START"
+        const val ACTION_STOP = "vn.vnvar.cameraStation.action.STOP"
         const val EXTRA_CAMERA_ID = "camera_id"
         const val EXTRA_COURT_ID = "court_id"
 

@@ -1,4 +1,4 @@
-package com.example.camera_station
+package vn.vnvar.cameraStation
 
 import android.Manifest
 import android.content.Intent
@@ -101,7 +101,7 @@ class MainActivity : FlutterActivity() {
 
         pendingStart = PendingStart(cameraId, courtId, result)
 
-        if (!hasCameraPermission()) {
+        if (!hasCapturePermissions()) {
             requestPermissions(requiredRuntimePermissions(), PERMISSION_REQUEST)
             return
         }
@@ -142,6 +142,15 @@ class MainActivity : FlutterActivity() {
             pending.result.error(
                 "CAMERA_PERMISSION_DENIED",
                 "Camera permission is required to run Camera Station.",
+                null,
+            )
+            return
+        }
+        if (!hasMicrophonePermission()) {
+            pendingStart = null
+            pending.result.error(
+                "MICROPHONE_PERMISSION_DENIED",
+                "Microphone permission is required to run Camera Station.",
                 null,
             )
             return
@@ -272,6 +281,15 @@ class MainActivity : FlutterActivity() {
             PackageManager.PERMISSION_GRANTED
     }
 
+    private fun hasMicrophonePermission(): Boolean {
+        return ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) ==
+            PackageManager.PERMISSION_GRANTED
+    }
+
+    private fun hasCapturePermissions(): Boolean {
+        return hasCameraPermission() && hasMicrophonePermission()
+    }
+
     private fun isRunningOnEmulator(): Boolean {
         return Build.FINGERPRINT.startsWith("generic") ||
             Build.FINGERPRINT.contains("emulator", ignoreCase = true) ||
@@ -284,7 +302,10 @@ class MainActivity : FlutterActivity() {
     }
 
     private fun requiredRuntimePermissions(): Array<String> {
-        val permissions = mutableListOf(Manifest.permission.CAMERA)
+        val permissions = mutableListOf(
+            Manifest.permission.CAMERA,
+            Manifest.permission.RECORD_AUDIO,
+        )
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             permissions.add(Manifest.permission.POST_NOTIFICATIONS)
         }
@@ -292,7 +313,7 @@ class MainActivity : FlutterActivity() {
     }
 
     private fun completePendingStartIfPossible() {
-        if (!activityResumed || !hasCameraPermission()) return
+        if (!activityResumed || !hasCapturePermissions()) return
 
         val pending = pendingStart ?: return
         pendingStart = null

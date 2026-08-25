@@ -36,6 +36,7 @@ class WebRtcService {
 
   bool _rendererInitialized = false;
   bool _cameraInitialized = false;
+  bool _microphoneEnabled = true;
   Timer? _muteFailureTimer;
   Timer? _firstFrameFailureTimer;
   bool _receivedFirstFrame = false;
@@ -50,6 +51,10 @@ class WebRtcService {
   // ============================================================
 
   bool get cameraInitialized => _cameraInitialized;
+
+  bool get microphoneEnabled => localAudioTrack?.enabled ?? _microphoneEnabled;
+
+  bool get microphoneAvailable => localAudioTrack != null;
 
   String? get rtspError => _rtspError;
 
@@ -77,6 +82,24 @@ class WebRtcService {
     }
 
     return tracks.first;
+  }
+
+  MediaStreamTrack? get localAudioTrack {
+    final tracks = _localStream?.getAudioTracks();
+    return tracks == null || tracks.isEmpty ? null : tracks.first;
+  }
+
+  Future<void> setMicrophoneEnabled(bool enabled) async {
+    _microphoneEnabled = enabled;
+    final track = localAudioTrack;
+    if (track == null) {
+      throw StateError('Micro chưa sẵn sàng.');
+    }
+    track.enabled = enabled;
+    developer.log(
+      '[MICROPHONE] ${enabled ? 'Enabled' : 'Disabled'} by user',
+      name: 'WebRtcService',
+    );
   }
 
   // ============================================================
@@ -197,7 +220,7 @@ class WebRtcService {
           };
 
     final streamFuture = navigator.mediaDevices.getUserMedia({
-      'audio': false,
+      'audio': true,
       'video': videoConstraints,
     });
 
@@ -263,6 +286,11 @@ class WebRtcService {
 
     if (!videoTrack.enabled) {
       videoTrack.enabled = true;
+    }
+
+    final audioTracks = stream.getAudioTracks();
+    for (final track in audioTracks) {
+      track.enabled = _microphoneEnabled;
     }
 
     videoTrack.onEnded = () {
@@ -510,6 +538,14 @@ class WebRtcService {
       developer.log(
         'Station added video track: '
         '${track.id}',
+        name: 'WebRtcService',
+      );
+    }
+
+    for (final track in stream.getAudioTracks()) {
+      await pc.addTrack(track, stream);
+      developer.log(
+        'Station added audio track: ${track.id}, enabled=${track.enabled}',
         name: 'WebRtcService',
       );
     }

@@ -41,6 +41,10 @@ class CameraStationRuntime {
   CameraServer? get cameraServer => _cameraServer;
   bool get ready => _cameraServer?.running ?? false;
   bool get cameraEnabled => _cameraEnabled;
+  bool get microphoneAvailable =>
+      _cameraEnabled && (_webRtcService?.microphoneAvailable ?? false);
+  bool get microphoneEnabled =>
+      microphoneAvailable && (_webRtcService?.microphoneEnabled ?? false);
 
   Future<void> initialize({
     required String cameraId,
@@ -242,6 +246,18 @@ class CameraStationRuntime {
       throw StateError('Camera Station chưa khởi tạo xong.');
     }
     await webRtc.switchCamera();
+    _emitState();
+  }
+
+  Future<void> setMicrophoneEnabled(bool enabled) async {
+    if (!_cameraEnabled) {
+      throw StateError('Camera đang tắt.');
+    }
+    final webRtc = _webRtcService;
+    if (webRtc == null) {
+      throw StateError('Camera Station chưa khởi tạo xong.');
+    }
+    await webRtc.setMicrophoneEnabled(enabled);
     _emitState();
   }
 

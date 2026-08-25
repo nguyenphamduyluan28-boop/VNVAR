@@ -42,6 +42,7 @@ class _StationScreenState extends State<StationScreen> {
   String? _error;
   int _cameraQuarterTurns = 0;
   bool _cameraSwitching = false;
+  bool _microphoneSwitching = false;
   bool _lensSwitching = false;
   String _viewerAddress = 'Đang kiểm tra mạng...';
 
@@ -89,6 +90,23 @@ class _StationScreenState extends State<StationScreen> {
       }
     } finally {
       if (mounted) setState(() => _cameraSwitching = false);
+    }
+  }
+
+  Future<void> _toggleMicrophone() async {
+    if (_microphoneSwitching || !_runtime.microphoneAvailable) return;
+    setState(() => _microphoneSwitching = true);
+    final enableMicrophone = !_runtime.microphoneEnabled;
+    try {
+      await _runtime.setMicrophoneEnabled(enableMicrophone);
+    } catch (error) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Không thể đổi trạng thái micro: $error')),
+        );
+      }
+    } finally {
+      if (mounted) setState(() => _microphoneSwitching = false);
     }
   }
 
@@ -745,6 +763,8 @@ class _StationScreenState extends State<StationScreen> {
                       cameraReady: _cameraReady,
                       cameraEnabled: _runtime.cameraEnabled,
                       cameraSwitching: _cameraSwitching,
+                      microphoneEnabled: _runtime.microphoneEnabled,
+                      microphoneSwitching: _microphoneSwitching,
                       lensSwitching: _lensSwitching,
                       onRotate: _cameraReady
                           ? () {
@@ -758,6 +778,10 @@ class _StationScreenState extends State<StationScreen> {
                           ? _switchCameraLens
                           : null,
                       onToggleCamera: _cameraSwitching ? null : _toggleCamera,
+                      onToggleMicrophone:
+                          _runtime.microphoneAvailable && !_microphoneSwitching
+                          ? _toggleMicrophone
+                          : null,
                     ),
                   ),
                 ),
@@ -1046,20 +1070,26 @@ class _CameraControlDock extends StatelessWidget {
   final bool cameraReady;
   final bool cameraEnabled;
   final bool cameraSwitching;
+  final bool microphoneEnabled;
+  final bool microphoneSwitching;
   final bool lensSwitching;
   final VoidCallback? onRotate;
   final VoidCallback? onSwitchLens;
   final VoidCallback? onToggleCamera;
+  final VoidCallback? onToggleMicrophone;
 
   const _CameraControlDock({
     required this.compact,
     required this.cameraReady,
     required this.cameraEnabled,
     required this.cameraSwitching,
+    required this.microphoneEnabled,
+    required this.microphoneSwitching,
     required this.lensSwitching,
     required this.onRotate,
     required this.onSwitchLens,
     required this.onToggleCamera,
+    required this.onToggleMicrophone,
   });
 
   @override
@@ -1101,6 +1131,17 @@ class _CameraControlDock extends StatelessWidget {
             onPressed: onToggleCamera,
             loading: cameraSwitching,
             background: cameraEnabled
+                ? Colors.red.withValues(alpha: 0.75)
+                : Colors.green.withValues(alpha: 0.75),
+          ),
+          SizedBox(height: gap),
+          _DockButton(
+            icon: microphoneEnabled ? Icons.mic_rounded : Icons.mic_off_rounded,
+            tooltip: microphoneEnabled ? 'Tắt micro' : 'Bật micro',
+            size: buttonSize,
+            onPressed: onToggleMicrophone,
+            loading: microphoneSwitching,
+            background: microphoneEnabled
                 ? Colors.red.withValues(alpha: 0.75)
                 : Colors.green.withValues(alpha: 0.75),
           ),
