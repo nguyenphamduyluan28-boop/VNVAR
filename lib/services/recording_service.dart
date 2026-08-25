@@ -3,12 +3,30 @@ import 'dart:developer' as developer;
 import 'dart:io';
 
 import 'package:flutter/foundation.dart';
-import 'package:flutter/services.dart';
 import 'package:flutter_webrtc/flutter_webrtc.dart';
 import 'package:ffmpeg_kit_flutter_new_video/ffmpeg_kit.dart';
 import 'package:ffmpeg_kit_flutter_new_video/return_code.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
+
+import 'video_storage_service.dart';
+
+String normalizeCameraKey(String cameraId) {
+  final cameraNumber = RegExp(r'(\d+)$').firstMatch(cameraId.trim())?.group(1);
+  final normalized = cameraNumber == null
+      ? cameraId
+            .trim()
+            .toLowerCase()
+            .replaceAll(RegExp(r'[^a-z0-9_-]+'), '_')
+            .replaceAll(RegExp(r'^_+|_+$'), '')
+      : 'cam${int.parse(cameraNumber)}';
+  return normalized.isEmpty ? 'camera' : normalized;
+}
+
+/// Builds a cache-safe, unique name for a clip exported by the trim API.
+String buildTrimmedClipFileName(String cameraId, int timestampMs) {
+  return '${normalizeCameraKey(cameraId)}_trim_$timestampMs.mp4';
+}
 
 // ============================================================
 // RECORDED SEGMENT
@@ -100,31 +118,30 @@ class RecordingService {
   static const int hlsEmergencyThresholdBytes = 1 * 1024 * 1024 * 1024;
   static const Duration recentSegmentProtection = Duration(minutes: 5);
 
-  static const MethodChannel _platformChannel = MethodChannel(
-    'vnvar/camera_station_service',
-  );
+  RecordingService({
+    required this.cameraId,
+    VideoStorageService? videoStorageService,
+  }) : _videoStorage = videoStorageService ?? VideoStorageService();
 
-  RecordingService({required this.cameraId});
+  final VideoStorageService _videoStorage;
 
   // ============================================================
   // CONFIG
   // ============================================================
 
-  static const _storagePathKey = 'camera_video_storage_path';
   static const _segmentMinutesKey = 'camera_video_segment_minutes';
   Duration _segmentDuration = const Duration(minutes: 3);
-  String? _selectedStoragePath;
 
   Duration get segmentDuration => _segmentDuration;
   int get segmentMinutes => _segmentDuration.inMinutes;
-  String? get selectedStoragePath => _selectedStoragePath;
+  String? get selectedStoragePath => _videoStorage.selectedPath;
+  bool get supportsStorageFolderSelection => _videoStorage.supportsFolderPicker;
 
   Future<void> loadSettings() async {
     final prefs = await SharedPreferences.getInstance();
     final minutes = prefs.getInt(_segmentMinutesKey) ?? 3;
     _segmentDuration = Duration(minutes: minutes.clamp(1, 30));
-    final path = prefs.getString(_storagePathKey)?.trim();
-    _selectedStoragePath = path == null || path.isEmpty ? null : path;
+    await _videoStorage.load();
   }
 
   Future<void> setSegmentMinutes(int minutes) async {
@@ -137,26 +154,10 @@ class RecordingService {
   }
 
   Future<void> setStoragePath(String? path) async {
-    final normalized = path?.trim();
-    if (normalized != null && normalized.isNotEmpty) {
-      final testDirectory = Directory(normalized);
-      await testDirectory.create(recursive: true);
-      final test = File(
-        '${testDirectory.path}${Platform.pathSeparator}.write_test',
-      );
-      await test.writeAsString('VNVAR');
-      await test.delete();
-      _selectedStoragePath = normalized;
-    } else {
-      _selectedStoragePath = null;
-    }
-    final prefs = await SharedPreferences.getInstance();
-    if (_selectedStoragePath == null) {
-      await prefs.remove(_storagePathKey);
-    } else {
-      await prefs.setString(_storagePathKey, _selectedStoragePath!);
-    }
+    await _videoStorage.setStoragePath(path);
   }
+
+  Future<String?> selectStorageFolder() => _videoStorage.selectFolder();
 
   // ============================================================
   // RECORDER
@@ -181,7 +182,7 @@ class RecordingService {
   // ============================================================
 
   bool _recording = false;
-  bool _processing = false;
+  Future<RecordedSegment>? _trimOperation;
 
   bool _rotating = false;
 
@@ -232,14 +233,32 @@ class RecordingService {
     required String segmentId,
     required int startMs,
     required int endMs,
-  }) async {
-    if (_processing) {
-      throw StateError('Camera Station đang xử lý một video khác.');
+  }) {
+    if (_trimOperation != null || _exportCleanupOperation != null) {
+      return Future<RecordedSegment>.error(
+        StateError('Camera Station đang xử lý một video khác.'),
+      );
     }
+    final operation = _trimSegmentInternal(
+      segmentId: segmentId,
+      startMs: startMs,
+      endMs: endMs,
+    );
+    _trimOperation = operation;
+    return operation.whenComplete(() {
+      if (identical(_trimOperation, operation)) _trimOperation = null;
+    });
+  }
+
+  Future<RecordedSegment> _trimSegmentInternal({
+    required String segmentId,
+    required int startMs,
+    required int endMs,
+  }) async {
     if (startMs < 0 || endMs <= startMs || endMs - startMs < 500) {
       throw ArgumentError('Khoảng cắt video không hợp lệ.');
     }
-    final source = findById(segmentId);
+    final source = findById(segmentId) ?? findByFileName(segmentId);
     if (source == null || !await File(source.path).exists()) {
       throw StateError('Không tìm thấy video nguồn $segmentId.');
     }
@@ -247,18 +266,21 @@ class RecordingService {
       throw ArgumentError('Khoảng cắt vượt quá thời lượng video.');
     }
 
-    _processing = true;
     File? output;
     try {
       final now = DateTime.now();
       final startedAt = source.startedAt.add(Duration(milliseconds: startMs));
       final endedAt = startedAt.add(Duration(milliseconds: endMs - startMs));
       final directory = await _exportDownloadDirectory();
-      final id = 'CLIP_${cameraId}_${now.millisecondsSinceEpoch}';
-      output = File(
-        '${directory.path}${Platform.pathSeparator}'
-        '${_videoFileName(startedAt: startedAt, endedAt: endedAt)}.ts',
-      );
+      var timestampMs = now.millisecondsSinceEpoch;
+      var fileName = buildTrimmedClipFileName(cameraId, timestampMs);
+      output = File('${directory.path}${Platform.pathSeparator}$fileName');
+      while (await output!.exists()) {
+        fileName = buildTrimmedClipFileName(cameraId, ++timestampMs);
+        output = File('${directory.path}${Platform.pathSeparator}$fileName');
+      }
+      final target = output;
+      final id = 'CLIP_${cameraId}_$timestampMs';
       final durationMs = endMs - startMs;
       final session = await FFmpegKit.executeWithArguments([
         '-y',
@@ -275,21 +297,23 @@ class RecordingService {
         'mpeg4',
         '-q:v',
         '4',
+        '-movflags',
+        '+faststart',
         '-f',
-        'mpegts',
-        output.path,
+        'mp4',
+        target.path,
       ]);
       final returnCode = await session.getReturnCode();
       if (!ReturnCode.isSuccess(returnCode) ||
-          !await output.exists() ||
-          await output.length() <= 0) {
+          !await target.exists() ||
+          await target.length() <= 0) {
         final details = await session.getOutput();
         throw StateError('FFmpeg xử lý thất bại: ${details ?? returnCode}');
       }
       final clip = RecordedSegment(
         id: id,
         cameraId: cameraId,
-        path: output.path,
+        path: target.path,
         startedAt: startedAt,
         endedAt: endedAt,
         type: 'CLIP',
@@ -299,8 +323,6 @@ class RecordingService {
     } catch (_) {
       if (output != null && await output.exists()) await output.delete();
       rethrow;
-    } finally {
-      _processing = false;
     }
   }
 
@@ -321,15 +343,7 @@ class RecordingService {
   // ============================================================
 
   Future<Directory> _videoRootDirectory() async {
-    final defaultRoot = await getApplicationDocumentsDirectory();
-    final rootPath =
-        _selectedStoragePath ??
-        '${defaultRoot.path}${Platform.pathSeparator}VNVAR';
-    final directory = Directory(rootPath);
-    if (!await directory.exists()) {
-      await directory.create(recursive: true);
-    }
-    return directory;
+    return _videoStorage.rootDirectory();
   }
 
   Future<String> getStoragePath() async {
@@ -444,8 +458,7 @@ class RecordingService {
     return int.tryParse(match?.group(1) ?? '');
   }
 
-  String get _cameraFolderName =>
-      _cameraNumber == null ? cameraId.toUpperCase() : 'CAM$_cameraNumber';
+  String get _cameraFolderName => normalizeCameraKey(cameraId).toUpperCase();
 
   String _videoFileName({
     required DateTime startedAt,
@@ -938,6 +951,14 @@ class RecordingService {
   }
 
   Future<void> _cleanupExportDownloadsInternal() async {
+    final trimming = _trimOperation;
+    if (trimming != null) {
+      try {
+        await trimming;
+      } catch (_) {
+        // A failed trim removes its partial output before completing.
+      }
+    }
     final root = await _videoRootDirectory();
     final directory = Directory(
       '${root.path}${Platform.pathSeparator}download',
@@ -1076,11 +1097,13 @@ class RecordingService {
         ).firstMatch(normalizedPath);
         if (newNameMatch != null &&
             dateMatch != null &&
-            indexedCameraId != null) {
+            indexedCameraId != null &&
+            normalizeCameraKey(indexedCameraId) ==
+                normalizeCameraKey(cameraId)) {
           final year = int.parse(dateMatch.group(3)!);
           final month = int.parse(dateMatch.group(2)!);
           final day = int.parse(dateMatch.group(1)!);
-          final startedAt = DateTime(
+          var startedAt = DateTime(
             year,
             month,
             day,
@@ -1097,7 +1120,9 @@ class RecordingService {
             int.parse(newNameMatch.group(6)!),
           );
           if (endedAt.isBefore(startedAt)) {
-            endedAt = endedAt.add(const Duration(days: 1));
+            // The directory is selected from the segment end date. A range
+            // such as 23:59-00:01 therefore started on the previous day.
+            startedAt = startedAt.subtract(const Duration(days: 1));
           }
           final timestamp = startedAt.millisecondsSinceEpoch;
           _segments.add(
@@ -1203,27 +1228,7 @@ class RecordingService {
   }
 
   Future<int?> availableStorageBytes() async {
-    final root = await _videoRootDirectory();
-    try {
-      return await _platformChannel.invokeMethod<int>(
-        'getAvailableStorageBytes',
-        {'path': root.path},
-      );
-    } on MissingPluginException {
-      developer.log(
-        '[STORAGE] Free-space check is only available on Android.',
-        name: 'RecordingService',
-      );
-      return null;
-    } catch (error, stackTrace) {
-      developer.log(
-        '[STORAGE] Unable to read available storage.',
-        error: error,
-        stackTrace: stackTrace,
-        name: 'RecordingService',
-      );
-      return null;
-    }
+    return _videoStorage.availableBytes();
   }
 
   void configureHlsRollingBuffer({

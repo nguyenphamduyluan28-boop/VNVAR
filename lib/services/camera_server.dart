@@ -289,7 +289,8 @@ class CameraServer {
       // GET /video/trim sẽ bị hiểu nhầm "trim" là tên một file video.
       // ========================================================
 
-      if (path == '/video/trim') {
+      const trimPaths = {'/trim', '/videos/process/trim', '/video/trim'};
+      if (trimPaths.contains(path)) {
         if (method == 'POST') {
           await _trimVideo(request);
         } else {
