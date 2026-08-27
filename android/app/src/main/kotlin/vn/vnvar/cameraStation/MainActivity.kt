@@ -4,6 +4,9 @@ import android.Manifest
 import android.content.Intent
 import android.net.Uri
 import android.content.pm.PackageManager
+import android.graphics.SurfaceTexture
+import android.hardware.camera2.CameraCharacteristics
+import android.hardware.camera2.CameraManager
 import android.os.Build
 import android.os.Environment
 import android.os.StatFs
@@ -21,14 +24,16 @@ class MainActivity : FlutterActivity() {
     private var rtspPublisher: VnvarRtspPublisher? = null
     private var pendingFolderResult: MethodChannel.Result? = null
     private var waitingStoragePermission = false
+    private lateinit var platformChannel: MethodChannel
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
 
-        MethodChannel(
+        platformChannel = MethodChannel(
             flutterEngine.dartExecutor.binaryMessenger,
             CHANNEL_NAME,
-        ).setMethodCallHandler { call, result ->
+        )
+        platformChannel.setMethodCallHandler { call, result ->
             when (call.method) {
                 "start" -> {
                     val cameraId = call.argument<String>("cameraId") ?: "Camera"
@@ -43,9 +48,30 @@ class MainActivity : FlutterActivity() {
 
                 "isEmulator" -> result.success(isRunningOnEmulator())
 
+                "setScreenDimmed" -> {
+                    val dimmed = call.argument<Boolean>("dimmed") ?: false
+                    runOnUiThread {
+                        val attributes = window.attributes
+                        attributes.screenBrightness = if (dimmed) 0.05f else -1f
+                        window.attributes = attributes
+                        result.success(null)
+                    }
+                }
+
+                "getCameraResolutionProfiles" -> {
+                    try {
+                        val facing = call.argument<String>("facing") ?: "environment"
+                        result.success(getCameraResolutionProfiles(facing))
+                    } catch (error: Exception) {
+                        result.error("CAMERA_CAPABILITY_FAILED", error.message, null)
+                    }
+                }
+
                 "startRtsp" -> {
                     val trackId = call.argument<String>("trackId")
                     val port = call.argument<Int>("port") ?: 8554
+                    val bitrate = call.argument<Int>("bitrate") ?: 2_000_000
+                    val fps = call.argument<Int>("fps") ?: 30
                     val track = trackId?.let {
                         FlutterWebRTCPlugin.sharedSingleton?.getTrackForId(it, null)
                     }
@@ -54,7 +80,28 @@ class MainActivity : FlutterActivity() {
                     } else {
                         try {
                             rtspPublisher?.stop()
-                            rtspPublisher = VnvarRtspPublisher(track, port).also { it.start() }
+                            rtspPublisher = VnvarRtspPublisher(
+                                track = track,
+                                port = port,
+                                bitrate = bitrate,
+                                fps = fps,
+                                onEncoderConfigured = {
+                                    runOnUiThread {
+                                        platformChannel.invokeMethod(
+                                            "onRtspEncoderConfigured",
+                                            null,
+                                        )
+                                    }
+                                },
+                                onEncoderError = { message ->
+                                    runOnUiThread {
+                                        platformChannel.invokeMethod(
+                                            "onRtspEncoderError",
+                                            mapOf("error" to message),
+                                        )
+                                    }
+                                },
+                            ).also { it.start() }
                             result.success(mapOf("running" to true, "port" to port, "path" to "/camera"))
                         } catch (error: Exception) {
                             rtspPublisher = null
@@ -279,6 +326,57 @@ class MainActivity : FlutterActivity() {
     private fun hasCameraPermission(): Boolean {
         return ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) ==
             PackageManager.PERMISSION_GRANTED
+    }
+
+    private fun getCameraResolutionProfiles(facing: String): List<Map<String, Any>> {
+        val manager = getSystemService(CameraManager::class.java)
+        val requestedLensFacing = if (facing == "user") {
+            CameraCharacteristics.LENS_FACING_FRONT
+        } else {
+            CameraCharacteristics.LENS_FACING_BACK
+        }
+        val cameraId = manager.cameraIdList.firstOrNull { id ->
+            manager.getCameraCharacteristics(id)
+                .get(CameraCharacteristics.LENS_FACING) == requestedLensFacing
+        } ?: return emptyList()
+        val characteristics = manager.getCameraCharacteristics(cameraId)
+        val configuration = characteristics.get(
+            CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP,
+        ) ?: return emptyList()
+        val sizes = configuration.getOutputSizes(SurfaceTexture::class.java)?.toList().orEmpty()
+        val targets = listOf(
+            Triple("hd720", 1280, 720),
+            Triple("fullHd1080", 1920, 1080),
+            Triple("qhd2k", 2560, 1440),
+            Triple("ultraHd4k", 3840, 2160),
+        )
+        return targets.mapNotNull { (id, width, height) ->
+            val size = sizes.firstOrNull { it.width == width && it.height == height }
+                ?: return@mapNotNull null
+            // WebRTC getUserMedia opens a STANDARD capture session. High-speed
+            // ranges describe constrained high-speed sessions and must not be
+            // used here: a device may advertise 1080p60 for high-speed capture
+            // while only supporting 1080p30 in a standard session.
+            val minFrameDurationNs = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                configuration.getOutputMinFrameDuration(SurfaceTexture::class.java, size)
+            } else {
+                0L
+            }
+            val standardMaxFps = if (minFrameDurationNs > 0L) {
+                (1_000_000_000L / minFrameDurationNs).toInt().coerceAtLeast(1)
+            } else {
+                // A zero duration means the camera does not publish a reliable
+                // per-output limit. Prefer a safe standard-capture fallback.
+                30
+            }
+            val preferredFps = if (height <= 1080) 60 else 30
+            mapOf(
+                "id" to id,
+                "width" to width,
+                "height" to height,
+                "maxFps" to minOf(preferredFps, standardMaxFps),
+            )
+        }
     }
 
     private fun hasMicrophonePermission(): Boolean {

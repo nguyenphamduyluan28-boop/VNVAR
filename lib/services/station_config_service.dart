@@ -4,6 +4,7 @@ import 'dart:math';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import '../models/station_identity.dart';
+import '../models/camera_resolution_profile.dart';
 
 class StationConfigService {
   static const String _courtKey = 'courtId';
@@ -12,6 +13,7 @@ class StationConfigService {
   static const String _cameraNameKey = 'cameraName';
   static const String _cameraPositionKey = 'cameraPosition';
   static const String _courtCountKey = 'courtCount';
+  static const String _resolutionProfileKey = 'camera_resolution_profile';
 
   // ConfigService cũ đã lưu Camera ID bằng key này.
   static const String _legacyCameraKey = 'camera_id';
@@ -90,6 +92,18 @@ class StationConfigService {
     final prefs = await SharedPreferences.getInstance();
     final count = prefs.getInt(_courtCountKey);
     return count != null && count > 0 ? count : null;
+  }
+
+  Future<void> saveResolutionProfile(CameraResolutionProfile profile) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString(_resolutionProfileKey, profile.id);
+  }
+
+  Future<CameraResolutionProfile?> loadResolutionProfile() async {
+    final prefs = await SharedPreferences.getInstance();
+    return CameraResolutionProfile.fromId(
+      prefs.getString(_resolutionProfileKey),
+    );
   }
 
   Future<void> clearIdentity() async {

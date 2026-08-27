@@ -28,6 +28,38 @@ String buildTrimmedClipFileName(String cameraId, int timestampMs) {
   return '${normalizeCameraKey(cameraId)}_trim_$timestampMs.mp4';
 }
 
+class TrimInProgressException implements Exception {
+  final String message;
+  const TrimInProgressException(this.message);
+
+  @override
+  String toString() => message;
+}
+
+class TrimSegmentNotFoundException implements Exception {
+  final String message;
+  const TrimSegmentNotFoundException(this.message);
+
+  @override
+  String toString() => message;
+}
+
+class InvalidTrimRangeException implements Exception {
+  final String message;
+  const InvalidTrimRangeException(this.message);
+
+  @override
+  String toString() => message;
+}
+
+class TrimProcessingException implements Exception {
+  final String message;
+  const TrimProcessingException(this.message);
+
+  @override
+  String toString() => message;
+}
+
 // ============================================================
 // RECORDED SEGMENT
 // ============================================================
@@ -236,7 +268,9 @@ class RecordingService {
   }) {
     if (_trimOperation != null || _exportCleanupOperation != null) {
       return Future<RecordedSegment>.error(
-        StateError('Camera Station đang xử lý một video khác.'),
+        const TrimInProgressException(
+          'Camera Station đang xử lý một video khác.',
+        ),
       );
     }
     final operation = _trimSegmentInternal(
@@ -256,14 +290,18 @@ class RecordingService {
     required int endMs,
   }) async {
     if (startMs < 0 || endMs <= startMs || endMs - startMs < 500) {
-      throw ArgumentError('Khoảng cắt video không hợp lệ.');
+      throw const InvalidTrimRangeException('Khoảng cắt video không hợp lệ.');
     }
     final source = findById(segmentId) ?? findByFileName(segmentId);
     if (source == null || !await File(source.path).exists()) {
-      throw StateError('Không tìm thấy video nguồn $segmentId.');
+      throw TrimSegmentNotFoundException(
+        'Không tìm thấy video nguồn $segmentId.',
+      );
     }
     if (endMs > source.duration.inMilliseconds + 1000) {
-      throw ArgumentError('Khoảng cắt vượt quá thời lượng video.');
+      throw const InvalidTrimRangeException(
+        'Khoảng cắt vượt quá thời lượng video.',
+      );
     }
 
     File? output;
@@ -308,7 +346,9 @@ class RecordingService {
           !await target.exists() ||
           await target.length() <= 0) {
         final details = await session.getOutput();
-        throw StateError('FFmpeg xử lý thất bại: ${details ?? returnCode}');
+        throw TrimProcessingException(
+          'FFmpeg xử lý thất bại: ${details ?? returnCode}',
+        );
       }
       final clip = RecordedSegment(
         id: id,

@@ -1,6 +1,7 @@
 import 'dart:convert';
 import 'dart:developer' as developer;
 import 'dart:io';
+import 'dart:math';
 
 import 'package:flutter/foundation.dart';
 import 'package:flutter_webrtc/flutter_webrtc.dart';
@@ -10,6 +11,8 @@ import 'recording_service.dart';
 import 'webrtc_service.dart';
 
 class CameraServer {
+  static const String apiTokenHeader = 'X-VNVAR-TOKEN';
+
   // ============================================================
   // SERVER
   // ============================================================
@@ -25,6 +28,7 @@ class CameraServer {
   final String courtId;
   final String cameraId;
   final String deviceId;
+  late final String apiToken = _generateApiToken();
 
   // ============================================================
   // SERVICES
@@ -102,6 +106,7 @@ class CameraServer {
       cameraId: cameraId,
       deviceId: deviceId,
       port: apiPort,
+      apiToken: apiToken,
       status: recordingService.recording ? 'RECORDING' : 'READY',
     );
   }
@@ -192,6 +197,14 @@ class CameraServer {
     developer.log('$method $path', name: 'CameraServer');
 
     try {
+      if (_requiresApiToken(request) && !_hasValidApiToken(request)) {
+        await _sendJson(request.response, HttpStatus.unauthorized, {
+          'error': 'Unauthorized',
+          'message': 'Thiếu hoặc sai header $apiTokenHeader.',
+        });
+        return;
+      }
+
       if ((path == '/' || path == '/viewer') && method == 'GET') {
         await _viewerPage(request);
         return;
@@ -370,12 +383,49 @@ class CameraServer {
       try {
         await _sendJson(request.response, HttpStatus.internalServerError, {
           'error': 'Internal Server Error',
-          'message': error.toString(),
+          'message': 'Camera Station không thể xử lý yêu cầu.',
         });
       } catch (_) {
         // Response có thể đã đóng.
       }
     }
+  }
+
+  bool _requiresApiToken(HttpRequest request) {
+    if (request.method != 'POST') return false;
+    final path = request.uri.path;
+    if (path == '/recording/auto-start' ||
+        path == '/start' ||
+        path == '/stop' ||
+        path == '/checkvar' ||
+        path == '/trim' ||
+        path == '/videos/process/trim' ||
+        path == '/video/trim' ||
+        path == '/download/session/close') {
+      return true;
+    }
+    return _isDownloadedRoute(request);
+  }
+
+  bool _hasValidApiToken(HttpRequest request) {
+    final supplied = request.headers.value(apiTokenHeader);
+    if (supplied == null) return false;
+    final expected = apiToken.codeUnits;
+    final actual = supplied.codeUnits;
+    var difference = expected.length ^ actual.length;
+    final length = max(expected.length, actual.length);
+    for (var index = 0; index < length; index++) {
+      final expectedByte = index < expected.length ? expected[index] : 0;
+      final actualByte = index < actual.length ? actual[index] : 0;
+      difference |= expectedByte ^ actualByte;
+    }
+    return difference == 0;
+  }
+
+  static String _generateApiToken() {
+    final random = Random.secure();
+    final bytes = List<int>.generate(32, (_) => random.nextInt(256));
+    return base64UrlEncode(bytes).replaceAll('=', '');
   }
 
   // ============================================================
@@ -404,7 +454,18 @@ class CameraServer {
 
       'rtspSupported': webRtcService.rtspSupported,
 
+      'rtspRunning': webRtcService.rtspRunning,
+
       'rtspError': webRtcService.rtspError,
+
+      'videoProfile': {
+        'id': webRtcService.resolutionProfile.id,
+        'label': webRtcService.resolutionProfile.shortLabel,
+        'width': webRtcService.resolutionProfile.width,
+        'height': webRtcService.resolutionProfile.height,
+        'fps': webRtcService.resolutionProfile.fps,
+        'bitrate': webRtcService.resolutionProfile.bitrate,
+      },
 
       'segmentCount': recordingService.segments.length,
 
@@ -762,21 +823,55 @@ class CameraServer {
   }
 
   Future<void> _trimVideo(HttpRequest request) async {
-    final body = await _readJson(request);
-    final segmentId = body['segmentId'];
-    final startMs = body['startMs'];
-    final endMs = body['endMs'];
-    if (segmentId is! String || startMs is! num || endMs is! num) {
+    late final Map<String, dynamic> body;
+    try {
+      body = await _readJson(request);
+    } on FormatException catch (error) {
       await _sendJson(request.response, HttpStatus.badRequest, {
-        'error': 'segmentId, startMs và endMs là bắt buộc',
+        'error': 'Bad Request',
+        'message': error.message,
       });
       return;
     }
-    final clip = await recordingService.trimSegment(
-      segmentId: segmentId,
-      startMs: startMs.toInt(),
-      endMs: endMs.toInt(),
-    );
+    final segmentId = body['segmentId'];
+    final startMs = body['startMs'];
+    final endMs = body['endMs'];
+    if (segmentId is! String ||
+        segmentId.trim().isEmpty ||
+        startMs is! num ||
+        endMs is! num) {
+      await _sendJson(request.response, HttpStatus.badRequest, {
+        'error': 'Bad Request',
+        'message': 'segmentId, startMs và endMs là bắt buộc',
+      });
+      return;
+    }
+    late final RecordedSegment clip;
+    try {
+      clip = await recordingService.trimSegment(
+        segmentId: segmentId.trim(),
+        startMs: startMs.toInt(),
+        endMs: endMs.toInt(),
+      );
+    } on InvalidTrimRangeException catch (error) {
+      await _sendJson(request.response, HttpStatus.badRequest, {
+        'error': 'Bad Request',
+        'message': error.message,
+      });
+      return;
+    } on TrimSegmentNotFoundException catch (error) {
+      await _sendJson(request.response, HttpStatus.notFound, {
+        'error': 'Not Found',
+        'message': error.message,
+      });
+      return;
+    } on TrimInProgressException catch (error) {
+      await _sendJson(request.response, HttpStatus.conflict, {
+        'error': 'Conflict',
+        'message': error.message,
+      });
+      return;
+    }
     onStateChanged?.call();
     await _sendJson(request.response, HttpStatus.ok, {
       'success': true,

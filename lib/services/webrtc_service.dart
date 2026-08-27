@@ -5,12 +5,21 @@ import 'dart:io';
 import 'package:flutter/services.dart';
 import 'package:flutter_webrtc/flutter_webrtc.dart';
 
+import '../models/camera_resolution_profile.dart';
+
 class WebRtcService {
   static const MethodChannel _platformChannel = MethodChannel(
     'vnvar/camera_station_service',
   );
 
   void Function(String reason)? onCameraFailure;
+  void Function()? onRtspStateChanged;
+
+  WebRtcService() {
+    if (Platform.isAndroid) {
+      _platformChannel.setMethodCallHandler(_handlePlatformCallback);
+    }
+  }
 
   // ============================================================
   // LOCAL CAMERA
@@ -40,11 +49,14 @@ class WebRtcService {
   Timer? _muteFailureTimer;
   Timer? _firstFrameFailureTimer;
   bool _receivedFirstFrame = false;
-  int _cameraOpenAttempt = 0;
   int _cameraLifecycleGeneration = 0;
+  String? _currentFacingMode;
   bool? _isEmulator;
   bool _rtspRunning = false;
+  bool _rtspServerStarted = false;
   String? _rtspError;
+  CameraResolutionProfile _resolutionProfile =
+      CameraResolutionProfile.fullHd1080;
 
   // ============================================================
   // GETTERS
@@ -58,7 +70,39 @@ class WebRtcService {
 
   String? get rtspError => _rtspError;
 
+  bool get rtspRunning => _rtspRunning;
+
   bool get rtspSupported => Platform.isAndroid;
+
+  Future<void> _handlePlatformCallback(MethodCall call) async {
+    if (!_rtspServerStarted) return;
+    switch (call.method) {
+      case 'onRtspEncoderConfigured':
+        _rtspRunning = true;
+        _rtspError = null;
+        developer.log(
+          '[RTSP] H.264 encoder ready at rtsp://0.0.0.0:8554/camera',
+          name: 'WebRtcService',
+        );
+        onRtspStateChanged?.call();
+      case 'onRtspEncoderError':
+        _rtspRunning = false;
+        final arguments = call.arguments;
+        final message = arguments is Map ? arguments['error'] : null;
+        _rtspError = message is String && message.trim().isNotEmpty
+            ? message
+            : 'Không thể khởi tạo H.264 encoder.';
+        developer.log(
+          '[RTSP] H.264 encoder failed: $_rtspError',
+          name: 'WebRtcService',
+        );
+        onRtspStateChanged?.call();
+    }
+  }
+
+  CameraResolutionProfile get resolutionProfile => _resolutionProfile;
+
+  String get currentFacingMode => _currentFacingMode ?? 'environment';
 
   MediaStream? get localStream => _localStream;
 
@@ -100,6 +144,45 @@ class WebRtcService {
       '[MICROPHONE] ${enabled ? 'Enabled' : 'Disabled'} by user',
       name: 'WebRtcService',
     );
+  }
+
+  void setResolutionProfile(CameraResolutionProfile profile) {
+    _resolutionProfile = profile;
+  }
+
+  Future<List<CameraResolutionProfile>> getSupportedResolutionProfiles({
+    String facingMode = 'environment',
+    bool fallbackWhenUnavailable = true,
+  }) async {
+    if (!Platform.isAndroid) {
+      return const [
+        CameraResolutionProfile.hd720,
+        CameraResolutionProfile.fullHd1080,
+      ];
+    }
+    try {
+      final result = await _platformChannel.invokeListMethod<Object?>(
+        'getCameraResolutionProfiles',
+        {'facing': facingMode},
+      );
+      final supported = <CameraResolutionProfile>[];
+      for (final item in result ?? const []) {
+        if (item is! Map) continue;
+        final profile = CameraResolutionProfile.fromId(item['id'] as String?);
+        final maxFps = item['maxFps'];
+        if (profile != null && maxFps is num) {
+          supported.add(profile.withFps(maxFps.toInt()));
+        }
+      }
+      if (supported.isNotEmpty) return supported;
+      if (!fallbackWhenUnavailable) return const [];
+    } catch (error) {
+      developer.log(
+        '[CAMERA] Cannot detect resolution profiles: $error',
+        name: 'WebRtcService',
+      );
+    }
+    return const [CameraResolutionProfile.hd720];
   }
 
   // ============================================================
@@ -149,7 +232,7 @@ class WebRtcService {
   // INITIALIZE CAMERA
   // ============================================================
 
-  Future<void> initializeCamera() async {
+  Future<void> initializeCamera({String? facingMode}) async {
     // Camera đã mở rồi thì không mở lại.
     if (_cameraInitialized && _localStream != null && localVideoTrack != null) {
       return;
@@ -192,31 +275,35 @@ class WebRtcService {
 
     _isEmulator ??= await _detectEmulator();
     if (cameraGeneration != _cameraLifecycleGeneration) return;
-    final preferFrontCamera = _isEmulator == true
-        ? _cameraOpenAttempt.isEven
-        : _cameraOpenAttempt.isOdd;
-    final facingMode = preferFrontCamera ? 'user' : 'environment';
-    _cameraOpenAttempt++;
+    final selectedFacingMode = facingMode ?? currentFacingMode;
     developer.log(
-      '[CAMERA] Open attempt $_cameraOpenAttempt, facingMode=$facingMode',
+      '[CAMERA] Opening facingMode=$selectedFacingMode',
       name: 'WebRtcService',
     );
 
     final videoConstraints = _isEmulator == true
         ? <String, dynamic>{
-            'facingMode': facingMode,
+            'facingMode': selectedFacingMode,
             'width': {'min': 320, 'ideal': 640, 'max': 640},
             'height': {'min': 240, 'ideal': 480, 'max': 480},
             'frameRate': {'min': 10, 'ideal': 15, 'max': 20},
           }
         : <String, dynamic>{
-            'facingMode': facingMode,
-            // 720p is broadly supported; capable phones may negotiate 1080p.
-            'width': {'min': 640, 'ideal': 1280, 'max': 1920},
-            'height': {'min': 360, 'ideal': 720, 'max': 1080},
-            // `ideal` is not mandatory: 30/24/15 FPS phones automatically use
-            // their highest supported capture mode.
-            'frameRate': {'min': 10, 'ideal': 60, 'max': 60},
+            'facingMode': selectedFacingMode,
+            'width': {
+              'ideal': _resolutionProfile.width,
+              'max': _resolutionProfile.width,
+            },
+            'height': {
+              'ideal': _resolutionProfile.height,
+              'max': _resolutionProfile.height,
+            },
+            'frameRate': {
+              'min': 10,
+              'ideal': _resolutionProfile.fps,
+              'max': _resolutionProfile.fps,
+            },
+            'focusMode': 'continuous',
           };
 
     final streamFuture = navigator.mediaDevices.getUserMedia({
@@ -237,7 +324,7 @@ class WebRtcService {
         ),
       );
       throw TimeoutException(
-        'Camera $facingMode không trả dữ liệu sau 12 giây.',
+        'Camera $selectedFacingMode không trả dữ liệu sau 12 giây.',
       );
     }
 
@@ -314,6 +401,7 @@ class WebRtcService {
     };
 
     _cameraInitialized = true;
+    _currentFacingMode = selectedFacingMode;
 
     await _startRtsp(videoTrack);
 
@@ -364,17 +452,21 @@ class WebRtcService {
       return;
     }
     try {
+      _rtspRunning = false;
+      _rtspError = null;
+      _rtspServerStarted = true;
       await _platformChannel.invokeMethod<Map<Object?, Object?>>('startRtsp', {
         'trackId': track.id,
         'port': 8554,
+        'bitrate': _resolutionProfile.bitrate,
+        'fps': _resolutionProfile.fps,
       });
-      _rtspRunning = true;
-      _rtspError = null;
       developer.log(
-        '[RTSP] Running at rtsp://0.0.0.0:8554/camera',
+        '[RTSP] Server opened; waiting for H.264 encoder readiness.',
         name: 'WebRtcService',
       );
     } catch (error, stackTrace) {
+      _rtspServerStarted = false;
       _rtspRunning = false;
       _rtspError = error.toString();
       developer.log(
@@ -388,7 +480,8 @@ class WebRtcService {
 
   Future<void> _stopRtsp() async {
     if (!Platform.isAndroid) return;
-    if (!_rtspRunning) return;
+    if (!_rtspServerStarted) return;
+    _rtspServerStarted = false;
     _rtspRunning = false;
     try {
       await _platformChannel.invokeMethod<void>('stopRtsp');
@@ -406,6 +499,9 @@ class WebRtcService {
     if (!switched) {
       throw StateError('Thiết bị không có camera khác để chuyển.');
     }
+    _currentFacingMode = currentFacingMode == 'environment'
+        ? 'user'
+        : 'environment';
     developer.log(
       '[CAMERA] Switched front/back on the current VideoTrack',
       name: 'WebRtcService',
@@ -522,8 +618,8 @@ class WebRtcService {
             RTCDegradationPreference.MAINTAIN_FRAMERATE;
         for (final encoding in parameters.encodings ?? <RTCRtpEncoding>[]) {
           encoding.minBitrate = 300000;
-          encoding.maxBitrate = 1500000;
-          encoding.maxFramerate = 60;
+          encoding.maxBitrate = _resolutionProfile.bitrate;
+          encoding.maxFramerate = _resolutionProfile.fps;
           encoding.priority = RTCPriorityType.high;
           encoding.networkPriority = RTCPriorityType.high;
         }
@@ -755,6 +851,11 @@ class WebRtcService {
     // ==========================================================
 
     await disposeCamera();
+
+    onRtspStateChanged = null;
+    if (Platform.isAndroid) {
+      _platformChannel.setMethodCallHandler(null);
+    }
 
     // ==========================================================
     // RENDERER

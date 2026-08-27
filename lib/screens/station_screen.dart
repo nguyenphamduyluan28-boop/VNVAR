@@ -4,10 +4,12 @@ import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:flutter_webrtc/flutter_webrtc.dart';
 
+import '../models/camera_resolution_profile.dart';
 import '../models/station_identity.dart';
 import '../services/camera_station_foreground_service.dart';
 import '../services/camera_station_runtime.dart';
 import '../services/station_config_service.dart';
+import '../services/station_display_service.dart';
 import 'setup_screen.dart';
 import 'video_storage_screen.dart';
 
@@ -44,6 +46,9 @@ class _StationScreenState extends State<StationScreen> {
   bool _cameraSwitching = false;
   bool _microphoneSwitching = false;
   bool _lensSwitching = false;
+  bool _screenDimmed = false;
+  bool _screenDimSwitching = false;
+  String? _lastShownRtspError;
   String _viewerAddress = 'Đang kiểm tra mạng...';
 
   bool get _recording => _runtime.recordingService?.recording ?? false;
@@ -110,11 +115,33 @@ class _StationScreenState extends State<StationScreen> {
     }
   }
 
+  Future<void> _toggleScreenDim() async {
+    if (_screenDimSwitching) return;
+
+    final dimmed = !_screenDimmed;
+    setState(() => _screenDimSwitching = true);
+    try {
+      await StationDisplayService.setDimmed(dimmed);
+      if (mounted) setState(() => _screenDimmed = dimmed);
+    } catch (error) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('Không thể thay đổi độ sáng màn hình: $error'),
+          ),
+        );
+      }
+    } finally {
+      if (mounted) setState(() => _screenDimSwitching = false);
+    }
+  }
+
   void _showRtspWarningIfNeeded() {
     final webRtc = _runtime.webRtcService;
     if (webRtc == null || !webRtc.rtspSupported) return;
     final error = webRtc.rtspError;
-    if (!mounted || error == null) return;
+    if (!mounted || error == null || error == _lastShownRtspError) return;
+    _lastShownRtspError = error;
     ScaffoldMessenger.of(context).showSnackBar(
       SnackBar(
         content: Text(
@@ -153,6 +180,7 @@ class _StationScreenState extends State<StationScreen> {
       }
 
       setState(() {});
+      _showRtspWarningIfNeeded();
     });
 
     _initialize();
@@ -482,6 +510,76 @@ class _StationScreenState extends State<StationScreen> {
     if (mounted) setState(() {});
   }
 
+  Future<void> _openResolutionPicker() async {
+    if (!_cameraReady || _runtime.profileSwitching) return;
+    final selected = await showModalBottomSheet<CameraResolutionProfile>(
+      context: context,
+      backgroundColor: const Color(0xFF11161D),
+      showDragHandle: true,
+      builder: (sheetContext) {
+        return SafeArea(
+          child: Padding(
+            padding: const EdgeInsets.fromLTRB(16, 0, 16, 20),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                const Text(
+                  'CHẤT LƯỢNG CAMERA',
+                  style: TextStyle(
+                    color: Colors.white,
+                    fontSize: 17,
+                    fontWeight: FontWeight.w900,
+                  ),
+                ),
+                const SizedBox(height: 8),
+                ..._runtime.supportedResolutionProfiles.map((profile) {
+                  final active =
+                      profile.preset == _runtime.resolutionProfile.preset;
+                  return ListTile(
+                    contentPadding: const EdgeInsets.symmetric(horizontal: 4),
+                    leading: Icon(
+                      active
+                          ? Icons.check_circle_rounded
+                          : Icons.radio_button_unchecked_rounded,
+                      color: active ? Colors.greenAccent : Colors.white38,
+                    ),
+                    title: Text(
+                      profile.title,
+                      style: const TextStyle(
+                        color: Colors.white,
+                        fontWeight: FontWeight.w800,
+                      ),
+                    ),
+                    subtitle: Text(
+                      '${profile.width} × ${profile.height}  •  '
+                      '${profile.fps} FPS  •  '
+                      '${(profile.bitrate / 1000000).toStringAsFixed(1)} Mbps',
+                      style: const TextStyle(color: Colors.white60),
+                    ),
+                    onTap: active
+                        ? null
+                        : () => Navigator.pop(sheetContext, profile),
+                  );
+                }),
+              ],
+            ),
+          ),
+        );
+      },
+    );
+    if (selected == null || !mounted) return;
+    try {
+      await _runtime.setResolutionProfile(selected);
+    } catch (error) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Không thể đổi chất lượng camera: $error')),
+        );
+      }
+    }
+  }
+
   // ============================================================
   // COURT LABEL
   // ============================================================
@@ -525,6 +623,9 @@ class _StationScreenState extends State<StationScreen> {
   @override
   void dispose() {
     _runtimeSubscription?.cancel();
+    if (_screenDimmed) {
+      unawaited(StationDisplayService.setDimmed(false));
+    }
     unawaited(_shutdownStation());
 
     super.dispose();
@@ -706,7 +807,8 @@ class _StationScreenState extends State<StationScreen> {
                   child: RTCVideoView(
                     renderer,
                     mirror: false,
-                    objectFit: RTCVideoViewObjectFit.RTCVideoViewObjectFitCover,
+                    objectFit:
+                        RTCVideoViewObjectFit.RTCVideoViewObjectFitContain,
                   ),
                 )
               else
@@ -742,7 +844,10 @@ class _StationScreenState extends State<StationScreen> {
                       courtLabel: _courtLabel(widget.identity.courtId),
                       recording: _recording,
                       compact: compact,
+                      resolutionProfile: _runtime.resolutionProfile,
+                      resolutionSwitching: _runtime.profileSwitching,
                       onVideoStorage: _openVideoStorage,
+                      onResolution: _openResolutionPicker,
                       onSettings: _openSettings,
                     ),
                   ),
@@ -765,6 +870,8 @@ class _StationScreenState extends State<StationScreen> {
                       cameraSwitching: _cameraSwitching,
                       microphoneEnabled: _runtime.microphoneEnabled,
                       microphoneSwitching: _microphoneSwitching,
+                      screenDimmed: _screenDimmed,
+                      screenDimSwitching: _screenDimSwitching,
                       lensSwitching: _lensSwitching,
                       onRotate: _cameraReady
                           ? () {
@@ -782,6 +889,9 @@ class _StationScreenState extends State<StationScreen> {
                           _runtime.microphoneAvailable && !_microphoneSwitching
                           ? _toggleMicrophone
                           : null,
+                      onToggleScreenDim: _screenDimSwitching
+                          ? null
+                          : _toggleScreenDim,
                     ),
                   ),
                 ),
@@ -821,7 +931,10 @@ class _StationHeader extends StatelessWidget {
   final String courtLabel;
   final bool recording;
   final bool compact;
+  final CameraResolutionProfile resolutionProfile;
+  final bool resolutionSwitching;
   final VoidCallback onVideoStorage;
+  final VoidCallback onResolution;
   final VoidCallback onSettings;
 
   const _StationHeader({
@@ -829,7 +942,10 @@ class _StationHeader extends StatelessWidget {
     required this.courtLabel,
     required this.recording,
     required this.compact,
+    required this.resolutionProfile,
+    required this.resolutionSwitching,
     required this.onVideoStorage,
+    required this.onResolution,
     required this.onSettings,
   });
 
@@ -919,6 +1035,11 @@ class _StationHeader extends StatelessWidget {
             spacing: 6,
             runSpacing: 6,
             children: [
+              _ResolutionChip(
+                profile: resolutionProfile,
+                switching: resolutionSwitching,
+                onTap: onResolution,
+              ),
               _HeaderTag(icon: Icons.videocam_rounded, text: identity.cameraId),
               _HeaderTag(icon: Icons.stadium_rounded, text: courtLabel),
               _HeaderTag(
@@ -928,6 +1049,58 @@ class _StationHeader extends StatelessWidget {
             ],
           ),
         ],
+      ),
+    );
+  }
+}
+
+class _ResolutionChip extends StatelessWidget {
+  final CameraResolutionProfile profile;
+  final bool switching;
+  final VoidCallback onTap;
+
+  const _ResolutionChip({
+    required this.profile,
+    required this.switching,
+    required this.onTap,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return Material(
+      color: const Color(0xFF1565C0).withValues(alpha: 0.8),
+      borderRadius: BorderRadius.circular(20),
+      child: InkWell(
+        borderRadius: BorderRadius.circular(20),
+        onTap: switching ? null : onTap,
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 9, vertical: 5),
+          child: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              if (switching)
+                const SizedBox(
+                  width: 12,
+                  height: 12,
+                  child: CircularProgressIndicator(
+                    strokeWidth: 2,
+                    color: Colors.white,
+                  ),
+                )
+              else
+                const Icon(Icons.high_quality_rounded, size: 13),
+              const SizedBox(width: 5),
+              Text(
+                '${profile.shortLabel} ${profile.fps}FPS',
+                style: const TextStyle(
+                  color: Colors.white,
+                  fontSize: 10,
+                  fontWeight: FontWeight.w900,
+                ),
+              ),
+            ],
+          ),
+        ),
       ),
     );
   }
@@ -1072,11 +1245,14 @@ class _CameraControlDock extends StatelessWidget {
   final bool cameraSwitching;
   final bool microphoneEnabled;
   final bool microphoneSwitching;
+  final bool screenDimmed;
+  final bool screenDimSwitching;
   final bool lensSwitching;
   final VoidCallback? onRotate;
   final VoidCallback? onSwitchLens;
   final VoidCallback? onToggleCamera;
   final VoidCallback? onToggleMicrophone;
+  final VoidCallback? onToggleScreenDim;
 
   const _CameraControlDock({
     required this.compact,
@@ -1085,11 +1261,14 @@ class _CameraControlDock extends StatelessWidget {
     required this.cameraSwitching,
     required this.microphoneEnabled,
     required this.microphoneSwitching,
+    required this.screenDimmed,
+    required this.screenDimSwitching,
     required this.lensSwitching,
     required this.onRotate,
     required this.onSwitchLens,
     required this.onToggleCamera,
     required this.onToggleMicrophone,
+    required this.onToggleScreenDim,
   });
 
   @override
@@ -1144,6 +1323,21 @@ class _CameraControlDock extends StatelessWidget {
             background: microphoneEnabled
                 ? Colors.red.withValues(alpha: 0.75)
                 : Colors.green.withValues(alpha: 0.75),
+          ),
+          SizedBox(height: gap),
+          _DockButton(
+            icon: screenDimmed
+                ? Icons.brightness_7_rounded
+                : Icons.dark_mode_rounded,
+            tooltip: screenDimmed
+                ? 'Khôi phục độ sáng màn hình'
+                : 'Làm mờ màn hình để giảm nhiệt',
+            size: buttonSize,
+            onPressed: onToggleScreenDim,
+            loading: screenDimSwitching,
+            background: screenDimmed
+                ? Colors.amber.withValues(alpha: 0.8)
+                : Colors.blueGrey.withValues(alpha: 0.75),
           ),
         ],
       ),

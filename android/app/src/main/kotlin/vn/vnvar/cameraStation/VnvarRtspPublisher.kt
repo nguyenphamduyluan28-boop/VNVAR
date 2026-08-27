@@ -5,20 +5,19 @@ import android.media.MediaCodecInfo
 import android.media.MediaCodecList
 import android.media.MediaFormat
 import android.os.Build
+import android.os.Bundle
 import android.util.Base64
 import android.util.Log
 import org.webrtc.VideoFrame
 import org.webrtc.VideoSink
 import org.webrtc.VideoTrack
-import java.io.BufferedReader
-import java.io.BufferedWriter
-import java.io.InputStreamReader
+import java.io.InputStream
 import java.io.OutputStream
-import java.io.OutputStreamWriter
 import java.net.ServerSocket
 import java.net.Socket
 import java.nio.ByteBuffer
 import java.util.UUID
+import java.util.Locale
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
@@ -28,6 +27,10 @@ import kotlin.concurrent.thread
 class VnvarRtspPublisher(
     private val track: VideoTrack,
     private val port: Int = 8554,
+    private val bitrate: Int = 2_000_000,
+    private val fps: Int = 30,
+    private val onEncoderConfigured: () -> Unit = {},
+    private val onEncoderError: (String) -> Unit = {},
 ) : VideoSink {
     private val running = AtomicBoolean(false)
     private val sessions = ConcurrentHashMap<String, Session>()
@@ -43,11 +46,20 @@ class VnvarRtspPublisher(
         Thread(task, "VNVAR-RTSP-Encoder").apply { isDaemon = true }
     }
     private val framePending = AtomicBoolean(false)
+    private val encoderReady = AtomicBoolean(false)
+    private val encoderErrorReported = AtomicBoolean(false)
 
     fun start() {
         if (!running.compareAndSet(false, true)) return
-        track.addSink(this)
-        serverSocket = ServerSocket(port).apply { reuseAddress = true }
+        try {
+            serverSocket = ServerSocket(port).apply { reuseAddress = true }
+            track.addSink(this)
+        } catch (error: Exception) {
+            running.set(false)
+            try { serverSocket?.close() } catch (_: Exception) {}
+            serverSocket = null
+            throw error
+        }
         thread(name = "VNVAR-RTSP-Accept", isDaemon = true) {
             while (running.get()) {
                 try {
@@ -80,9 +92,10 @@ class VnvarRtspPublisher(
                     framePending.set(false)
                 }
             }
-        } catch (_: Exception) {
+        } catch (error: Exception) {
             frame.release()
             framePending.set(false)
+            reportEncoderError(error)
         }
     }
 
@@ -116,8 +129,17 @@ class VnvarRtspPublisher(
                 }
             } catch (error: Exception) {
                 Log.e(TAG, "H264 frame encode failed", error)
+                reportEncoderError(error)
             }
         }
+    }
+
+    private fun reportEncoderError(error: Throwable) {
+        encoderReady.set(false)
+        if (!encoderErrorReported.compareAndSet(false, true)) return
+        val message = error.message?.takeIf { it.isNotBlank() }
+            ?: error.javaClass.simpleName
+        onEncoderError(message)
     }
 
     private fun copyPlane(source: ByteBuffer, stride: Int, rowWidth: Int, rows: Int, target: ByteBuffer) {
@@ -153,37 +175,78 @@ class VnvarRtspPublisher(
         height = newHeight and 1.inv()
         sps = null
         pps = null
-        val codecInfo = MediaCodecList(MediaCodecList.REGULAR_CODECS).codecInfos.firstOrNull {
-            it.isEncoder && it.supportedTypes.any { type ->
-                type.equals(MediaFormat.MIMETYPE_VIDEO_AVC, ignoreCase = true)
+        val codecInfo = MediaCodecList(MediaCodecList.REGULAR_CODECS).codecInfos
+            .filter { codec ->
+                codec.isEncoder && codec.supportedTypes.any { type ->
+                    type.equals(MediaFormat.MIMETYPE_VIDEO_AVC, ignoreCase = true)
+                }
             }
-        } ?: throw IllegalStateException("Thiết bị không có H.264 encoder")
+            .sortedBy { codec ->
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q && codec.isSoftwareOnly) 1
+                else if (codec.name.contains("google", ignoreCase = true)) 1 else 0
+            }
+            .firstOrNull { codec ->
+                try {
+                    codec.getCapabilitiesForType(MediaFormat.MIMETYPE_VIDEO_AVC)
+                        .videoCapabilities.isSizeSupported(width, height)
+                } catch (_: Exception) {
+                    false
+                }
+            } ?: throw IllegalStateException(
+                "Thiết bị không có H.264 encoder hỗ trợ ${width}x$height",
+            )
         val capabilities = codecInfo.getCapabilitiesForType(MediaFormat.MIMETYPE_VIDEO_AVC)
         encoderColorFormat = when {
             capabilities.colorFormats.contains(MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420SemiPlanar) ->
                 MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420SemiPlanar
             capabilities.colorFormats.contains(MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420Planar) ->
                 MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420Planar
-            else -> MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420Flexible
+            else -> throw IllegalStateException(
+                "H.264 encoder ${codecInfo.name} không nhận I420/NV12 ByteBuffer",
+            )
         }
-        Log.i(TAG, "H264 encoder=${codecInfo.name}, colorFormat=0x${encoderColorFormat.toString(16)}")
+        val videoCapabilities = capabilities.videoCapabilities
+        val supportedFps = try {
+            val range = videoCapabilities.getSupportedFrameRatesFor(width, height)
+            fps.coerceIn(maxOf(1, range.lower.toInt()), maxOf(1, range.upper.toInt()))
+        } catch (_: Exception) {
+            fps
+        }
+        val supportedBitrate = bitrate.coerceIn(
+            videoCapabilities.bitrateRange.lower,
+            videoCapabilities.bitrateRange.upper,
+        )
+        val bitrateMode = if (
+            capabilities.encoderCapabilities.isBitrateModeSupported(
+                MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_CBR,
+            )
+        ) MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_CBR
+        else MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_VBR
+        Log.i(
+            TAG,
+            "H264 encoder=${codecInfo.name}, ${width}x$height@${supportedFps}, " +
+                "bitrate=$supportedBitrate, colorFormat=0x${encoderColorFormat.toString(16)}",
+        )
         codec = MediaCodec.createByCodecName(codecInfo.name).apply {
             val format = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, width, height)
             format.setInteger(MediaFormat.KEY_COLOR_FORMAT, encoderColorFormat)
-            format.setInteger(MediaFormat.KEY_BIT_RATE, 2_000_000)
-            format.setInteger(MediaFormat.KEY_FRAME_RATE, 60)
+            format.setInteger(MediaFormat.KEY_BIT_RATE, supportedBitrate)
+            format.setInteger(MediaFormat.KEY_FRAME_RATE, supportedFps)
             format.setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1)
-            format.setInteger(MediaFormat.KEY_PROFILE, MediaCodecInfo.CodecProfileLevel.AVCProfileBaseline)
             format.setInteger(MediaFormat.KEY_PRIORITY, 0)
             format.setInteger(
                 MediaFormat.KEY_BITRATE_MODE,
-                MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_CBR,
+                bitrateMode,
             )
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
                 format.setInteger(MediaFormat.KEY_LOW_LATENCY, 1)
             }
             configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
             start()
+        }
+        encoderErrorReported.set(false)
+        if (encoderReady.compareAndSet(false, true)) {
+            onEncoderConfigured()
         }
     }
 
@@ -205,12 +268,20 @@ class VnvarRtspPublisher(
                 output.limit(info.offset + info.size)
                 val bytes = ByteArray(info.size)
                 output.get(bytes)
+                val frameNals = mutableListOf<ByteArray>()
                 for (nal in splitNals(bytes)) {
                     when (nal.firstOrNull()?.toInt()?.and(0x1f)) {
                         7 -> sps = nal
                         8 -> pps = nal
-                        else -> sendNal(nal, info.presentationTimeUs)
+                        else -> frameNals += nal
                     }
+                }
+                frameNals.forEachIndexed { nalIndex, nal ->
+                    sendNal(
+                        nal,
+                        info.presentationTimeUs,
+                        nalIndex == frameNals.lastIndex,
+                    )
                 }
             }
             encoder.releaseOutputBuffer(index, false)
@@ -267,38 +338,50 @@ class VnvarRtspPublisher(
         return -1
     }
 
-    private fun sendNal(nal: ByteArray, presentationTimeUs: Long) {
+    private fun sendNal(nal: ByteArray, presentationTimeUs: Long, marker: Boolean) {
         if (nal.isEmpty()) return
         val timestamp = presentationTimeUs * 90 / 1000
-        sessions.values.filter { it.playing }.forEach { it.sendNal(nal, timestamp) }
+        sessions.values.filter { it.playing }.forEach {
+            it.sendNal(nal, timestamp, marker)
+        }
     }
 
     private fun handleClient(socket: Socket) {
         val session = Session(socket)
         sessions[session.id] = session
         try {
-            val reader = BufferedReader(InputStreamReader(socket.getInputStream()))
-            val writer = BufferedWriter(OutputStreamWriter(socket.getOutputStream()))
             while (running.get() && !socket.isClosed) {
-                val requestLine = reader.readLine() ?: break
-                if (requestLine.isBlank()) continue
-                val method = requestLine.substringBefore(' ')
-                val headers = mutableMapOf<String, String>()
-                while (true) {
-                    val line = reader.readLine() ?: break
-                    if (line.isEmpty()) break
-                    val split = line.indexOf(':')
-                    if (split > 0) headers[line.substring(0, split).trim().lowercase()] = line.substring(split + 1).trim()
-                }
-                val cseq = headers["cseq"] ?: "0"
-                when (method) {
-                    "OPTIONS" -> respond(writer, cseq, "Public: OPTIONS, DESCRIBE, SETUP, PLAY, PAUSE, TEARDOWN\r\n")
-                    "DESCRIBE" -> describe(writer, cseq)
-                    "SETUP" -> session.setup(writer, cseq, headers["transport"] ?: "")
-                    "PLAY" -> { session.playing = true; respond(writer, cseq, "Session: ${session.id}\r\nRTP-Info: url=track0\r\n") }
-                    "PAUSE" -> { session.playing = false; respond(writer, cseq, "Session: ${session.id}\r\n") }
-                    "TEARDOWN" -> { respond(writer, cseq, "Session: ${session.id}\r\n"); break }
-                    else -> writer.apply { write("RTSP/1.0 405 Method Not Allowed\r\nCSeq: $cseq\r\n\r\n"); flush() }
+                val request = readRtspRequest(socket.getInputStream()) ?: break
+                val cseq = request.headers["cseq"] ?: "0"
+                when (request.method) {
+                    "OPTIONS" -> session.respond(
+                        cseq,
+                        "Public: OPTIONS, DESCRIBE, SETUP, PLAY, PAUSE, TEARDOWN\r\n",
+                    )
+                    "DESCRIBE" -> session.describe(cseq)
+                    "SETUP" -> session.setup(cseq, request.headers["transport"] ?: "")
+                    "PLAY" -> {
+                        // The RTSP response must be fully written before RTP is
+                        // allowed onto the same interleaved TCP connection.
+                        session.respond(
+                            cseq,
+                            "Session: ${session.id}\r\nRTP-Info: url=track0\r\n",
+                        )
+                        session.playing = true
+                        requestSyncFrame()
+                    }
+                    "PAUSE" -> {
+                        session.playing = false
+                        session.respond(cseq, "Session: ${session.id}\r\n")
+                    }
+                    "TEARDOWN" -> {
+                        session.playing = false
+                        session.respond(cseq, "Session: ${session.id}\r\n")
+                        break
+                    }
+                    else -> session.writeRtsp(
+                        "RTSP/1.0 405 Method Not Allowed\r\nCSeq: $cseq\r\n\r\n",
+                    )
                 }
             }
         } catch (error: Exception) {
@@ -309,22 +392,72 @@ class VnvarRtspPublisher(
         }
     }
 
-    private fun describe(writer: BufferedWriter, cseq: String) {
-        val localSps = sps
-        val localPps = pps
-        if (localSps == null || localPps == null) {
-            writer.write("RTSP/1.0 503 Service Unavailable\r\nCSeq: $cseq\r\nRetry-After: 1\r\n\r\n")
-            writer.flush()
-            return
+    private data class RtspRequest(
+        val method: String,
+        val headers: Map<String, String>,
+    )
+
+    /** Reads RTSP text while consuming interleaved RTP/RTCP binary frames. */
+    private fun readRtspRequest(input: InputStream): RtspRequest? {
+        val request = ArrayList<Byte>(1024)
+        var matchedHeaderEnd = 0
+        while (running.get()) {
+            val first = input.read()
+            if (first < 0) return null
+            if (first == '$'.code) {
+                val channel = input.read()
+                val high = input.read()
+                val low = input.read()
+                if (channel < 0 || high < 0 || low < 0) return null
+                var remaining = (high shl 8) or low
+                while (remaining > 0) {
+                    val skipped = input.skip(remaining.toLong())
+                    if (skipped > 0) remaining -= skipped.toInt()
+                    else if (input.read() < 0) return null else remaining--
+                }
+                continue
+            }
+
+            request += first.toByte()
+            matchedHeaderEnd = when {
+                matchedHeaderEnd == 0 && first == '\r'.code -> 1
+                matchedHeaderEnd == 1 && first == '\n'.code -> 2
+                matchedHeaderEnd == 2 && first == '\r'.code -> 3
+                matchedHeaderEnd == 3 && first == '\n'.code -> 4
+                first == '\r'.code -> 1
+                else -> 0
+            }
+            if (matchedHeaderEnd == 4) break
+            if (request.size > MAX_RTSP_HEADER_BYTES) {
+                throw IllegalArgumentException("RTSP header quá lớn")
+            }
         }
-        val sdp = "v=0\r\no=- 0 0 IN IP4 0.0.0.0\r\ns=VNVAR Camera\r\nt=0 0\r\na=control:*\r\nm=video 0 RTP/AVP 96\r\na=rtpmap:96 H264/90000\r\na=fmtp:96 packetization-mode=1;profile-level-id=42C01F;sprop-parameter-sets=${Base64.encodeToString(localSps, Base64.NO_WRAP)},${Base64.encodeToString(localPps, Base64.NO_WRAP)}\r\na=control:track0\r\n"
-        writer.write("RTSP/1.0 200 OK\r\nCSeq: $cseq\r\nContent-Type: application/sdp\r\nContent-Length: ${sdp.toByteArray().size}\r\n\r\n$sdp")
-        writer.flush()
+
+        val text = request.toByteArray().toString(Charsets.ISO_8859_1)
+        val lines = text.split("\r\n")
+        val requestLine = lines.firstOrNull()?.trim().orEmpty()
+        if (requestLine.isEmpty()) return readRtspRequest(input)
+        val headers = mutableMapOf<String, String>()
+        for (line in lines.drop(1)) {
+            val separator = line.indexOf(':')
+            if (separator > 0) {
+                headers[line.substring(0, separator).trim().lowercase()] =
+                    line.substring(separator + 1).trim()
+            }
+        }
+        return RtspRequest(requestLine.substringBefore(' ').uppercase(), headers)
     }
 
-    private fun respond(writer: BufferedWriter, cseq: String, extra: String) {
-        writer.write("RTSP/1.0 200 OK\r\nCSeq: $cseq\r\n$extra\r\n")
-        writer.flush()
+    private fun requestSyncFrame() {
+        synchronized(codecLock) {
+            try {
+                codec?.setParameters(Bundle().apply {
+                    putInt(MediaCodec.PARAMETER_KEY_REQUEST_SYNC_FRAME, 0)
+                })
+            } catch (error: Exception) {
+                Log.w(TAG, "Unable to request H264 sync frame", error)
+            }
+        }
     }
 
     fun stop() {
@@ -347,19 +480,70 @@ class VnvarRtspPublisher(
         private var rtpChannel = 0
         private var sequence = 0
         private val output: OutputStream = socket.getOutputStream()
+        private val outputLock = Any()
 
-        fun setup(writer: BufferedWriter, cseq: String, transport: String) {
+        fun setup(cseq: String, transport: String) {
             if (transport.contains("TCP", true) || transport.contains("interleaved", true)) {
                 rtpChannel = Regex("interleaved=(\\d+)").find(transport)?.groupValues?.get(1)?.toIntOrNull() ?: 0
-                respond(writer, cseq, "Session: $id\r\nTransport: RTP/AVP/TCP;unicast;interleaved=$rtpChannel-${rtpChannel + 1}\r\n")
+                respond(cseq, "Session: $id\r\nTransport: RTP/AVP/TCP;unicast;interleaved=$rtpChannel-${rtpChannel + 1}\r\n")
             } else {
-                writer.write("RTSP/1.0 461 Unsupported Transport\r\nCSeq: $cseq\r\n\r\n")
-                writer.flush()
+                writeRtsp("RTSP/1.0 461 Unsupported Transport\r\nCSeq: $cseq\r\n\r\n")
             }
         }
 
-        fun sendNal(nal: ByteArray, timestamp: Long) {
-            if (nal.size <= 1200) sendPacket(nal, timestamp, true)
+        fun describe(cseq: String) {
+            val localSps = sps
+            val localPps = pps
+            if (localSps == null || localPps == null) {
+                writeRtsp(
+                    "RTSP/1.0 503 Service Unavailable\r\n" +
+                        "CSeq: $cseq\r\nRetry-After: 1\r\n\r\n",
+                )
+                return
+            }
+            val profileLevelId = if (localSps.size >= 4) {
+                String.format(
+                    Locale.US,
+                    "%02X%02X%02X",
+                    localSps[1].toInt() and 0xff,
+                    localSps[2].toInt() and 0xff,
+                    localSps[3].toInt() and 0xff,
+                )
+            } else {
+                "42E01F"
+            }
+            val sdp = "v=0\r\n" +
+                "o=- 0 0 IN IP4 0.0.0.0\r\n" +
+                "s=VNVAR Camera\r\n" +
+                "t=0 0\r\n" +
+                "a=control:*\r\n" +
+                "m=video 0 RTP/AVP 96\r\n" +
+                "a=rtpmap:96 H264/90000\r\n" +
+                "a=fmtp:96 packetization-mode=1;profile-level-id=$profileLevelId;" +
+                "sprop-parameter-sets=${Base64.encodeToString(localSps, Base64.NO_WRAP)}," +
+                "${Base64.encodeToString(localPps, Base64.NO_WRAP)}\r\n" +
+                "a=control:track0\r\n"
+            val response = "RTSP/1.0 200 OK\r\n" +
+                "CSeq: $cseq\r\n" +
+                "Content-Type: application/sdp\r\n" +
+                "Content-Length: ${sdp.toByteArray(Charsets.UTF_8).size}\r\n\r\n" +
+                sdp
+            writeRtsp(response)
+        }
+
+        fun respond(cseq: String, extra: String) {
+            writeRtsp("RTSP/1.0 200 OK\r\nCSeq: $cseq\r\n$extra\r\n")
+        }
+
+        fun writeRtsp(value: String) {
+            synchronized(outputLock) {
+                output.write(value.toByteArray(Charsets.ISO_8859_1))
+                output.flush()
+            }
+        }
+
+        fun sendNal(nal: ByteArray, timestamp: Long, marker: Boolean) {
+            if (nal.size <= RTP_PAYLOAD_BYTES) sendPacket(nal, timestamp, marker)
             else {
                 val header = nal[0].toInt() and 255
                 val fuIndicator = (header and 0xe0) or 28
@@ -367,20 +551,20 @@ class VnvarRtspPublisher(
                 var offset = 1
                 var first = true
                 while (offset < nal.size) {
-                    val size = minOf(1198, nal.size - offset)
+                    val size = minOf(RTP_PAYLOAD_BYTES - 2, nal.size - offset)
                     val last = offset + size >= nal.size
                     val payload = ByteArray(size + 2)
                     payload[0] = fuIndicator.toByte()
                     payload[1] = (nalType or (if (first) 0x80 else 0) or (if (last) 0x40 else 0)).toByte()
                     System.arraycopy(nal, offset, payload, 2, size)
-                    sendPacket(payload, timestamp, last)
+                    sendPacket(payload, timestamp, marker && last)
                     first = false
                     offset += size
                 }
             }
         }
 
-        @Synchronized private fun sendPacket(payload: ByteArray, timestamp: Long, marker: Boolean) {
+        private fun sendPacket(payload: ByteArray, timestamp: Long, marker: Boolean) {
             val packet = ByteArray(12 + payload.size)
             packet[0] = 0x80.toByte(); packet[1] = ((if (marker) 0x80 else 0) or 96).toByte()
             packet[2] = (sequence shr 8).toByte(); packet[3] = sequence.toByte(); sequence = (sequence + 1) and 0xffff
@@ -388,13 +572,20 @@ class VnvarRtspPublisher(
             packet[8] = 0x56; packet[9] = 0x4e; packet[10] = 0x56; packet[11] = 0x52
             System.arraycopy(payload, 0, packet, 12, payload.size)
             try {
-                output.write(byteArrayOf('$'.code.toByte(), rtpChannel.toByte(), (packet.size shr 8).toByte(), packet.size.toByte()))
-                output.write(packet); output.flush()
+                synchronized(outputLock) {
+                    output.write(byteArrayOf('$'.code.toByte(), rtpChannel.toByte(), (packet.size shr 8).toByte(), packet.size.toByte()))
+                    output.write(packet)
+                    output.flush()
+                }
             } catch (_: Exception) { close() }
         }
 
         fun close() { playing = false; try { socket.close() } catch (_: Exception) {} }
     }
 
-    companion object { private const val TAG = "VNVAR-RTSP" }
+    companion object {
+        private const val TAG = "VNVAR-RTSP"
+        private const val RTP_PAYLOAD_BYTES = 1200
+        private const val MAX_RTSP_HEADER_BYTES = 64 * 1024
+    }
 }

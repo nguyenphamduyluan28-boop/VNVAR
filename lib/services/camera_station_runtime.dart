@@ -3,8 +3,10 @@ import 'dart:developer' as developer;
 
 import 'package:wakelock_plus/wakelock_plus.dart';
 
+import '../models/camera_resolution_profile.dart';
 import 'camera_server.dart';
 import 'recording_service.dart';
+import 'station_config_service.dart';
 import 'webrtc_service.dart';
 
 class CameraStationRuntime {
@@ -27,6 +29,12 @@ class CameraStationRuntime {
   bool _recovering = false;
   bool _stopping = false;
   bool _cameraEnabled = true;
+  bool _profileSwitching = false;
+  CameraResolutionProfile _resolutionProfile =
+      CameraResolutionProfile.fullHd1080;
+  List<CameraResolutionProfile> _supportedResolutionProfiles = const [
+    CameraResolutionProfile.hd720,
+  ];
   int _generation = 0;
 
   static const List<Duration> _recoveryDelays = [
@@ -47,6 +55,10 @@ class CameraStationRuntime {
       _cameraEnabled && (_webRtcService?.microphoneAvailable ?? false);
   bool get microphoneEnabled =>
       microphoneAvailable && (_webRtcService?.microphoneEnabled ?? false);
+  bool get profileSwitching => _profileSwitching;
+  CameraResolutionProfile get resolutionProfile => _resolutionProfile;
+  List<CameraResolutionProfile> get supportedResolutionProfiles =>
+      List.unmodifiable(_supportedResolutionProfiles);
 
   Future<void> initialize({
     required String cameraId,
@@ -107,6 +119,7 @@ class CameraStationRuntime {
     final recording = _recordingService ?? RecordingService(cameraId: cameraId);
 
     webRtc.onCameraFailure = _scheduleRecovery;
+    webRtc.onRtspStateChanged = _emitState;
     _webRtcService = webRtc;
     _recordingService = recording;
     _cameraId = cameraId;
@@ -114,7 +127,18 @@ class CameraStationRuntime {
     _deviceId = deviceId;
 
     try {
-      await webRtc.initializeCamera();
+      _supportedResolutionProfiles = await webRtc
+          .getSupportedResolutionProfiles();
+      final savedProfile = await StationConfigService().loadResolutionProfile();
+      _resolutionProfile = _supportedResolutionProfiles.firstWhere(
+        (profile) => profile.preset == savedProfile?.preset,
+        orElse: () => _supportedResolutionProfiles.firstWhere(
+          (profile) => profile.preset == CameraResolutionPreset.fullHd1080,
+          orElse: () => _supportedResolutionProfiles.first,
+        ),
+      );
+      webRtc.setResolutionProfile(_resolutionProfile);
+      await webRtc.initializeCamera(facingMode: 'environment');
 
       final server = CameraServer(
         courtId: courtId,
@@ -183,7 +207,10 @@ class CameraStationRuntime {
     try {
       await server?.stop();
     } finally {
-      if (webRtc != null) webRtc.onCameraFailure = null;
+      if (webRtc != null) {
+        webRtc.onCameraFailure = null;
+        webRtc.onRtspStateChanged = null;
+      }
       await webRtc?.dispose();
       _recovering = false;
       _stopping = false;
@@ -255,12 +282,77 @@ class CameraStationRuntime {
     if (!_cameraEnabled) {
       throw StateError('Camera đang tắt.');
     }
+    if (_profileSwitching) {
+      throw StateError('Camera đang thay đổi cấu hình.');
+    }
     final webRtc = _webRtcService;
-    if (webRtc == null) {
+    final recording = _recordingService;
+    final server = _cameraServer;
+    if (webRtc == null || recording == null || server == null) {
       throw StateError('Camera Station chưa khởi tạo xong.');
     }
-    await webRtc.switchCamera();
+
+    final previousFacing = webRtc.currentFacingMode;
+    final targetFacing = previousFacing == 'environment'
+        ? 'user'
+        : 'environment';
+    final targetProfiles = await webRtc.getSupportedResolutionProfiles(
+      facingMode: targetFacing,
+      fallbackWhenUnavailable: false,
+    );
+    if (targetProfiles.isEmpty) {
+      throw StateError('Thiết bị không có camera $targetFacing khả dụng.');
+    }
+
+    final previousProfile = _resolutionProfile;
+    final previousProfiles = _supportedResolutionProfiles;
+    final selectedProfile = targetProfiles.firstWhere(
+      (profile) => profile.preset == previousProfile.preset,
+      orElse: () => targetProfiles.last,
+    );
+
+    _profileSwitching = true;
+    _generation++;
     _emitState();
+    try {
+      await recording.stop();
+      await webRtc.disposeConnection();
+      await webRtc.disposeCamera();
+      webRtc.setResolutionProfile(selectedProfile);
+      await webRtc.initializeCamera(facingMode: targetFacing);
+      await server.ensureRecording();
+
+      _supportedResolutionProfiles = targetProfiles;
+      _resolutionProfile = selectedProfile;
+      if (selectedProfile != previousProfile) {
+        await StationConfigService().saveResolutionProfile(selectedProfile);
+      }
+      developer.log(
+        '[CAMERA] Switched to $targetFacing at '
+        '${selectedProfile.shortLabel} ${selectedProfile.fps} FPS',
+        name: 'CameraStationRuntime',
+      );
+    } catch (_) {
+      _supportedResolutionProfiles = previousProfiles;
+      _resolutionProfile = previousProfile;
+      webRtc.setResolutionProfile(previousProfile);
+      try {
+        await webRtc.disposeCamera();
+        await webRtc.initializeCamera(facingMode: previousFacing);
+        await server.ensureRecording();
+      } catch (rollbackError, stackTrace) {
+        developer.log(
+          '[CAMERA] Lens switch rollback failed',
+          error: rollbackError,
+          stackTrace: stackTrace,
+          name: 'CameraStationRuntime',
+        );
+      }
+      rethrow;
+    } finally {
+      _profileSwitching = false;
+      _emitState();
+    }
   }
 
   Future<void> setMicrophoneEnabled(bool enabled) async {
@@ -275,6 +367,69 @@ class CameraStationRuntime {
     _emitState();
   }
 
+  Future<void> setResolutionProfile(CameraResolutionProfile profile) async {
+    if (_profileSwitching || profile.preset == _resolutionProfile.preset) {
+      return;
+    }
+    CameraResolutionProfile? selected;
+    for (final supported in _supportedResolutionProfiles) {
+      if (supported.preset == profile.preset) {
+        selected = supported;
+        break;
+      }
+    }
+    if (selected == null) {
+      throw ArgumentError('Thiết bị không hỗ trợ ${profile.shortLabel}.');
+    }
+    final webRtc = _webRtcService;
+    final recording = _recordingService;
+    final server = _cameraServer;
+    if (!_cameraEnabled ||
+        webRtc == null ||
+        recording == null ||
+        server == null) {
+      throw StateError('Camera chưa sẵn sàng.');
+    }
+
+    final previous = _resolutionProfile;
+    _profileSwitching = true;
+    _generation++;
+    _emitState();
+    try {
+      await recording.stop();
+      await webRtc.disposeConnection();
+      await webRtc.disposeCamera();
+      webRtc.setResolutionProfile(selected);
+      await webRtc.initializeCamera();
+      await server.ensureRecording();
+      _resolutionProfile = selected;
+      await StationConfigService().saveResolutionProfile(selected);
+      developer.log(
+        '[CAMERA] Resolution changed to ${selected.shortLabel} '
+        '${selected.fps} FPS',
+        name: 'CameraStationRuntime',
+      );
+    } catch (_) {
+      webRtc.setResolutionProfile(previous);
+      try {
+        await webRtc.disposeCamera();
+        await webRtc.initializeCamera();
+        await server.ensureRecording();
+      } catch (rollbackError, stackTrace) {
+        developer.log(
+          '[CAMERA] Resolution rollback failed',
+          error: rollbackError,
+          stackTrace: stackTrace,
+          name: 'CameraStationRuntime',
+        );
+      }
+      rethrow;
+    } finally {
+      _profileSwitching = false;
+      _emitState();
+    }
+  }
+
   void _emitState() {
     if (!_stateController.isClosed) _stateController.add(null);
   }
@@ -282,7 +437,9 @@ class CameraStationRuntime {
   void _startHealthMonitor() {
     _healthTimer?.cancel();
     _healthTimer = Timer.periodic(const Duration(seconds: 10), (_) {
-      if (_stopping || _recovering || !_cameraEnabled) return;
+      if (_stopping || _recovering || _profileSwitching || !_cameraEnabled) {
+        return;
+      }
 
       final webRtc = _webRtcService;
       final track = webRtc?.localVideoTrack;
