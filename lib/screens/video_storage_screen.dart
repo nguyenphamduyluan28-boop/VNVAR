@@ -86,9 +86,7 @@ class _VideoStorageScreenState extends State<VideoStorageScreen> {
       final path = await widget.recordingService.selectStorageFolder();
       if (path == null || path.trim().isEmpty) return;
       if (!mounted) return;
-      final finalPath =
-          '$path${Platform.pathSeparator}ngày-tháng-năm'
-          '${Platform.pathSeparator}AUTOMODE';
+      final folderName = _selectedFolderName(path);
       final accepted = await showDialog<bool>(
         context: context,
         builder: (context) => AlertDialog(
@@ -109,9 +107,36 @@ class _VideoStorageScreenState extends State<VideoStorageScreen> {
                   color: const Color(0xFFF4F6F9),
                   borderRadius: BorderRadius.circular(12),
                 ),
-                child: SelectableText(
-                  finalPath,
-                  style: const TextStyle(fontWeight: FontWeight.w700),
+                child: Row(
+                  children: [
+                    const Icon(
+                      Icons.folder_rounded,
+                      color: Color(0xFF1565C0),
+                      size: 30,
+                    ),
+                    const SizedBox(width: 12),
+                    Expanded(
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Text(
+                            folderName,
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                            style: const TextStyle(fontWeight: FontWeight.w800),
+                          ),
+                          const SizedBox(height: 2),
+                          const Text(
+                            'Tự động sắp xếp theo ngày · AUTOMODE',
+                            style: TextStyle(
+                              color: Colors.black54,
+                              fontSize: 12,
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ],
                 ),
               ),
             ],
@@ -158,6 +183,15 @@ class _VideoStorageScreenState extends State<VideoStorageScreen> {
       return '${(bytes / (1024 * 1024)).toStringAsFixed(1)} MB';
     }
     return '${(bytes / 1024).toStringAsFixed(1)} KB';
+  }
+
+  String _selectedFolderName(String path) {
+    final normalized = path.replaceAll('\\', '/');
+    final parts = normalized
+        .split('/')
+        .where((part) => part.trim().isNotEmpty)
+        .toList();
+    return parts.isEmpty ? 'Bộ nhớ thiết bị' : parts.last;
   }
 
   Future<void> _viewVideo(RecordedSegment video) async {
@@ -284,6 +318,16 @@ class _InformationPanel extends StatelessWidget {
     required this.onChooseStorage,
   });
 
+  String get _folderName {
+    if (storagePath.trim().isEmpty) return 'Chưa chọn nơi lưu';
+    final parts = storagePath
+        .replaceAll('\\', '/')
+        .split('/')
+        .where((part) => part.trim().isNotEmpty)
+        .toList();
+    return parts.isEmpty ? 'Bộ nhớ thiết bị' : parts.last;
+  }
+
   @override
   Widget build(BuildContext context) {
     return Card(
@@ -392,17 +436,54 @@ class _InformationPanel extends StatelessWidget {
                         borderRadius: BorderRadius.circular(12),
                         border: Border.all(color: const Color(0xFF90CAF9)),
                       ),
-                      child: SelectableText(
-                        storagePath.isEmpty ? 'Chưa chọn thư mục' : storagePath,
-                        maxLines: 2,
-                        style: const TextStyle(fontWeight: FontWeight.w700),
+                      child: Row(
+                        children: [
+                          Container(
+                            padding: const EdgeInsets.all(9),
+                            decoration: BoxDecoration(
+                              color: Colors.white,
+                              borderRadius: BorderRadius.circular(10),
+                            ),
+                            child: const Icon(
+                              Icons.sd_storage_rounded,
+                              color: Color(0xFF1565C0),
+                              size: 22,
+                            ),
+                          ),
+                          const SizedBox(width: 11),
+                          Expanded(
+                            child: Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                Text(
+                                  _folderName,
+                                  maxLines: 1,
+                                  overflow: TextOverflow.ellipsis,
+                                  style: const TextStyle(
+                                    fontWeight: FontWeight.w800,
+                                  ),
+                                ),
+                                const SizedBox(height: 2),
+                                Text(
+                                  storagePath.isEmpty
+                                      ? 'Chọn thư mục để bắt đầu lưu video'
+                                      : 'Theo ngày · AUTOMODE',
+                                  style: const TextStyle(
+                                    color: Colors.black54,
+                                    fontSize: 12,
+                                  ),
+                                ),
+                              ],
+                            ),
+                          ),
+                        ],
                       ),
                     ),
                   ),
                   if (onChooseStorage != null) ...[
                     const SizedBox(width: 8),
-                    FilledButton.icon(
-                      style: FilledButton.styleFrom(
+                    OutlinedButton.icon(
+                      style: OutlinedButton.styleFrom(
                         padding: const EdgeInsets.symmetric(
                           horizontal: 10,
                           vertical: 11,

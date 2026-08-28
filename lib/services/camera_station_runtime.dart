@@ -32,6 +32,9 @@ class CameraStationRuntime {
   Timer? _storageCleanupTimer;
   Timer? _thermalTimer;
   bool _thermalThrottled = false;
+  bool _thermalCriticalSuspended = false;
+  bool _thermalCheckRunning = false;
+  DateTime? _thermalNormalSince;
   double? _temperatureC;
   CameraResolutionProfile? _profileBeforeThermalThrottle;
   bool _recovering = false;
@@ -39,6 +42,13 @@ class CameraStationRuntime {
   bool _cameraEnabled = true;
   bool _profileSwitching = false;
   bool _iosLifecycleSuspended = false;
+  bool _healthCheckRunning = false;
+  String? _lastRecordingPath;
+  int? _lastRecordingBytes;
+  DateTime? _lastRecordingProgressAt;
+  String? _lastAudioPath;
+  int? _lastAudioBytes;
+  DateTime? _lastAudioProgressAt;
   CameraResolutionProfile _resolutionProfile =
       CameraResolutionProfile.fullHd1080;
   List<CameraResolutionProfile> _supportedResolutionProfiles = const [
@@ -53,6 +63,9 @@ class CameraStationRuntime {
     Duration(seconds: 30),
     Duration(seconds: 30),
   ];
+  static const Duration _thermalRestoreDelay = Duration(minutes: 2);
+  static const Duration _recordingStallTimeout = Duration(seconds: 45);
+  static const Duration _bufferedVideoHardStallTimeout = Duration(minutes: 2);
   static const MethodChannel _platformChannel = MethodChannel(
     'vnvar/camera_station_service',
   );
@@ -82,6 +95,24 @@ class CameraStationRuntime {
   bool get thermalWarning => _thermalThrottled;
   bool get storageWarning => _recordingService?.lowStorageWarning ?? false;
   bool get lifecycleSuspended => _iosLifecycleSuspended;
+  String get captureState {
+    if (_thermalCriticalSuspended) return 'thermal_suspended';
+    if (_recordingService?.storageSuspended == true) {
+      return 'storage_suspended';
+    }
+    if (_iosLifecycleSuspended) return 'lifecycle_suspended';
+    if (_recovering) return 'recovering';
+    if (_profileSwitching) return 'profile_switching';
+    if (_recordingService?.recording == true) return 'recording';
+    return ready ? 'ready' : 'starting';
+  }
+
+  String get thermalState {
+    if (_thermalCriticalSuspended) return 'critical';
+    if (_thermalThrottled) return 'hot';
+    return _temperatureC == null ? 'unknown' : 'normal';
+  }
+
   CameraResolutionProfile get resolutionProfile => _resolutionProfile;
   List<CameraResolutionProfile> get supportedResolutionProfiles =>
       List.unmodifiable(_supportedResolutionProfiles);
@@ -144,6 +175,7 @@ class CameraStationRuntime {
       _stopping = false;
       _cameraEnabled = true;
     }
+    await _setIosStationActive(true);
 
     developer.log(
       '[SERVICE] Initializing runtime: $cameraId / $courtId',
@@ -172,11 +204,28 @@ class CameraStationRuntime {
           orElse: () => _supportedResolutionProfiles.first,
         ),
       );
+      final preflightThermal = await _readThermalSnapshot();
+      _temperatureC = preflightThermal.temperatureC;
+      final criticalThermal = preflightThermal.critical;
+      if (preflightThermal.hot) {
+        _profileBeforeThermalThrottle = _resolutionProfile;
+        _thermalThrottled = true;
+        _resolutionProfile = CameraResolutionProfile.hd720.withFps(15);
+      }
+      if (criticalThermal) {
+        _thermalCriticalSuspended = true;
+        developer.log(
+          '[THERMAL] Critical state detected before camera startup; capture remains paused',
+          name: 'CameraStationRuntime',
+        );
+      }
       webRtc.setResolutionProfile(_resolutionProfile);
-      await webRtc.initializeCamera(facingMode: 'environment');
-      // Camera Station always records with microphone audio. The control is
-      // intentionally not exposed on Station Screen.
-      await webRtc.ensureMicrophoneEnabled();
+      if (!criticalThermal) {
+        await webRtc.initializeCamera(facingMode: 'environment');
+        // Camera Station always requests microphone audio. A denied permission
+        // intentionally falls back to video-only recording.
+        await webRtc.ensureMicrophoneEnabled();
+      }
 
       final server = CameraServer(
         courtId: courtId,
@@ -185,19 +234,24 @@ class CameraStationRuntime {
         webRtcService: webRtc,
         recordingService: recording,
         onStateChanged: _emitState,
+        captureStateProvider: () => captureState,
+        thermalStateProvider: () => thermalState,
+        temperatureProvider: () => _temperatureC,
       );
       _cameraServer = server;
 
       await server.start();
-      try {
-        await server.ensureRecording();
-      } catch (error, stackTrace) {
-        developer.log(
-          '[RECORDING] Initial start blocked because mandatory audio is unavailable; retrying from health monitor.',
-          error: error,
-          stackTrace: stackTrace,
-          name: 'CameraStationRuntime',
-        );
+      if (!criticalThermal) {
+        try {
+          await server.ensureRecording();
+        } catch (error, stackTrace) {
+          developer.log(
+            '[RECORDING] Initial recording start failed; retrying from health monitor.',
+            error: error,
+            stackTrace: stackTrace,
+            name: 'CameraStationRuntime',
+          );
+        }
       }
       _startHealthMonitor();
       _startThermalMonitor();
@@ -206,6 +260,7 @@ class CameraStationRuntime {
       // Trên iOS, điều này đảm bảo app luôn ở foreground và camera
       // không bị hệ điều hành dừng khi màn hình tắt.
       await WakelockPlus.enable();
+      await _setIosStationActive(true);
 
       developer.log(
         '[RECORDING] Automatic recording is active (wakelock enabled)',
@@ -255,10 +310,15 @@ class CameraStationRuntime {
     _thermalTimer?.cancel();
     _thermalTimer = null;
     _thermalThrottled = false;
+    _thermalCriticalSuspended = false;
+    _thermalCheckRunning = false;
+    _thermalNormalSince = null;
     _temperatureC = null;
     _profileBeforeThermalThrottle = null;
     _storageCleanupTimer?.cancel();
     _storageCleanupTimer = null;
+    _healthCheckRunning = false;
+    _resetRecordingProgressWatchdog();
 
     final server = _cameraServer;
     final webRtc = _webRtcService;
@@ -285,6 +345,7 @@ class CameraStationRuntime {
 
       // Cho phép màn hình tắt bình thường khi dừng camera.
       await WakelockPlus.disable();
+      await _setIosStationActive(false);
 
       _emitState();
     }
@@ -316,16 +377,23 @@ class CameraStationRuntime {
       '[LIFECYCLE] iOS entering background; finalizing current segment',
       name: 'CameraStationRuntime',
     );
+    await _beginIosBackgroundFinalization();
     try {
       await recording.stop();
     } finally {
       try {
-        await webRtc.disposeConnection();
+        try {
+          await webRtc.disposeConnection();
+        } finally {
+          await webRtc.disposeCamera();
+        }
+        await WakelockPlus.disable();
+        await _setIosStationActive(false);
+        _resetRecordingProgressWatchdog();
+        _emitState();
       } finally {
-        await webRtc.disposeCamera();
+        await _endIosBackgroundFinalization();
       }
-      await WakelockPlus.disable();
-      _emitState();
     }
   }
 
@@ -341,6 +409,13 @@ class CameraStationRuntime {
     final webRtc = _webRtcService;
     final server = _cameraServer;
     if (webRtc == null || server == null) return;
+    if (_thermalCriticalSuspended) {
+      _iosLifecycleSuspended = false;
+      await WakelockPlus.enable();
+      await _setIosStationActive(true);
+      _emitState();
+      return;
+    }
     try {
       // Recreating the stream also rechecks microphone permission. A grant
       // made in iOS Settings therefore takes effect on the first new segment.
@@ -348,6 +423,7 @@ class CameraStationRuntime {
       await webRtc.ensureMicrophoneEnabled();
       await server.ensureRecording();
       await WakelockPlus.enable();
+      await _setIosStationActive(true);
       _iosLifecycleSuspended = false;
       developer.log(
         '[LIFECYCLE] iOS foreground capture resumed',
@@ -402,6 +478,7 @@ class CameraStationRuntime {
       }
 
       await WakelockPlus.disable();
+      await _setIosStationActive(false);
       developer.log('[CAMERA] Disabled by user', name: 'CameraStationRuntime');
       _emitState();
       return;
@@ -411,6 +488,7 @@ class CameraStationRuntime {
       await webRtc.initializeCamera();
       await server.ensureRecording();
       await WakelockPlus.enable();
+      await _setIosStationActive(true);
       developer.log('[CAMERA] Enabled by user', name: 'CameraStationRuntime');
     } catch (_) {
       _cameraEnabled = false;
@@ -588,41 +666,9 @@ class CameraStationRuntime {
   void _startHealthMonitor() {
     _healthTimer?.cancel();
     _healthTimer = Timer.periodic(const Duration(seconds: 10), (_) {
-      if (_stopping ||
-          _recovering ||
-          _profileSwitching ||
-          _iosLifecycleSuspended ||
-          !_cameraEnabled) {
-        return;
-      }
-
-      final webRtc = _webRtcService;
-      final track = webRtc?.localVideoTrack;
-      if (webRtc == null ||
-          !webRtc.cameraInitialized ||
-          track == null ||
-          !track.enabled) {
-        _scheduleRecovery('health_check_failed');
-        return;
-      }
-      final recording = _recordingService;
-      final server = _cameraServer;
-      if (recording != null &&
-          server != null &&
-          !recording.recording &&
-          !recording.rotating) {
-        unawaited(
-          server.ensureRecording().catchError((Object error, StackTrace stack) {
-            developer.log(
-              '[RECORDING] Mandatory-audio retry failed',
-              error: error,
-              stackTrace: stack,
-              name: 'CameraStationRuntime',
-            );
-          }),
-        );
-      }
+      unawaited(_checkRuntimeHealth());
     });
+    unawaited(_checkRuntimeHealth());
 
     _storageCleanupTimer?.cancel();
     _storageCleanupTimer = Timer.periodic(const Duration(seconds: 60), (_) {
@@ -648,6 +694,135 @@ class CameraStationRuntime {
     });
   }
 
+  Future<void> _checkRuntimeHealth() async {
+    if (_healthCheckRunning ||
+        _stopping ||
+        _recovering ||
+        _profileSwitching ||
+        _thermalCriticalSuspended ||
+        _iosLifecycleSuspended ||
+        !_cameraEnabled) {
+      return;
+    }
+    _healthCheckRunning = true;
+    try {
+      final webRtc = _webRtcService;
+      final track = webRtc?.localVideoTrack;
+      if (webRtc == null ||
+          !webRtc.cameraInitialized ||
+          track == null ||
+          !track.enabled) {
+        _scheduleRecovery('health_check_failed');
+        return;
+      }
+
+      final recording = _recordingService;
+      final server = _cameraServer;
+      if (recording == null || server == null) return;
+      if (!recording.recording && !recording.rotating) {
+        _resetRecordingProgressWatchdog();
+        if (!recording.storageRetryDue) return;
+        try {
+          await server.ensureRecording();
+        } catch (error, stackTrace) {
+          developer.log(
+            '[RECORDING] Automatic recording retry failed',
+            error: error,
+            stackTrace: stackTrace,
+            name: 'CameraStationRuntime',
+          );
+        }
+        return;
+      }
+      if (recording.rotating) {
+        _resetRecordingProgressWatchdog();
+        return;
+      }
+
+      final progress = await recording.currentRecordingProgress();
+      if (progress == null) {
+        _scheduleRecovery('recording_progress_missing');
+        return;
+      }
+      final now = DateTime.now();
+      var videoStalled = false;
+      var videoHardStalled = false;
+      if (_lastRecordingPath != progress.path) {
+        _lastRecordingPath = progress.path;
+        _lastRecordingBytes = progress.bytes;
+        _lastRecordingProgressAt = now;
+      } else if (_lastRecordingBytes != progress.bytes) {
+        _lastRecordingBytes = progress.bytes;
+        _lastRecordingProgressAt = now;
+      } else {
+        final lastProgress = _lastRecordingProgressAt ?? now;
+        final stalledFor = now.difference(lastProgress);
+        videoStalled =
+            stalledFor >= _recordingStallTimeout &&
+            now.difference(progress.startedAt) >= _recordingStallTimeout;
+        videoHardStalled =
+            stalledFor >= _bufferedVideoHardStallTimeout &&
+            now.difference(progress.startedAt) >=
+                _bufferedVideoHardStallTimeout;
+      }
+
+      final audioProgress = await recording.currentAudioProgress();
+      var audioStalled = false;
+      if (audioProgress != null) {
+        if (!audioProgress.active) {
+          _scheduleRecovery('recording_audio_inactive');
+          return;
+        }
+        if (_lastAudioPath != audioProgress.path) {
+          _lastAudioPath = audioProgress.path;
+          _lastAudioBytes = audioProgress.bytes;
+          _lastAudioProgressAt = now;
+        } else if (_lastAudioBytes != audioProgress.bytes) {
+          _lastAudioBytes = audioProgress.bytes;
+          _lastAudioProgressAt = now;
+        } else if (now.difference(_lastAudioProgressAt ?? now) >=
+                _recordingStallTimeout &&
+            now.difference(progress.startedAt) >= _recordingStallTimeout) {
+          audioStalled = true;
+        }
+      }
+      if (audioStalled) {
+        developer.log(
+          '[RECORDING] Native audio stopped growing at ${audioProgress?.bytes} bytes',
+          name: 'CameraStationRuntime',
+        );
+        _scheduleRecovery('recording_audio_stalled');
+      } else if (videoStalled && (audioProgress == null || videoHardStalled)) {
+        // MP4 writers may buffer metadata/video writes. On Android, continuing
+        // WAV progress proves the capture pipeline is alive and avoids a false
+        // recovery. Video-only/iOS segments still rely on MP4 growth.
+        developer.log(
+          '[RECORDING] Staging file stopped growing at ${progress.bytes} bytes',
+          name: 'CameraStationRuntime',
+        );
+        _scheduleRecovery('recording_file_stalled');
+      }
+    } catch (error, stackTrace) {
+      developer.log(
+        '[HEALTH] Runtime health check failed',
+        error: error,
+        stackTrace: stackTrace,
+        name: 'CameraStationRuntime',
+      );
+    } finally {
+      _healthCheckRunning = false;
+    }
+  }
+
+  void _resetRecordingProgressWatchdog() {
+    _lastRecordingPath = null;
+    _lastRecordingBytes = null;
+    _lastRecordingProgressAt = null;
+    _lastAudioPath = null;
+    _lastAudioBytes = null;
+    _lastAudioProgressAt = null;
+  }
+
   void _startThermalMonitor() {
     _thermalTimer?.cancel();
     _thermalTimer = Timer.periodic(const Duration(seconds: 10), (_) {
@@ -657,20 +832,44 @@ class CameraStationRuntime {
   }
 
   Future<void> _checkThermalState() async {
-    if ((!Platform.isAndroid && !Platform.isIOS) ||
+    if (_thermalCheckRunning ||
+        (!Platform.isAndroid && !Platform.isIOS) ||
         _stopping ||
         !_cameraEnabled ||
         _iosLifecycleSuspended) {
       return;
     }
+    _thermalCheckRunning = true;
     try {
-      final result = await _platformChannel.invokeMapMethod<String, dynamic>(
-        'getThermalStatus',
-      );
-      final temperature = (result?['temperatureC'] as num?)?.toDouble();
-      final status = (result?['thermalStatus'] as num?)?.toInt() ?? 0;
+      final snapshot = await _readThermalSnapshot();
+      final temperature = snapshot.temperatureC;
       _temperatureC = temperature;
-      final hot = (temperature != null && temperature >= 45.0) || status >= 4;
+      final critical = snapshot.critical;
+      final hot = snapshot.hot;
+      if (critical) {
+        _thermalNormalSince = null;
+        if (!_thermalCriticalSuspended && !_profileSwitching) {
+          await _serializeLifecycle(_suspendForCriticalThermal);
+        }
+        _emitState();
+        return;
+      }
+      if (_thermalCriticalSuspended) {
+        if (hot) {
+          _thermalNormalSince = null;
+          _emitState();
+          return;
+        }
+        final now = DateTime.now();
+        _thermalNormalSince ??= now;
+        if (now.difference(_thermalNormalSince!) >= _thermalRestoreDelay) {
+          await _serializeLifecycle(_resumeAfterCriticalThermal);
+          _thermalNormalSince = DateTime.now();
+        }
+        _emitState();
+        return;
+      }
+      if (hot) _thermalNormalSince = null;
       if (hot && !_thermalThrottled && !_profileSwitching) {
         _profileBeforeThermalThrottle = _resolutionProfile;
         _thermalThrottled = true;
@@ -691,18 +890,26 @@ class CameraStationRuntime {
           );
         }
       } else if (!hot && _thermalThrottled && !_profileSwitching) {
-        _thermalThrottled = false;
-        _emitState();
+        final now = DateTime.now();
+        _thermalNormalSince ??= now;
+        if (now.difference(_thermalNormalSince!) < _thermalRestoreDelay) {
+          _emitState();
+          return;
+        }
         final previous = _profileBeforeThermalThrottle;
-        _profileBeforeThermalThrottle = null;
         if (previous != null) {
           try {
+            _thermalThrottled = false;
             await setResolutionProfile(previous);
+            _profileBeforeThermalThrottle = null;
+            _thermalNormalSince = null;
             developer.log(
-              '[THERMAL] Temperature normal; restored camera profile',
+              '[THERMAL] Temperature stable for 2 minutes; restored camera profile',
               name: 'CameraStationRuntime',
             );
           } catch (error, stackTrace) {
+            _thermalThrottled = true;
+            _thermalNormalSince = now;
             developer.log(
               '[THERMAL] Failed to restore camera profile',
               error: error,
@@ -710,7 +917,11 @@ class CameraStationRuntime {
               name: 'CameraStationRuntime',
             );
           }
+        } else {
+          _thermalThrottled = false;
+          _thermalNormalSince = null;
         }
+        _emitState();
       } else {
         _emitState();
       }
@@ -719,12 +930,128 @@ class CameraStationRuntime {
         '[THERMAL] Unable to read thermal state: $error',
         name: 'CameraStationRuntime',
       );
+    } finally {
+      _thermalCheckRunning = false;
+    }
+  }
+
+  Future<({double? temperatureC, bool hot, bool critical})>
+  _readThermalSnapshot() async {
+    if (!Platform.isAndroid && !Platform.isIOS) {
+      return (temperatureC: null, hot: false, critical: false);
+    }
+    final result = await _platformChannel.invokeMapMethod<String, dynamic>(
+      'getThermalStatus',
+    );
+    final temperature = (result?['temperatureC'] as num?)?.toDouble();
+    final status = (result?['thermalStatus'] as num?)?.toInt() ?? 0;
+    return (
+      temperatureC: temperature,
+      hot: (temperature != null && temperature >= 45.0) || status >= 4,
+      critical: (temperature != null && temperature >= 50.0) || status >= 5,
+    );
+  }
+
+  Future<void> _suspendForCriticalThermal() async {
+    if (_thermalCriticalSuspended || _stopping || !_cameraEnabled) return;
+    final recording = _recordingService;
+    final webRtc = _webRtcService;
+    if (recording == null || webRtc == null) return;
+
+    _thermalCriticalSuspended = true;
+    _profileBeforeThermalThrottle ??= _resolutionProfile;
+    _thermalThrottled = true;
+    final safeProfile = CameraResolutionProfile.hd720.withFps(15);
+    _resolutionProfile = safeProfile;
+    webRtc.setResolutionProfile(safeProfile);
+    developer.log(
+      '[THERMAL] Critical state; finalizing segment and pausing capture',
+      name: 'CameraStationRuntime',
+    );
+    try {
+      await recording.stop();
+    } finally {
+      try {
+        await webRtc.disposeConnection();
+      } finally {
+        await webRtc.disposeCamera();
+      }
+      _resetRecordingProgressWatchdog();
+    }
+  }
+
+  Future<void> _resumeAfterCriticalThermal() async {
+    if (!_thermalCriticalSuspended ||
+        _stopping ||
+        !_cameraEnabled ||
+        _iosLifecycleSuspended) {
+      return;
+    }
+    final webRtc = _webRtcService;
+    final server = _cameraServer;
+    if (webRtc == null || server == null) return;
+    try {
+      await webRtc.initializeCamera();
+      await webRtc.ensureMicrophoneEnabled();
+      await server.ensureRecording();
+      _thermalCriticalSuspended = false;
+      developer.log(
+        '[THERMAL] Device stable; capture resumed at 720p/15fps',
+        name: 'CameraStationRuntime',
+      );
+    } catch (error, stackTrace) {
+      developer.log(
+        '[THERMAL] Unable to resume capture after critical state',
+        error: error,
+        stackTrace: stackTrace,
+        name: 'CameraStationRuntime',
+      );
+      await webRtc.disposeCamera();
+    }
+  }
+
+  Future<void> _setIosStationActive(bool active) async {
+    if (!Platform.isIOS) return;
+    try {
+      await _platformChannel.invokeMethod<void>('setStationActive', {
+        'active': active,
+      });
+    } catch (error) {
+      developer.log(
+        '[LIFECYCLE] Unable to update iOS idle timer: $error',
+        name: 'CameraStationRuntime',
+      );
+    }
+  }
+
+  Future<void> _beginIosBackgroundFinalization() async {
+    if (!Platform.isIOS) return;
+    try {
+      await _platformChannel.invokeMethod<void>('beginBackgroundFinalization');
+    } catch (error) {
+      developer.log(
+        '[LIFECYCLE] Unable to begin iOS background finalization: $error',
+        name: 'CameraStationRuntime',
+      );
+    }
+  }
+
+  Future<void> _endIosBackgroundFinalization() async {
+    if (!Platform.isIOS) return;
+    try {
+      await _platformChannel.invokeMethod<void>('endBackgroundFinalization');
+    } catch (error) {
+      developer.log(
+        '[LIFECYCLE] Unable to end iOS background finalization: $error',
+        name: 'CameraStationRuntime',
+      );
     }
   }
 
   void _scheduleRecovery(String reason) {
     if (_stopping ||
         _recovering ||
+        _thermalCriticalSuspended ||
         _iosLifecycleSuspended ||
         !_cameraEnabled) {
       return;

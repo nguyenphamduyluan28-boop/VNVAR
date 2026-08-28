@@ -10,6 +10,7 @@ import androidx.core.content.ContextCompat
 import java.io.File
 import java.io.RandomAccessFile
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicLong
 
 /** Records microphone PCM independently from flutter_webrtc's video muxer. */
 class NativeAudioSegmentRecorder(private val context: Context) {
@@ -18,7 +19,8 @@ class NativeAudioSegmentRecorder(private val context: Context) {
     private var worker: Thread? = null
     private var output: RandomAccessFile? = null
     private var outputFile: File? = null
-    private var dataBytes = 0L
+    private val dataBytes = AtomicLong(0L)
+    private val lastProgressElapsedMs = AtomicLong(0L)
 
     @Synchronized
     fun start(path: String): Map<String, Any> {
@@ -52,7 +54,8 @@ class NativeAudioSegmentRecorder(private val context: Context) {
         writer.setLength(0)
         writeWavHeader(writer, sampleRate, 1, 16, 0)
 
-        dataBytes = 0
+        dataBytes.set(0L)
+        lastProgressElapsedMs.set(android.os.SystemClock.elapsedRealtime())
         outputFile = file
         output = writer
         audioRecord = recorder
@@ -68,7 +71,7 @@ class NativeAudioSegmentRecorder(private val context: Context) {
             audioRecord = null
             output = null
             outputFile = null
-            dataBytes = 0
+            dataBytes.set(0L)
             throw error
         }
         running.set(true)
@@ -80,7 +83,8 @@ class NativeAudioSegmentRecorder(private val context: Context) {
                 when {
                     count > 0 -> try {
                         output?.write(buffer, 0, count)
-                        dataBytes += count
+                        dataBytes.addAndGet(count.toLong())
+                        lastProgressElapsedMs.set(android.os.SystemClock.elapsedRealtime())
                     } catch (_: Exception) {
                         running.set(false)
                     }
@@ -93,6 +97,13 @@ class NativeAudioSegmentRecorder(private val context: Context) {
         return mapOf("path" to path, "sampleRate" to sampleRate, "channels" to 1)
     }
 
+    fun status(): Map<String, Any?> = mapOf(
+        "active" to running.get(),
+        "path" to outputFile?.absolutePath,
+        "bytes" to dataBytes.get(),
+        "lastProgressElapsedMs" to lastProgressElapsedMs.get(),
+    )
+
     @Synchronized
     fun stop(): Map<String, Any?> {
         val recorder = audioRecord
@@ -104,7 +115,7 @@ class NativeAudioSegmentRecorder(private val context: Context) {
                 Thread.currentThread().interrupt()
             }
         }
-        val bytes = dataBytes
+        val bytes = dataBytes.get()
         val file = outputFile
         try {
             output?.let {
@@ -118,7 +129,8 @@ class NativeAudioSegmentRecorder(private val context: Context) {
             worker = null
             output = null
             outputFile = null
-            dataBytes = 0
+            dataBytes.set(0L)
+            lastProgressElapsedMs.set(0L)
         }
         return mapOf("path" to file?.absolutePath, "bytes" to bytes)
     }

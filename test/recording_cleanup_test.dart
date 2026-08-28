@@ -92,6 +92,15 @@ void main() {
     expect(await file.exists(), isTrue);
   });
 
+  test('uses warning and emergency free-space safety thresholds', () {
+    expect(RecordingService.normalFreeSpaceThresholdBytes, 1024 * 1024 * 1024);
+    expect(RecordingService.minimumStartFreeSpaceBytes, 512 * 1024 * 1024);
+    expect(
+      RecordingService.minimumStartFreeSpaceBytes,
+      lessThan(RecordingService.normalFreeSpaceThresholdBytes),
+    );
+  });
+
   test('does not index another camera from shared AUTOMODE storage', () async {
     final now = DateTime.now();
     String two(int value) => value.toString().padLeft(2, '0');

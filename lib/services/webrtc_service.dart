@@ -17,7 +17,7 @@ class WebRtcService {
   void Function()? onRtspStateChanged;
 
   WebRtcService() {
-    if (Platform.isAndroid) {
+    if (Platform.isAndroid || Platform.isIOS) {
       _platformChannel.setMethodCallHandler(_handlePlatformCallback);
     }
   }
@@ -59,6 +59,7 @@ class WebRtcService {
   final Map<String, String> _preferredCameraDeviceIds = <String, String>{};
   bool? _isEmulator;
   bool _rtspRunning = false;
+  bool _rtspAudio = false;
   bool _rtspServerStarted = false;
   String? _rtspError;
   CameraResolutionProfile _resolutionProfile =
@@ -77,8 +78,9 @@ class WebRtcService {
   String? get rtspError => _rtspError;
 
   bool get rtspRunning => _rtspRunning;
+  bool get rtspAudio => _rtspAudio;
 
-  bool get rtspSupported => Platform.isAndroid;
+  bool get rtspSupported => Platform.isAndroid || Platform.isIOS;
 
   Future<void> _handlePlatformCallback(MethodCall call) async {
     if (!_rtspServerStarted) return;
@@ -96,6 +98,7 @@ class WebRtcService {
         onRtspStateChanged?.call();
       case 'onRtspEncoderError':
         _rtspRunning = false;
+        _rtspAudio = false;
         final arguments = call.arguments;
         final message = arguments is Map ? arguments['error'] : null;
         _rtspError = message is String && message.trim().isNotEmpty
@@ -622,7 +625,7 @@ class WebRtcService {
     _rtspStarting = true;
     if (!rtspSupported) {
       _rtspRunning = false;
-      _rtspError = 'RTSP chỉ được hỗ trợ trên Android.';
+      _rtspError = 'RTSP không được hỗ trợ trên nền tảng này.';
       developer.log(
         '[RTSP] Unsupported on ${Platform.operatingSystem}.',
         name: 'WebRtcService',
@@ -632,15 +635,19 @@ class WebRtcService {
     }
     try {
       _rtspRunning = false;
+      _rtspAudio = false;
       _rtspError = null;
       _rtspServerStarted = true;
       _rtspRetryTimer?.cancel();
-      await _platformChannel.invokeMethod<Map<Object?, Object?>>('startRtsp', {
-        'trackId': track.id,
-        'port': 8554,
-        'bitrate': _resolutionProfile.bitrate,
-        'fps': _resolutionProfile.fps,
-      });
+      final result = await _platformChannel
+          .invokeMethod<Map<Object?, Object?>>('startRtsp', {
+            'trackId': track.id,
+            'audioTrackId': localAudioTrack?.id,
+            'port': 8554,
+            'bitrate': _resolutionProfile.bitrate,
+            'fps': _resolutionProfile.fps,
+          });
+      _rtspAudio = result?['audio'] == true;
       developer.log(
         '[RTSP] Server opened; waiting for H.264 encoder readiness.',
         name: 'WebRtcService',
@@ -650,6 +657,7 @@ class WebRtcService {
       // can be retried without requiring the tablet to reconnect manually.
       _rtspServerStarted = true;
       _rtspRunning = false;
+      _rtspAudio = false;
       _rtspError = error.toString();
       developer.log(
         '[RTSP] Cannot start server',
@@ -664,13 +672,14 @@ class WebRtcService {
   }
 
   Future<void> _stopRtsp() async {
-    if (!Platform.isAndroid) return;
+    if (!Platform.isAndroid && !Platform.isIOS) return;
     if (!_rtspServerStarted) return;
     _rtspRetryTimer?.cancel();
     _rtspRetryTimer = null;
     _rtspRetryAttempt = 0;
     _rtspServerStarted = false;
     _rtspRunning = false;
+    _rtspAudio = false;
     try {
       await _platformChannel.invokeMethod<void>('stopRtsp');
     } catch (error) {
@@ -1103,7 +1112,7 @@ class WebRtcService {
     await disposeCamera();
 
     onRtspStateChanged = null;
-    if (Platform.isAndroid) {
+    if (Platform.isAndroid || Platform.isIOS) {
       _platformChannel.setMethodCallHandler(null);
     }
 

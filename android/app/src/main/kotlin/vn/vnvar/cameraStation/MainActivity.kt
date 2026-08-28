@@ -93,6 +93,10 @@ class MainActivity : FlutterActivity() {
                     }
                 }
 
+                "getNativeAudioSegmentStatus" -> {
+                    result.success(nativeAudioRecorder.status())
+                }
+
                 "isEmulator" -> result.success(isRunningOnEmulator())
 
                 "setScreenDimmed" -> {

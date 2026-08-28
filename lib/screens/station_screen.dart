@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:io';
 
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_webrtc/flutter_webrtc.dart';
 
 import '../models/camera_resolution_profile.dart';
@@ -37,6 +38,9 @@ class StationScreen extends StatefulWidget {
 
 class _StationScreenState extends State<StationScreen>
     with WidgetsBindingObserver {
+  static const MethodChannel _platformChannel = MethodChannel(
+    'vnvar/camera_station_service',
+  );
   final CameraStationRuntime _runtime = CameraStationRuntime.instance;
 
   StreamSubscription<void>? _runtimeSubscription;
@@ -188,6 +192,16 @@ class _StationScreenState extends State<StationScreen>
   Future<void> _loadViewerAddress() async {
     var result = 'Chưa kết nối Wi-Fi/LAN';
     try {
+      if (Platform.isIOS) {
+        final wifiIp = await _platformChannel
+            .invokeMethod<String>('getWifiIpAddress')
+            .timeout(const Duration(seconds: 2));
+        if (wifiIp != null && wifiIp.isNotEmpty) {
+          result = 'http://$wifiIp:8080/viewer';
+        }
+        if (mounted) setState(() => _viewerAddress = result);
+        return;
+      }
       final interfaces = await NetworkInterface.list(
         type: InternetAddressType.IPv4,
         includeLoopback: false,

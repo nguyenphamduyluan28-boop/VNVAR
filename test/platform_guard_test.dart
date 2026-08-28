@@ -35,6 +35,6 @@ void main() {
 
   test('RTSP capability matches the host platform', () {
     final service = WebRtcService();
-    expect(service.rtspSupported, Platform.isAndroid);
+    expect(service.rtspSupported, Platform.isAndroid || Platform.isIOS);
   });
 }

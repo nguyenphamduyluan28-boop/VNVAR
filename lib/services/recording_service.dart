@@ -7,6 +7,7 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_webrtc/flutter_webrtc.dart';
 import 'package:ffmpeg_kit_flutter_new_video/ffmpeg_kit.dart';
+import 'package:ffmpeg_kit_flutter_new_video/ffprobe_kit.dart';
 import 'package:ffmpeg_kit_flutter_new_video/return_code.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
@@ -33,6 +34,14 @@ String buildTrimmedClipFileName(String cameraId, int timestampMs) {
 class TrimInProgressException implements Exception {
   final String message;
   const TrimInProgressException(this.message);
+
+  @override
+  String toString() => message;
+}
+
+class StorageSafetyException implements Exception {
+  final String message;
+  const StorageSafetyException(this.message);
 
   @override
   String toString() => message;
@@ -153,6 +162,7 @@ class RecordingService {
   static const int autoCleanupMaxPasses = 50;
   static const int autoCleanupBatchSize = 10;
   static const int hlsEmergencyThresholdBytes = 1 * 1024 * 1024 * 1024;
+  static const int minimumStartFreeSpaceBytes = 512 * 1024 * 1024;
   static const Duration recentSegmentProtection = Duration(minutes: 5);
 
   static String? get _hardwareH264Encoder {
@@ -235,6 +245,8 @@ class RecordingService {
   bool _rotating = false;
   bool _lowStorageWarning = false;
   DateTime? _lowStorageWarningSince;
+  bool _storageSuspended = false;
+  DateTime? _nextStorageRetryAt;
 
   bool _stopping = false;
   Future<RecordedSegment?>? _stopOperation;
@@ -250,10 +262,41 @@ class RecordingService {
   bool _hlsEnabled = false;
   int? _hlsMaxSegments;
   String? _hlsDirectoryPath;
+  final Map<String, int> _activeFileReaders = <String, int>{};
 
   bool get recording => _recording;
 
   bool get rotating => _rotating;
+
+  String _leaseKey(String path) =>
+      File(path).absolute.path.replaceAll('\\', '/').toLowerCase();
+
+  /// Prevents retention cleanup from deleting a file while HTTP is reading it.
+  void acquireFileRead(String path) {
+    final key = _leaseKey(path);
+    _activeFileReaders[key] = (_activeFileReaders[key] ?? 0) + 1;
+  }
+
+  void releaseFileRead(String path) {
+    final key = _leaseKey(path);
+    final count = _activeFileReaders[key];
+    if (count == null || count <= 1) {
+      _activeFileReaders.remove(key);
+    } else {
+      _activeFileReaders[key] = count - 1;
+    }
+  }
+
+  bool isFileReadActive(String path) =>
+      (_activeFileReaders[_leaseKey(path)] ?? 0) > 0;
+
+  bool _hasActiveReaderUnder(String directoryPath) {
+    final directory = _leaseKey(directoryPath);
+    final prefix = directory.endsWith('/') ? directory : '$directory/';
+    return _activeFileReaders.keys.any(
+      (path) => path == directory || path.startsWith(prefix),
+    );
+  }
 
   // ============================================================
   // COMPLETED SEGMENTS
@@ -432,6 +475,50 @@ class RecordingService {
 
   bool get currentSegmentHasAudio => _currentSegmentHasAudio;
   bool get lowStorageWarning => _lowStorageWarning;
+  bool get storageSuspended => _storageSuspended;
+  bool get storageRetryDue =>
+      !_storageSuspended ||
+      !DateTime.now().isBefore(
+        _nextStorageRetryAt ?? DateTime.fromMillisecondsSinceEpoch(0),
+      );
+
+  Future<({String path, int bytes, DateTime startedAt})?>
+  currentRecordingProgress() async {
+    final path = _currentPath;
+    final startedAt = _segmentStartedAt;
+    if (!_recording || path == null || startedAt == null) return null;
+    final file = File(path);
+    try {
+      final bytes = await file.exists() ? await file.length() : 0;
+      return (path: path, bytes: bytes, startedAt: startedAt);
+    } catch (_) {
+      return (path: path, bytes: 0, startedAt: startedAt);
+    }
+  }
+
+  Future<({String? path, int bytes, bool active})?>
+  currentAudioProgress() async {
+    if (!Platform.isAndroid || !_currentSegmentHasAudio) return null;
+    try {
+      final raw = await _androidChannel.invokeMapMethod<String, dynamic>(
+        'getNativeAudioSegmentStatus',
+      );
+      if (raw == null) return null;
+      return (
+        path: raw['path'] as String?,
+        bytes: (raw['bytes'] as num?)?.toInt() ?? 0,
+        active: raw['active'] == true,
+      );
+    } catch (error, stackTrace) {
+      developer.log(
+        'Unable to read native audio progress',
+        error: error,
+        stackTrace: stackTrace,
+        name: 'RecordingService',
+      );
+      return null;
+    }
+  }
 
   // ============================================================
   // PERMANENT VIDEO DIRECTORY ON THE CAMERA PHONE
@@ -501,6 +588,7 @@ class RecordingService {
         } catch (_) {}
       }
       if (containsRecentFile) continue;
+      if (_hasActiveReaderUnder(entity.path)) continue;
 
       try {
         final normalizedDirectory = entity.path.replaceAll('\\', '/');
@@ -739,6 +827,56 @@ class RecordingService {
     return target;
   }
 
+  Future<bool> _isPlayableVideo(File file) async {
+    try {
+      if (!await file.exists() || await file.length() <= 0) return false;
+      final session = await FFprobeKit.getMediaInformation(file.path);
+      final information = session.getMediaInformation();
+      if (information == null) return false;
+      final duration = double.tryParse(information.getDuration() ?? '');
+      final hasVideo = information.getStreams().any(
+        (stream) => stream.getType() == 'video',
+      );
+      return hasVideo && duration != null && duration > 0.05;
+    } catch (error, stackTrace) {
+      developer.log(
+        'FFprobe validation failed: ${file.path}',
+        error: error,
+        stackTrace: stackTrace,
+        name: 'RecordingService',
+      );
+      return false;
+    }
+  }
+
+  Future<void> _writeJournalState(
+    File? journal,
+    String state, {
+    String? finalPath,
+    String? error,
+  }) async {
+    if (journal == null) return;
+    try {
+      var values = <String, dynamic>{};
+      if (await journal.exists()) {
+        final decoded = jsonDecode(await journal.readAsString());
+        if (decoded is Map<String, dynamic>) values = decoded;
+      }
+      values['state'] = state;
+      values['updatedAtMs'] = DateTime.now().millisecondsSinceEpoch;
+      if (finalPath != null) values['finalPath'] = finalPath;
+      if (error != null) values['error'] = error;
+      await journal.writeAsString(jsonEncode(values), flush: true);
+    } catch (journalError, stackTrace) {
+      developer.log(
+        'Unable to update recording journal: $state',
+        error: journalError,
+        stackTrace: stackTrace,
+        name: 'RecordingService',
+      );
+    }
+  }
+
   // ============================================================
   // START RECORDING
   // ============================================================
@@ -826,6 +964,8 @@ class RecordingService {
     if (videoTrack == null) {
       throw StateError('Không có video track để ghi.');
     }
+
+    await _ensureFreeSpaceForNewSegment();
 
     final now = DateTime.now();
     final timestamp = now.millisecondsSinceEpoch;
@@ -965,6 +1105,44 @@ class RecordingService {
     );
   }
 
+  Future<void> _ensureFreeSpaceForNewSegment() async {
+    var available = await availableStorageBytes();
+    if (available == null || available >= normalFreeSpaceThresholdBytes) {
+      _setStorageSuspended(false);
+      return;
+    }
+
+    // Publish the normal 1 GB warning first. Below 512 MB the grace period is
+    // bypassed: starting another MP4 is more likely to produce a corrupt file
+    // than to preserve useful footage.
+    await enforceStorageLimit();
+    available = await availableStorageBytes();
+    if (available != null && available < minimumStartFreeSpaceBytes) {
+      await performAutoCleanup();
+      available = await availableStorageBytes();
+    }
+    if (available != null && available < minimumStartFreeSpaceBytes) {
+      _setStorageSuspended(true);
+      throw StorageSafetyException(
+        'Không đủ dung lượng an toàn để bắt đầu segment mới '
+        '(${(available / (1024 * 1024)).toStringAsFixed(0)} MB còn trống).',
+      );
+    }
+    _setStorageSuspended(false);
+  }
+
+  void _setStorageSuspended(bool value) {
+    if (value) {
+      _nextStorageRetryAt = DateTime.now().add(const Duration(minutes: 2));
+    } else {
+      _nextStorageRetryAt = null;
+    }
+    if (_storageSuspended == value) return;
+    _storageSuspended = value;
+    debugPrint('[VNVAR] STORAGE RECORDING ${value ? 'SUSPENDED' : 'RESUMED'}');
+    _notifyVideoChanges();
+  }
+
   // ============================================================
   // ROTATE SEGMENT
   //
@@ -1097,6 +1275,7 @@ class RecordingService {
     }
 
     developer.log('Finishing segment: $path', name: 'RecordingService');
+    await _writeJournalState(journal, 'finalizing');
 
     if (Platform.isAndroid && audioPath != null) {
       try {
@@ -1189,6 +1368,19 @@ class RecordingService {
       return null;
     }
 
+    if (!await _isPlayableVideo(file)) {
+      await _writeJournalState(
+        journal,
+        'invalid',
+        error: 'FFprobe found no playable video stream',
+      );
+      developer.log(
+        'Recorded segment is not playable and remains in staging for forensic recovery: $path',
+        name: 'RecordingService',
+      );
+      return null;
+    }
+
     if (recorderStopError != null) {
       debugPrint('[VNVAR] RECORDER FILE RECOVERED: $path | $fileSize bytes');
     }
@@ -1239,6 +1431,7 @@ class RecordingService {
     await enforceStorageLimit();
 
     try {
+      await _writeJournalState(journal, 'completed', finalPath: file.path);
       if (journal != null && await journal.exists()) await journal.delete();
     } catch (_) {}
 
@@ -1338,9 +1531,16 @@ class RecordingService {
     );
     try {
       if (await directory.exists()) {
-        await directory.delete(recursive: true);
+        await for (final entity in directory.list(recursive: true)) {
+          if (entity is File && !isFileReadActive(entity.path)) {
+            await entity.delete();
+          }
+        }
+        await _deleteDirectoryTreeIfEmpty(directory);
       }
-      _exportSegments.clear();
+      _exportSegments.removeWhere(
+        (_, segment) => !isFileReadActive(segment.path),
+      );
       developer.log(
         '[STORAGE] Temporary download session cleaned.',
         name: 'RecordingService',
@@ -1587,6 +1787,35 @@ class RecordingService {
             .replaceFirst(RegExp(r'\.mp4$', caseSensitive: false), '');
         final timestamp = int.tryParse(timestampText);
         if (fileName.startsWith(prefix) && timestamp != null && stat.size > 0) {
+          final journal = File('${entity.path}.json');
+          if (await journal.exists()) {
+            try {
+              final decoded = jsonDecode(await journal.readAsString());
+              if (decoded is Map<String, dynamic> &&
+                  decoded['state'] == 'invalid') {
+                if (now.difference(stat.modified) >= maxAge) {
+                  await entity.delete();
+                  await journal.delete();
+                }
+                continue;
+              }
+            } catch (_) {
+              // A damaged journal does not prove the media is damaged; FFprobe
+              // below remains the source of truth.
+            }
+          }
+          await _writeJournalState(journal, 'recovering');
+          if (!await _isPlayableVideo(entity)) {
+            await _writeJournalState(
+              journal,
+              'invalid',
+              error: 'FFprobe found no playable video stream after crash',
+            );
+            if (now.difference(stat.modified) >= maxAge) {
+              await entity.delete();
+            }
+            continue;
+          }
           final startedAt = DateTime.fromMillisecondsSinceEpoch(timestamp);
           final endedAt = stat.modified.isAfter(startedAt)
               ? stat.modified
@@ -1603,6 +1832,12 @@ class RecordingService {
             endedAt,
             await wav.exists() ? wav : null,
           );
+          await _writeJournalState(
+            journal,
+            'completed',
+            finalPath: recovered.path,
+          );
+          if (await journal.exists()) await journal.delete();
           debugPrint(
             '[VNVAR] ABANDONED RECORDING RECOVERED: ${recovered.path}',
           );
@@ -1981,6 +2216,7 @@ class RecordingService {
     if (matches.length > 3) {
       var deletedAny = false;
       for (final match in matches.take(3)) {
+        if (_hasActiveReaderUnder(match.directory.path)) continue;
         try {
           final normalizedDirectory = match.directory.path
               .replaceAll('\\', '/')
@@ -2045,6 +2281,7 @@ class RecordingService {
 
   Future<bool> _deleteCleanupFile(File file) async {
     try {
+      if (isFileReadActive(file.path)) return false;
       if (!await file.exists()) return false;
       await file.delete();
       _segments.removeWhere((segment) => segment.path == file.path);
@@ -2069,6 +2306,15 @@ class RecordingService {
     } catch (_) {}
   }
 
+  Future<void> _deleteDirectoryTreeIfEmpty(Directory directory) async {
+    if (!await directory.exists()) return;
+    final children = await directory.list().toList();
+    for (final child in children.whereType<Directory>()) {
+      await _deleteDirectoryTreeIfEmpty(child);
+    }
+    await _deleteDirectoryIfEmpty(directory);
+  }
+
   Future<void> enforceStorageLimit() {
     final current = _storageLimitOperation;
     if (current != null) return current;
@@ -2087,6 +2333,10 @@ class RecordingService {
     final lowStorage =
         availableBefore != null &&
         availableBefore < normalFreeSpaceThresholdBytes;
+    if (availableBefore == null ||
+        availableBefore >= minimumStartFreeSpaceBytes) {
+      _setStorageSuspended(false);
+    }
     if (lowStorage != _lowStorageWarning) {
       _lowStorageWarning = lowStorage;
       _lowStorageWarningSince = lowStorage ? DateTime.now() : null;
@@ -2184,6 +2434,7 @@ class RecordingService {
       ({File file, FileStat stat, String day}) item,
     ) async {
       try {
+        if (isFileReadActive(item.file.path)) return;
         // Một dịch vụ camera khác có thể vừa xóa cùng file trong thư mục dùng
         // chung. Khi đó vẫn loại kích thước đã thống kê khỏi tổng hiện tại.
         if (await item.file.exists()) await item.file.delete();
@@ -2211,7 +2462,7 @@ class RecordingService {
       await deleteFile(item);
     }
 
-    // PerformAutoCleanup: nếu bộ nhớ trống dưới 5 GB, xóa AUTOMODE theo từng
+    // PerformAutoCleanup: nếu bộ nhớ trống dưới 1 GB, xóa AUTOMODE theo từng
     // lô 10 mốc thời gian, tối đa 50 lượt.
     await performAutoCleanup();
 

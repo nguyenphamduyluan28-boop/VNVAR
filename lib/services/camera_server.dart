@@ -5,6 +5,7 @@ import 'dart:io';
 import 'package:flutter/foundation.dart';
 import 'package:flutter_webrtc/flutter_webrtc.dart';
 
+import 'bounded_json_body.dart';
 import 'discovery_service.dart';
 import 'recording_service.dart';
 import 'webrtc_service.dart';
@@ -17,6 +18,7 @@ class CameraServer {
   HttpServer? _server;
 
   static const int apiPort = 8080;
+  static const int maximumJsonBodyBytes = 256 * 1024;
 
   // ============================================================
   // IDENTITY
@@ -34,6 +36,9 @@ class CameraServer {
   final RecordingService recordingService;
 
   final VoidCallback? onStateChanged;
+  final String Function()? captureStateProvider;
+  final String Function()? thermalStateProvider;
+  final double? Function()? temperatureProvider;
 
   final DiscoveryService _discovery = DiscoveryService();
 
@@ -58,6 +63,9 @@ class CameraServer {
     required this.webRtcService,
     required this.recordingService,
     this.onStateChanged,
+    this.captureStateProvider,
+    this.thermalStateProvider,
+    this.temperatureProvider,
   });
 
   // ============================================================
@@ -360,6 +368,21 @@ class CameraServer {
         'error': 'Not Found',
         'path': path,
       });
+    } on PayloadTooLargeException catch (error, stackTrace) {
+      developer.log(
+        'CameraServer rejected oversized request body',
+        error: error,
+        stackTrace: stackTrace,
+        name: 'CameraServer',
+      );
+      try {
+        await _sendJson(request.response, HttpStatus.requestEntityTooLarge, {
+          'error': 'Payload Too Large',
+          'maximumBytes': maximumJsonBodyBytes,
+        });
+      } catch (_) {
+        // The client may have disconnected while uploading the body.
+      }
     } catch (error, stackTrace) {
       developer.log(
         'CameraServer request error',
@@ -414,6 +437,8 @@ class CameraServer {
 
       'rtspRunning': webRtcService.rtspRunning,
 
+      'rtspAudio': webRtcService.rtspAudio,
+
       'rtspError': webRtcService.rtspError,
 
       'videoProfile': {
@@ -432,6 +457,12 @@ class CameraServer {
 
       'recordingAudio': recordingService.currentSegmentHasAudio,
       'storageWarning': recordingService.lowStorageWarning,
+      'storageSuspended': recordingService.storageSuspended,
+      'captureState':
+          captureStateProvider?.call() ??
+          (recordingService.recording ? 'recording' : 'ready'),
+      'thermalState': thermalStateProvider?.call() ?? 'unknown',
+      'temperatureC': temperatureProvider?.call(),
 
       'apiPort': apiPort,
     });
@@ -871,6 +902,19 @@ class CameraServer {
     File file, {
     required bool attachment,
   }) async {
+    recordingService.acquireFileRead(file.path);
+    try {
+      await _sendVideoFileWhileLeased(request, file, attachment: attachment);
+    } finally {
+      recordingService.releaseFileRead(file.path);
+    }
+  }
+
+  Future<void> _sendVideoFileWhileLeased(
+    HttpRequest request,
+    File file, {
+    required bool attachment,
+  }) async {
     final response = request.response;
 
     final int fileLength = await file.length();
@@ -1053,19 +1097,16 @@ class CameraServer {
   // ============================================================
 
   Future<Map<String, dynamic>> _readJson(HttpRequest request) async {
-    final body = await utf8.decoder.bind(request).join();
-
-    if (body.trim().isEmpty) {
-      return {};
+    final declaredLength = request.contentLength;
+    if (declaredLength > maximumJsonBodyBytes) {
+      throw const PayloadTooLargeException(maximumJsonBodyBytes);
     }
 
-    final decoded = jsonDecode(body);
-
-    if (decoded is! Map<String, dynamic>) {
-      throw const FormatException('JSON body must be object');
+    final decoder = BoundedJsonBodyDecoder(maximumBytes: maximumJsonBodyBytes);
+    await for (final chunk in request) {
+      decoder.add(chunk);
     }
-
-    return decoded;
+    return decoder.decode();
   }
 
   // ============================================================
