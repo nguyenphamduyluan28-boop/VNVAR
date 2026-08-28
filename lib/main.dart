@@ -6,6 +6,8 @@ import 'screens/setup_screen.dart';
 import 'screens/station_screen.dart';
 import 'screens/station_splash_screen.dart';
 import 'services/station_config_service.dart';
+import 'services/camera_station_foreground_service.dart';
+import 'services/camera_station_runtime.dart';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -76,10 +78,13 @@ class _VnvarCameraStationAppState extends State<VnvarCameraStationApp> {
     setState(() => _identity = identity);
   }
 
-  void _handleSystemBack(bool didPop) {
+  Future<void> _handleSystemBack(bool didPop) async {
     if (didPop || !mounted) return;
     switch (_step) {
       case _StartupStep.station:
+        await CameraStationRuntime.instance.stop();
+        await CameraStationForegroundService.stop();
+        if (!mounted) return;
         setState(() => _step = _StartupStep.cameraSetup);
         return;
       case _StartupStep.cameraSetup:

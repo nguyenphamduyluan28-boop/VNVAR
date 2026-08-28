@@ -1,8 +1,10 @@
 import 'dart:async';
+import 'dart:convert';
 import 'dart:developer' as developer;
 import 'dart:io';
 
 import 'package:flutter/foundation.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_webrtc/flutter_webrtc.dart';
 import 'package:ffmpeg_kit_flutter_new_video/ffmpeg_kit.dart';
 import 'package:ffmpeg_kit_flutter_new_video/return_code.dart';
@@ -139,6 +141,9 @@ class RecordedSegment {
 // ============================================================
 
 class RecordingService {
+  static const MethodChannel _androidChannel = MethodChannel(
+    'vnvar/camera_station_service',
+  );
   final String cameraId;
 
   static const int storageLimitBytes = 20 * 1024 * 1024 * 1024;
@@ -149,6 +154,12 @@ class RecordingService {
   static const int autoCleanupBatchSize = 10;
   static const int hlsEmergencyThresholdBytes = 1 * 1024 * 1024 * 1024;
   static const Duration recentSegmentProtection = Duration(minutes: 5);
+
+  static String? get _hardwareH264Encoder {
+    if (Platform.isAndroid) return 'h264_mediacodec';
+    if (Platform.isIOS) return 'h264_videotoolbox';
+    return null;
+  }
 
   RecordingService({
     required this.cameraId,
@@ -199,6 +210,8 @@ class RecordingService {
 
   MediaStreamTrack? _videoTrack;
 
+  bool _recordAudio = false;
+
   Timer? _segmentTimer;
 
   // ============================================================
@@ -208,6 +221,9 @@ class RecordingService {
   DateTime? _segmentStartedAt;
 
   String? _currentPath;
+  String? _currentAudioPath;
+  File? _currentJournal;
+  bool _currentSegmentHasAudio = false;
 
   // ============================================================
   // STATE
@@ -217,9 +233,11 @@ class RecordingService {
   Future<RecordedSegment>? _trimOperation;
 
   bool _rotating = false;
+  bool _lowStorageWarning = false;
+  DateTime? _lowStorageWarningSince;
 
   bool _stopping = false;
-  Future<void>? _stopOperation;
+  Future<RecordedSegment?>? _stopOperation;
   Future<RecordedSegment?>? _rotationOperation;
   Future<void>? _expiredCleanupOperation;
   Future<void>? _storageLimitOperation;
@@ -320,7 +338,7 @@ class RecordingService {
       final target = output;
       final id = 'CLIP_${cameraId}_$timestampMs';
       final durationMs = endMs - startMs;
-      final session = await FFmpegKit.executeWithArguments([
+      final commonArguments = <String>[
         '-y',
         '-ss',
         (startMs / 1000).toStringAsFixed(3),
@@ -328,20 +346,54 @@ class RecordingService {
         source.path,
         '-t',
         (durationMs / 1000).toStringAsFixed(3),
-        '-an',
+        '-map',
+        '0:v:0',
+        '-map',
+        '0:a:0?',
         '-threads',
         '1',
+      ];
+      final hardwareEncoder = _hardwareH264Encoder;
+      var session = await FFmpegKit.executeWithArguments([
+        ...commonArguments,
         '-c:v',
-        'mpeg4',
-        '-q:v',
-        '4',
+        hardwareEncoder ?? 'mpeg4',
+        if (hardwareEncoder != null) ...['-b:v', '8M'] else ...['-q:v', '4'],
+        '-c:a',
+        'aac',
+        '-b:a',
+        '128k',
         '-movflags',
         '+faststart',
         '-f',
         'mp4',
         target.path,
       ]);
-      final returnCode = await session.getReturnCode();
+      var returnCode = await session.getReturnCode();
+      if (hardwareEncoder != null && !ReturnCode.isSuccess(returnCode)) {
+        if (await target.exists()) await target.delete();
+        developer.log(
+          '[FFMPEG] $hardwareEncoder unavailable; falling back to MPEG-4',
+          name: 'RecordingService',
+        );
+        session = await FFmpegKit.executeWithArguments([
+          ...commonArguments,
+          '-c:v',
+          'mpeg4',
+          '-q:v',
+          '4',
+          '-c:a',
+          'aac',
+          '-b:a',
+          '128k',
+          '-movflags',
+          '+faststart',
+          '-f',
+          'mp4',
+          target.path,
+        ]);
+        returnCode = await session.getReturnCode();
+      }
       if (!ReturnCode.isSuccess(returnCode) ||
           !await target.exists() ||
           await target.length() <= 0) {
@@ -377,6 +429,9 @@ class RecordingService {
   String? get currentPath {
     return _currentPath;
   }
+
+  bool get currentSegmentHasAudio => _currentSegmentHasAudio;
+  bool get lowStorageWarning => _lowStorageWarning;
 
   // ============================================================
   // PERMANENT VIDEO DIRECTORY ON THE CAMERA PHONE
@@ -514,6 +569,7 @@ class RecordingService {
     File source,
     DateTime startedAt,
     DateTime endedAt,
+    File? nativeAudio,
   ) async {
     // Dùng ngày kết thúc để segment đi qua 0 giờ không bị lưu vào thư mục ngày
     // cũ rồi bị RemoveExpiredData xóa ngay.
@@ -522,34 +578,83 @@ class RecordingService {
       '${directory.path}${Platform.pathSeparator}'
       '${_videoFileName(startedAt: startedAt, endedAt: endedAt)}.ts',
     );
+    final hasNativeAudio =
+        nativeAudio != null &&
+        await nativeAudio.exists() &&
+        await nativeAudio.length() > 44;
+    final audioInput = hasNativeAudio ? ['-i', nativeAudio.path] : <String>[];
+    final audioMap = hasNativeAudio ? '1:a:0?' : '0:a:0?';
     var session = await FFmpegKit.executeWithArguments([
       '-y',
       '-i',
       source.path,
+      ...audioInput,
       '-map',
       '0:v:0',
-      '-an',
+      '-map',
+      audioMap,
       '-c:v',
       'copy',
+      '-c:a',
+      'aac',
+      '-b:a',
+      '128k',
       '-f',
       'mpegts',
       target.path,
     ]);
     var code = await session.getReturnCode();
     if (!ReturnCode.isSuccess(code)) {
+      final hardwareEncoder = _hardwareH264Encoder;
+      if (hardwareEncoder != null) {
+        if (await target.exists()) await target.delete();
+        session = await FFmpegKit.executeWithArguments([
+          '-y',
+          '-i',
+          source.path,
+          ...audioInput,
+          '-map',
+          '0:v:0',
+          '-map',
+          audioMap,
+          '-threads',
+          '1',
+          '-c:v',
+          hardwareEncoder,
+          '-b:v',
+          '8M',
+          '-c:a',
+          'aac',
+          '-b:a',
+          '128k',
+          '-f',
+          'mpegts',
+          target.path,
+        ]);
+        code = await session.getReturnCode();
+      }
+    }
+    if (!ReturnCode.isSuccess(code)) {
+      if (await target.exists()) await target.delete();
       session = await FFmpegKit.executeWithArguments([
         '-y',
         '-i',
         source.path,
+        ...audioInput,
         '-map',
         '0:v:0',
-        '-an',
+        '-map',
+        audioMap,
         '-threads',
         '1',
         '-c:v',
         'mpeg4',
         '-q:v',
         '4',
+        '-c:a',
+        'aac',
+        '-b:a',
+        '128k',
         '-f',
         'mpegts',
         target.path,
@@ -561,12 +666,71 @@ class RecordingService {
         await target.length() <= 0) {
       final output = await session.getOutput();
       if (await target.exists()) await target.delete();
-      throw StateError(
-        'Không thể tạo file MPEG-TS từ đoạn vừa ghi. '
-        'FFmpeg: ${output ?? 'không có thông tin lỗi'}',
+      // Không được bỏ mất đoạn recorder đã ghi chỉ vì bước đóng gói TS lỗi.
+      // Giữ nguyên MP4 trong thư mục video để segment vẫn xuất hiện và tải
+      // được; lần ghi kế tiếp vẫn có thể tiếp tục bình thường.
+      final fallback = File(
+        '${directory.path}${Platform.pathSeparator}'
+        '${_videoFileName(startedAt: startedAt, endedAt: endedAt)}.mp4',
       );
+      if (await fallback.exists()) await fallback.delete();
+      if (hasNativeAudio) {
+        final muxSession = await FFmpegKit.executeWithArguments([
+          '-y',
+          '-i',
+          source.path,
+          '-i',
+          nativeAudio.path,
+          '-map',
+          '0:v:0',
+          '-map',
+          '1:a:0',
+          '-c:v',
+          'copy',
+          '-c:a',
+          'aac',
+          '-b:a',
+          '128k',
+          '-shortest',
+          '-movflags',
+          '+faststart',
+          fallback.path,
+        ]);
+        final muxCode = await muxSession.getReturnCode();
+        if (ReturnCode.isSuccess(muxCode) &&
+            await fallback.exists() &&
+            await fallback.length() > 0) {
+          if (await source.exists()) await source.delete();
+          if (await nativeAudio.exists()) await nativeAudio.delete();
+          debugPrint('[VNVAR] MP4 WITH AUDIO FALLBACK SAVED: ${fallback.path}');
+          return fallback;
+        }
+        if (await fallback.exists()) await fallback.delete();
+      }
+      final preserved = await source.copy(fallback.path);
+      if (!await preserved.exists() || await preserved.length() <= 0) {
+        throw StateError(
+          'Không thể lưu đoạn video cuối. '
+          'FFmpeg: ${output ?? 'không có thông tin lỗi'}',
+        );
+      }
+      // Giữ lại cặp MP4/WAV staging khi mux audio thất bại. Lần khởi động
+      // sau sẽ thử recover lại thay vì xóa WAV hợp lệ và mất cơ hội ghép tiếng.
+      if (!hasNativeAudio) {
+        if (await source.exists()) await source.delete();
+      }
+      developer.log(
+        'TS conversion failed; preserved original MP4: ${preserved.path}. '
+        'FFmpeg: ${output ?? 'no error details'}',
+        name: 'RecordingService',
+      );
+      debugPrint('[VNVAR] MP4 FALLBACK SAVED: ${preserved.path}');
+      return preserved;
     }
     if (await source.exists()) await source.delete();
+    if (nativeAudio != null && await nativeAudio.exists()) {
+      await nativeAudio.delete();
+    }
     developer.log(
       'TS SAVED: ${target.path} | ${await target.length()} bytes',
       name: 'RecordingService',
@@ -579,7 +743,10 @@ class RecordingService {
   // START RECORDING
   // ============================================================
 
-  Future<void> start({required MediaStreamTrack videoTrack}) async {
+  Future<void> start({
+    required MediaStreamTrack videoTrack,
+    bool audioAvailable = true,
+  }) async {
     final stopping = _stopOperation;
     if (stopping != null) await stopping;
 
@@ -594,6 +761,9 @@ class RecordingService {
     }
 
     _videoTrack = videoTrack;
+    // Capture capability, not a user-facing microphone toggle. Android checks
+    // native permission per segment; iOS supplies false after permission denial.
+    _recordAudio = Platform.isAndroid || audioAvailable;
 
     _recording = true;
 
@@ -622,10 +792,14 @@ class RecordingService {
       _recording = false;
 
       _videoTrack = null;
+      _recordAudio = false;
 
       _segmentTimer?.cancel();
 
       _segmentTimer = null;
+
+      debugPrint('[VNVAR] RECORDER START FAILED: $error');
+      debugPrintStack(stackTrace: stackTrace);
 
       developer.log(
         'Failed to start recording',
@@ -679,14 +853,116 @@ class RecordingService {
     // START MEDIA RECORDER
     // ==========================================================
 
-    await recorder.start(path, videoTrack: videoTrack);
+    try {
+      await recorder.start(
+        path,
+        videoTrack: videoTrack,
+        audioChannel: _recordAudio && !Platform.isAndroid
+            ? RecorderAudioChannel.INPUT
+            : null,
+      );
+    } catch (_) {
+      // Dọn native recorder/file khởi tạo dở trước khi caller thử fallback.
+      try {
+        await recorder.stop();
+      } catch (_) {}
+      final partial = File(path);
+      try {
+        if (await partial.exists()) await partial.delete();
+      } catch (_) {}
+      rethrow;
+    }
 
     _recorder = recorder;
 
     _currentPath = path;
+    _currentJournal = File('$path.json');
+    try {
+      await _currentJournal!.writeAsString(
+        jsonEncode({
+          'cameraId': cameraId,
+          'startedAtMs': now.millisecondsSinceEpoch,
+          'videoPath': path,
+          'audioPath': _recordAudio && Platform.isAndroid
+              ? path.replaceFirst(RegExp(r'\.mp4$'), '.wav')
+              : null,
+          'state': 'recording',
+        }),
+        flush: true,
+      );
+    } catch (error, stackTrace) {
+      developer.log(
+        'Unable to write recording journal',
+        error: error,
+        stackTrace: stackTrace,
+        name: 'RecordingService',
+      );
+    }
 
     _segmentStartedAt = now;
+    _currentSegmentHasAudio = _recordAudio && !Platform.isAndroid;
+    if (_recordAudio && Platform.isAndroid) {
+      final audioPath = path.replaceFirst(RegExp(r'\.mp4$'), '.wav');
+      try {
+        await _androidChannel.invokeMethod<void>('startNativeAudioSegment', {
+          'path': audioPath,
+        });
+        _currentAudioPath = audioPath;
+        _currentSegmentHasAudio = true;
+        debugPrint('[VNVAR] NATIVE AUDIO STARTED: $audioPath');
+      } catch (error, stackTrace) {
+        _currentAudioPath = null;
+        _currentSegmentHasAudio = false;
+        final microphonePermissionDenied =
+            error is PlatformException &&
+            error.code == 'MICROPHONE_PERMISSION_DENIED';
+        if (microphonePermissionDenied) {
+          developer.log(
+            'Microphone permission denied; continuing with video-only segment.',
+            name: 'RecordingService',
+          );
+          debugPrint('[VNVAR] MICROPHONE PERMISSION DENIED: VIDEO-ONLY');
+          _notifyVideoChanges();
+          debugPrint(
+            '[VNVAR] RECORDER STARTED: $path | '
+            'audio=off | microphoneRequested=on',
+          );
+          return;
+        }
+        _recording = false;
+        _recorder = null;
+        _currentPath = null;
+        _segmentStartedAt = null;
+        final journal = _currentJournal;
+        _currentJournal = null;
+        try {
+          await _androidChannel.invokeMethod<void>('stopNativeAudioSegment');
+        } catch (_) {}
+        try {
+          await recorder.stop();
+        } catch (_) {}
+        for (final partial in <File>[File(path), File(audioPath), ?journal]) {
+          try {
+            if (await partial.exists()) await partial.delete();
+          } catch (_) {}
+        }
+        developer.log(
+          'Native microphone recording unavailable; rejecting video segment.',
+          error: error,
+          stackTrace: stackTrace,
+          name: 'RecordingService',
+        );
+        debugPrint('[VNVAR] NATIVE AUDIO START FAILED: $error');
+        _notifyVideoChanges();
+        throw StateError('Microphone bắt buộc nhưng không thể bắt đầu: $error');
+      }
+    }
     _notifyVideoChanges();
+    debugPrint(
+      '[VNVAR] RECORDER STARTED: $path | '
+      'audio=${_currentSegmentHasAudio ? 'on' : 'off'} | '
+      'microphoneRequested=on',
+    );
   }
 
   // ============================================================
@@ -802,6 +1078,8 @@ class RecordingService {
     final path = _currentPath;
 
     final startedAt = _segmentStartedAt;
+    final audioPath = _currentAudioPath;
+    final journal = _currentJournal;
 
     // Clear trước để tránh stop gọi hai lần.
     _recorder = null;
@@ -809,6 +1087,9 @@ class RecordingService {
     _currentPath = null;
 
     _segmentStartedAt = null;
+    _currentAudioPath = null;
+    _currentJournal = null;
+    _currentSegmentHasAudio = false;
     _notifyVideoChanges();
 
     if (recorder == null || path == null || startedAt == null) {
@@ -817,11 +1098,44 @@ class RecordingService {
 
     developer.log('Finishing segment: $path', name: 'RecordingService');
 
+    if (Platform.isAndroid && audioPath != null) {
+      try {
+        await _androidChannel.invokeMethod<void>('stopNativeAudioSegment');
+        debugPrint('[VNVAR] NATIVE AUDIO STOPPED: $audioPath');
+      } catch (error, stackTrace) {
+        developer.log(
+          'Unable to stop native audio segment cleanly.',
+          error: error,
+          stackTrace: stackTrace,
+          name: 'RecordingService',
+        );
+        debugPrint('[VNVAR] NATIVE AUDIO STOP FAILED: $error');
+      }
+    }
+
     // ==========================================================
     // STOP RECORDER
     // ==========================================================
 
-    await recorder.stop();
+    Object? recorderStopError;
+    StackTrace? recorderStopStack;
+    try {
+      await recorder.stop();
+    } catch (error, stackTrace) {
+      // Một số codec Android/Unisoc ném lỗi khi drain buffer cuối dù container
+      // MP4 đã được ghi ra đĩa. Không bỏ segment ngay tại đây; chờ filesystem
+      // ổn định rồi xác thực file và tiếp tục lưu nếu dữ liệu vẫn hợp lệ.
+      recorderStopError = error;
+      recorderStopStack = stackTrace;
+      developer.log(
+        'MediaRecorder.stop failed; attempting to recover the recorded file.',
+        error: error,
+        stackTrace: stackTrace,
+        name: 'RecordingService',
+      );
+      debugPrint('[VNVAR] RECORDER STOP ERROR, RECOVERING FILE: $error');
+      await Future<void>.delayed(const Duration(milliseconds: 500));
+    }
 
     final endedAt = DateTime.now();
     if (onRecorderStopped != null) {
@@ -851,6 +1165,9 @@ class RecordingService {
         name: 'RecordingService',
       );
 
+      if (recorderStopError != null) {
+        Error.throwWithStackTrace(recorderStopError, recorderStopStack!);
+      }
       return null;
     }
 
@@ -866,10 +1183,22 @@ class RecordingService {
         await file.delete();
       } catch (_) {}
 
+      if (recorderStopError != null) {
+        Error.throwWithStackTrace(recorderStopError, recorderStopStack!);
+      }
       return null;
     }
 
-    file = await _convertRecordingToTs(file, startedAt, endedAt);
+    if (recorderStopError != null) {
+      debugPrint('[VNVAR] RECORDER FILE RECOVERED: $path | $fileSize bytes');
+    }
+
+    file = await _convertRecordingToTs(
+      file,
+      startedAt,
+      endedAt,
+      audioPath == null ? null : File(audioPath),
+    );
 
     // Lấy kích thước trước cleanup. Một RecordingService khác dùng chung thư
     // mục hoặc chính cơ chế giới hạn 20 GB có thể xóa file trong lúc cleanup.
@@ -908,6 +1237,10 @@ class RecordingService {
     _segments.add(segment);
     _notifyVideoChanges();
     await enforceStorageLimit();
+
+    try {
+      if (journal != null && await journal.exists()) await journal.delete();
+    } catch (_) {}
 
     if (!await file.exists()) {
       // Cleanup đã xóa file hợp lệ để đáp ứng giới hạn dung lượng. Đồng bộ lại
@@ -1223,6 +1556,14 @@ class RecordingService {
     );
   }
 
+  /// Cleans only recorder staging files. This is safe to call while the
+  /// station is running and avoids rebuilding the permanent video index.
+  Future<void> cleanupStagingFiles({
+    Duration maxAge = const Duration(hours: 24),
+  }) async {
+    await _cleanupAbandonedRecordings(maxAge: maxAge);
+  }
+
   Future<void> _cleanupAbandonedRecordings({required Duration maxAge}) async {
     final stagingRoot = await getTemporaryDirectory();
     final directory = Directory(
@@ -1239,10 +1580,83 @@ class RecordingService {
       if (activePath != null && entity.path == activePath) continue;
       try {
         final stat = await entity.stat();
+        final fileName = entity.uri.pathSegments.last;
+        final prefix = '${cameraId}_';
+        final timestampText = fileName
+            .replaceFirst(prefix, '')
+            .replaceFirst(RegExp(r'\.mp4$', caseSensitive: false), '');
+        final timestamp = int.tryParse(timestampText);
+        if (fileName.startsWith(prefix) && timestamp != null && stat.size > 0) {
+          final startedAt = DateTime.fromMillisecondsSinceEpoch(timestamp);
+          final endedAt = stat.modified.isAfter(startedAt)
+              ? stat.modified
+              : startedAt;
+          final wav = File(
+            entity.path.replaceFirst(
+              RegExp(r'\.mp4$', caseSensitive: false),
+              '.wav',
+            ),
+          );
+          final recovered = await _convertRecordingToTs(
+            entity,
+            startedAt,
+            endedAt,
+            await wav.exists() ? wav : null,
+          );
+          debugPrint(
+            '[VNVAR] ABANDONED RECORDING RECOVERED: ${recovered.path}',
+          );
+          continue;
+        }
         if (now.difference(stat.modified) >= maxAge) await entity.delete();
       } catch (error, stackTrace) {
         developer.log(
           '[STORAGE] Unable to remove abandoned recording: ${entity.path}',
+          error: error,
+          stackTrace: stackTrace,
+          name: 'RecordingService',
+        );
+      }
+    }
+
+    // WAV không còn MP4 cùng tên không thể mux; xóa sau maxAge để cache không
+    // tăng vô hạn sau crash hoặc lỗi filesystem.
+    await for (final entity in directory.list()) {
+      if (entity is! File || !entity.path.toLowerCase().endsWith('.wav')) {
+        continue;
+      }
+      if (_currentAudioPath == entity.path) continue;
+      try {
+        final mp4 = File(
+          entity.path.replaceFirst(
+            RegExp(r'\.wav$', caseSensitive: false),
+            '.mp4',
+          ),
+        );
+        final stat = await entity.stat();
+        if (!await mp4.exists() && now.difference(stat.modified) >= maxAge) {
+          await entity.delete();
+        }
+      } catch (error, stackTrace) {
+        developer.log(
+          '[STORAGE] Unable to remove abandoned audio: ${entity.path}',
+          error: error,
+          stackTrace: stackTrace,
+          name: 'RecordingService',
+        );
+      }
+    }
+    await for (final entity in directory.list()) {
+      if (entity is! File || !entity.path.toLowerCase().endsWith('.json')) {
+        continue;
+      }
+      if (_currentJournal?.path == entity.path) continue;
+      try {
+        final stat = await entity.stat();
+        if (now.difference(stat.modified) >= maxAge) await entity.delete();
+      } catch (error, stackTrace) {
+        developer.log(
+          '[STORAGE] Unable to remove stale recording journal: ${entity.path}',
           error: error,
           stackTrace: stackTrace,
           name: 'RecordingService',
@@ -1669,6 +2083,25 @@ class RecordingService {
   }
 
   Future<void> _enforceStorageLimitInternal() async {
+    final availableBefore = await availableStorageBytes();
+    final lowStorage =
+        availableBefore != null &&
+        availableBefore < normalFreeSpaceThresholdBytes;
+    if (lowStorage != _lowStorageWarning) {
+      _lowStorageWarning = lowStorage;
+      _lowStorageWarningSince = lowStorage ? DateTime.now() : null;
+      debugPrint(
+        '[VNVAR] STORAGE WARNING: ${lowStorage ? 'low space; cleanup may delete old videos' : 'space recovered'}',
+      );
+      _notifyVideoChanges();
+    }
+    // Give the operator one cleanup cycle to react to the warning before
+    // deleting any old recording. Subsequent cycles enforce the limit.
+    if (lowStorage &&
+        DateTime.now().difference(_lowStorageWarningSince ?? DateTime.now()) <
+            const Duration(minutes: 1)) {
+      return;
+    }
     final root = await _videoRootDirectory();
     final files = <({File file, FileStat stat, String day})>[];
     var total = 0;
@@ -1801,7 +2234,7 @@ class RecordingService {
   // STOP RECORDING
   // ============================================================
 
-  Future<void> stop() {
+  Future<RecordedSegment?> stop() {
     final current = _stopOperation;
     if (current != null) return current;
 
@@ -1812,8 +2245,9 @@ class RecordingService {
     });
   }
 
-  Future<void> _stopInternal() async {
+  Future<RecordedSegment?> _stopInternal() async {
     _stopping = true;
+    RecordedSegment? rotatedSegment;
 
     try {
       // ========================================================
@@ -1824,28 +2258,30 @@ class RecordingService {
 
       _segmentTimer = null;
 
-      if (!_recording) {
-        return;
+      if (!_recording && _rotationOperation == null && _recorder == null) {
+        return null;
+      }
+
+      // Chờ đúng thao tác rotation/finalize đang chạy. Không dùng timeout vì
+      // chuyển MP4 sang TS có thể mất hơn 10 giây trên thiết bị chậm. Trả về
+      // sớm sẽ khiến runtime dispose camera khi segment cuối chưa hoàn tất.
+      final rotation = _rotationOperation;
+      if (rotation != null) {
+        try {
+          rotatedSegment = await rotation;
+        } catch (error, stackTrace) {
+          // Rotation có thể đã đóng recorder nhưng lỗi ở bước chuyển đổi. Vẫn
+          // tiếp tục chốt recorder hiện tại (nếu có) và dọn trạng thái stop.
+          developer.log(
+            'Segment rotation failed while stopping recording.',
+            error: error,
+            stackTrace: stackTrace,
+            name: 'RecordingService',
+          );
+        }
       }
 
       _recording = false;
-
-      // Nếu rotation đang xảy ra,
-      // chờ một chút cho nó kết thúc.
-      final rotationDeadline = DateTime.now().add(const Duration(seconds: 10));
-      while (_rotating && DateTime.now().isBefore(rotationDeadline)) {
-        await Future<void>.delayed(const Duration(milliseconds: 50));
-      }
-
-      if (_rotating) {
-        developer.log(
-          'Timed out waiting 10 seconds for segment rotation to finish. '
-          'The rotation will finish asynchronously.',
-          name: 'RecordingService',
-        );
-        _videoTrack = null;
-        return;
-      }
 
       // ========================================================
       // SAVE LAST PARTIAL SEGMENT
@@ -1854,12 +2290,14 @@ class RecordingService {
       // thì vẫn lưu đoạn 1 phút 42 giây cuối.
       // ========================================================
 
-      await _finishCurrentSegment();
-
-      _videoTrack = null;
+      final finalSegment = await _finishCurrentSegment();
 
       developer.log('Recording stopped', name: 'RecordingService');
+      return finalSegment ?? rotatedSegment;
     } finally {
+      _recording = false;
+      _videoTrack = null;
+      _recordAudio = false;
       _stopping = false;
     }
   }
@@ -1885,6 +2323,7 @@ class RecordingService {
     }
 
     _videoTrack = null;
+    _recordAudio = false;
 
     await cleanupExportDownloads();
     if (!_videoChanges.isClosed) await _videoChanges.close();

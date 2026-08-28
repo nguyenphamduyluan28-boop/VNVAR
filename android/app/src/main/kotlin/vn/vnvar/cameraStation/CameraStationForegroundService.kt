@@ -7,13 +7,19 @@ import android.app.PendingIntent
 import android.app.Service
 import android.content.Intent
 import android.content.pm.ServiceInfo
+import android.content.pm.PackageManager
+import android.Manifest
 import android.os.Build
 import android.os.IBinder
 import android.util.Log
 
 class CameraStationForegroundService : Service() {
+    private var currentCameraId = "Camera"
+    private var currentCourtId = "Chưa chọn sân"
+
     override fun onCreate() {
         super.onCreate()
+        isRunning = true
         createNotificationChannel()
         Log.i(TAG, "[SERVICE] Camera Station foreground service created")
     }
@@ -26,22 +32,32 @@ class CameraStationForegroundService : Service() {
             return START_NOT_STICKY
         }
 
-        val cameraId = intent?.getStringExtra(EXTRA_CAMERA_ID) ?: "Camera"
-        val courtId = intent?.getStringExtra(EXTRA_COURT_ID) ?: "Chưa chọn sân"
-        val notification = buildNotification(cameraId, courtId)
+        if (intent?.action != ACTION_REFRESH_TYPES) {
+            currentCameraId = intent?.getStringExtra(EXTRA_CAMERA_ID) ?: currentCameraId
+            currentCourtId = intent?.getStringExtra(EXTRA_COURT_ID) ?: currentCourtId
+        }
+        val notification = buildNotification(currentCameraId, currentCourtId)
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            val foregroundTypes = if (
+                checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
+            ) {
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_CAMERA or
+                    ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE
+            } else {
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_CAMERA
+            }
             startForeground(
                 NOTIFICATION_ID,
                 notification,
-                ServiceInfo.FOREGROUND_SERVICE_TYPE_CAMERA or
-                    ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE,
+                foregroundTypes,
             )
         } else {
             startForeground(NOTIFICATION_ID, notification)
         }
 
-        Log.i(TAG, "[SERVICE] Foreground active: $cameraId / $courtId")
+        val action = if (intent?.action == ACTION_REFRESH_TYPES) "types refreshed" else "active"
+        Log.i(TAG, "[SERVICE] Foreground $action: $currentCameraId / $currentCourtId")
 
         // Camera services must be started while the Activity is visible. Do not
         // ask Android to recreate this service silently from the background.
@@ -51,13 +67,15 @@ class CameraStationForegroundService : Service() {
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onTaskRemoved(rootIntent: Intent?) {
-        Log.i(TAG, "[SERVICE] App removed from recent tasks; stopping foreground service")
-        stopForeground(STOP_FOREGROUND_REMOVE)
-        stopSelf()
+        // Keep the already-running camera/microphone foreground service alive.
+        // The user can stop it explicitly from the app/API after Dart has
+        // finalized MP4, WAV and TS segments.
+        Log.i(TAG, "[SERVICE] App removed from recent tasks; keeping recording active")
         super.onTaskRemoved(rootIntent)
     }
 
     override fun onDestroy() {
+        isRunning = false
         stopForeground(STOP_FOREGROUND_REMOVE)
         Log.i(TAG, "[SERVICE] Camera Station foreground service destroyed")
         super.onDestroy()
@@ -102,8 +120,13 @@ class CameraStationForegroundService : Service() {
     }
 
     companion object {
+        @Volatile
+        var isRunning: Boolean = false
+            private set
+
         const val ACTION_START = "vn.vnvar.cameraStation.action.START"
         const val ACTION_STOP = "vn.vnvar.cameraStation.action.STOP"
+        const val ACTION_REFRESH_TYPES = "vn.vnvar.cameraStation.action.REFRESH_TYPES"
         const val EXTRA_CAMERA_ID = "camera_id"
         const val EXTRA_COURT_ID = "court_id"
 

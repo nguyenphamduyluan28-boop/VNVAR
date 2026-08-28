@@ -1,7 +1,6 @@
 import 'dart:convert';
 import 'dart:developer' as developer;
 import 'dart:io';
-import 'dart:math';
 
 import 'package:flutter/foundation.dart';
 import 'package:flutter_webrtc/flutter_webrtc.dart';
@@ -11,8 +10,6 @@ import 'recording_service.dart';
 import 'webrtc_service.dart';
 
 class CameraServer {
-  static const String apiTokenHeader = 'X-VNVAR-TOKEN';
-
   // ============================================================
   // SERVER
   // ============================================================
@@ -28,7 +25,6 @@ class CameraServer {
   final String courtId;
   final String cameraId;
   final String deviceId;
-  late final String apiToken = _generateApiToken();
 
   // ============================================================
   // SERVICES
@@ -47,6 +43,7 @@ class CameraServer {
 
   bool recording = false;
   Future<void>? _ensureRecordingOperation;
+  Future<void> _recordingRequestTail = Future<void>.value();
 
   bool get running => _server != null;
 
@@ -106,7 +103,6 @@ class CameraServer {
       cameraId: cameraId,
       deviceId: deviceId,
       port: apiPort,
-      apiToken: apiToken,
       status: recordingService.recording ? 'RECORDING' : 'READY',
     );
   }
@@ -197,14 +193,6 @@ class CameraServer {
     developer.log('$method $path', name: 'CameraServer');
 
     try {
-      if (_requiresApiToken(request) && !_hasValidApiToken(request)) {
-        await _sendJson(request.response, HttpStatus.unauthorized, {
-          'error': 'Unauthorized',
-          'message': 'Thiếu hoặc sai header $apiTokenHeader.',
-        });
-        return;
-      }
-
       if ((path == '/' || path == '/viewer') && method == 'GET') {
         await _viewerPage(request);
         return;
@@ -228,7 +216,7 @@ class CameraServer {
       // ========================================================
 
       if (path == '/recording/auto-start' && method == 'POST') {
-        await _autoStartRecording(request);
+        await _serializeRecordingRequest(() => _autoStartRecording(request));
         return;
       }
 
@@ -239,7 +227,7 @@ class CameraServer {
       // ========================================================
 
       if (path == '/start' && method == 'POST') {
-        await _startRecording(request);
+        await _serializeRecordingRequest(() => _startRecording(request));
         return;
       }
 
@@ -248,19 +236,19 @@ class CameraServer {
       // ========================================================
 
       if (path == '/stop' && method == 'POST') {
-        await _stopRecording(request);
+        await _serializeRecordingRequest(() => _stopRecording(request));
         return;
       }
 
       // ========================================================
       // CHECKVAR
       //
-      // KHÔNG checkpoint nữa.
-      // Recorder 3 phút phải chạy liên tục.
+      // Chốt segment hiện tại và mở segment kế tiếp. Live WebRTC vẫn dùng
+      // video track đang chạy nên không được đóng camera/peer connection.
       // ========================================================
 
       if (path == '/checkvar' && method == 'POST') {
-        await _checkVar(request);
+        await _serializeRecordingRequest(() => _checkVar(request));
         return;
       }
 
@@ -391,41 +379,11 @@ class CameraServer {
     }
   }
 
-  bool _requiresApiToken(HttpRequest request) {
-    if (request.method != 'POST') return false;
-    final path = request.uri.path;
-    if (path == '/recording/auto-start' ||
-        path == '/start' ||
-        path == '/stop' ||
-        path == '/checkvar' ||
-        path == '/trim' ||
-        path == '/videos/process/trim' ||
-        path == '/video/trim' ||
-        path == '/download/session/close') {
-      return true;
-    }
-    return _isDownloadedRoute(request);
-  }
-
-  bool _hasValidApiToken(HttpRequest request) {
-    final supplied = request.headers.value(apiTokenHeader);
-    if (supplied == null) return false;
-    final expected = apiToken.codeUnits;
-    final actual = supplied.codeUnits;
-    var difference = expected.length ^ actual.length;
-    final length = max(expected.length, actual.length);
-    for (var index = 0; index < length; index++) {
-      final expectedByte = index < expected.length ? expected[index] : 0;
-      final actualByte = index < actual.length ? actual[index] : 0;
-      difference |= expectedByte ^ actualByte;
-    }
-    return difference == 0;
-  }
-
-  static String _generateApiToken() {
-    final random = Random.secure();
-    final bytes = List<int>.generate(32, (_) => random.nextInt(256));
-    return base64UrlEncode(bytes).replaceAll('=', '');
+  Future<void> _serializeRecordingRequest(Future<void> Function() operation) {
+    final previous = _recordingRequestTail;
+    final current = previous.catchError((Object _) {}).then((_) => operation());
+    _recordingRequestTail = current;
+    return current;
   }
 
   // ============================================================
@@ -471,6 +429,9 @@ class CameraServer {
 
       'currentSegmentStartedAt': recordingService.currentSegmentStartedAt
           ?.toIso8601String(),
+
+      'recordingAudio': recordingService.currentSegmentHasAudio,
+      'storageWarning': recordingService.lowStorageWarning,
 
       'apiPort': apiPort,
     });
@@ -572,7 +533,10 @@ class CameraServer {
       throw StateError('Camera video track unavailable.');
     }
 
-    await recordingService.start(videoTrack: videoTrack);
+    await recordingService.start(
+      videoTrack: videoTrack,
+      audioAvailable: webRtcService.microphoneAvailable,
+    );
 
     recording = true;
 
@@ -592,9 +556,9 @@ class CameraServer {
   // ============================================================
 
   Future<void> _stopRecording(HttpRequest request) async {
-    if (recordingService.recording) {
-      await recordingService.stop();
-    }
+    // Luôn gọi stop để chốt cả recorder/rotation đang finalize, kể cả khi cờ
+    // recording vừa đổi trạng thái do một thao tác lifecycle đồng thời.
+    final finalSegment = await recordingService.stop();
 
     recording = false;
 
@@ -614,6 +578,15 @@ class CameraServer {
       'recording': false,
 
       'segmentCount': recordingService.segments.length,
+
+      'finalSegment': finalSegment == null
+          ? null
+          : {
+              'id': finalSegment.id,
+              'fileName': finalSegment.fileName,
+              'durationMs': finalSegment.durationMs,
+              'downloadUrl': '/video/${finalSegment.fileName}',
+            },
     });
   }
 

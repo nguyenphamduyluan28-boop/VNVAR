@@ -1,6 +1,9 @@
 import 'dart:async';
 import 'dart:developer' as developer;
+import 'dart:io';
 
+import 'package:flutter/foundation.dart';
+import 'package:flutter/services.dart';
 import 'package:wakelock_plus/wakelock_plus.dart';
 
 import '../models/camera_resolution_profile.dart';
@@ -20,16 +23,22 @@ class CameraStationRuntime {
   WebRtcService? _webRtcService;
   RecordingService? _recordingService;
   CameraServer? _cameraServer;
-  Future<void>? _initializing;
+  Future<void> _lifecycleTail = Future<void>.value();
+  Completer<void> _recoveryCancellation = Completer<void>();
   String? _cameraId;
   String? _courtId;
   String? _deviceId;
   Timer? _healthTimer;
   Timer? _storageCleanupTimer;
+  Timer? _thermalTimer;
+  bool _thermalThrottled = false;
+  double? _temperatureC;
+  CameraResolutionProfile? _profileBeforeThermalThrottle;
   bool _recovering = false;
   bool _stopping = false;
   bool _cameraEnabled = true;
   bool _profileSwitching = false;
+  bool _iosLifecycleSuspended = false;
   CameraResolutionProfile _resolutionProfile =
       CameraResolutionProfile.fullHd1080;
   List<CameraResolutionProfile> _supportedResolutionProfiles = const [
@@ -44,6 +53,9 @@ class CameraStationRuntime {
     Duration(seconds: 30),
     Duration(seconds: 30),
   ];
+  static const MethodChannel _platformChannel = MethodChannel(
+    'vnvar/camera_station_service',
+  );
 
   Stream<void> get stateChanges => _stateController.stream;
   WebRtcService? get webRtcService => _webRtcService;
@@ -53,9 +65,23 @@ class CameraStationRuntime {
   bool get cameraEnabled => _cameraEnabled;
   bool get microphoneAvailable =>
       _cameraEnabled && (_webRtcService?.microphoneAvailable ?? false);
-  bool get microphoneEnabled =>
-      microphoneAvailable && (_webRtcService?.microphoneEnabled ?? false);
+  bool get microphoneEnabled {
+    if (!microphoneAvailable) return false;
+    // Android records audio through AudioRecord, not a WebRTC audio track.
+    // During recording expose the actual segment state so a failed native
+    // microphone start is not presented as an enabled microphone.
+    final recording = _recordingService;
+    if (Platform.isAndroid && recording?.recording == true) {
+      return recording!.currentSegmentHasAudio;
+    }
+    return _webRtcService?.microphoneEnabled ?? false;
+  }
+
   bool get profileSwitching => _profileSwitching;
+  double? get temperatureC => _temperatureC;
+  bool get thermalWarning => _thermalThrottled;
+  bool get storageWarning => _recordingService?.lowStorageWarning ?? false;
+  bool get lifecycleSuspended => _iosLifecycleSuspended;
   CameraResolutionProfile get resolutionProfile => _resolutionProfile;
   List<CameraResolutionProfile> get supportedResolutionProfiles =>
       List.unmodifiable(_supportedResolutionProfiles);
@@ -64,34 +90,42 @@ class CameraStationRuntime {
     required String cameraId,
     required String courtId,
     required String deviceId,
-  }) async {
-    while (true) {
+  }) {
+    _interruptRecovery();
+    return _serializeLifecycle(() async {
       if (ready &&
           _cameraId == cameraId &&
           _courtId == courtId &&
           _deviceId == deviceId) {
         return;
       }
-
-      final current = _initializing;
-      if (current != null) {
-        await current;
-        continue;
-      }
-
-      final operation = _initializeInternal(
+      await _initializeInternal(
         cameraId: cameraId,
         courtId: courtId,
         deviceId: deviceId,
       );
-      _initializing = operation;
+    });
+  }
+
+  Future<T> _serializeLifecycle<T>(Future<T> Function() operation) {
+    final completer = Completer<T>();
+    final previous = _lifecycleTail;
+    _lifecycleTail = previous.catchError((Object _) {}).then((_) async {
       try {
-        await operation;
-        return;
-      } finally {
-        if (identical(_initializing, operation)) _initializing = null;
+        completer.complete(await operation());
+      } catch (error, stackTrace) {
+        completer.completeError(error, stackTrace);
       }
+    });
+    return completer.future;
+  }
+
+  void _interruptRecovery() {
+    _generation++;
+    if (!_recoveryCancellation.isCompleted) {
+      _recoveryCancellation.complete();
     }
+    _recoveryCancellation = Completer<void>();
   }
 
   Future<void> _initializeInternal({
@@ -101,11 +135,12 @@ class CameraStationRuntime {
   }) async {
     _stopping = false;
     _cameraEnabled = true;
+    _iosLifecycleSuspended = false;
     if (_cameraId != null &&
         (_cameraId != cameraId ||
             _courtId != courtId ||
             _deviceId != deviceId)) {
-      await stop();
+      await _stopInternal();
       _stopping = false;
       _cameraEnabled = true;
     }
@@ -139,6 +174,9 @@ class CameraStationRuntime {
       );
       webRtc.setResolutionProfile(_resolutionProfile);
       await webRtc.initializeCamera(facingMode: 'environment');
+      // Camera Station always records with microphone audio. The control is
+      // intentionally not exposed on Station Screen.
+      await webRtc.ensureMicrophoneEnabled();
 
       final server = CameraServer(
         courtId: courtId,
@@ -151,8 +189,18 @@ class CameraStationRuntime {
       _cameraServer = server;
 
       await server.start();
-      await server.ensureRecording();
+      try {
+        await server.ensureRecording();
+      } catch (error, stackTrace) {
+        developer.log(
+          '[RECORDING] Initial start blocked because mandatory audio is unavailable; retrying from health monitor.',
+          error: error,
+          stackTrace: stackTrace,
+          name: 'CameraStationRuntime',
+        );
+      }
       _startHealthMonitor();
+      _startThermalMonitor();
 
       // Giữ màn hình luôn sáng khi camera đang hoạt động.
       // Trên iOS, điều này đảm bảo app luôn ở foreground và camera
@@ -165,13 +213,15 @@ class CameraStationRuntime {
       );
       _emitState();
     } catch (error, stackTrace) {
+      debugPrint('[VNVAR] RUNTIME INIT ERROR: $error');
+      debugPrintStack(stackTrace: stackTrace);
       developer.log(
         '[SERVICE] Runtime initialization failed',
         error: error,
         stackTrace: stackTrace,
         name: 'CameraStationRuntime',
       );
-      await stop();
+      await _stopInternal();
       rethrow;
     }
   }
@@ -180,16 +230,33 @@ class CameraStationRuntime {
     required String cameraId,
     required String courtId,
     required String deviceId,
-  }) async {
-    await stop();
-    await initialize(cameraId: cameraId, courtId: courtId, deviceId: deviceId);
+  }) {
+    _interruptRecovery();
+    return _serializeLifecycle(() async {
+      await _stopInternal();
+      await _initializeInternal(
+        cameraId: cameraId,
+        courtId: courtId,
+        deviceId: deviceId,
+      );
+    });
   }
 
-  Future<void> stop() async {
+  Future<void> stop() {
     _stopping = true;
-    _generation++;
+    _interruptRecovery();
+    return _serializeLifecycle(_stopInternal);
+  }
+
+  Future<void> _stopInternal() async {
+    _stopping = true;
     _healthTimer?.cancel();
     _healthTimer = null;
+    _thermalTimer?.cancel();
+    _thermalTimer = null;
+    _thermalThrottled = false;
+    _temperatureC = null;
+    _profileBeforeThermalThrottle = null;
     _storageCleanupTimer?.cancel();
     _storageCleanupTimer = null;
 
@@ -203,6 +270,7 @@ class CameraStationRuntime {
     _courtId = null;
     _deviceId = null;
     _cameraEnabled = false;
+    _iosLifecycleSuspended = false;
 
     try {
       await server?.stop();
@@ -224,7 +292,82 @@ class CameraStationRuntime {
     developer.log('[SERVICE] Runtime stopped', name: 'CameraStationRuntime');
   }
 
-  Future<void> setCameraEnabled(bool enabled) async {
+  Future<void> setCameraEnabled(bool enabled) {
+    _interruptRecovery();
+    return _serializeLifecycle(() => _setCameraEnabledInternal(enabled));
+  }
+
+  Future<void> suspendForIosBackground() {
+    if (!Platform.isIOS || _iosLifecycleSuspended || !_cameraEnabled) {
+      return Future<void>.value();
+    }
+    _iosLifecycleSuspended = true;
+    _interruptRecovery();
+    _emitState();
+    return _serializeLifecycle(_suspendForIosBackgroundInternal);
+  }
+
+  Future<void> _suspendForIosBackgroundInternal() async {
+    if (!Platform.isIOS || !_iosLifecycleSuspended) return;
+    final recording = _recordingService;
+    final webRtc = _webRtcService;
+    if (recording == null || webRtc == null) return;
+    developer.log(
+      '[LIFECYCLE] iOS entering background; finalizing current segment',
+      name: 'CameraStationRuntime',
+    );
+    try {
+      await recording.stop();
+    } finally {
+      try {
+        await webRtc.disposeConnection();
+      } finally {
+        await webRtc.disposeCamera();
+      }
+      await WakelockPlus.disable();
+      _emitState();
+    }
+  }
+
+  Future<void> resumeFromIosBackground() {
+    if (!Platform.isIOS || !_iosLifecycleSuspended || !_cameraEnabled) {
+      return Future<void>.value();
+    }
+    return _serializeLifecycle(_resumeFromIosBackgroundInternal);
+  }
+
+  Future<void> _resumeFromIosBackgroundInternal() async {
+    if (!Platform.isIOS || !_iosLifecycleSuspended || !_cameraEnabled) return;
+    final webRtc = _webRtcService;
+    final server = _cameraServer;
+    if (webRtc == null || server == null) return;
+    try {
+      // Recreating the stream also rechecks microphone permission. A grant
+      // made in iOS Settings therefore takes effect on the first new segment.
+      await webRtc.initializeCamera();
+      await webRtc.ensureMicrophoneEnabled();
+      await server.ensureRecording();
+      await WakelockPlus.enable();
+      _iosLifecycleSuspended = false;
+      developer.log(
+        '[LIFECYCLE] iOS foreground capture resumed',
+        name: 'CameraStationRuntime',
+      );
+    } catch (error, stackTrace) {
+      developer.log(
+        '[LIFECYCLE] Unable to resume iOS capture; scheduling recovery',
+        error: error,
+        stackTrace: stackTrace,
+        name: 'CameraStationRuntime',
+      );
+      _iosLifecycleSuspended = false;
+      _scheduleRecovery('ios_foreground_resume_failed');
+    } finally {
+      _emitState();
+    }
+  }
+
+  Future<void> _setCameraEnabledInternal(bool enabled) async {
     if (_cameraEnabled == enabled) return;
     final webRtc = _webRtcService;
     final recording = _recordingService;
@@ -278,7 +421,12 @@ class CameraStationRuntime {
     }
   }
 
-  Future<void> switchCamera() async {
+  Future<void> switchCamera() {
+    _interruptRecovery();
+    return _serializeLifecycle(_switchCameraInternal);
+  }
+
+  Future<void> _switchCameraInternal() async {
     if (!_cameraEnabled) {
       throw StateError('Camera đang tắt.');
     }
@@ -355,26 +503,29 @@ class CameraStationRuntime {
     }
   }
 
-  Future<void> setMicrophoneEnabled(bool enabled) async {
-    if (!_cameraEnabled) {
-      throw StateError('Camera đang tắt.');
+  Future<void> setResolutionProfile(CameraResolutionProfile profile) {
+    if (_thermalThrottled &&
+        (profile.preset != CameraResolutionPreset.hd720 || profile.fps > 15)) {
+      return Future<void>.error(
+        StateError('Thiết bị đang nóng; camera tạm khóa ở 720p/15 FPS.'),
+      );
     }
-    final webRtc = _webRtcService;
-    if (webRtc == null) {
-      throw StateError('Camera Station chưa khởi tạo xong.');
-    }
-    await webRtc.setMicrophoneEnabled(enabled);
-    _emitState();
+    _interruptRecovery();
+    return _serializeLifecycle(() => _setResolutionProfileInternal(profile));
   }
 
-  Future<void> setResolutionProfile(CameraResolutionProfile profile) async {
-    if (_profileSwitching || profile.preset == _resolutionProfile.preset) {
+  Future<void> _setResolutionProfileInternal(
+    CameraResolutionProfile profile,
+  ) async {
+    if (_profileSwitching || profile == _resolutionProfile) {
       return;
     }
     CameraResolutionProfile? selected;
     for (final supported in _supportedResolutionProfiles) {
       if (supported.preset == profile.preset) {
-        selected = supported;
+        selected = profile.fps < supported.fps
+            ? supported.withFps(profile.fps)
+            : supported;
         break;
       }
     }
@@ -437,7 +588,11 @@ class CameraStationRuntime {
   void _startHealthMonitor() {
     _healthTimer?.cancel();
     _healthTimer = Timer.periodic(const Duration(seconds: 10), (_) {
-      if (_stopping || _recovering || _profileSwitching || !_cameraEnabled) {
+      if (_stopping ||
+          _recovering ||
+          _profileSwitching ||
+          _iosLifecycleSuspended ||
+          !_cameraEnabled) {
         return;
       }
 
@@ -448,6 +603,24 @@ class CameraStationRuntime {
           track == null ||
           !track.enabled) {
         _scheduleRecovery('health_check_failed');
+        return;
+      }
+      final recording = _recordingService;
+      final server = _cameraServer;
+      if (recording != null &&
+          server != null &&
+          !recording.recording &&
+          !recording.rotating) {
+        unawaited(
+          server.ensureRecording().catchError((Object error, StackTrace stack) {
+            developer.log(
+              '[RECORDING] Mandatory-audio retry failed',
+              error: error,
+              stackTrace: stack,
+              name: 'CameraStationRuntime',
+            );
+          }),
+        );
       }
     });
 
@@ -455,21 +628,127 @@ class CameraStationRuntime {
     _storageCleanupTimer = Timer.periodic(const Duration(seconds: 60), (_) {
       final recording = _recordingService;
       if (recording == null) return;
-      unawaited(recording.enforceStorageLimit());
+      unawaited(() async {
+        try {
+          // Never inspect staging files while MediaRecorder/FFmpeg may still
+          // be writing them; cleanup runs again after the next stop/start.
+          if (!recording.recording && !recording.rotating) {
+            await recording.cleanupStagingFiles();
+          }
+          await recording.enforceStorageLimit();
+        } catch (error, stackTrace) {
+          developer.log(
+            '[STORAGE] Periodic cleanup failed',
+            error: error,
+            stackTrace: stackTrace,
+            name: 'CameraStationRuntime',
+          );
+        }
+      }());
     });
   }
 
-  void _scheduleRecovery(String reason) {
-    if (_stopping || _recovering || !_cameraEnabled) return;
-    unawaited(_recoverCamera(reason));
+  void _startThermalMonitor() {
+    _thermalTimer?.cancel();
+    _thermalTimer = Timer.periodic(const Duration(seconds: 10), (_) {
+      unawaited(_checkThermalState());
+    });
+    unawaited(_checkThermalState());
   }
 
-  Future<void> _recoverCamera(String reason) async {
-    if (_stopping || _recovering) return;
+  Future<void> _checkThermalState() async {
+    if ((!Platform.isAndroid && !Platform.isIOS) ||
+        _stopping ||
+        !_cameraEnabled ||
+        _iosLifecycleSuspended) {
+      return;
+    }
+    try {
+      final result = await _platformChannel.invokeMapMethod<String, dynamic>(
+        'getThermalStatus',
+      );
+      final temperature = (result?['temperatureC'] as num?)?.toDouble();
+      final status = (result?['thermalStatus'] as num?)?.toInt() ?? 0;
+      _temperatureC = temperature;
+      final hot = (temperature != null && temperature >= 45.0) || status >= 4;
+      if (hot && !_thermalThrottled && !_profileSwitching) {
+        _profileBeforeThermalThrottle = _resolutionProfile;
+        _thermalThrottled = true;
+        _emitState();
+        developer.log(
+          '[THERMAL] Hot device; reducing camera to 720p/15fps',
+          name: 'CameraStationRuntime',
+        );
+        try {
+          await setResolutionProfile(CameraResolutionProfile.hd720.withFps(15));
+        } catch (error, stackTrace) {
+          _thermalThrottled = false;
+          developer.log(
+            '[THERMAL] Failed to reduce camera profile',
+            error: error,
+            stackTrace: stackTrace,
+            name: 'CameraStationRuntime',
+          );
+        }
+      } else if (!hot && _thermalThrottled && !_profileSwitching) {
+        _thermalThrottled = false;
+        _emitState();
+        final previous = _profileBeforeThermalThrottle;
+        _profileBeforeThermalThrottle = null;
+        if (previous != null) {
+          try {
+            await setResolutionProfile(previous);
+            developer.log(
+              '[THERMAL] Temperature normal; restored camera profile',
+              name: 'CameraStationRuntime',
+            );
+          } catch (error, stackTrace) {
+            developer.log(
+              '[THERMAL] Failed to restore camera profile',
+              error: error,
+              stackTrace: stackTrace,
+              name: 'CameraStationRuntime',
+            );
+          }
+        }
+      } else {
+        _emitState();
+      }
+    } catch (error) {
+      developer.log(
+        '[THERMAL] Unable to read thermal state: $error',
+        name: 'CameraStationRuntime',
+      );
+    }
+  }
+
+  void _scheduleRecovery(String reason) {
+    if (_stopping ||
+        _recovering ||
+        _iosLifecycleSuspended ||
+        !_cameraEnabled) {
+      return;
+    }
     _recovering = true;
     final generation = _generation;
+    final cancellation = _recoveryCancellation.future;
     _emitState();
+    unawaited(
+      _serializeLifecycle(
+        () => _recoverCamera(reason, generation, cancellation),
+      ).whenComplete(() {
+        _recovering = false;
+        _emitState();
+      }),
+    );
+  }
 
+  Future<void> _recoverCamera(
+    String reason,
+    int generation,
+    Future<void> cancellation,
+  ) async {
+    if (_stopping || generation != _generation) return;
     developer.log(
       '[CAMERA] Recovery requested: $reason',
       name: 'CameraStationRuntime',
@@ -480,55 +759,49 @@ class CameraStationRuntime {
     final server = _cameraServer;
 
     if (webRtc == null || recording == null || server == null) {
-      _recovering = false;
       return;
     }
 
-    try {
-      await recording.stop();
-      await webRtc.disposeConnection();
-      await webRtc.disposeCamera();
+    await recording.stop();
+    await webRtc.disposeConnection();
+    await webRtc.disposeCamera();
 
-      for (var attempt = 0; attempt < _recoveryDelays.length; attempt++) {
-        if (_stopping || generation != _generation) return;
+    for (var attempt = 0; attempt < _recoveryDelays.length; attempt++) {
+      if (_stopping || generation != _generation) return;
 
-        final delay = _recoveryDelays[attempt];
-        developer.log(
-          '[CAMERA] Recovery attempt ${attempt + 1} '
-          'in ${delay.inSeconds}s',
-          name: 'CameraStationRuntime',
-        );
-        await Future<void>.delayed(delay);
-
-        if (_stopping || generation != _generation) return;
-
-        try {
-          await webRtc.initializeCamera();
-          await server.ensureRecording();
-          developer.log(
-            '[CAMERA] Recovery successful on attempt ${attempt + 1}',
-            name: 'CameraStationRuntime',
-          );
-          _emitState();
-          return;
-        } catch (error, stackTrace) {
-          developer.log(
-            '[CAMERA] Recovery attempt ${attempt + 1} failed',
-            error: error,
-            stackTrace: stackTrace,
-            name: 'CameraStationRuntime',
-          );
-          await webRtc.disposeCamera();
-        }
-      }
-
+      final delay = _recoveryDelays[attempt];
       developer.log(
-        '[CAMERA] Recovery stopped after ${_recoveryDelays.length} attempts',
+        '[CAMERA] Recovery attempt ${attempt + 1} '
+        'in ${delay.inSeconds}s',
         name: 'CameraStationRuntime',
       );
-    } finally {
-      _recovering = false;
-      _emitState();
+      await Future.any<void>([Future<void>.delayed(delay), cancellation]);
+
+      if (_stopping || generation != _generation) return;
+
+      try {
+        await webRtc.initializeCamera();
+        await server.ensureRecording();
+        developer.log(
+          '[CAMERA] Recovery successful on attempt ${attempt + 1}',
+          name: 'CameraStationRuntime',
+        );
+        _emitState();
+        return;
+      } catch (error, stackTrace) {
+        developer.log(
+          '[CAMERA] Recovery attempt ${attempt + 1} failed',
+          error: error,
+          stackTrace: stackTrace,
+          name: 'CameraStationRuntime',
+        );
+        await webRtc.disposeCamera();
+      }
     }
+
+    developer.log(
+      '[CAMERA] Recovery stopped after ${_recoveryDelays.length} attempts',
+      name: 'CameraStationRuntime',
+    );
   }
 }

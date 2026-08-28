@@ -14,7 +14,6 @@ class DiscoveryService {
   String? _courtId;
   String? _cameraId;
   String? _deviceId;
-  String? _apiToken;
 
   int _apiPort = 8080;
 
@@ -35,7 +34,6 @@ class DiscoveryService {
     required String cameraId,
     required String deviceId,
     required int port,
-    required String apiToken,
     String status = 'READY',
   }) async {
     if (_socket != null) {
@@ -45,7 +43,6 @@ class DiscoveryService {
     _courtId = courtId;
     _cameraId = cameraId;
     _deviceId = deviceId;
-    _apiToken = apiToken;
     _apiPort = port;
     _status = status;
 
@@ -110,7 +107,6 @@ class DiscoveryService {
           'cameraId': _cameraId,
           'deviceId': _deviceId,
           'apiPort': _apiPort,
-          'apiToken': _apiToken,
           'webrtc': true,
           'transport': 'TCP',
           'status': _status,

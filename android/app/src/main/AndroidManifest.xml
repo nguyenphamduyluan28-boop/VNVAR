@@ -22,7 +22,7 @@
             android:name=".CameraStationForegroundService"
             android:exported="false"
             android:foregroundServiceType="camera|microphone"
-            android:stopWithTask="true" />
+            android:stopWithTask="false" />
 
         <activity
             android:name=".MainActivity"

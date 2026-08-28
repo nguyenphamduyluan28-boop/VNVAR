@@ -121,7 +121,7 @@ class _CourtCountScreenState extends State<CourtCountScreen> {
                         maxLines: 2,
                         decoration: const InputDecoration(
                           labelText: 'Địa chỉ / vị trí trên bản đồ',
-                          hintText: 'Ví dụ: 123 Nguyễn Trãi, Quận 1, TP.HCM',
+                          hintText: 'Nhập địa chỉ',
                           prefixIcon: Icon(Icons.location_on_rounded),
                           border: OutlineInputBorder(),
                         ),
@@ -132,7 +132,7 @@ class _CourtCountScreenState extends State<CourtCountScreen> {
                         keyboardType: TextInputType.number,
                         decoration: const InputDecoration(
                           labelText: 'Số lượng sân Pickleball',
-                          hintText: 'Ví dụ: 8',
+                          hintText: 'Nhập số lượng ',
                           prefixIcon: Icon(Icons.stadium_rounded),
                           border: OutlineInputBorder(),
                         ),

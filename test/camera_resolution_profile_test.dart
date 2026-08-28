@@ -10,7 +10,9 @@ void main() {
 
   test('defines the expected VAR resolution presets', () {
     expect(CameraResolutionProfile.hd720.shortLabel, '720p');
-    expect(CameraResolutionProfile.fullHd1080.bitrate, 4500000);
+    expect(CameraResolutionProfile.hd720.fps, 30);
+    expect(CameraResolutionProfile.fullHd1080.fps, 30);
+    expect(CameraResolutionProfile.fullHd1080.bitrate, 8000000);
     expect(CameraResolutionProfile.qhd2k.width, 2560);
     expect(CameraResolutionProfile.ultraHd4k.height, 2160);
   });
@@ -19,8 +21,18 @@ void main() {
     final profile = CameraResolutionProfile.fullHd1080.withFps(30);
     expect(profile.fps, 30);
     expect(profile.width, 1920);
-    expect(profile.bitrate, 4500000);
+    expect(profile.bitrate, 8000000);
   });
+
+  test(
+    'treats profiles with the same preset but different FPS as different',
+    () {
+      expect(
+        CameraResolutionProfile.hd720.withFps(15),
+        isNot(CameraResolutionProfile.hd720),
+      );
+    },
+  );
 
   test('persists and restores the selected resolution preset', () async {
     final config = StationConfigService();

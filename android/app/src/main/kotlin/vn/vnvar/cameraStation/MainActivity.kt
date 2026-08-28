@@ -10,13 +10,17 @@ import android.hardware.camera2.CameraManager
 import android.os.Build
 import android.os.Environment
 import android.os.StatFs
+import android.os.PowerManager
 import android.provider.DocumentsContract
 import android.provider.Settings
 import androidx.core.content.ContextCompat
 import com.cloudwebrtc.webrtc.FlutterWebRTCPlugin
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
+import io.flutter.embedding.engine.FlutterEngineCache
 import io.flutter.plugin.common.MethodChannel
+import kotlin.math.abs
+import kotlin.math.atan
 
 class MainActivity : FlutterActivity() {
     private var pendingStart: PendingStart? = null
@@ -24,10 +28,22 @@ class MainActivity : FlutterActivity() {
     private var rtspPublisher: VnvarRtspPublisher? = null
     private var pendingFolderResult: MethodChannel.Result? = null
     private var waitingStoragePermission = false
+    private val nativeAudioRecorder: NativeAudioSegmentRecorder
+        get() = sharedAudioRecorder ?: synchronized(MainActivity::class.java) {
+            sharedAudioRecorder ?: NativeAudioSegmentRecorder(applicationContext).also {
+                sharedAudioRecorder = it
+            }
+        }
     private lateinit var platformChannel: MethodChannel
+
+    override fun shouldDestroyEngineWithHost(): Boolean = false
+
+    override fun provideFlutterEngine(context: android.content.Context): FlutterEngine? =
+        FlutterEngineCache.getInstance().get(ENGINE_CACHE_KEY)
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
+        FlutterEngineCache.getInstance().put(ENGINE_CACHE_KEY, flutterEngine)
 
         platformChannel = MethodChannel(
             flutterEngine.dartExecutor.binaryMessenger,
@@ -44,6 +60,37 @@ class MainActivity : FlutterActivity() {
                 "stop" -> {
                     stopService(Intent(this, CameraStationForegroundService::class.java))
                     result.success(null)
+                }
+
+                "startNativeAudioSegment" -> {
+                    val path = call.argument<String>("path")
+                    if (path.isNullOrBlank()) {
+                        result.error("AUDIO_PATH_REQUIRED", "Audio path is required", null)
+                    } else if (
+                        ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) !=
+                            PackageManager.PERMISSION_GRANTED
+                    ) {
+                        result.error(
+                            "MICROPHONE_PERMISSION_DENIED",
+                            "Microphone permission is not granted",
+                            null,
+                        )
+                    } else {
+                        try {
+                            refreshCameraStationForegroundTypes()
+                            result.success(nativeAudioRecorder.start(path))
+                        } catch (error: Exception) {
+                            result.error("AUDIO_START_FAILED", error.message, null)
+                        }
+                    }
+                }
+
+                "stopNativeAudioSegment" -> {
+                    try {
+                        result.success(nativeAudioRecorder.stop())
+                    } catch (error: Exception) {
+                        result.error("AUDIO_STOP_FAILED", error.message, null)
+                    }
                 }
 
                 "isEmulator" -> result.success(isRunningOnEmulator())
@@ -65,6 +112,23 @@ class MainActivity : FlutterActivity() {
                     } catch (error: Exception) {
                         result.error("CAMERA_CAPABILITY_FAILED", error.message, null)
                     }
+                }
+
+                "setCameraExposureBoost" -> {
+                    val trackId = call.argument<String>("trackId")
+                    val targetEv = call.argument<Double>("targetEv") ?: 1.3
+                    if (trackId.isNullOrBlank()) {
+                        result.error("INVALID_TRACK", "Thiếu video track để chỉnh exposure.", null)
+                    } else {
+                        CameraExposureController.apply(trackId, targetEv) { response ->
+                            runOnUiThread { result.success(response) }
+                        }
+                    }
+                }
+
+                "clearCameraExposureBoost" -> {
+                    CameraExposureController.clear(call.argument<String>("trackId"))
+                    result.success(null)
                 }
 
                 "startRtsp" -> {
@@ -131,6 +195,16 @@ class MainActivity : FlutterActivity() {
                     }
                 }
 
+                "getThermalStatus" -> {
+                    val battery = registerReceiver(null, android.content.IntentFilter(Intent.ACTION_BATTERY_CHANGED))
+                    val tenths = battery?.getIntExtra("temperature", Int.MIN_VALUE) ?: Int.MIN_VALUE
+                    val power = getSystemService(PowerManager::class.java)
+                    result.success(mapOf(
+                        "temperatureC" to if (tenths == Int.MIN_VALUE) null else tenths / 10.0,
+                        "thermalStatus" to if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) power?.currentThermalStatus else 0,
+                    ))
+                }
+
                 else -> result.notImplemented()
             }
         }
@@ -148,7 +222,7 @@ class MainActivity : FlutterActivity() {
 
         pendingStart = PendingStart(cameraId, courtId, result)
 
-        if (!hasCapturePermissions()) {
+        if (!hasCameraPermission()) {
             requestPermissions(requiredRuntimePermissions(), PERMISSION_REQUEST)
             return
         }
@@ -193,22 +267,14 @@ class MainActivity : FlutterActivity() {
             )
             return
         }
-        if (!hasMicrophonePermission()) {
-            pendingStart = null
-            pending.result.error(
-                "MICROPHONE_PERMISSION_DENIED",
-                "Microphone permission is required to run Camera Station.",
-                null,
-            )
-            return
-        }
-
         completePendingStartIfPossible()
     }
 
     override fun onPostResume() {
         super.onPostResume()
         activityResumed = true
+        refreshCameraStationForegroundTypes()
+        CameraExposureController.reapplyAfterLifecycleChange("foreground")
         completePendingStartIfPossible()
         if (waitingStoragePermission &&
             (Build.VERSION.SDK_INT < Build.VERSION_CODES.R || Environment.isExternalStorageManager())
@@ -321,6 +387,7 @@ class MainActivity : FlutterActivity() {
     override fun onPause() {
         activityResumed = false
         super.onPause()
+        CameraExposureController.reapplyAfterLifecycleChange("background")
     }
 
     private fun hasCameraPermission(): Boolean {
@@ -335,10 +402,7 @@ class MainActivity : FlutterActivity() {
         } else {
             CameraCharacteristics.LENS_FACING_BACK
         }
-        val cameraId = manager.cameraIdList.firstOrNull { id ->
-            manager.getCameraCharacteristics(id)
-                .get(CameraCharacteristics.LENS_FACING) == requestedLensFacing
-        } ?: return emptyList()
+        val cameraId = selectMainCamera(manager, requestedLensFacing) ?: return emptyList()
         val characteristics = manager.getCameraCharacteristics(cameraId)
         val configuration = characteristics.get(
             CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP,
@@ -369,23 +433,54 @@ class MainActivity : FlutterActivity() {
                 // per-output limit. Prefer a safe standard-capture fallback.
                 30
             }
-            val preferredFps = if (height <= 1080) 60 else 30
+            // Keep normal capture at 30 fps. Compared with 60 fps this gives
+            // auto-exposure up to twice as much time per frame, which is much
+            // closer to the stock camera preview in indoor/low-light courts.
+            // WebRTC does not receive the vendor HDR/night-processing pipeline,
+            // so preferring 60 fps here makes its image unnecessarily dark.
+            val preferredFps = 30
             mapOf(
                 "id" to id,
                 "width" to width,
                 "height" to height,
                 "maxFps" to minOf(preferredFps, standardMaxFps),
+                "deviceId" to cameraId,
             )
         }
     }
 
-    private fun hasMicrophonePermission(): Boolean {
-        return ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) ==
-            PackageManager.PERMISSION_GRANTED
+    /**
+     * Selects the normal wide camera (roughly 1x) instead of relying on camera
+     * ID ordering, which may put an ultra-wide or auxiliary sensor first.
+     */
+    private fun selectMainCamera(manager: CameraManager, lensFacing: Int): String? {
+        val candidates = manager.cameraIdList.filter { id ->
+            manager.getCameraCharacteristics(id)
+                .get(CameraCharacteristics.LENS_FACING) == lensFacing
+        }
+        if (candidates.isEmpty()) return null
+
+        return candidates.minByOrNull { id ->
+            val characteristics = manager.getCameraCharacteristics(id)
+            val sensorSize = characteristics.get(
+                CameraCharacteristics.SENSOR_INFO_PHYSICAL_SIZE,
+            )
+            val focalLength = characteristics.get(
+                CameraCharacteristics.LENS_INFO_AVAILABLE_FOCAL_LENGTHS,
+            )?.firstOrNull()
+            if (sensorSize == null || focalLength == null || focalLength <= 0f) {
+                Double.MAX_VALUE
+            } else {
+                val horizontalFovDegrees =
+                    2.0 * atan(sensorSize.width / (2.0 * focalLength)) * 180.0 / Math.PI
+                // A phone's primary 1x camera is normally around 65-80 degrees.
+                abs(horizontalFovDegrees - 73.0)
+            }
+        }
     }
 
     private fun hasCapturePermissions(): Boolean {
-        return hasCameraPermission() && hasMicrophonePermission()
+        return hasCameraPermission()
     }
 
     private fun isRunningOnEmulator(): Boolean {
@@ -442,6 +537,16 @@ class MainActivity : FlutterActivity() {
         ContextCompat.startForegroundService(this, intent)
     }
 
+    private fun refreshCameraStationForegroundTypes() {
+        if (!CameraStationForegroundService.isRunning) return
+        ContextCompat.startForegroundService(
+            this,
+            Intent(this, CameraStationForegroundService::class.java).apply {
+                action = CameraStationForegroundService.ACTION_REFRESH_TYPES
+            },
+        )
+    }
+
     private data class PendingStart(
         val cameraId: String,
         val courtId: String,
@@ -449,6 +554,9 @@ class MainActivity : FlutterActivity() {
     )
 
     companion object {
+        private const val ENGINE_CACHE_KEY = "vnvar_camera_station_engine"
+        @Volatile
+        private var sharedAudioRecorder: NativeAudioSegmentRecorder? = null
         private const val CHANNEL_NAME = "vnvar/camera_station_service"
         private const val PERMISSION_REQUEST = 4101
         private const val NOTIFICATION_PERMISSION_REQUEST = 4102

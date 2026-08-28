@@ -35,7 +35,8 @@ class StationScreen extends StatefulWidget {
 // STATE
 // ============================================================
 
-class _StationScreenState extends State<StationScreen> {
+class _StationScreenState extends State<StationScreen>
+    with WidgetsBindingObserver {
   final CameraStationRuntime _runtime = CameraStationRuntime.instance;
 
   StreamSubscription<void>? _runtimeSubscription;
@@ -44,7 +45,6 @@ class _StationScreenState extends State<StationScreen> {
   String? _error;
   int _cameraQuarterTurns = 0;
   bool _cameraSwitching = false;
-  bool _microphoneSwitching = false;
   bool _lensSwitching = false;
   bool _screenDimmed = false;
   bool _screenDimSwitching = false;
@@ -95,23 +95,6 @@ class _StationScreenState extends State<StationScreen> {
       }
     } finally {
       if (mounted) setState(() => _cameraSwitching = false);
-    }
-  }
-
-  Future<void> _toggleMicrophone() async {
-    if (_microphoneSwitching || !_runtime.microphoneAvailable) return;
-    setState(() => _microphoneSwitching = true);
-    final enableMicrophone = !_runtime.microphoneEnabled;
-    try {
-      await _runtime.setMicrophoneEnabled(enableMicrophone);
-    } catch (error) {
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Không thể đổi trạng thái micro: $error')),
-        );
-      }
-    } finally {
-      if (mounted) setState(() => _microphoneSwitching = false);
     }
   }
 
@@ -173,6 +156,7 @@ class _StationScreenState extends State<StationScreen> {
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
 
     _runtimeSubscription = _runtime.stateChanges.listen((_) {
       if (!mounted) {
@@ -185,6 +169,20 @@ class _StationScreenState extends State<StationScreen> {
 
     _initialize();
     _loadViewerAddress();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (!Platform.isIOS) return;
+    if (state == AppLifecycleState.resumed) {
+      unawaited(_runtime.resumeFromIosBackground());
+      return;
+    }
+    if (state == AppLifecycleState.inactive ||
+        state == AppLifecycleState.paused ||
+        state == AppLifecycleState.detached) {
+      unawaited(_runtime.suspendForIosBackground());
+    }
   }
 
   Future<void> _loadViewerAddress() async {
@@ -622,12 +620,11 @@ class _StationScreenState extends State<StationScreen> {
 
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
     _runtimeSubscription?.cancel();
     if (_screenDimmed) {
       unawaited(StationDisplayService.setDimmed(false));
     }
-    unawaited(_shutdownStation());
-
     super.dispose();
   }
 
@@ -845,9 +842,12 @@ class _StationScreenState extends State<StationScreen> {
                       recording: _recording,
                       compact: compact,
                       resolutionProfile: _runtime.resolutionProfile,
-                      resolutionSwitching: _runtime.profileSwitching,
+                      resolutionSwitching:
+                          _runtime.profileSwitching || _runtime.thermalWarning,
                       onVideoStorage: _openVideoStorage,
-                      onResolution: _openResolutionPicker,
+                      onResolution: _runtime.thermalWarning
+                          ? null
+                          : _openResolutionPicker,
                       onSettings: _openSettings,
                     ),
                   ),
@@ -868,8 +868,6 @@ class _StationScreenState extends State<StationScreen> {
                       cameraReady: _cameraReady,
                       cameraEnabled: _runtime.cameraEnabled,
                       cameraSwitching: _cameraSwitching,
-                      microphoneEnabled: _runtime.microphoneEnabled,
-                      microphoneSwitching: _microphoneSwitching,
                       screenDimmed: _screenDimmed,
                       screenDimSwitching: _screenDimSwitching,
                       lensSwitching: _lensSwitching,
@@ -885,10 +883,6 @@ class _StationScreenState extends State<StationScreen> {
                           ? _switchCameraLens
                           : null,
                       onToggleCamera: _cameraSwitching ? null : _toggleCamera,
-                      onToggleMicrophone:
-                          _runtime.microphoneAvailable && !_microphoneSwitching
-                          ? _toggleMicrophone
-                          : null,
                       onToggleScreenDim: _screenDimSwitching
                           ? null
                           : _toggleScreenDim,
@@ -896,6 +890,34 @@ class _StationScreenState extends State<StationScreen> {
                   ),
                 ),
               ),
+
+              if (_runtime.thermalWarning || _runtime.storageWarning)
+                Positioned(
+                  top: 0,
+                  left: compact ? 8 : 14,
+                  right: compact ? 8 : 14,
+                  child: SafeArea(
+                    bottom: false,
+                    child: Container(
+                      margin: const EdgeInsets.only(top: 8),
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 12,
+                        vertical: 8,
+                      ),
+                      color: Colors.orange.withValues(alpha: 0.9),
+                      child: Text(
+                        _runtime.thermalWarning
+                            ? 'Thiết bị đang nóng${_runtime.temperatureC == null ? '' : ' (${_runtime.temperatureC!.toStringAsFixed(1)}°C)'}. Đã giảm FPS để bảo vệ camera.'
+                            : 'Dung lượng lưu trữ thấp. Hệ thống sẽ dọn video cũ theo chính sách lưu trữ.',
+                        textAlign: TextAlign.center,
+                        style: const TextStyle(
+                          color: Colors.black,
+                          fontWeight: FontWeight.w600,
+                        ),
+                      ),
+                    ),
+                  ),
+                ),
 
               // ==============================================
               // BOTTOM STATUS
@@ -934,7 +956,7 @@ class _StationHeader extends StatelessWidget {
   final CameraResolutionProfile resolutionProfile;
   final bool resolutionSwitching;
   final VoidCallback onVideoStorage;
-  final VoidCallback onResolution;
+  final VoidCallback? onResolution;
   final VoidCallback onSettings;
 
   const _StationHeader({
@@ -1057,7 +1079,7 @@ class _StationHeader extends StatelessWidget {
 class _ResolutionChip extends StatelessWidget {
   final CameraResolutionProfile profile;
   final bool switching;
-  final VoidCallback onTap;
+  final VoidCallback? onTap;
 
   const _ResolutionChip({
     required this.profile,
@@ -1243,15 +1265,12 @@ class _CameraControlDock extends StatelessWidget {
   final bool cameraReady;
   final bool cameraEnabled;
   final bool cameraSwitching;
-  final bool microphoneEnabled;
-  final bool microphoneSwitching;
   final bool screenDimmed;
   final bool screenDimSwitching;
   final bool lensSwitching;
   final VoidCallback? onRotate;
   final VoidCallback? onSwitchLens;
   final VoidCallback? onToggleCamera;
-  final VoidCallback? onToggleMicrophone;
   final VoidCallback? onToggleScreenDim;
 
   const _CameraControlDock({
@@ -1259,15 +1278,12 @@ class _CameraControlDock extends StatelessWidget {
     required this.cameraReady,
     required this.cameraEnabled,
     required this.cameraSwitching,
-    required this.microphoneEnabled,
-    required this.microphoneSwitching,
     required this.screenDimmed,
     required this.screenDimSwitching,
     required this.lensSwitching,
     required this.onRotate,
     required this.onSwitchLens,
     required this.onToggleCamera,
-    required this.onToggleMicrophone,
     required this.onToggleScreenDim,
   });
 
@@ -1310,17 +1326,6 @@ class _CameraControlDock extends StatelessWidget {
             onPressed: onToggleCamera,
             loading: cameraSwitching,
             background: cameraEnabled
-                ? Colors.red.withValues(alpha: 0.75)
-                : Colors.green.withValues(alpha: 0.75),
-          ),
-          SizedBox(height: gap),
-          _DockButton(
-            icon: microphoneEnabled ? Icons.mic_rounded : Icons.mic_off_rounded,
-            tooltip: microphoneEnabled ? 'Tắt micro' : 'Bật micro',
-            size: buttonSize,
-            onPressed: onToggleMicrophone,
-            loading: microphoneSwitching,
-            background: microphoneEnabled
                 ? Colors.red.withValues(alpha: 0.75)
                 : Colors.green.withValues(alpha: 0.75),
           ),

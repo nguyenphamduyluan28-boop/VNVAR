@@ -19,15 +19,15 @@ class CameraResolutionProfile {
     preset: CameraResolutionPreset.hd720,
     width: 1280,
     height: 720,
-    fps: 60,
-    bitrate: 2000000,
+    fps: 30,
+    bitrate: 4000000,
   );
   static const fullHd1080 = CameraResolutionProfile(
     preset: CameraResolutionPreset.fullHd1080,
     width: 1920,
     height: 1080,
-    fps: 60,
-    bitrate: 4500000,
+    fps: 30,
+    bitrate: 8000000,
   );
   static const qhd2k = CameraResolutionProfile(
     preset: CameraResolutionPreset.qhd2k,

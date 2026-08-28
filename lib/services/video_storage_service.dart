@@ -114,7 +114,7 @@ class VideoStorageService {
   }
 
   Future<int?> availableBytes() async {
-    if (!Platform.isAndroid) return null;
+    if (!Platform.isAndroid && !Platform.isIOS) return null;
     try {
       final root = await rootDirectory();
       return await _androidChannel.invokeMethod<int>(
@@ -125,7 +125,7 @@ class VideoStorageService {
       return null;
     } catch (error, stackTrace) {
       developer.log(
-        '[STORAGE] Unable to read available storage.',
+        '[STORAGE] Unable to read available storage on ${Platform.operatingSystem}.',
         error: error,
         stackTrace: stackTrace,
         name: 'VideoStorageService',

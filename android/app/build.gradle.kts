@@ -7,7 +7,8 @@ plugins {
 
 android {
     namespace = "vn.vnvar.cameraStation"
-    compileSdk = flutter.compileSdkVersion
+    // flutter_webrtc 1.6.0 is compiled against Android SDK 36.
+    compileSdk = 36
     ndkVersion = flutter.ndkVersion
 
     compileOptions {
@@ -46,7 +47,7 @@ flutter {
 }
 
 dependencies {
-    // Same native WebRTC artifact used by flutter_webrtc 1.6.0. Declared here
-    // so the VNVAR RTSP sink can attach to the existing VideoTrack.
+    // Keep this version exactly aligned with flutter_webrtc 1.6.0. The app
+    // module needs it directly because the VNVAR RTSP sink uses VideoTrack.
     implementation("io.github.webrtc-sdk:android:144.7559.09")
 }
