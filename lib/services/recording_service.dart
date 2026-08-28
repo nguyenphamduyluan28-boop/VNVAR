@@ -520,6 +520,67 @@ class RecordingService {
     }
   }
 
+  /// AVPlayer does not reliably open a standalone MPEG-TS file. On iOS,
+  /// remux the selected segment to a temporary MP4 without re-encoding. The
+  /// permanent `.ts` recording remains unchanged.
+  Future<File> preparePlaybackFile(RecordedSegment segment) async {
+    final source = File(segment.path);
+    if (!Platform.isIOS || !source.path.toLowerCase().endsWith('.ts')) {
+      return source;
+    }
+    if (!await source.exists()) {
+      throw FileSystemException('Video không còn tồn tại.', source.path);
+    }
+    final temporaryRoot = await getTemporaryDirectory();
+    final directory = Directory(
+      '${temporaryRoot.path}${Platform.pathSeparator}vnvar_playback',
+    );
+    await directory.create(recursive: true);
+    final staleCutoff = DateTime.now().subtract(const Duration(hours: 24));
+    await for (final entity in directory.list()) {
+      if (entity is! File) continue;
+      try {
+        if ((await entity.stat()).modified.isBefore(staleCutoff)) {
+          await entity.delete();
+        }
+      } catch (_) {}
+    }
+    final safeId = segment.id.replaceAll(RegExp(r'[^a-zA-Z0-9_-]'), '_');
+    final target = File(
+      '${directory.path}${Platform.pathSeparator}$safeId.mp4',
+    );
+    if (await target.exists()) await target.delete();
+
+    final session = await FFmpegKit.executeWithArguments([
+      '-y',
+      '-i',
+      source.path,
+      '-map',
+      '0:v:0',
+      '-map',
+      '0:a:0?',
+      '-c',
+      'copy',
+      '-movflags',
+      '+faststart',
+      '-f',
+      'mp4',
+      target.path,
+    ]);
+    final code = await session.getReturnCode();
+    if (!ReturnCode.isSuccess(code) ||
+        !await target.exists() ||
+        await target.length() <= 0 ||
+        !await _isPlayableVideo(target)) {
+      final output = await session.getOutput();
+      try {
+        if (await target.exists()) await target.delete();
+      } catch (_) {}
+      throw StateError('Không thể chuẩn bị video để phát: ${output ?? code}');
+    }
+    return target;
+  }
+
   // ============================================================
   // PERMANENT VIDEO DIRECTORY ON THE CAMERA PHONE
   // ============================================================
@@ -1168,22 +1229,51 @@ class RecordingService {
     }
   }
 
-  Future<RecordedSegment> checkpointCurrentSegment() async {
+  Future<RecordedSegment> checkpointCurrentSegment({
+    Future<void> Function()? onRecorderStopped,
+  }) async {
     if (!_recording) {
       throw StateError('Camera chưa bắt đầu ghi video.');
     }
-    final segment = await _requestSegmentRotation();
+    Object? handoffError;
+    StackTrace? handoffStackTrace;
+    final segment = await _requestSegmentRotation(
+      onRecorderStopped: onRecorderStopped == null
+          ? null
+          : () async {
+              try {
+                await onRecorderStopped();
+              } catch (error, stackTrace) {
+                handoffError = error;
+                handoffStackTrace = stackTrace;
+                rethrow;
+              }
+            },
+    );
+    if (handoffError != null) {
+      Error.throwWithStackTrace(handoffError!, handoffStackTrace!);
+    }
     if (segment == null) {
       throw StateError('Không có file đang quay để chốt Check VAR.');
     }
     return segment;
   }
 
-  Future<RecordedSegment?> _requestSegmentRotation() {
+  Future<RecordedSegment?> _requestSegmentRotation({
+    Future<void> Function()? onRecorderStopped,
+  }) async {
     final current = _rotationOperation;
-    if (current != null) return current;
+    if (current != null) {
+      final segment = await current;
+      // The current rotation has already opened its next recorder, so the
+      // caller can safely change the source on the same VideoTrack.
+      if (onRecorderStopped != null) await onRecorderStopped();
+      return segment;
+    }
 
-    final operation = _performSegmentRotation();
+    final operation = _performSegmentRotation(
+      onRecorderStopped: onRecorderStopped,
+    );
     _rotationOperation = operation;
     return operation.whenComplete(() {
       if (identical(_rotationOperation, operation)) {
@@ -1192,7 +1282,9 @@ class RecordingService {
     });
   }
 
-  Future<RecordedSegment?> _performSegmentRotation() async {
+  Future<RecordedSegment?> _performSegmentRotation({
+    Future<void> Function()? onRecorderStopped,
+  }) async {
     if (!_recording) return null;
 
     _rotating = true;
@@ -1201,6 +1293,7 @@ class RecordingService {
     try {
       final segment = await _finishCurrentSegment(
         onRecorderStopped: () async {
+          if (onRecorderStopped != null) await onRecorderStopped();
           if (_recording && !_stopping) await _startNewSegment();
         },
       );

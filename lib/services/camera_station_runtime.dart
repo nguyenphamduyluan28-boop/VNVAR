@@ -541,6 +541,27 @@ class CameraStationRuntime {
     _generation++;
     _emitState();
     try {
+      if (Platform.isIOS) {
+        if (recording.recording) {
+          await recording.checkpointCurrentSegment(
+            onRecorderStopped: webRtc.switchCamera,
+          );
+        } else {
+          await webRtc.switchCamera();
+          await server.ensureRecording();
+        }
+        _supportedResolutionProfiles = targetProfiles;
+        _resolutionProfile = selectedProfile;
+        webRtc.setResolutionProfile(selectedProfile);
+        if (selectedProfile != previousProfile) {
+          await StationConfigService().saveResolutionProfile(selectedProfile);
+        }
+        developer.log(
+          '[CAMERA] Switched iOS lens on the active VideoTrack; recording resumed after segment handoff',
+          name: 'CameraStationRuntime',
+        );
+        return;
+      }
       await recording.stop();
       await webRtc.disposeConnection();
       await webRtc.disposeCamera();
@@ -563,6 +584,12 @@ class CameraStationRuntime {
       _resolutionProfile = previousProfile;
       webRtc.setResolutionProfile(previousProfile);
       try {
+        // The iOS handoff may already have opened a new recorder on the old
+        // VideoTrack before the lens switch error is reported. Finalize that
+        // recorder before disposing the track, otherwise its state remains
+        // `recording` while no camera frames can reach it.
+        await recording.stop();
+        await webRtc.disposeConnection();
         await webRtc.disposeCamera();
         await webRtc.initializeCamera(facingMode: previousFacing);
         await server.ensureRecording();

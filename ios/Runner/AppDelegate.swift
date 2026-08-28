@@ -288,7 +288,7 @@ import UIKit
     return profiles
   }
 
-  private func setScreenDimmed(_ call: FlutterMethodCall, _ result: FlutterResult) {
+  private func setScreenDimmed(_ call: FlutterMethodCall, _ result: @escaping FlutterResult) {
     guard
       let arguments = call.arguments as? [String: Any],
       let dimmed = arguments["dimmed"] as? Bool

@@ -196,7 +196,12 @@ class _VideoStorageScreenState extends State<VideoStorageScreen> {
 
   Future<void> _viewVideo(RecordedSegment video) async {
     await Navigator.of(context).push<void>(
-      MaterialPageRoute<void>(builder: (_) => _VideoPlayerScreen(video: video)),
+      MaterialPageRoute<void>(
+        builder: (_) => _VideoPlayerScreen(
+          video: video,
+          recordingService: widget.recordingService,
+        ),
+      ),
     );
   }
 
@@ -921,40 +926,75 @@ class _ActiveRecordingTileState extends State<_ActiveRecordingTile> {
 
 class _VideoPlayerScreen extends StatefulWidget {
   final RecordedSegment video;
+  final RecordingService recordingService;
 
-  const _VideoPlayerScreen({required this.video});
+  const _VideoPlayerScreen({
+    required this.video,
+    required this.recordingService,
+  });
 
   @override
   State<_VideoPlayerScreen> createState() => _VideoPlayerScreenState();
 }
 
 class _VideoPlayerScreenState extends State<_VideoPlayerScreen> {
-  late final VideoPlayerController _controller;
+  VideoPlayerController? _controller;
+  File? _temporaryPlaybackFile;
   late final Future<void> _initialization;
+  bool _disposed = false;
 
   @override
   void initState() {
     super.initState();
-    _controller = VideoPlayerController.file(File(widget.video.path));
-    _initialization = _controller.initialize().then((_) async {
-      await _controller.play();
-      if (mounted) setState(() {});
-    });
+    _initialization = _initializePlayer();
+  }
+
+  Future<void> _initializePlayer() async {
+    final file = await widget.recordingService.preparePlaybackFile(
+      widget.video,
+    );
+    if (file.path != widget.video.path) _temporaryPlaybackFile = file;
+    if (_disposed) {
+      await _deleteTemporaryPlaybackFile();
+      return;
+    }
+    final controller = VideoPlayerController.file(file);
+    _controller = controller;
+    await controller.initialize();
+    if (_disposed) {
+      await controller.dispose();
+      await _deleteTemporaryPlaybackFile();
+      return;
+    }
+    await controller.play();
+    if (mounted) setState(() {});
   }
 
   @override
   void dispose() {
-    _controller.dispose();
+    _disposed = true;
+    _controller?.dispose();
+    unawaited(_deleteTemporaryPlaybackFile());
     super.dispose();
   }
 
+  Future<void> _deleteTemporaryPlaybackFile() async {
+    final temporary = _temporaryPlaybackFile;
+    _temporaryPlaybackFile = null;
+    if (temporary == null) return;
+    try {
+      if (await temporary.exists()) await temporary.delete();
+    } catch (_) {}
+  }
+
   void _togglePlayback() {
-    if (!_controller.value.isInitialized) return;
+    final controller = _controller;
+    if (controller == null || !controller.value.isInitialized) return;
     setState(() {
-      if (_controller.value.isPlaying) {
-        _controller.pause();
+      if (controller.value.isPlaying) {
+        controller.pause();
       } else {
-        _controller.play();
+        controller.play();
       }
     });
   }
@@ -986,8 +1026,9 @@ class _VideoPlayerScreenState extends State<_VideoPlayerScreen> {
           if (snapshot.connectionState != ConnectionState.done) {
             return const Center(child: CircularProgressIndicator());
           }
-          final aspectRatio = _controller.value.aspectRatio > 0
-              ? _controller.value.aspectRatio
+          final controller = _controller!;
+          final aspectRatio = controller.value.aspectRatio > 0
+              ? controller.value.aspectRatio
               : 16 / 9;
           return Column(
             children: [
@@ -1000,9 +1041,9 @@ class _VideoPlayerScreenState extends State<_VideoPlayerScreen> {
                       children: [
                         AspectRatio(
                           aspectRatio: aspectRatio,
-                          child: VideoPlayer(_controller),
+                          child: VideoPlayer(controller),
                         ),
-                        if (!_controller.value.isPlaying)
+                        if (!controller.value.isPlaying)
                           const Icon(
                             Icons.play_circle_fill_rounded,
                             color: Colors.white70,
@@ -1016,7 +1057,7 @@ class _VideoPlayerScreenState extends State<_VideoPlayerScreen> {
               SafeArea(
                 top: false,
                 child: VideoProgressIndicator(
-                  _controller,
+                  controller,
                   allowScrubbing: true,
                   padding: const EdgeInsets.all(16),
                   colors: const VideoProgressColors(
