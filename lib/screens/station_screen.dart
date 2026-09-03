@@ -14,6 +14,13 @@ import '../services/station_display_service.dart';
 import 'setup_screen.dart';
 import 'video_storage_screen.dart';
 
+@visibleForTesting
+bool shouldSuspendIosCapture(AppLifecycleState state) {
+  return state == AppLifecycleState.hidden ||
+      state == AppLifecycleState.paused ||
+      state == AppLifecycleState.detached;
+}
+
 // ============================================================
 // STATION SCREEN
 // ============================================================
@@ -182,9 +189,12 @@ class _StationScreenState extends State<StationScreen>
       unawaited(_runtime.resumeFromIosBackground());
       return;
     }
-    if (state == AppLifecycleState.inactive ||
-        state == AppLifecycleState.paused ||
-        state == AppLifecycleState.detached) {
+    // `inactive` is transient on iOS (Control Center, notification shade,
+    // permission prompts and some system overlays). Stopping capture there
+    // needlessly finalizes a segment and leaves a blue preview while the
+    // camera is recreated. Only suspend once the app is actually hidden or
+    // backgrounded.
+    if (shouldSuspendIosCapture(state)) {
       unawaited(_runtime.suspendForIosBackground());
     }
   }

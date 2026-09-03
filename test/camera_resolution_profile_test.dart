@@ -13,6 +13,10 @@ void main() {
     expect(CameraResolutionProfile.hd720.fps, 30);
     expect(CameraResolutionProfile.fullHd1080.fps, 30);
     expect(CameraResolutionProfile.fullHd1080.bitrate, 8000000);
+    expect(CameraResolutionProfile.hd720.rtspBitrate, 3000000);
+    expect(CameraResolutionProfile.fullHd1080.rtspBitrate, 5000000);
+    expect(CameraResolutionProfile.qhd2k.rtspBitrate, 7000000);
+    expect(CameraResolutionProfile.ultraHd4k.rtspBitrate, 10000000);
     expect(CameraResolutionProfile.qhd2k.width, 2560);
     expect(CameraResolutionProfile.ultraHd4k.height, 2160);
   });
@@ -22,6 +26,7 @@ void main() {
     expect(profile.fps, 30);
     expect(profile.width, 1920);
     expect(profile.bitrate, 8000000);
+    expect(profile.rtspBitrate, 5000000);
   });
 
   test(

@@ -42,8 +42,12 @@ final class VnvarRtspPublisher: NSObject, RTCVideoRenderer {
         }
       }
     }
-    encoder.onAccessUnit = { [weak self] nals, timestamp, _ in
-      self?.server.sendAccessUnit(nals: nals, timestamp: timestamp)
+    encoder.onAccessUnit = { [weak self] nals, timestamp, isKeyFrame in
+      self?.server.sendAccessUnit(
+        nals: nals,
+        timestamp: timestamp,
+        isKeyFrame: isKeyFrame
+      )
     }
     encoder.onError = { [weak self] message in self?.reportError(message) }
     server.onPlayRequested = { [weak self] in self?.encoder.requestKeyFrame() }

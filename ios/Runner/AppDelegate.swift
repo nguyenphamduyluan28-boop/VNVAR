@@ -9,6 +9,7 @@ import UIKit
   private var rtspPublisher: VnvarRtspPublisher?
   private var rtspGeneration: UInt64 = 0
   private var finalizationTask: UIBackgroundTaskIdentifier = .invalid
+  private var brightnessBeforeDimming: CGFloat?
 
   override func application(
     _ application: UIApplication,
@@ -230,7 +231,7 @@ import UIKit
 
   private func setStationActive(
     _ call: FlutterMethodCall,
-    _ result: FlutterResult
+    _ result: @escaping FlutterResult
   ) {
     guard let arguments = call.arguments as? [String: Any],
           let active = arguments["active"] as? Bool else {
@@ -243,9 +244,14 @@ import UIKit
       )
       return
     }
-    UIApplication.shared.isIdleTimerDisabled = active
-    if (!active) { endBackgroundFinalization() }
-    result(nil)
+    DispatchQueue.main.async {
+      UIApplication.shared.isIdleTimerDisabled = active
+      if !active {
+        self.restoreBrightnessIfNeeded()
+        self.endBackgroundFinalization()
+      }
+      result(nil)
+    }
   }
 
   private func cameraProfiles(facing: String) -> [[String: Any]] {
@@ -303,8 +309,21 @@ import UIKit
       return
     }
     DispatchQueue.main.async {
-      UIScreen.main.brightness = dimmed ? 0.05 : 0.6
+      if dimmed {
+        if self.brightnessBeforeDimming == nil {
+          self.brightnessBeforeDimming = UIScreen.main.brightness
+        }
+        UIScreen.main.brightness = 0.05
+      } else {
+        self.restoreBrightnessIfNeeded()
+      }
       result(nil)
     }
+  }
+
+  private func restoreBrightnessIfNeeded() {
+    guard let previousBrightness = brightnessBeforeDimming else { return }
+    UIScreen.main.brightness = previousBrightness
+    brightnessBeforeDimming = nil
   }
 }

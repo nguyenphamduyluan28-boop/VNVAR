@@ -59,6 +59,17 @@ class CameraResolutionProfile {
     CameraResolutionPreset.qhd2k => '2K QHD',
     CameraResolutionPreset.ultraHd4k => '4K Ultra HD',
   };
+
+  /// RTSP/TCP has no WebRTC-style congestion controller. Keep enough bitrate
+  /// for sports motion while leaving headroom for Wi-Fi retransmissions and
+  /// protocol overhead so latency does not grow without bound on a weak LAN.
+  int get rtspBitrate => switch (preset) {
+    CameraResolutionPreset.hd720 => 3000000,
+    CameraResolutionPreset.fullHd1080 => 5000000,
+    CameraResolutionPreset.qhd2k => 7000000,
+    CameraResolutionPreset.ultraHd4k => 10000000,
+  };
+
   CameraResolutionProfile withFps(int supportedFps) {
     return CameraResolutionProfile(
       preset: preset,

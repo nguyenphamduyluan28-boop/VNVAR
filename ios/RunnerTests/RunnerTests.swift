@@ -27,6 +27,44 @@ class RunnerTests: XCTestCase {
     XCTAssertEqual(last[1] & 0x1F, 5)
   }
 
+  func testFuAFragmentsReconstructOriginalNal() {
+    var nal = Data([0x61])
+    nal.append(Data((0..<5_000).map { UInt8($0 % 251) }))
+
+    let payloads = VnvarRtpPacketizer.payloads(for: nal)
+    XCTAssertGreaterThan(payloads.count, 1)
+
+    var reconstructed = Data([nal[0]])
+    for payload in payloads {
+      XCTAssertLessThanOrEqual(
+        payload.count,
+        VnvarRtpPacketizer.maxPayloadBytes
+      )
+      reconstructed.append(payload.dropFirst(2))
+    }
+    XCTAssertEqual(reconstructed, nal)
+  }
+
+  func testNalAtPayloadLimitIsNotFragmented() {
+    let nal = Data(
+      repeating: 0x55,
+      count: VnvarRtpPacketizer.maxPayloadBytes
+    )
+    XCTAssertEqual(VnvarRtpPacketizer.payloads(for: nal), [nal])
+  }
+
+  func testNalOverPayloadLimitIsFragmented() {
+    let nal = Data(
+      repeating: 0x65,
+      count: VnvarRtpPacketizer.maxPayloadBytes + 1
+    )
+    let payloads = VnvarRtpPacketizer.payloads(for: nal)
+    XCTAssertEqual(payloads.count, 2)
+    XCTAssertTrue(payloads.allSatisfy {
+      $0.count <= VnvarRtpPacketizer.maxPayloadBytes
+    })
+  }
+
   func testRtpHeaderContainsSequenceTimestampAndMarker() {
     let packet = VnvarRtpPacketizer.packet(
       payload: Data([1, 2, 3]),
@@ -39,6 +77,18 @@ class RunnerTests: XCTestCase {
       Data([0x80, 0xE0, 0x12, 0x34, 1, 2, 3, 4])
     )
     XCTAssertEqual(packet.count, 15)
+    XCTAssertEqual(Data(packet[8..<12]), Data([0x56, 0x4E, 0x56, 0x52]))
+  }
+
+  func testRtpHeaderWithoutMarkerUsesPayloadType96() {
+    let packet = VnvarRtpPacketizer.packet(
+      payload: Data([0x01]),
+      sequence: UInt16.max,
+      timestamp: 7,
+      marker: false
+    )
+    XCTAssertEqual(packet[1], 96)
+    XCTAssertEqual(Data(packet[2..<4]), Data([0xFF, 0xFF]))
   }
 
   func testL16AudioRtpHeaderUsesPayload97WithoutMarker() {
@@ -52,5 +102,50 @@ class RunnerTests: XCTestCase {
       Data([0x80, 0x61, 0x45, 0x67, 0x10, 0x20, 0x30, 0x40])
     )
     XCTAssertEqual(Data(packet.suffix(4)), Data([0x12, 0x34, 0xFE, 0xDC]))
+  }
+
+  func testRecoveryGateRejectsPFramesUntilFirstKeyFrame() {
+    var gate = VnvarVideoRecoveryGate()
+
+    XCTAssertTrue(gate.awaitingKeyFrame)
+    XCTAssertFalse(gate.shouldSend(isKeyFrame: false))
+    XCTAssertTrue(gate.shouldSend(isKeyFrame: true))
+    XCTAssertFalse(gate.awaitingKeyFrame)
+    XCTAssertTrue(gate.shouldSend(isKeyFrame: false))
+  }
+
+  func testRecoveryGateResetsWheneverPlaybackBegins() {
+    var gate = VnvarVideoRecoveryGate()
+    XCTAssertTrue(gate.shouldSend(isKeyFrame: true))
+    XCTAssertFalse(gate.awaitingKeyFrame)
+
+    gate.beginPlaying()
+
+    XCTAssertTrue(gate.awaitingKeyFrame)
+    XCTAssertFalse(gate.shouldSend(isKeyFrame: false))
+  }
+
+  func testDroppingPFrameBreaksReferenceChainAndRequestsKeyFrame() {
+    var gate = VnvarVideoRecoveryGate()
+    XCTAssertTrue(gate.shouldSend(isKeyFrame: true))
+
+    XCTAssertTrue(gate.didDrop(isKeyFrame: false))
+    XCTAssertTrue(gate.awaitingKeyFrame)
+    XCTAssertFalse(gate.shouldSend(isKeyFrame: false))
+  }
+
+  func testDroppingRequestedKeyFrameRequestsAnotherOne() {
+    var gate = VnvarVideoRecoveryGate()
+
+    XCTAssertTrue(gate.didDrop(isKeyFrame: true))
+    XCTAssertTrue(gate.awaitingKeyFrame)
+  }
+
+  func testRepeatedPFramesWhileWaitingDoNotSpamKeyFrameRequests() {
+    var gate = VnvarVideoRecoveryGate()
+
+    XCTAssertFalse(gate.didDrop(isKeyFrame: false))
+    XCTAssertFalse(gate.shouldSend(isKeyFrame: false))
+    XCTAssertTrue(gate.awaitingKeyFrame)
   }
 }

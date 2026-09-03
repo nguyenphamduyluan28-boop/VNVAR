@@ -108,13 +108,14 @@
       const AudioStreamBasicDescription *format = description == nil
           ? nil : CMAudioFormatDescriptionGetStreamBasicDescription(description);
       if (block == nil || format == nil || format->mFormatID != kAudioFormatLinearPCM) return;
-      size_t lengthAtOffset = 0, totalLength = 0;
-      char *bytes = NULL;
-      OSStatus status = CMBlockBufferGetDataPointer(
-          block, 0, &lengthAtOffset, &totalLength, &bytes);
-      if (status != kCMBlockBufferNoErr || bytes == NULL || totalLength == 0) return;
+      size_t totalLength = CMBlockBufferGetDataLength(block);
+      if (totalLength == 0) return;
+      NSMutableData *pcm = [NSMutableData dataWithLength:totalLength];
+      OSStatus status = CMBlockBufferCopyDataBytes(
+          block, 0, totalLength, pcm.mutableBytes);
+      if (status != kCMBlockBufferNoErr) return;
       strongSelf.onPcm(
-          [NSData dataWithBytes:bytes length:totalLength],
+          pcm,
           (NSInteger)llround(format->mSampleRate),
           (NSInteger)format->mChannelsPerFrame,
           (NSInteger)format->mBitsPerChannel);

@@ -1,6 +1,28 @@
 import Foundation
 import Network
 
+struct VnvarVideoRecoveryGate {
+  private(set) var awaitingKeyFrame = true
+
+  mutating func beginPlaying() {
+    awaitingKeyFrame = true
+  }
+
+  mutating func shouldSend(isKeyFrame: Bool) -> Bool {
+    guard !awaitingKeyFrame || isKeyFrame else { return false }
+    if isKeyFrame { awaitingKeyFrame = false }
+    return true
+  }
+
+  /// Marks the reference chain as broken and returns whether the encoder
+  /// should be asked for a fresh keyframe.
+  mutating func didDrop(isKeyFrame: Bool) -> Bool {
+    let shouldRequestKeyFrame = !awaitingKeyFrame || isKeyFrame
+    awaitingKeyFrame = true
+    return shouldRequestKeyFrame
+  }
+}
+
 final class VnvarRtspServer {
   var onPlayRequested: (() -> Void)?
   var onError: ((String) -> Void)?
@@ -12,6 +34,7 @@ final class VnvarRtspServer {
   private var sps: Data?
   private var pps: Data?
   private var audioAvailable = false
+  private let maximumClients = 4
 
   init(port: Int) {
     self.port = port
@@ -55,13 +78,27 @@ final class VnvarRtspServer {
     queue.async { [weak self] in self?.audioAvailable = available }
   }
 
-  func sendAccessUnit(nals: [Data], timestamp: UInt32) {
+  func sendAccessUnit(
+    nals: [Data],
+    timestamp: UInt32,
+    isKeyFrame: Bool
+  ) {
     queue.async { [weak self] in
       guard let self = self else { return }
       let playing = self.sessions.values.filter(\.playing)
       guard !playing.isEmpty else { return }
+      var shouldRequestKeyFrame = false
       for session in playing {
-        session.send(nals: nals, timestamp: timestamp)
+        if session.send(
+          nals: nals,
+          timestamp: timestamp,
+          isKeyFrame: isKeyFrame
+        ) {
+          shouldRequestKeyFrame = true
+        }
+      }
+      if shouldRequestKeyFrame {
+        self.onPlayRequested?()
       }
     }
   }
@@ -86,6 +123,11 @@ final class VnvarRtspServer {
   }
 
   private func accept(_ connection: NWConnection) {
+    guard sessions.count < maximumClients else {
+      NSLog("[VNVAR-RTSP] Rejecting client: limit %d reached", maximumClients)
+      connection.cancel()
+      return
+    }
     let session = ClientSession(connection: connection, queue: queue)
     sessions[session.id] = session
     connection.stateUpdateHandler = { [weak self, weak session] state in
@@ -180,7 +222,7 @@ final class VnvarRtspServer {
         cseq: cseq,
         headers: "Session: \(session.sessionId)\r\nRTP-Info: \(rtpInfo)\r\n"
       )
-      session.playing = true
+      session.beginPlaying()
       onPlayRequested?()
     case "PAUSE":
       session.playing = false
@@ -319,7 +361,14 @@ final class VnvarRtspServer {
     var videoSequence = UInt16.random(in: UInt16.min...UInt16.max)
     var audioSequence = UInt16.random(in: UInt16.min...UInt16.max)
     var pendingSends = 0
-    private let maximumPendingSends = 512
+    // A new client, or one whose network queue overflowed, must start again at
+    // an IDR frame. Sending dependent P-frames after dropping an access unit
+    // produces green/yellow macroblocks until the next keyframe.
+    private var recoveryGate = VnvarVideoRecoveryGate()
+    private let maximumPendingSends = 384
+    private let sendStallTimeout: TimeInterval = 2
+    private var sendProgressUptime: TimeInterval = 0
+    private var stallCheckGeneration = 0
 
     init(connection: NWConnection, queue: DispatchQueue) {
       self.connection = connection
@@ -335,45 +384,58 @@ final class VnvarRtspServer {
       connection.send(content: data, completion: .contentProcessed { _ in })
     }
 
-    func send(nals: [Data], timestamp: UInt32) {
+    func beginPlaying() {
+      recoveryGate.beginPlaying()
+      playing = true
+    }
+
+    /// Returns true when the encoder should be asked for a fresh keyframe.
+    func send(
+      nals: [Data],
+      timestamp: UInt32,
+      isKeyFrame: Bool
+    ) -> Bool {
       // A slow RTSP reader must not create an unbounded Network.framework queue.
-      // Drop this complete access unit so the next delivered frame stays decodable.
-      var packets: [Data] = []
+      // Build payloads first. Sequence numbers are assigned only after the
+      // complete access unit has passed admission, so a locally dropped frame
+      // does not look like RTP packet loss to the receiver.
+      var payloads: [(data: Data, marker: Bool)] = []
       for (nalIndex, nal) in nals.enumerated() {
-        let payloads = VnvarRtpPacketizer.payloads(for: nal)
-        for (payloadIndex, payload) in payloads.enumerated() {
-          let marker = nalIndex == nals.count - 1 && payloadIndex == payloads.count - 1
-          let packet = VnvarRtpPacketizer.packet(
-            payload: payload,
-            sequence: videoSequence,
-            timestamp: timestamp,
-            marker: marker
-          )
-          videoSequence &+= 1
-          packets.append(packet)
+        let nalPayloads = VnvarRtpPacketizer.payloads(for: nal)
+        for (payloadIndex, payload) in nalPayloads.enumerated() {
+          payloads.append((
+            data: payload,
+            marker: nalIndex == nals.count - 1 &&
+              payloadIndex == nalPayloads.count - 1
+          ))
         }
       }
-      guard pendingSends == 0 ||
-              pendingSends + packets.count <= maximumPendingSends else { return }
-      for packet in packets {
-        var interleaved = Data(capacity: packet.count + 4)
-        interleaved.append(0x24)
-        interleaved.append(videoRtpChannel)
-        interleaved.append(UInt8((packet.count >> 8) & 0xFF))
-        interleaved.append(UInt8(packet.count & 0xFF))
-        interleaved.append(packet)
-        pendingSends += 1
-        connection.send(
-          content: interleaved,
-          completion: .contentProcessed { [weak self] error in
-            guard let self = self else { return }
-            self.queue.async {
-              self.pendingSends = max(0, self.pendingSends - 1)
-              if error != nil { self.connection.cancel() }
-            }
-          }
-        )
+      guard !payloads.isEmpty else { return false }
+      guard recoveryGate.shouldSend(isKeyFrame: isKeyFrame) else {
+        return false
       }
+      guard pendingSends == 0 ||
+              pendingSends + payloads.count <= maximumPendingSends else {
+        NSLog(
+          "[VNVAR-RTSP] Client %@ congested: pending=%d incoming=%d; waiting for IDR",
+          String(sessionId),
+          pendingSends,
+          payloads.count
+        )
+        return recoveryGate.didDrop(isKeyFrame: isKeyFrame)
+      }
+
+      for payload in payloads {
+        let packet = VnvarRtpPacketizer.packet(
+          payload: payload.data,
+          sequence: videoSequence,
+          timestamp: timestamp,
+          marker: payload.marker
+        )
+        videoSequence &+= 1
+        sendInterleaved(packet, channel: videoRtpChannel, admitted: true)
+      }
+      return false
     }
 
     func sendAudio(pcm: Data, timestamp: UInt32) {
@@ -388,31 +450,75 @@ final class VnvarRtspServer {
           sequence: audioSequence,
           timestamp: timestamp &+ UInt32(offset / 2)
         )
-        audioSequence &+= 1
-        sendInterleaved(packet, channel: audioRtpChannel)
+        if sendInterleaved(packet, channel: audioRtpChannel) {
+          audioSequence &+= 1
+        }
         offset += size
       }
     }
 
-    private func sendInterleaved(_ packet: Data, channel: UInt8) {
-      guard pendingSends < maximumPendingSends else { return }
+    @discardableResult
+    private func sendInterleaved(
+      _ packet: Data,
+      channel: UInt8,
+      admitted: Bool = false
+    ) -> Bool {
+      guard admitted || pendingSends < maximumPendingSends else { return false }
       var interleaved = Data(capacity: packet.count + 4)
       interleaved.append(0x24)
       interleaved.append(channel)
       interleaved.append(UInt8((packet.count >> 8) & 0xFF))
       interleaved.append(UInt8(packet.count & 0xFF))
       interleaved.append(packet)
+      let wasIdle = pendingSends == 0
       pendingSends += 1
+      if wasIdle {
+        sendProgressUptime = ProcessInfo.processInfo.systemUptime
+        scheduleStallCheck()
+      }
       connection.send(
         content: interleaved,
         completion: .contentProcessed { [weak self] error in
           guard let self = self else { return }
           self.queue.async {
             self.pendingSends = max(0, self.pendingSends - 1)
-            if error != nil { self.connection.cancel() }
+            self.sendProgressUptime = ProcessInfo.processInfo.systemUptime
+            if error != nil {
+              self.connection.cancel()
+            } else if self.pendingSends == 0 {
+              self.stallCheckGeneration &+= 1
+            }
           }
         }
       )
+      return true
+    }
+
+    private func scheduleStallCheck() {
+      stallCheckGeneration &+= 1
+      let generation = stallCheckGeneration
+      queue.asyncAfter(deadline: .now() + sendStallTimeout) { [weak self] in
+        self?.checkForSendStall(generation: generation)
+      }
+    }
+
+    private func checkForSendStall(generation: Int) {
+      guard generation == stallCheckGeneration, pendingSends > 0 else { return }
+      let elapsed = ProcessInfo.processInfo.systemUptime - sendProgressUptime
+      if elapsed >= sendStallTimeout {
+        NSLog(
+          "[VNVAR-RTSP] Closing stalled client %@ after %.2f seconds",
+          String(sessionId),
+          elapsed
+        )
+        connection.cancel()
+        return
+      }
+      queue.asyncAfter(
+        deadline: .now() + max(0.01, sendStallTimeout - elapsed)
+      ) { [weak self] in
+        self?.checkForSendStall(generation: generation)
+      }
     }
   }
 }

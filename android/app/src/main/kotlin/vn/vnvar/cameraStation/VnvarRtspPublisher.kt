@@ -64,8 +64,18 @@ class VnvarRtspPublisher(
             while (running.get()) {
                 try {
                     val socket = serverSocket?.accept() ?: break
+                    if (sessions.size >= MAX_RTSP_CLIENTS) {
+                        Log.w(TAG, "Rejecting RTSP client: limit $MAX_RTSP_CLIENTS reached")
+                        try { socket.close() } catch (_: Exception) {}
+                        continue
+                    }
                     socket.tcpNoDelay = true
-                    thread(name = "VNVAR-RTSP-Client", isDaemon = true) { handleClient(socket) }
+                    socket.sendBufferSize = SOCKET_SEND_BUFFER_BYTES
+                    val session = Session(socket)
+                    sessions[session.id] = session
+                    thread(name = "VNVAR-RTSP-Client", isDaemon = true) {
+                        handleClient(session)
+                    }
                 } catch (error: Exception) {
                     if (running.get()) Log.e(TAG, "RTSP accept failed", error)
                 }
@@ -276,11 +286,16 @@ class VnvarRtspPublisher(
                         else -> frameNals += nal
                     }
                 }
-                frameNals.forEachIndexed { nalIndex, nal ->
-                    sendNal(
-                        nal,
+                if (frameNals.isNotEmpty()) {
+                    val isKeyFrame =
+                        info.flags and MediaCodec.BUFFER_FLAG_KEY_FRAME != 0 ||
+                            frameNals.any { nal ->
+                                nal.firstOrNull()?.toInt()?.and(0x1f) == 5
+                            }
+                    sendAccessUnit(
+                        frameNals,
                         info.presentationTimeUs,
-                        nalIndex == frameNals.lastIndex,
+                        isKeyFrame,
                     )
                 }
             }
@@ -338,17 +353,23 @@ class VnvarRtspPublisher(
         return -1
     }
 
-    private fun sendNal(nal: ByteArray, presentationTimeUs: Long, marker: Boolean) {
-        if (nal.isEmpty()) return
+    private fun sendAccessUnit(
+        nals: List<ByteArray>,
+        presentationTimeUs: Long,
+        isKeyFrame: Boolean,
+    ) {
         val timestamp = presentationTimeUs * 90 / 1000
+        var shouldRequestKeyFrame = false
         sessions.values.filter { it.playing }.forEach {
-            it.sendNal(nal, timestamp, marker)
+            if (it.enqueueAccessUnit(nals, timestamp, isKeyFrame)) {
+                shouldRequestKeyFrame = true
+            }
         }
+        if (shouldRequestKeyFrame) requestSyncFrame()
     }
 
-    private fun handleClient(socket: Socket) {
-        val session = Session(socket)
-        sessions[session.id] = session
+    private fun handleClient(session: Session) {
+        val socket = session.socket
         try {
             while (running.get() && !socket.isClosed) {
                 val request = readRtspRequest(socket.getInputStream()) ?: break
@@ -367,15 +388,15 @@ class VnvarRtspPublisher(
                             cseq,
                             "Session: ${session.id}\r\nRTP-Info: url=track0\r\n",
                         )
-                        session.playing = true
+                        session.beginPlaying()
                         requestSyncFrame()
                     }
                     "PAUSE" -> {
-                        session.playing = false
+                        session.pause()
                         session.respond(cseq, "Session: ${session.id}\r\n")
                     }
                     "TEARDOWN" -> {
-                        session.playing = false
+                        session.pause()
                         session.respond(cseq, "Session: ${session.id}\r\n")
                         break
                     }
@@ -481,6 +502,16 @@ class VnvarRtspPublisher(
         private var sequence = 0
         private val output: OutputStream = socket.getOutputStream()
         private val outputLock = Any()
+        private val sendStateLock = Any()
+        private val senderExecutor = Executors.newSingleThreadExecutor { task ->
+            Thread(task, "VNVAR-RTSP-Send-$id").apply { isDaemon = true }
+        }
+        private var sendGeneration = 0L
+        private var pendingRtpPackets = 0
+        private var awaitingKeyFrame = true
+        private var keyFrameQueued = false
+        private var closed = false
+        @Volatile private var writeStartedNanos = 0L
 
         fun setup(cseq: String, transport: String) {
             if (transport.contains("TCP", true) || transport.contains("interleaved", true)) {
@@ -542,7 +573,124 @@ class VnvarRtspPublisher(
             }
         }
 
-        fun sendNal(nal: ByteArray, timestamp: Long, marker: Boolean) {
+        fun beginPlaying() {
+            // MediaCodec may still have P-frames queued when PLAY arrives. Do
+            // not send them to a decoder that has no reference picture yet.
+            synchronized(sendStateLock) {
+                sendGeneration++
+                awaitingKeyFrame = true
+                keyFrameQueued = false
+                playing = true
+            }
+        }
+
+        fun pause() {
+            synchronized(sendStateLock) {
+                playing = false
+                sendGeneration++
+                pendingRtpPackets = 0
+                awaitingKeyFrame = true
+                keyFrameQueued = false
+            }
+        }
+
+        /**
+         * Queues one complete H.264 access unit without ever blocking the
+         * encoder. Returns true when congestion broke the reference chain and
+         * MediaCodec should produce a fresh IDR frame.
+         */
+        fun enqueueAccessUnit(
+            nals: List<ByteArray>,
+            timestamp: Long,
+            isKeyFrame: Boolean,
+        ): Boolean {
+            val packetCount = nals.sumOf(::rtpPacketCount)
+            if (packetCount == 0) return false
+            val writeStarted = writeStartedNanos
+            if (writeStarted != 0L &&
+                System.nanoTime() - writeStarted > CLIENT_WRITE_STALL_NANOS
+            ) {
+                Log.w(TAG, "Closing stalled RTSP client $id")
+                close()
+                return false
+            }
+
+            val generation: Long
+            synchronized(sendStateLock) {
+                if (closed || !playing) return false
+                if (awaitingKeyFrame && !isKeyFrame) return false
+                if (isKeyFrame && keyFrameQueued) return false
+
+                val queueWouldOverflow = pendingRtpPackets > 0 &&
+                    pendingRtpPackets + packetCount > MAX_PENDING_RTP_PACKETS
+                if (queueWouldOverflow) {
+                    val shouldRequest = !awaitingKeyFrame || isKeyFrame
+                    Log.w(
+                        TAG,
+                        "RTSP client $id congested: pending=$pendingRtpPackets, " +
+                            "incoming=$packetCount; waiting for a fresh keyframe",
+                    )
+                    sendGeneration++
+                    pendingRtpPackets = 0
+                    awaitingKeyFrame = true
+                    keyFrameQueued = false
+                    return shouldRequest
+                }
+
+                generation = sendGeneration
+                pendingRtpPackets += packetCount
+                if (isKeyFrame) keyFrameQueued = true
+            }
+
+            try {
+                senderExecutor.execute {
+                    var sent = false
+                    try {
+                        val valid = synchronized(sendStateLock) {
+                            !closed && playing && generation == sendGeneration
+                        }
+                        if (!valid) return@execute
+                        writeStartedNanos = System.nanoTime()
+                        nals.forEachIndexed { index, nal ->
+                            sendNal(nal, timestamp, index == nals.lastIndex)
+                        }
+                        sent = !socket.isClosed
+                    } finally {
+                        writeStartedNanos = 0L
+                        synchronized(sendStateLock) {
+                            if (generation == sendGeneration) {
+                                pendingRtpPackets =
+                                    (pendingRtpPackets - packetCount).coerceAtLeast(0)
+                                if (isKeyFrame) {
+                                    keyFrameQueued = false
+                                    if (sent) awaitingKeyFrame = false
+                                }
+                            }
+                        }
+                    }
+                }
+            } catch (_: Exception) {
+                synchronized(sendStateLock) {
+                    if (generation == sendGeneration) {
+                        pendingRtpPackets =
+                            (pendingRtpPackets - packetCount).coerceAtLeast(0)
+                        if (isKeyFrame) keyFrameQueued = false
+                    }
+                }
+                close()
+            }
+            return false
+        }
+
+        private fun rtpPacketCount(nal: ByteArray): Int {
+            if (nal.isEmpty()) return 0
+            if (nal.size <= RTP_PAYLOAD_BYTES) return 1
+            val bodySize = nal.size - 1
+            val fragmentSize = RTP_PAYLOAD_BYTES - 2
+            return (bodySize + fragmentSize - 1) / fragmentSize
+        }
+
+        private fun sendNal(nal: ByteArray, timestamp: Long, marker: Boolean) {
             if (nal.size <= RTP_PAYLOAD_BYTES) sendPacket(nal, timestamp, marker)
             else {
                 val header = nal[0].toInt() and 255
@@ -571,21 +719,39 @@ class VnvarRtspPublisher(
             val ts = timestamp.toInt(); packet[4] = (ts shr 24).toByte(); packet[5] = (ts shr 16).toByte(); packet[6] = (ts shr 8).toByte(); packet[7] = ts.toByte()
             packet[8] = 0x56; packet[9] = 0x4e; packet[10] = 0x56; packet[11] = 0x52
             System.arraycopy(payload, 0, packet, 12, payload.size)
+            val interleaved = ByteArray(packet.size + 4)
+            interleaved[0] = '$'.code.toByte()
+            interleaved[1] = rtpChannel.toByte()
+            interleaved[2] = (packet.size shr 8).toByte()
+            interleaved[3] = packet.size.toByte()
+            System.arraycopy(packet, 0, interleaved, 4, packet.size)
             try {
                 synchronized(outputLock) {
-                    output.write(byteArrayOf('$'.code.toByte(), rtpChannel.toByte(), (packet.size shr 8).toByte(), packet.size.toByte()))
-                    output.write(packet)
-                    output.flush()
+                    output.write(interleaved)
                 }
             } catch (_: Exception) { close() }
         }
 
-        fun close() { playing = false; try { socket.close() } catch (_: Exception) {} }
+        fun close() {
+            synchronized(sendStateLock) {
+                if (closed) return
+                closed = true
+                playing = false
+                sendGeneration++
+                pendingRtpPackets = 0
+            }
+            senderExecutor.shutdownNow()
+            try { socket.close() } catch (_: Exception) {}
+        }
     }
 
     companion object {
         private const val TAG = "VNVAR-RTSP"
         private const val RTP_PAYLOAD_BYTES = 1200
+        private const val MAX_PENDING_RTP_PACKETS = 384
+        private const val SOCKET_SEND_BUFFER_BYTES = 256 * 1024
+        private const val CLIENT_WRITE_STALL_NANOS = 2_000_000_000L
+        private const val MAX_RTSP_CLIENTS = 4
         private const val MAX_RTSP_HEADER_BYTES = 64 * 1024
     }
 }

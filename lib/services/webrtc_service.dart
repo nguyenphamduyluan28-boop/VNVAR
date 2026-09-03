@@ -644,7 +644,9 @@ class WebRtcService {
             'trackId': track.id,
             'audioTrackId': localAudioTrack?.id,
             'port': 8554,
-            'bitrate': _resolutionProfile.bitrate,
+            // RTSP/TCP cannot adapt to congestion like WebRTC. Use the
+            // profile's LAN-safe budget while WebRTC keeps its higher ceiling.
+            'bitrate': _resolutionProfile.rtspBitrate,
             'fps': _resolutionProfile.fps,
           });
       _rtspAudio = result?['audio'] == true;
