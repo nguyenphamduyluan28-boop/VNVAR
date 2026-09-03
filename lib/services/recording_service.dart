@@ -1213,6 +1213,24 @@ class RecordingService {
           );
           return;
         }
+        if (Platform.isIOS) {
+          // Calls, route changes and another audio app can temporarily own the
+          // iOS audio session. Keep the court video instead of tearing down the
+          // complete capture pipeline; the next segment retries microphone.
+          try {
+            final partialAudio = File(audioPath);
+            if (await partialAudio.exists()) await partialAudio.delete();
+          } catch (_) {}
+          developer.log(
+            'iOS microphone temporarily unavailable; continuing video-only.',
+            error: error,
+            stackTrace: stackTrace,
+            name: 'RecordingService',
+          );
+          debugPrint('[VNVAR] IOS AUDIO UNAVAILABLE: VIDEO-ONLY');
+          _notifyVideoChanges();
+          return;
+        }
         _recording = false;
         _recorder = null;
         _currentPath = null;

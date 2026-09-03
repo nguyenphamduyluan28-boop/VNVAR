@@ -91,6 +91,26 @@ class RunnerTests: XCTestCase {
     XCTAssertEqual(Data(packet[2..<4]), Data([0xFF, 0xFF]))
   }
 
+  func testRtpSequenceCanWrapFromMaximumToZero() {
+    var sequence = UInt16.max
+    let lastPacket = VnvarRtpPacketizer.packet(
+      payload: Data([0x01]),
+      sequence: sequence,
+      timestamp: 1,
+      marker: true
+    )
+    sequence &+= 1
+    let firstPacket = VnvarRtpPacketizer.packet(
+      payload: Data([0x02]),
+      sequence: sequence,
+      timestamp: 2,
+      marker: true
+    )
+
+    XCTAssertEqual(Data(lastPacket[2..<4]), Data([0xFF, 0xFF]))
+    XCTAssertEqual(Data(firstPacket[2..<4]), Data([0x00, 0x00]))
+  }
+
   func testL16AudioRtpHeaderUsesPayload97WithoutMarker() {
     let packet = VnvarRtpPacketizer.audioPacket(
       payload: Data([0x12, 0x34, 0xFE, 0xDC]),
@@ -102,6 +122,18 @@ class RunnerTests: XCTestCase {
       Data([0x80, 0x61, 0x45, 0x67, 0x10, 0x20, 0x30, 0x40])
     )
     XCTAssertEqual(Data(packet.suffix(4)), Data([0x12, 0x34, 0xFE, 0xDC]))
+  }
+
+  func testEmptyL16AudioPayloadStillProducesAValidRtpHeader() {
+    let packet = VnvarRtpPacketizer.audioPacket(
+      payload: Data(),
+      sequence: 1,
+      timestamp: 2
+    )
+
+    XCTAssertEqual(packet.count, 12)
+    XCTAssertEqual(packet[0], 0x80)
+    XCTAssertEqual(packet[1], 97)
   }
 
   func testRecoveryGateRejectsPFramesUntilFirstKeyFrame() {
@@ -147,5 +179,72 @@ class RunnerTests: XCTestCase {
     XCTAssertFalse(gate.didDrop(isKeyFrame: false))
     XCTAssertFalse(gate.shouldSend(isKeyFrame: false))
     XCTAssertTrue(gate.awaitingKeyFrame)
+  }
+
+  func testStoppingAnUnstartedRtspServerIsIdempotent() {
+    let server = VnvarRtspServer(port: 0)
+
+    server.stop()
+    server.stop()
+  }
+
+  func testUnstartedAudioRecorderHasStableEmptyState() throws {
+    let recorder = VnvarAudioSegmentRecorder()
+
+    XCTAssertNil(try recorder.stop())
+    let status = recorder.status()
+    XCTAssertEqual(status["active"] as? Bool, false)
+    XCTAssertEqual(status["bytes"] as? Int, 0)
+    XCTAssertNil(status["path"])
+  }
+
+  func testRtcpReceiverReportParsesWorstFractionLost() throws {
+    var packet = Data([
+      0x82, 201, 0x00, 0x0D, // RR with two report blocks, 56 bytes
+      0, 0, 0, 1,            // sender SSRC
+    ])
+    packet.append(contentsOf: [0, 0, 0, 2, 13])
+    packet.append(Data(repeating: 0, count: 19))
+    packet.append(contentsOf: [0, 0, 0, 3, 64])
+    packet.append(Data(repeating: 0, count: 19))
+
+    let feedback = try XCTUnwrap(VnvarRtcpFeedback.parse(packet))
+    let fractionLost = try XCTUnwrap(feedback.fractionLost)
+    XCTAssertEqual(fractionLost, 0.25, accuracy: 0.0001)
+    XCTAssertFalse(feedback.requestsKeyFrame)
+  }
+
+  func testRtcpPliRequestsKeyFrame() throws {
+    let packet = Data([
+      0x81, 206, 0x00, 0x02,
+      0, 0, 0, 1,
+      0x56, 0x4E, 0x56, 0x52,
+    ])
+
+    let feedback = try XCTUnwrap(VnvarRtcpFeedback.parse(packet))
+    XCTAssertTrue(feedback.requestsKeyFrame)
+    XCTAssertNil(feedback.fractionLost)
+  }
+
+  func testMalformedRtcpIsRejected() {
+    XCTAssertNil(VnvarRtcpFeedback.parse(Data([0x81, 206, 0, 10])))
+    XCTAssertNil(VnvarRtcpFeedback.parse(Data([0x41, 206, 0, 2])))
+  }
+
+  func testRtspBitrateDropsFastAndRecoversSlowly() {
+    var controller = VnvarRtspBitrateController(maximumBitrate: 8_000_000)
+
+    XCTAssertEqual(controller.report(fractionLost: 0.20), 6_000_000)
+    XCTAssertNil(controller.report(fractionLost: 0.01))
+    XCTAssertNil(controller.report(fractionLost: 0.01))
+    XCTAssertEqual(controller.report(fractionLost: 0.01), 6_600_000)
+  }
+
+  func testRtspBitrateNeverDropsBelowItsFloor() {
+    var controller = VnvarRtspBitrateController(maximumBitrate: 8_000_000)
+    for _ in 0..<20 { _ = controller.report(fractionLost: 1) }
+
+    XCTAssertEqual(controller.currentBitrate, 2_000_000)
+    XCTAssertNil(controller.report(fractionLost: 1))
   }
 }

@@ -18,6 +18,40 @@ void main() {
     expect(constraints['deviceId'], 'back-camera');
   });
 
+  test('iOS 4K keeps the sustained 20 FPS device budget', () {
+    final constraints = buildCameraVideoConstraints(
+      isEmulator: false,
+      isIos: true,
+      facingMode: 'environment',
+      preferredDeviceId: 'wide-camera',
+      profile: CameraResolutionProfile.ultraHd4k,
+    );
+
+    expect(constraints, {
+      'facingMode': 'environment',
+      'width': 3840,
+      'height': 2160,
+      'frameRate': 20,
+      'deviceId': 'wide-camera',
+    });
+  });
+
+  test('iOS falls back to facingMode when no stable device id exists', () {
+    final constraints = buildCameraVideoConstraints(
+      isEmulator: false,
+      isIos: true,
+      facingMode: 'user',
+      preferredDeviceId: null,
+      profile: CameraResolutionProfile.hd720,
+    );
+
+    expect(constraints['facingMode'], 'user');
+    expect(constraints.containsKey('deviceId'), isFalse);
+    expect(constraints['width'], 1280);
+    expect(constraints['height'], 720);
+    expect(constraints['frameRate'], 30);
+  });
+
   test('Android keeps ideal and maximum capture constraints', () {
     final constraints = buildCameraVideoConstraints(
       isEmulator: false,

@@ -80,3 +80,43 @@ enum VnvarRtpPacketizer {
     data.append(UInt8(value & 0xFF))
   }
 }
+
+struct VnvarRtcpFeedback: Equatable {
+  var fractionLost: Double?
+  var requestsKeyFrame = false
+
+  static func parse(_ data: Data) -> VnvarRtcpFeedback? {
+    var feedback = VnvarRtcpFeedback()
+    var found = false
+    var offset = 0
+    while offset + 4 <= data.count {
+      let first = data[offset]
+      guard first >> 6 == 2 else { return nil }
+      let reportCount = Int(first & 0x1F)
+      let packetType = data[offset + 1]
+      let words = (Int(data[offset + 2]) << 8) | Int(data[offset + 3])
+      let packetLength = (words + 1) * 4
+      guard packetLength >= 4, offset + packetLength <= data.count else {
+        return nil
+      }
+
+      if packetType == 201, reportCount > 0, packetLength >= 32 {
+        for index in 0..<reportCount {
+          let blockOffset = offset + 8 + index * 24
+          guard blockOffset + 24 <= offset + packetLength else { break }
+          // The first four bytes identify the reported RTP SSRC; the next
+          // byte is the RFC 3550 fraction-lost value in units of 1/256.
+          let lost = Double(data[blockOffset + 4]) / 256.0
+          feedback.fractionLost = max(feedback.fractionLost ?? 0, lost)
+          found = true
+        }
+      } else if packetType == 206, reportCount == 1, packetLength >= 12 {
+        feedback.requestsKeyFrame = true
+        found = true
+      }
+      offset += packetLength
+    }
+    guard offset == data.count else { return nil }
+    return found ? feedback : nil
+  }
+}

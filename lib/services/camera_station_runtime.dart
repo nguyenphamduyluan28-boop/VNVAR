@@ -12,6 +12,11 @@ import 'recording_service.dart';
 import 'station_config_service.dart';
 import 'webrtc_service.dart';
 
+bool shouldRecreateIosCameraForLensSwitch(
+  CameraResolutionProfile previous,
+  CameraResolutionProfile selected,
+) => selected != previous;
+
 class CameraStationRuntime {
   CameraStationRuntime._();
 
@@ -543,12 +548,26 @@ class CameraStationRuntime {
     _emitState();
     try {
       if (Platform.isIOS) {
-        if (recording.recording) {
+        final recreateCapture = shouldRecreateIosCameraForLensSwitch(
+          previousProfile,
+          selectedProfile,
+        );
+        if (!recreateCapture && recording.recording) {
           await recording.checkpointCurrentSegment(
             onRecorderStopped: webRtc.switchCamera,
           );
-        } else {
+        } else if (!recreateCapture) {
           await webRtc.switchCamera();
+          await server.ensureRecording();
+        } else {
+          // Helper.switchCamera keeps the constraints of the previous lens.
+          // Recreate capture when the target lens needs a lower profile (for
+          // example a 4K rear camera switching to a 1080p front camera).
+          await recording.stop();
+          await webRtc.disposeConnection();
+          await webRtc.disposeCamera();
+          webRtc.setResolutionProfile(selectedProfile);
+          await webRtc.initializeCamera(facingMode: targetFacing);
           await server.ensureRecording();
         }
         _supportedResolutionProfiles = targetProfiles;
@@ -558,7 +577,7 @@ class CameraStationRuntime {
           await StationConfigService().saveResolutionProfile(selectedProfile);
         }
         developer.log(
-          '[CAMERA] Switched iOS lens on the active VideoTrack; recording resumed after segment handoff',
+          '[CAMERA] Switched iOS lens with a compatible capture profile',
           name: 'CameraStationRuntime',
         );
         return;

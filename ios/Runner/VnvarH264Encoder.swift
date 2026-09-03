@@ -16,7 +16,8 @@ final class VnvarH264Encoder {
 
   private let queue = DispatchQueue(label: "vnvar.rtsp.h264.encoder")
   private let admissionLock = NSLock()
-  private let bitrate: Int
+  private let maximumBitrate: Int
+  private var currentBitrate: Int
   private let fps: Int
   private var session: VTCompressionSession?
   private var dimensions: (width: Int, height: Int)?
@@ -24,31 +25,43 @@ final class VnvarH264Encoder {
   private var stopped = false
   private var lastParameterSets: (sps: Data, pps: Data)?
   private var encodeQueued = false
+  private var pendingCompletion: (() -> Void)?
 
   init(bitrate: Int, fps: Int) {
-    self.bitrate = max(250_000, bitrate)
+    maximumBitrate = max(250_000, bitrate)
+    currentBitrate = max(250_000, bitrate)
     self.fps = max(1, min(fps, 60))
   }
 
-  func encode(pixelBuffer: CVPixelBuffer, timestampNs: Int64) {
+  func encode(
+    pixelBuffer: CVPixelBuffer,
+    timestampNs: Int64,
+    completion: @escaping () -> Void
+  ) {
     admissionLock.lock()
     guard !encodeQueued else {
       admissionLock.unlock()
+      completion()
       return
     }
     encodeQueued = true
+    pendingCompletion = completion
     admissionLock.unlock()
     queue.async { [weak self] in
-      guard let self = self else { return }
-      defer {
-        self.admissionLock.lock()
-        self.encodeQueued = false
-        self.admissionLock.unlock()
+      guard let self = self else {
+        completion()
+        return
       }
-      guard !self.stopped else { return }
+      guard !self.stopped else {
+        self.finishPendingFrame()
+        return
+      }
       do {
         try self.ensureSession(for: pixelBuffer)
-        guard let session = self.session else { return }
+        guard let session = self.session else {
+          self.finishPendingFrame()
+          return
+        }
         let timestamp = CMTime(value: timestampNs, timescale: 1_000_000_000)
         var options: CFDictionary?
         if self.forceNextKeyFrame {
@@ -68,6 +81,7 @@ final class VnvarH264Encoder {
           throw EncoderError.operation("encode", status)
         }
       } catch {
+        self.finishPendingFrame()
         self.report(error)
       }
     }
@@ -75,6 +89,28 @@ final class VnvarH264Encoder {
 
   func requestKeyFrame() {
     queue.async { [weak self] in self?.forceNextKeyFrame = true }
+  }
+
+  func updateBitrate(_ bitrate: Int) {
+    queue.async { [weak self] in
+      guard let self = self else { return }
+      let target = min(self.maximumBitrate, max(250_000, bitrate))
+      guard target != self.currentBitrate else { return }
+      self.currentBitrate = target
+      guard let session = self.session else { return }
+      // Some older hardware encoders do not accept live property changes.
+      // Keep streaming with the previous native value instead of restarting.
+      self.setIfSupported(
+        kVTCompressionPropertyKey_AverageBitRate,
+        value: target,
+        on: session
+      )
+      self.setIfSupported(
+        kVTCompressionPropertyKey_DataRateLimits,
+        value: [target / 8, 1],
+        on: session
+      )
+    }
   }
 
   func stop() {
@@ -87,6 +123,7 @@ final class VnvarH264Encoder {
       session = nil
       dimensions = nil
       lastParameterSets = nil
+      finishPendingFrame()
     }
   }
 
@@ -129,12 +166,19 @@ final class VnvarH264Encoder {
         value: kVTProfileLevel_H264_Main_AutoLevel,
         on: newSession
       )
-      try set(kVTCompressionPropertyKey_AverageBitRate, value: bitrate, on: newSession)
+      try set(kVTCompressionPropertyKey_AverageBitRate, value: currentBitrate, on: newSession)
       try set(kVTCompressionPropertyKey_ExpectedFrameRate, value: fps, on: newSession)
       try set(kVTCompressionPropertyKey_MaxKeyFrameInterval, value: fps, on: newSession)
+      // Keep at most one frame inside VideoToolbox. A deep encoder queue makes
+      // 4K preview and recording appear frozen several seconds behind live.
+      setIfSupported(
+        kVTCompressionPropertyKey_MaxFrameDelayCount,
+        value: 1,
+        on: newSession
+      )
       try set(
         kVTCompressionPropertyKey_DataRateLimits,
-        value: [bitrate / 8, 1],
+        value: [currentBitrate / 8, 1],
         on: newSession
       )
       let prepareStatus = VTCompressionSessionPrepareToEncodeFrames(newSession)
@@ -166,7 +210,29 @@ final class VnvarH264Encoder {
     }
   }
 
+  @discardableResult
+  private func setIfSupported(
+    _ key: CFString,
+    value: Any,
+    on session: VTCompressionSession
+  ) -> Bool {
+    let status = VTSessionSetProperty(
+      session,
+      key: key,
+      value: value as CFTypeRef
+    )
+    if status != noErr {
+      NSLog(
+        "[VNVAR-RTSP] VideoToolbox ignored optional property %@ (%d)",
+        String(describing: key),
+        status
+      )
+    }
+    return status == noErr
+  }
+
   fileprivate func handle(status: OSStatus, sampleBuffer: CMSampleBuffer?) {
+    defer { finishPendingFrame() }
     guard status == noErr,
           let sampleBuffer = sampleBuffer,
           CMSampleBufferDataIsReady(sampleBuffer) else {
@@ -205,6 +271,15 @@ final class VnvarH264Encoder {
       truncatingIfNeeded: UInt64(max(0, seconds * 90_000))
     )
     onAccessUnit?(nals, timestamp, isKeyFrame)
+  }
+
+  private func finishPendingFrame() {
+    admissionLock.lock()
+    encodeQueued = false
+    let completion = pendingCompletion
+    pendingCompletion = nil
+    admissionLock.unlock()
+    completion?()
   }
 
   private func parameterSets(

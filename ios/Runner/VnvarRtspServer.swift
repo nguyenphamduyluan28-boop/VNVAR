@@ -25,6 +25,8 @@ struct VnvarVideoRecoveryGate {
 
 final class VnvarRtspServer {
   var onPlayRequested: (() -> Void)?
+  var onReceiverReport: ((Double) -> Void)?
+  var onPictureLossIndication: (() -> Void)?
   var onError: ((String) -> Void)?
   var onReady: (() -> Void)?
 
@@ -191,9 +193,17 @@ final class VnvarRtspServer {
     while !session.input.isEmpty {
       if session.input.first == 0x24 {
         guard session.input.count >= 4 else { return }
-        let length = (Int(session.input[2]) << 8) | Int(session.input[3])
+        let start = session.input.startIndex
+        let channel = session.input[session.input.index(start, offsetBy: 1)]
+        let lengthHigh = session.input[session.input.index(start, offsetBy: 2)]
+        let lengthLow = session.input[session.input.index(start, offsetBy: 3)]
+        let length = (Int(lengthHigh) << 8) | Int(lengthLow)
         guard session.input.count >= 4 + length else { return }
-        session.input.removeFirst(4 + length)
+        let payloadStart = session.input.index(start, offsetBy: 4)
+        let payloadEnd = session.input.index(payloadStart, offsetBy: length)
+        let payload = session.input.subdata(in: payloadStart..<payloadEnd)
+        session.input.removeSubrange(start..<payloadEnd)
+        processInterleaved(payload, channel: channel, session: session)
         continue
       }
       let delimiter = Data([13, 10, 13, 10])
@@ -211,9 +221,29 @@ final class VnvarRtspServer {
         session.connection.cancel()
         return
       }
-      guard session.input.count >= headerEnd + contentLength else { return }
-      session.input.removeFirst(headerEnd + contentLength)
+      guard contentLength <= session.input.distance(
+        from: headerEnd,
+        to: session.input.endIndex
+      ) else { return }
+      let bodyEnd = session.input.index(headerEnd, offsetBy: contentLength)
+      session.input.removeSubrange(session.input.startIndex..<bodyEnd)
       handle(text, session: session)
+    }
+  }
+
+  private func processInterleaved(
+    _ payload: Data,
+    channel: UInt8,
+    session: ClientSession
+  ) {
+    guard session.videoConfigured,
+          channel == (session.videoRtpChannel &+ 1),
+          let feedback = VnvarRtcpFeedback.parse(payload) else { return }
+    if feedback.requestsKeyFrame {
+      onPictureLossIndication?()
+    }
+    if let fractionLost = feedback.fractionLost {
+      onReceiverReport?(fractionLost)
     }
   }
 

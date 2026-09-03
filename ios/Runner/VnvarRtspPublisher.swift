@@ -16,6 +16,7 @@ final class VnvarRtspPublisher: NSObject, RTCVideoRenderer {
   private var formatReady = false
   private var framePending = false
   private var errorReported = false
+  private var bitrateController: VnvarRtspBitrateController
   var audioAvailable: Bool { audioSink != nil }
 
   init(
@@ -29,6 +30,7 @@ final class VnvarRtspPublisher: NSObject, RTCVideoRenderer {
     audioSink = audioTrackId.flatMap { VnvarWebRtcAudioSink(trackId: $0) }
     server = VnvarRtspServer(port: port)
     encoder = VnvarH264Encoder(bitrate: bitrate, fps: fps)
+    bitrateController = VnvarRtspBitrateController(maximumBitrate: bitrate)
     super.init()
 
     encoder.onFormat = { [weak self] sps, pps in
@@ -52,6 +54,17 @@ final class VnvarRtspPublisher: NSObject, RTCVideoRenderer {
     }
     encoder.onError = { [weak self] message in self?.reportError(message) }
     server.onPlayRequested = { [weak self] in self?.encoder.requestKeyFrame() }
+    server.onPictureLossIndication = { [weak self] in
+      self?.encoder.requestKeyFrame()
+    }
+    server.onReceiverReport = { [weak self] fractionLost in
+      guard let self = self else { return }
+      self.stateQueue.async {
+        if let bitrate = self.bitrateController.report(fractionLost: fractionLost) {
+          self.encoder.updateBitrate(bitrate)
+        }
+      }
+    }
     server.onError = { [weak self] message in self?.reportError(message) }
     server.onReady = { [weak self] in
       DispatchQueue.main.async { self?.onServerReady?() }
@@ -113,13 +126,21 @@ final class VnvarRtspPublisher: NSObject, RTCVideoRenderer {
     }
     frameQueue.async { [weak self] in
       guard let self = self else { return }
-      defer { self.stateQueue.async { self.framePending = false } }
-      guard self.stateQueue.sync(execute: { self.running }) else { return }
+      guard self.stateQueue.sync(execute: { self.running }) else {
+        self.stateQueue.async { self.framePending = false }
+        return
+      }
       guard let pixelBuffer = VnvarWebRtcTrackBridge.copyPixelBuffer(for: frame) else {
+        self.stateQueue.async { self.framePending = false }
         self.reportError("Cannot convert WebRTC frame to CVPixelBuffer")
         return
       }
-      self.encoder.encode(pixelBuffer: pixelBuffer, timestampNs: frame.timeStampNs)
+      self.encoder.encode(
+        pixelBuffer: pixelBuffer,
+        timestampNs: frame.timeStampNs
+      ) { [weak self] in
+        self?.stateQueue.async { self?.framePending = false }
+      }
     }
   }
 
@@ -173,5 +194,41 @@ final class VnvarRtspPublisher: NSObject, RTCVideoRenderer {
       self.errorReported = true
       DispatchQueue.main.async { self.onEncoderError?(message) }
     }
+  }
+}
+
+struct VnvarRtspBitrateController {
+  let maximumBitrate: Int
+  let minimumBitrate: Int
+  private(set) var currentBitrate: Int
+  private var healthyReports = 0
+
+  init(maximumBitrate: Int) {
+    let maximum = max(250_000, maximumBitrate)
+    self.maximumBitrate = maximum
+    minimumBitrate = max(500_000, maximum / 4)
+    currentBitrate = maximum
+  }
+
+  mutating func report(fractionLost: Double) -> Int? {
+    let loss = min(1, max(0, fractionLost))
+    if loss >= 0.10 {
+      healthyReports = 0
+      let reduced = max(minimumBitrate, Int(Double(currentBitrate) * 0.75))
+      guard reduced != currentBitrate else { return nil }
+      currentBitrate = reduced
+      return currentBitrate
+    }
+    if loss <= 0.02 {
+      healthyReports += 1
+      guard healthyReports >= 3 else { return nil }
+      healthyReports = 0
+      let increased = min(maximumBitrate, Int(Double(currentBitrate) * 1.10))
+      guard increased != currentBitrate else { return nil }
+      currentBitrate = increased
+      return currentBitrate
+    }
+    healthyReports = 0
+    return nil
   }
 }
