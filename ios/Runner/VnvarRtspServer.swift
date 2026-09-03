@@ -160,6 +160,7 @@ final class VnvarRtspServer {
         // Network.framework already owns teardown in these terminal states.
         // Cancelling again causes redundant endpoint inspection on a socket
         // that never reached .ready (the copy_connected_* console warnings).
+        session.markConnectionTerminal()
         self.detach(session)
       default:
         break
@@ -184,6 +185,7 @@ final class VnvarRtspServer {
           self.processInput(session)
         }
         if error != nil {
+          session.markConnectionTerminal()
           self.detach(session)
         } else if isComplete {
           self.close(session)
@@ -389,19 +391,22 @@ final class VnvarRtspServer {
   }
 
   private func detach(_ session: ClientSession) {
-    guard sessions.removeValue(forKey: session.id) != nil else { return }
+    sessions.removeValue(forKey: session.id)
     session.connection.stateUpdateHandler = nil
   }
 
   private func close(_ session: ClientSession) {
     detach(session)
-    session.connection.cancel()
+    session.cancelIfNeeded()
   }
 
   private func stopLocked() {
     listener?.cancel()
     listener = nil
-    sessions.values.forEach { $0.connection.cancel() }
+    sessions.values.forEach { session in
+      session.connection.stateUpdateHandler = nil
+      session.cancelIfNeeded()
+    }
     sessions.removeAll()
   }
 
@@ -433,6 +438,10 @@ final class VnvarRtspServer {
     private let sendStallTimeout: TimeInterval = 2
     private var sendProgressUptime: TimeInterval = 0
     private var stallCheckGeneration = 0
+    private var connectionTerminal = false
+    private var videoPacketCount: UInt32 = 0
+    private var videoOctetCount: UInt32 = 0
+    private var lastSenderReportUptime: TimeInterval = 0
 
     init(connection: NWConnection, queue: DispatchQueue) {
       self.connection = connection
@@ -444,6 +453,7 @@ final class VnvarRtspServer {
     }
 
     func sendText(_ value: String) {
+      guard !connectionTerminal else { return }
       guard let data = value.data(using: .isoLatin1) else { return }
       connection.send(content: data, completion: .contentProcessed { _ in })
     }
@@ -497,9 +507,25 @@ final class VnvarRtspServer {
           marker: payload.marker
         )
         videoSequence &+= 1
+        videoPacketCount &+= 1
+        videoOctetCount &+= UInt32(truncatingIfNeeded: payload.data.count)
         sendInterleaved(packet, channel: videoRtpChannel, admitted: true)
       }
+      sendVideoSenderReportIfDue(rtpTimestamp: timestamp)
       return false
+    }
+
+    private func sendVideoSenderReportIfDue(rtpTimestamp: UInt32) {
+      let now = ProcessInfo.processInfo.systemUptime
+      guard now - lastSenderReportUptime >= 5 else { return }
+      lastSenderReportUptime = now
+      let report = VnvarRtpPacketizer.senderReport(
+        ntpTimestamp: VnvarRtpPacketizer.currentNtpTimestamp(),
+        rtpTimestamp: rtpTimestamp,
+        packetCount: videoPacketCount,
+        octetCount: videoOctetCount
+      )
+      sendInterleaved(report, channel: videoRtpChannel &+ 1)
     }
 
     func sendAudio(pcm: Data, timestamp: UInt32) {
@@ -527,7 +553,8 @@ final class VnvarRtspServer {
       channel: UInt8,
       admitted: Bool = false
     ) -> Bool {
-      guard admitted || pendingSends < maximumPendingSends else { return false }
+      guard !connectionTerminal,
+            admitted || pendingSends < maximumPendingSends else { return false }
       var interleaved = Data(capacity: packet.count + 4)
       interleaved.append(0x24)
       interleaved.append(channel)
@@ -548,7 +575,7 @@ final class VnvarRtspServer {
             self.pendingSends = max(0, self.pendingSends - 1)
             self.sendProgressUptime = ProcessInfo.processInfo.systemUptime
             if error != nil {
-              self.connection.cancel()
+              self.cancelIfNeeded()
             } else if self.pendingSends == 0 {
               self.stallCheckGeneration &+= 1
             }
@@ -575,7 +602,7 @@ final class VnvarRtspServer {
           String(sessionId),
           elapsed
         )
-        connection.cancel()
+        cancelIfNeeded()
         return
       }
       queue.asyncAfter(
@@ -583,6 +610,18 @@ final class VnvarRtspServer {
       ) { [weak self] in
         self?.checkForSendStall(generation: generation)
       }
+    }
+
+    func markConnectionTerminal() {
+      connectionTerminal = true
+      stallCheckGeneration &+= 1
+    }
+
+    func cancelIfNeeded() {
+      guard !connectionTerminal else { return }
+      connectionTerminal = true
+      stallCheckGeneration &+= 1
+      connection.cancel()
     }
   }
 }

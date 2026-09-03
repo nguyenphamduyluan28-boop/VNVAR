@@ -68,6 +68,35 @@ enum VnvarRtpPacketizer {
     return packet
   }
 
+  static func senderReport(
+    ssrc: UInt32 = 0x564E5652,
+    ntpTimestamp: UInt64,
+    rtpTimestamp: UInt32,
+    packetCount: UInt32,
+    octetCount: UInt32
+  ) -> Data {
+    var packet = Data(capacity: 28)
+    packet.append(0x80)
+    packet.append(200)
+    appendUInt16(6, to: &packet)
+    appendUInt32(ssrc, to: &packet)
+    appendUInt32(UInt32(ntpTimestamp >> 32), to: &packet)
+    appendUInt32(UInt32(truncatingIfNeeded: ntpTimestamp), to: &packet)
+    appendUInt32(rtpTimestamp, to: &packet)
+    appendUInt32(packetCount, to: &packet)
+    appendUInt32(octetCount, to: &packet)
+    return packet
+  }
+
+  static func currentNtpTimestamp(date: Date = Date()) -> UInt64 {
+    let secondsSince1900 = date.timeIntervalSince1970 + 2_208_988_800
+    let whole = UInt64(max(0, floor(secondsSince1900)))
+    let fraction = UInt64(
+      max(0, secondsSince1900 - floor(secondsSince1900)) * 4_294_967_296
+    )
+    return (whole << 32) | (fraction & 0xFFFF_FFFF)
+  }
+
   private static func appendUInt16(_ value: UInt16, to data: inout Data) {
     data.append(UInt8((value >> 8) & 0xFF))
     data.append(UInt8(value & 0xFF))

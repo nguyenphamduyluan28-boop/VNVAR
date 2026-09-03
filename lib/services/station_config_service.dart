@@ -14,6 +14,7 @@ class StationConfigService {
   static const String _cameraPositionKey = 'cameraPosition';
   static const String _courtCountKey = 'courtCount';
   static const String _resolutionProfileKey = 'camera_resolution_profile';
+  static const String _adaptiveFpsPrefix = 'ios_adaptive_fps';
 
   // ConfigService cũ đã lưu Camera ID bằng key này.
   static const String _legacyCameraKey = 'camera_id';
@@ -104,6 +105,42 @@ class StationConfigService {
     return CameraResolutionProfile.fromId(
       prefs.getString(_resolutionProfileKey),
     );
+  }
+
+  Future<void> saveAdaptiveIosFps({
+    required String deviceId,
+    required String facingMode,
+    required CameraResolutionPreset preset,
+    required int fps,
+  }) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setInt(
+      _adaptiveFpsKey(deviceId, facingMode, preset),
+      fps.clamp(1, 60),
+    );
+  }
+
+  Future<int?> loadAdaptiveIosFps({
+    required String deviceId,
+    required String facingMode,
+    required CameraResolutionPreset preset,
+  }) async {
+    final prefs = await SharedPreferences.getInstance();
+    final fps = prefs.getInt(_adaptiveFpsKey(deviceId, facingMode, preset));
+    return fps != null && fps > 0 && fps <= 60 ? fps : null;
+  }
+
+  String _adaptiveFpsKey(
+    String deviceId,
+    String facingMode,
+    CameraResolutionPreset preset,
+  ) {
+    final safeDevice = deviceId.trim().toLowerCase().replaceAll(
+      RegExp(r'[^a-z0-9_-]'),
+      '_',
+    );
+    final safeFacing = facingMode.trim().toLowerCase();
+    return '${_adaptiveFpsPrefix}_${safeDevice}_${safeFacing}_${preset.name}';
   }
 
   Future<void> clearIdentity() async {

@@ -228,6 +228,10 @@ class CameraStationRuntime {
           orElse: () => _supportedResolutionProfiles.first,
         ),
       );
+      _resolutionProfile = await _applySavedIosAdaptiveFps(
+        _resolutionProfile,
+        facingMode: 'environment',
+      );
       final preflightThermal = await _readThermalSnapshot();
       _temperatureC = preflightThermal.temperatureC;
       final criticalThermal = preflightThermal.critical;
@@ -560,9 +564,13 @@ class CameraStationRuntime {
 
     final previousProfile = _resolutionProfile;
     final previousProfiles = _supportedResolutionProfiles;
-    final selectedProfile = targetProfiles.firstWhere(
+    var selectedProfile = targetProfiles.firstWhere(
       (profile) => profile.preset == previousProfile.preset,
       orElse: () => targetProfiles.last,
+    );
+    selectedProfile = await _applySavedIosAdaptiveFps(
+      selectedProfile,
+      facingMode: targetFacing,
     );
 
     _profileSwitching = true;
@@ -779,19 +787,46 @@ class CameraStationRuntime {
       'adapting to $nextFps FPS',
       name: 'CameraStationRuntime',
     );
-    unawaited(
-      setResolutionProfile(_resolutionProfile.withFps(nextFps)).catchError((
-        Object error,
-        StackTrace stackTrace,
-      ) {
+    final adjusted = _resolutionProfile.withFps(nextFps);
+    unawaited(() async {
+      try {
+        await setResolutionProfile(adjusted);
+        final deviceId = _deviceId;
+        if (deviceId != null) {
+          await StationConfigService().saveAdaptiveIosFps(
+            deviceId: deviceId,
+            facingMode: _webRtcService?.currentFacingMode ?? 'environment',
+            preset: adjusted.preset,
+            fps: adjusted.fps,
+          );
+        }
+      } catch (error, stackTrace) {
         developer.log(
           '[CAMERA] Unable to apply adaptive iOS FPS',
           error: error,
           stackTrace: stackTrace,
           name: 'CameraStationRuntime',
         );
-      }),
+      }
+    }());
+  }
+
+  Future<CameraResolutionProfile> _applySavedIosAdaptiveFps(
+    CameraResolutionProfile profile, {
+    required String facingMode,
+  }) async {
+    final deviceId = _deviceId;
+    if (!Platform.isIOS ||
+        deviceId == null ||
+        profile.preset != CameraResolutionPreset.ultraHd4k) {
+      return profile;
+    }
+    final savedFps = await StationConfigService().loadAdaptiveIosFps(
+      deviceId: deviceId,
+      facingMode: facingMode,
+      preset: profile.preset,
     );
+    return savedFps == null ? profile : profile.withFps(savedFps);
   }
 
   void _startHealthMonitor() {

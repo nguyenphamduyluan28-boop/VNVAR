@@ -136,6 +136,22 @@ class RunnerTests: XCTestCase {
     XCTAssertEqual(packet[1], 97)
   }
 
+  func testRtcpSenderReportContainsClockAndCounters() {
+    let report = VnvarRtpPacketizer.senderReport(
+      ntpTimestamp: 0x0102030405060708,
+      rtpTimestamp: 0x11223344,
+      packetCount: 9,
+      octetCount: 1_200
+    )
+
+    XCTAssertEqual(report.count, 28)
+    XCTAssertEqual(Data(report[0..<4]), Data([0x80, 200, 0, 6]))
+    XCTAssertEqual(Data(report[8..<16]), Data([1, 2, 3, 4, 5, 6, 7, 8]))
+    XCTAssertEqual(Data(report[16..<20]), Data([0x11, 0x22, 0x33, 0x44]))
+    XCTAssertEqual(Data(report[20..<24]), Data([0, 0, 0, 9]))
+    XCTAssertEqual(Data(report[24..<28]), Data([0, 0, 4, 0xB0]))
+  }
+
   func testRecoveryGateRejectsPFramesUntilFirstKeyFrame() {
     var gate = VnvarVideoRecoveryGate()
 

@@ -49,4 +49,45 @@ void main() {
 
     expect(restored?.preset, CameraResolutionPreset.qhd2k);
   });
+
+  test('persists adaptive iOS FPS per device and camera facing', () async {
+    final config = StationConfigService();
+    await config.saveAdaptiveIosFps(
+      deviceId: 'PHONE-001',
+      facingMode: 'environment',
+      preset: CameraResolutionPreset.ultraHd4k,
+      fps: 24,
+    );
+    await config.saveAdaptiveIosFps(
+      deviceId: 'PHONE-001',
+      facingMode: 'user',
+      preset: CameraResolutionPreset.ultraHd4k,
+      fps: 15,
+    );
+
+    expect(
+      await config.loadAdaptiveIosFps(
+        deviceId: 'PHONE-001',
+        facingMode: 'environment',
+        preset: CameraResolutionPreset.ultraHd4k,
+      ),
+      24,
+    );
+    expect(
+      await config.loadAdaptiveIosFps(
+        deviceId: 'PHONE-001',
+        facingMode: 'user',
+        preset: CameraResolutionPreset.ultraHd4k,
+      ),
+      15,
+    );
+    expect(
+      await config.loadAdaptiveIosFps(
+        deviceId: 'PHONE-002',
+        facingMode: 'environment',
+        preset: CameraResolutionPreset.ultraHd4k,
+      ),
+      isNull,
+    );
+  });
 }
