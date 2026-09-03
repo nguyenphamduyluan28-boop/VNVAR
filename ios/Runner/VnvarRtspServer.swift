@@ -157,7 +157,10 @@ final class VnvarRtspServer {
       case .ready:
         self.receive(session)
       case .failed, .cancelled:
-        self.remove(session)
+        // Network.framework already owns teardown in these terminal states.
+        // Cancelling again causes redundant endpoint inspection on a socket
+        // that never reached .ready (the copy_connected_* console warnings).
+        self.detach(session)
       default:
         break
       }
@@ -175,13 +178,15 @@ final class VnvarRtspServer {
         if let data = data, !data.isEmpty {
           session.input.append(data)
           guard session.input.count <= ClientSession.maximumInputBytes else {
-            self.remove(session)
+            self.close(session)
             return
           }
           self.processInput(session)
         }
-        if isComplete || error != nil {
-          self.remove(session)
+        if error != nil {
+          self.detach(session)
+        } else if isComplete {
+          self.close(session)
         } else {
           self.receive(session)
         }
@@ -211,14 +216,14 @@ final class VnvarRtspServer {
       let headerEnd = headerRange.upperBound
       let headerData = session.input.subdata(in: session.input.startIndex..<headerEnd)
       guard let text = String(data: headerData, encoding: .isoLatin1) else {
-        session.connection.cancel()
+        close(session)
         return
       }
       let contentLength = headerValue("content-length", in: text)
         .flatMap(Int.init) ?? 0
       guard contentLength >= 0,
             contentLength <= ClientSession.maximumBodyBytes else {
-        session.connection.cancel()
+        close(session)
         return
       }
       guard contentLength <= session.input.distance(
@@ -286,7 +291,7 @@ final class VnvarRtspServer {
     case "TEARDOWN":
       session.playing = false
       session.respond(cseq: cseq, headers: "Session: \(session.sessionId)\r\n")
-      session.connection.cancel()
+      close(session)
     default:
       session.sendText("RTSP/1.0 405 Method Not Allowed\r\nCSeq: \(cseq)\r\n\r\n")
     }
@@ -383,8 +388,13 @@ final class VnvarRtspServer {
     return nil
   }
 
-  private func remove(_ session: ClientSession) {
+  private func detach(_ session: ClientSession) {
     guard sessions.removeValue(forKey: session.id) != nil else { return }
+    session.connection.stateUpdateHandler = nil
+  }
+
+  private func close(_ session: ClientSession) {
+    detach(session)
     session.connection.cancel()
   }
 

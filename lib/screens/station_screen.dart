@@ -559,6 +559,9 @@ class _StationScreenState extends State<StationScreen>
                 ..._runtime.supportedResolutionProfiles.map((profile) {
                   final active =
                       profile.preset == _runtime.resolutionProfile.preset;
+                  final displayProfile = active
+                      ? _runtime.resolutionProfile
+                      : profile;
                   return ListTile(
                     contentPadding: const EdgeInsets.symmetric(horizontal: 4),
                     leading: Icon(
@@ -568,16 +571,16 @@ class _StationScreenState extends State<StationScreen>
                       color: active ? Colors.greenAccent : Colors.white38,
                     ),
                     title: Text(
-                      profile.title,
+                      displayProfile.title,
                       style: const TextStyle(
                         color: Colors.white,
                         fontWeight: FontWeight.w800,
                       ),
                     ),
                     subtitle: Text(
-                      '${profile.width} × ${profile.height}  •  '
-                      '${profile.fps} FPS  •  '
-                      '${(profile.bitrate / 1000000).toStringAsFixed(1)} Mbps',
+                      '${displayProfile.width} × ${displayProfile.height}  •  '
+                      '${displayProfile.fps} FPS  •  '
+                      '${(displayProfile.bitrate / 1000000).toStringAsFixed(1)} Mbps',
                       style: const TextStyle(color: Colors.white60),
                     ),
                     onTap: active
@@ -608,9 +611,11 @@ class _StationScreenState extends State<StationScreen>
       ScaffoldMessenger.of(context)
         ..hideCurrentSnackBar()
         ..showSnackBar(
-          const SnackBar(
+          SnackBar(
             content: Text(
-              'Thiết bị đang nóng. Chất lượng tạm khóa ở 720p/15 FPS và sẽ tự khôi phục khi nhiệt độ ổn định.',
+              'Thiết bị đang nóng. Chất lượng tạm khóa ở '
+              '${_runtime.resolutionProfile.shortLabel}/'
+              '${_runtime.resolutionProfile.fps} FPS và sẽ tự khôi phục khi nhiệt độ ổn định.',
             ),
           ),
         );
@@ -958,7 +963,7 @@ class _StationScreenState extends State<StationScreen>
                           ),
                           child: Text(
                             _runtime.thermalWarning
-                                ? 'Thiết bị đang nóng${_runtime.temperatureC == null ? '' : ' (${_runtime.temperatureC!.toStringAsFixed(1)}°C)'}. Đã giảm FPS để bảo vệ camera.'
+                                ? 'Thiết bị đang nóng${_runtime.temperatureC == null ? '' : ' (${_runtime.temperatureC!.toStringAsFixed(1)}°C)'}. Đã giảm xuống ${_runtime.resolutionProfile.shortLabel}/${_runtime.resolutionProfile.fps} FPS để bảo vệ camera.'
                                 : 'Dung lượng lưu trữ thấp. Hệ thống sẽ dọn video cũ theo chính sách lưu trữ.',
                             maxLines: compact ? 2 : 1,
                             overflow: TextOverflow.ellipsis,
