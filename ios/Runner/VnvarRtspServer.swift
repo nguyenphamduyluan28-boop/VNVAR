@@ -29,6 +29,7 @@ final class VnvarRtspServer {
   var onReady: (() -> Void)?
 
   private let queue = DispatchQueue(label: "vnvar.rtsp.server")
+  private let queueKey = DispatchSpecificKey<Void>()
   private let port: Int
   private var listener: NWListener?
   private var sessions: [UUID: ClientSession] = [:]
@@ -39,6 +40,7 @@ final class VnvarRtspServer {
 
   init(port: Int) {
     self.port = port
+    queue.setSpecific(key: queueKey, value: ())
   }
 
   func start() throws {
@@ -68,13 +70,20 @@ final class VnvarRtspServer {
       }
     }
     listener.newConnectionHandler = { [weak self] connection in
-      self?.queue.async { self?.accept(connection) }
+      // NWListener invokes this handler on its own queue. Keep acceptance on
+      // that queue; dispatching back onto the same serial queue creates a
+      // short window where a connection can be cancelled before it is started.
+      self?.accept(connection)
     }
     listener.start(queue: queue)
   }
 
   func stop() {
-    queue.sync { stopLocked() }
+    if DispatchQueue.getSpecific(key: queueKey) != nil {
+      stopLocked()
+    } else {
+      queue.sync { stopLocked() }
+    }
   }
 
   func updateFormat(sps: Data, pps: Data) {
@@ -142,11 +151,16 @@ final class VnvarRtspServer {
     sessions[session.id] = session
     connection.stateUpdateHandler = { [weak self, weak session] state in
       guard let self = self, let session = session else { return }
-      if case .failed = state { self.remove(session) }
-      if case .cancelled = state { self.remove(session) }
+      switch state {
+      case .ready:
+        self.receive(session)
+      case .failed, .cancelled:
+        self.remove(session)
+      default:
+        break
+      }
     }
     connection.start(queue: queue)
-    receive(session)
   }
 
   private func receive(_ session: ClientSession) {
@@ -185,7 +199,7 @@ final class VnvarRtspServer {
       let delimiter = Data([13, 10, 13, 10])
       guard let headerRange = session.input.range(of: delimiter) else { return }
       let headerEnd = headerRange.upperBound
-      let headerData = session.input.subdata(in: 0..<headerEnd)
+      let headerData = session.input.subdata(in: session.input.startIndex..<headerEnd)
       guard let text = String(data: headerData, encoding: .isoLatin1) else {
         session.connection.cancel()
         return
@@ -340,7 +354,7 @@ final class VnvarRtspServer {
   }
 
   private func remove(_ session: ClientSession) {
-    sessions.removeValue(forKey: session.id)
+    guard sessions.removeValue(forKey: session.id) != nil else { return }
     session.connection.cancel()
   }
 

@@ -174,7 +174,12 @@ import UIKit
     do {
       try publisher.start()
     } catch {
-      publisher.stop()
+      // Invalidate every asynchronous publisher callback before returning the
+      // synchronous startup failure. This guarantees FlutterResult is invoked
+      // exactly once even when Network.framework reports a listener failure
+      // at the same time as start() throws.
+      startResultSent = true
+      stopRtsp()
       result(
         FlutterError(
           code: "RTSP_START_FAILED",
