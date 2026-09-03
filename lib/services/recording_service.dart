@@ -219,8 +219,6 @@ class RecordingService {
   MediaRecorder? _recorder;
 
   MediaStreamTrack? _videoTrack;
-  String? _audioTrackId;
-
   bool _recordAudio = false;
 
   Timer? _segmentTimer;
@@ -555,8 +553,14 @@ class RecordingService {
     );
     if (await target.exists()) await target.delete();
 
-    final session = await FFmpegKit.executeWithArguments([
+    var session = await FFmpegKit.executeWithArguments([
       '-y',
+      '-fflags',
+      '+genpts+discardcorrupt',
+      '-analyzeduration',
+      '10000000',
+      '-probesize',
+      '10000000',
       '-i',
       source.path,
       '-map',
@@ -567,11 +571,52 @@ class RecordingService {
       'copy',
       '-movflags',
       '+faststart',
+      '-avoid_negative_ts',
+      'make_zero',
       '-f',
       'mp4',
       target.path,
     ]);
-    final code = await session.getReturnCode();
+    var code = await session.getReturnCode();
+    if (!ReturnCode.isSuccess(code) ||
+        !await target.exists() ||
+        await target.length() <= 0 ||
+        !await _isPlayableVideo(target)) {
+      if (await target.exists()) await target.delete();
+      // Rebuild timestamps for short iOS segments that AVPlayer cannot open
+      // safely after a direct MPEG-TS stream copy.
+      session = await FFmpegKit.executeWithArguments([
+        '-y',
+        '-fflags',
+        '+genpts+discardcorrupt',
+        '-analyzeduration',
+        '10000000',
+        '-probesize',
+        '10000000',
+        '-i',
+        source.path,
+        '-map',
+        '0:v:0',
+        '-map',
+        '0:a:0?',
+        '-c:v',
+        'h264_videotoolbox',
+        '-b:v',
+        '8M',
+        '-c:a',
+        'aac',
+        '-b:a',
+        '128k',
+        '-movflags',
+        '+faststart',
+        '-avoid_negative_ts',
+        'make_zero',
+        '-f',
+        'mp4',
+        target.path,
+      ]);
+      code = await session.getReturnCode();
+    }
     if (!ReturnCode.isSuccess(code) ||
         !await target.exists() ||
         await target.length() <= 0 ||
@@ -580,7 +625,21 @@ class RecordingService {
       try {
         if (await target.exists()) await target.delete();
       } catch (_) {}
-      throw StateError('Không thể chuẩn bị video để phát: ${output ?? code}');
+      final conciseOutput = (output ?? code.toString())
+          .split('\n')
+          .where(
+            (line) =>
+                line.contains('Error') ||
+                line.contains('Invalid') ||
+                line.contains('failed') ||
+                line.contains('not found'),
+          )
+          .take(6)
+          .join('\n');
+      throw StateError(
+        'Không thể chuẩn bị video để phát: '
+        '${conciseOutput.isEmpty ? code : conciseOutput}',
+      );
     }
     return target;
   }
@@ -948,7 +1007,6 @@ class RecordingService {
 
   Future<void> start({
     required MediaStreamTrack videoTrack,
-    String? audioTrackId,
     bool audioAvailable = true,
   }) async {
     final stopping = _stopOperation;
@@ -965,13 +1023,10 @@ class RecordingService {
     }
 
     _videoTrack = videoTrack;
-    _audioTrackId = audioTrackId;
     // Both mobile platforms record microphone PCM beside the WebRTC video and
-    // mux it while finalizing. On iOS this bypasses flutter_webrtc 1.6.0's
-    // receiver-only audio lookup while reusing the already captured local
-    // WebRTC audio track (no second AVAudioSession input).
-    _recordAudio = Platform.isAndroid ||
-        (Platform.isIOS && audioAvailable && audioTrackId != null);
+    // mux it while finalizing. iOS uses AVAudioRecorder because a local WebRTC
+    // track does not expose microphone PCM through RTCAudioRenderer.
+    _recordAudio = Platform.isAndroid || (Platform.isIOS && audioAvailable);
 
     _recording = true;
 
@@ -1000,7 +1055,6 @@ class RecordingService {
       _recording = false;
 
       _videoTrack = null;
-      _audioTrackId = null;
       _recordAudio = false;
 
       _segmentTimer?.cancel();
@@ -1117,7 +1171,6 @@ class RecordingService {
       try {
         await _platformChannel.invokeMethod<void>('startNativeAudioSegment', {
           'path': audioPath,
-          if (Platform.isIOS) 'audioTrackId': _audioTrackId,
         });
         _currentAudioPath = audioPath;
         _currentSegmentHasAudio = true;
@@ -2652,7 +2705,6 @@ class RecordingService {
     } finally {
       _recording = false;
       _videoTrack = null;
-      _audioTrackId = null;
       _recordAudio = false;
       _stopping = false;
     }
@@ -2679,7 +2731,6 @@ class RecordingService {
     }
 
     _videoTrack = null;
-    _audioTrackId = null;
     _recordAudio = false;
 
     await cleanupExportDownloads();

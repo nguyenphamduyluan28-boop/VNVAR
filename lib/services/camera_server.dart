@@ -567,7 +567,6 @@ class CameraServer {
 
     await recordingService.start(
       videoTrack: videoTrack,
-      audioTrackId: webRtcService.localAudioTrack?.id,
       audioAvailable: webRtcService.microphoneAvailable,
     );
 

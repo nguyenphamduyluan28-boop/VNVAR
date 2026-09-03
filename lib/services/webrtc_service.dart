@@ -84,6 +84,7 @@ class WebRtcService {
   bool _rendererInitialized = false;
   bool _cameraInitialized = false;
   bool _microphoneEnabled = true;
+  bool _iosMicrophonePermissionGranted = false;
   Timer? _muteFailureTimer;
   Timer? _audioFailureTimer;
   Timer? _firstFrameFailureTimer;
@@ -111,7 +112,10 @@ class WebRtcService {
 
   bool get microphoneEnabled => localAudioTrack?.enabled ?? _microphoneEnabled;
 
-  bool get microphoneAvailable => Platform.isAndroid || localAudioTrack != null;
+  bool get microphoneAvailable =>
+      Platform.isAndroid ||
+      (Platform.isIOS && _iosMicrophonePermissionGranted) ||
+      localAudioTrack != null;
 
   String? get rtspError => _rtspError;
 
@@ -197,7 +201,9 @@ class WebRtcService {
       }
       if (Platform.isIOS) {
         developer.log(
-          '[MICROPHONE] Permission denied; continuing video-only on iOS',
+          microphoneAvailable
+              ? '[MICROPHONE] Enabled for native iOS recorder'
+              : '[MICROPHONE] Permission denied; continuing video-only on iOS',
           name: 'WebRtcService',
         );
         return;
@@ -517,13 +523,17 @@ class WebRtcService {
             'requestMicrophonePermission',
           ) ??
           false;
+      _iosMicrophonePermissionGranted = granted;
       if (!granted) {
         developer.log(
           '[MICROPHONE] iOS permission denied; opening camera video-only',
           name: 'WebRtcService',
         );
       }
-      return granted;
+      // AVAudioRecorder owns microphone capture on iOS. A local WebRTC audio
+      // track does not deliver captured PCM to RTCAudioRenderer, and keeping
+      // WebRTC's voice-processing audio unit active starves the native writer.
+      return false;
     } on PlatformException catch (error, stackTrace) {
       developer.log(
         '[MICROPHONE] Unable to read iOS permission; using video-only',
@@ -531,6 +541,7 @@ class WebRtcService {
         stackTrace: stackTrace,
         name: 'WebRtcService',
       );
+      _iosMicrophonePermissionGranted = false;
       return false;
     }
   }

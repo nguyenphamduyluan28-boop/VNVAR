@@ -193,16 +193,12 @@ import UIKit
       result(FlutterError(code: "AUDIO_PATH_REQUIRED", message: "Audio path is required.", details: nil))
       return
     }
-    guard let trackId = arguments["audioTrackId"] as? String, !trackId.isEmpty else {
-      result(FlutterError(code: "AUDIO_TRACK_REQUIRED", message: "Local WebRTC audio track is required.", details: nil))
-      return
-    }
     guard AVAudioSession.sharedInstance().recordPermission == .granted else {
       result(FlutterError(code: "MICROPHONE_PERMISSION_DENIED", message: "Microphone permission is not granted.", details: nil))
       return
     }
     do {
-      result(try audioSegmentRecorder.start(path: path, trackId: trackId))
+      result(try audioSegmentRecorder.start(path: path))
     } catch {
       result(FlutterError(code: "AUDIO_START_FAILED", message: error.localizedDescription, details: nil))
     }
@@ -308,10 +304,12 @@ import UIKit
         let dimensions = CMVideoFormatDescriptionGetDimensions(format.formatDescription)
         guard dimensions.width == candidate.width,
               dimensions.height == candidate.height else { continue }
-        let formatFps = format.videoSupportedFrameRateRanges
-          .map { Int($0.maxFrameRate.rounded(.down)) }
-          .max() ?? 0
-        supportedFps = max(supportedFps, min(formatFps, 30))
+        let sustainedFps = candidate.id == "ultraHd4k" ? 24 : 30
+        let formatFps = format.videoSupportedFrameRateRanges.compactMap { range -> Int? in
+          let value = min(Int(range.maxFrameRate.rounded(.down)), sustainedFps)
+          return Double(value) >= range.minFrameRate ? value : nil
+        }.max() ?? 0
+        supportedFps = max(supportedFps, formatFps)
       }
       if supportedFps > 0 {
         profiles.append([

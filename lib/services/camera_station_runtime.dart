@@ -84,7 +84,8 @@ class CameraStationRuntime {
     // During recording expose the actual segment state so a failed native
     // microphone start is not presented as an enabled microphone.
     final recording = _recordingService;
-    if (Platform.isAndroid && recording?.recording == true) {
+    if ((Platform.isAndroid || Platform.isIOS) &&
+        recording?.recording == true) {
       return recording!.currentSegmentHasAudio;
     }
     return _webRtcService?.microphoneEnabled ?? false;

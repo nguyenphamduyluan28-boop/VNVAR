@@ -40,8 +40,11 @@ class CameraResolutionProfile {
     preset: CameraResolutionPreset.ultraHd4k,
     width: 3840,
     height: 2160,
-    fps: 30,
-    bitrate: 12000000,
+    // Sustained 4K/30 makes iOS encode the recorder, preview and RTSP path at
+    // the same time. A stable 24 fps produces smoother saved footage than a
+    // nominal 30 fps stream with repeated frame drops.
+    fps: 24,
+    bitrate: 10000000,
   );
 
   static const values = [hd720, fullHd1080, qhd2k, ultraHd4k];
@@ -67,7 +70,7 @@ class CameraResolutionProfile {
     CameraResolutionPreset.hd720 => 3000000,
     CameraResolutionPreset.fullHd1080 => 5000000,
     CameraResolutionPreset.qhd2k => 7000000,
-    CameraResolutionPreset.ultraHd4k => 10000000,
+    CameraResolutionPreset.ultraHd4k => 8000000,
   };
 
   CameraResolutionProfile withFps(int supportedFps) {
