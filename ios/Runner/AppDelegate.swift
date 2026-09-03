@@ -83,7 +83,7 @@ import UIKit
     }
   }
 
-  private func startRtsp(_ call: FlutterMethodCall, _ result: FlutterResult) {
+  private func startRtsp(_ call: FlutterMethodCall, _ result: @escaping FlutterResult) {
     guard let arguments = call.arguments as? [String: Any],
           let trackId = arguments["trackId"] as? String,
           !trackId.isEmpty else {
