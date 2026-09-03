@@ -48,7 +48,11 @@ final class VnvarRtspServer {
       throw ServerError.invalidPort
     }
     let parameters = NWParameters.tcp
-    parameters.allowLocalEndpointReuse = true
+    // Do not enable SO_REUSEPORT-style binding here. During a camera/profile
+    // restart iOS may keep the previous nexus flow alive briefly; endpoint
+    // reuse then makes the new listener fail with errno 17 (File exists) and
+    // every viewer sees Connection refused. A single exclusive listener is
+    // safer and the Dart retry path handles the short handoff window.
     let listener = try NWListener(using: parameters, on: endpointPort)
     self.listener = listener
     listener.stateUpdateHandler = { [weak self] state in

@@ -163,6 +163,7 @@ import UIKit
       startResultSent = true
       self.rtspPublisher = publisher
       result([
+        "running": true,
         "started": true,
         "port": port,
         "path": "/camera",

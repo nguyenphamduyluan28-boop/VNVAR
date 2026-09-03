@@ -170,7 +170,13 @@ class MainActivity : FlutterActivity() {
                                     }
                                 },
                             ).also { it.start() }
-                            result.success(mapOf("running" to true, "port" to port, "path" to "/camera"))
+                            result.success(mapOf(
+                                "running" to true,
+                                "started" to true,
+                                "port" to port,
+                                "path" to "/camera",
+                                "audio" to false,
+                            ))
                         } catch (error: Exception) {
                             rtspPublisher = null
                             result.error("RTSP_START_FAILED", error.message, null)
