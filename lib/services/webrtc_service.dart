@@ -52,6 +52,7 @@ class WebRtcService {
 
   void Function(String reason)? onCameraFailure;
   void Function()? onRtspStateChanged;
+  void Function(double actualFps, int requestedFps)? onIosCapturePerformance;
 
   WebRtcService() {
     if (Platform.isAndroid || Platform.isIOS) {
@@ -152,6 +153,15 @@ class WebRtcService {
         );
         onRtspStateChanged?.call();
         _scheduleRtspRetry();
+      case 'onIosCapturePerformance':
+        final arguments = call.arguments;
+        if (arguments is Map) {
+          final actualFps = (arguments['actualFps'] as num?)?.toDouble();
+          final requestedFps = (arguments['requestedFps'] as num?)?.toInt();
+          if (actualFps != null && requestedFps != null) {
+            onIosCapturePerformance?.call(actualFps, requestedFps);
+          }
+        }
     }
   }
 
@@ -246,7 +256,13 @@ class WebRtcService {
         final profile = CameraResolutionProfile.fromId(item['id'] as String?);
         final maxFps = item['maxFps'];
         if (profile != null && maxFps is num) {
-          supported.add(profile.withFps(maxFps.toInt()));
+          final detectedFps = maxFps.toInt();
+          final platformFps =
+              Platform.isAndroid &&
+                  profile.preset == CameraResolutionPreset.ultraHd4k
+              ? math.min(detectedFps, 20)
+              : detectedFps;
+          supported.add(profile.withFps(platformFps));
         }
       }
       if (supported.isNotEmpty) return supported;
@@ -673,16 +689,18 @@ class WebRtcService {
       _rtspError = null;
       _rtspServerStarted = true;
       _rtspRetryTimer?.cancel();
-      final result = await _platformChannel
-          .invokeMethod<Map<Object?, Object?>>('startRtsp', {
-            'trackId': track.id,
-            'audioTrackId': localAudioTrack?.id,
-            'port': 8554,
-            // RTSP/TCP cannot adapt to congestion like WebRTC. Use the
-            // profile's LAN-safe budget while WebRTC keeps its higher ceiling.
-            'bitrate': _resolutionProfile.rtspBitrate,
-            'fps': _resolutionProfile.fps,
-          });
+      final result = await _platformChannel.invokeMethod<Map<Object?, Object?>>(
+        'startRtsp',
+        {
+          'trackId': track.id,
+          'audioTrackId': localAudioTrack?.id,
+          'port': 8554,
+          // RTSP/TCP cannot adapt to congestion like WebRTC. Use the
+          // profile's LAN-safe budget while WebRTC keeps its higher ceiling.
+          'bitrate': _resolutionProfile.rtspBitrate,
+          'fps': _resolutionProfile.fps,
+        },
+      );
       _rtspAudio = result?['audio'] == true;
       developer.log(
         '[RTSP] Server opened; waiting for H.264 encoder readiness.',
@@ -1192,6 +1210,7 @@ class WebRtcService {
     await disposeCamera();
 
     onRtspStateChanged = null;
+    onIosCapturePerformance = null;
     if (Platform.isAndroid || Platform.isIOS) {
       _platformChannel.setMethodCallHandler(null);
     }

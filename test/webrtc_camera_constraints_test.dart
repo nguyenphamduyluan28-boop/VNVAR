@@ -18,7 +18,7 @@ void main() {
     expect(constraints['deviceId'], 'back-camera');
   });
 
-  test('iOS 4K keeps the sustained 20 FPS device budget', () {
+  test('iOS 4K requests 30 FPS when the device reports support', () {
     final constraints = buildCameraVideoConstraints(
       isEmulator: false,
       isIos: true,
@@ -31,7 +31,7 @@ void main() {
       'facingMode': 'environment',
       'width': 3840,
       'height': 2160,
-      'frameRate': 20,
+      'frameRate': 30,
       'deviceId': 'wide-camera',
     });
   });

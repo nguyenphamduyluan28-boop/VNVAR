@@ -40,15 +40,18 @@ void main() {
   });
 
   group('iOS lens handoff policy', () {
-    test('keeps the active track when both lenses support the same profile', () {
-      expect(
-        shouldRecreateIosCameraForLensSwitch(
-          CameraResolutionProfile.fullHd1080,
-          CameraResolutionProfile.fullHd1080,
-        ),
-        isFalse,
-      );
-    });
+    test(
+      'keeps the active track when both lenses support the same profile',
+      () {
+        expect(
+          shouldRecreateIosCameraForLensSwitch(
+            CameraResolutionProfile.fullHd1080,
+            CameraResolutionProfile.fullHd1080,
+          ),
+          isFalse,
+        );
+      },
+    );
 
     test('recreates capture when the target lens requires another profile', () {
       expect(
@@ -58,6 +61,34 @@ void main() {
         ),
         isTrue,
       );
+    });
+  });
+
+  group('iOS high-resolution warm-up policy', () {
+    test('4K gets enough time to settle before recorder startup', () {
+      expect(
+        iosCaptureWarmupDuration(CameraResolutionProfile.ultraHd4k),
+        const Duration(milliseconds: 1500),
+      );
+    });
+
+    test('1080p starts immediately', () {
+      expect(
+        iosCaptureWarmupDuration(CameraResolutionProfile.fullHd1080),
+        Duration.zero,
+      );
+    });
+  });
+
+  group('iOS adaptive 4K FPS policy', () {
+    test('steps down without skipping stability levels', () {
+      expect(nextLowerIos4kFps(30), 24);
+      expect(nextLowerIos4kFps(24), 20);
+      expect(nextLowerIos4kFps(20), 15);
+    });
+
+    test('stops reducing at the safe floor', () {
+      expect(nextLowerIos4kFps(15), isNull);
     });
   });
 }

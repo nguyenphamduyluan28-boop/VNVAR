@@ -603,6 +603,22 @@ class _StationScreenState extends State<StationScreen>
     }
   }
 
+  void _handleResolutionPressed() {
+    if (_runtime.thermalWarning) {
+      ScaffoldMessenger.of(context)
+        ..hideCurrentSnackBar()
+        ..showSnackBar(
+          const SnackBar(
+            content: Text(
+              'Thiết bị đang nóng. Chất lượng tạm khóa ở 720p/15 FPS và sẽ tự khôi phục khi nhiệt độ ổn định.',
+            ),
+          ),
+        );
+      return;
+    }
+    _openResolutionPicker();
+  }
+
   // ============================================================
   // COURT LABEL
   // ============================================================
@@ -867,12 +883,9 @@ class _StationScreenState extends State<StationScreen>
                       recording: _recording,
                       compact: compact,
                       resolutionProfile: _runtime.resolutionProfile,
-                      resolutionSwitching:
-                          _runtime.profileSwitching || _runtime.thermalWarning,
+                      resolutionSwitching: _runtime.profileSwitching,
                       onVideoStorage: _openVideoStorage,
-                      onResolution: _runtime.thermalWarning
-                          ? null
-                          : _openResolutionPicker,
+                      onResolution: _handleResolutionPressed,
                       onSettings: _openSettings,
                     ),
                   ),
@@ -916,34 +929,6 @@ class _StationScreenState extends State<StationScreen>
                 ),
               ),
 
-              if (_runtime.thermalWarning || _runtime.storageWarning)
-                Positioned(
-                  top: 0,
-                  left: compact ? 8 : 14,
-                  right: compact ? 8 : 14,
-                  child: SafeArea(
-                    bottom: false,
-                    child: Container(
-                      margin: const EdgeInsets.only(top: 8),
-                      padding: const EdgeInsets.symmetric(
-                        horizontal: 12,
-                        vertical: 8,
-                      ),
-                      color: Colors.orange.withValues(alpha: 0.9),
-                      child: Text(
-                        _runtime.thermalWarning
-                            ? 'Thiết bị đang nóng${_runtime.temperatureC == null ? '' : ' (${_runtime.temperatureC!.toStringAsFixed(1)}°C)'}. Đã giảm FPS để bảo vệ camera.'
-                            : 'Dung lượng lưu trữ thấp. Hệ thống sẽ dọn video cũ theo chính sách lưu trữ.',
-                        textAlign: TextAlign.center,
-                        style: const TextStyle(
-                          color: Colors.black,
-                          fontWeight: FontWeight.w600,
-                        ),
-                      ),
-                    ),
-                  ),
-                ),
-
               // ==============================================
               // BOTTOM STATUS
               // ==============================================
@@ -954,10 +939,43 @@ class _StationScreenState extends State<StationScreen>
                 child: SafeArea(
                   top: false,
                   minimum: EdgeInsets.only(bottom: compact ? 10 : 14),
-                  child: _BottomStatusBar(
-                    compact: compact,
-                    cameraReady: _cameraReady,
-                    recording: _recording,
+                  child: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      if (_runtime.thermalWarning || _runtime.storageWarning)
+                        Container(
+                          width: double.infinity,
+                          margin: EdgeInsets.only(bottom: compact ? 6 : 8),
+                          padding: EdgeInsets.symmetric(
+                            horizontal: compact ? 10 : 12,
+                            vertical: compact ? 6 : 8,
+                          ),
+                          decoration: BoxDecoration(
+                            color: Colors.orange.withValues(alpha: 0.92),
+                            borderRadius: BorderRadius.circular(
+                              compact ? 10 : 12,
+                            ),
+                          ),
+                          child: Text(
+                            _runtime.thermalWarning
+                                ? 'Thiết bị đang nóng${_runtime.temperatureC == null ? '' : ' (${_runtime.temperatureC!.toStringAsFixed(1)}°C)'}. Đã giảm FPS để bảo vệ camera.'
+                                : 'Dung lượng lưu trữ thấp. Hệ thống sẽ dọn video cũ theo chính sách lưu trữ.',
+                            maxLines: compact ? 2 : 1,
+                            overflow: TextOverflow.ellipsis,
+                            textAlign: TextAlign.center,
+                            style: TextStyle(
+                              color: Colors.black,
+                              fontSize: compact ? 11 : 12,
+                              fontWeight: FontWeight.w700,
+                            ),
+                          ),
+                        ),
+                      _BottomStatusBar(
+                        compact: compact,
+                        cameraReady: _cameraReady,
+                        recording: _recording,
+                      ),
+                    ],
                   ),
                 ),
               ),

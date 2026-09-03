@@ -170,6 +170,16 @@ import UIKit
         "audio": publisher.audioAvailable,
       ])
     }
+    publisher.onCapturePerformance = { [weak self] actualFps, requestedFps in
+      guard let self = self, self.rtspGeneration == generation else { return }
+      self.stationChannel?.invokeMethod(
+        "onIosCapturePerformance",
+        arguments: [
+          "actualFps": actualFps,
+          "requestedFps": requestedFps,
+        ]
+      )
+    }
     rtspPublisher = publisher
     do {
       try publisher.start()
@@ -329,7 +339,7 @@ import UIKit
         let dimensions = CMVideoFormatDescriptionGetDimensions(format.formatDescription)
         guard dimensions.width == candidate.width,
               dimensions.height == candidate.height else { continue }
-        let sustainedFps = candidate.id == "ultraHd4k" ? 20 : 30
+        let sustainedFps = 30
         let formatFps = format.videoSupportedFrameRateRanges.compactMap { range -> Int? in
           let value = min(Int(range.maxFrameRate.rounded(.down)), sustainedFps)
           return Double(value) >= range.minFrameRate ? value : nil

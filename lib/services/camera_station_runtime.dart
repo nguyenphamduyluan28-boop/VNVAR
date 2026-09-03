@@ -17,6 +17,21 @@ bool shouldRecreateIosCameraForLensSwitch(
   CameraResolutionProfile selected,
 ) => selected != previous;
 
+Duration iosCaptureWarmupDuration(CameraResolutionProfile profile) {
+  return switch (profile.preset) {
+    CameraResolutionPreset.ultraHd4k => const Duration(milliseconds: 1500),
+    CameraResolutionPreset.qhd2k => const Duration(milliseconds: 500),
+    _ => Duration.zero,
+  };
+}
+
+int? nextLowerIos4kFps(int currentFps) {
+  if (currentFps > 24) return 24;
+  if (currentFps > 20) return 20;
+  if (currentFps > 15) return 15;
+  return null;
+}
+
 class CameraStationRuntime {
   CameraStationRuntime._();
 
@@ -48,6 +63,8 @@ class CameraStationRuntime {
   bool _profileSwitching = false;
   bool _iosLifecycleSuspended = false;
   bool _healthCheckRunning = false;
+  int _iosLowFpsReports = 0;
+  DateTime? _lastIosFpsAdjustmentAt;
   String? _lastRecordingPath;
   int? _lastRecordingBytes;
   DateTime? _lastRecordingProgressAt;
@@ -193,6 +210,7 @@ class CameraStationRuntime {
 
     webRtc.onCameraFailure = _scheduleRecovery;
     webRtc.onRtspStateChanged = _emitState;
+    webRtc.onIosCapturePerformance = _handleIosCapturePerformance;
     _webRtcService = webRtc;
     _recordingService = recording;
     _cameraId = cameraId;
@@ -249,6 +267,7 @@ class CameraStationRuntime {
       await server.start();
       if (!criticalThermal) {
         try {
+          await _waitForIosCaptureWarmup();
           await server.ensureRecording();
         } catch (error, stackTrace) {
           developer.log(
@@ -344,6 +363,7 @@ class CameraStationRuntime {
       if (webRtc != null) {
         webRtc.onCameraFailure = null;
         webRtc.onRtspStateChanged = null;
+        webRtc.onIosCapturePerformance = null;
       }
       await webRtc?.dispose();
       _recovering = false;
@@ -427,6 +447,7 @@ class CameraStationRuntime {
       // made in iOS Settings therefore takes effect on the first new segment.
       await webRtc.initializeCamera();
       await webRtc.ensureMicrophoneEnabled();
+      await _waitForIosCaptureWarmup();
       await server.ensureRecording();
       await WakelockPlus.enable();
       await _setIosStationActive(true);
@@ -492,6 +513,7 @@ class CameraStationRuntime {
 
     try {
       await webRtc.initializeCamera();
+      await _waitForIosCaptureWarmup();
       await server.ensureRecording();
       await WakelockPlus.enable();
       await _setIosStationActive(true);
@@ -568,6 +590,7 @@ class CameraStationRuntime {
           await webRtc.disposeCamera();
           webRtc.setResolutionProfile(selectedProfile);
           await webRtc.initializeCamera(facingMode: targetFacing);
+          await _waitForIosCaptureWarmup(profile: selectedProfile);
           await server.ensureRecording();
         }
         _supportedResolutionProfiles = targetProfiles;
@@ -612,6 +635,7 @@ class CameraStationRuntime {
         await webRtc.disposeConnection();
         await webRtc.disposeCamera();
         await webRtc.initializeCamera(facingMode: previousFacing);
+        await _waitForIosCaptureWarmup(profile: previousProfile);
         await server.ensureRecording();
       } catch (rollbackError, stackTrace) {
         developer.log(
@@ -668,6 +692,7 @@ class CameraStationRuntime {
     }
 
     final previous = _resolutionProfile;
+    _iosLowFpsReports = 0;
     _profileSwitching = true;
     _generation++;
     _emitState();
@@ -677,6 +702,7 @@ class CameraStationRuntime {
       await webRtc.disposeCamera();
       webRtc.setResolutionProfile(selected);
       await webRtc.initializeCamera();
+      await _waitForIosCaptureWarmup(profile: selected);
       await server.ensureRecording();
       _resolutionProfile = selected;
       await StationConfigService().saveResolutionProfile(selected);
@@ -690,6 +716,7 @@ class CameraStationRuntime {
       try {
         await webRtc.disposeCamera();
         await webRtc.initializeCamera();
+        await _waitForIosCaptureWarmup(profile: previous);
         await server.ensureRecording();
       } catch (rollbackError, stackTrace) {
         developer.log(
@@ -708,6 +735,63 @@ class CameraStationRuntime {
 
   void _emitState() {
     if (!_stateController.isClosed) _stateController.add(null);
+  }
+
+  Future<void> _waitForIosCaptureWarmup({CameraResolutionProfile? profile}) {
+    if (!Platform.isIOS) return Future<void>.value();
+    final delay = iosCaptureWarmupDuration(profile ?? _resolutionProfile);
+    if (delay == Duration.zero) return Future<void>.value();
+    return Future<void>.delayed(delay);
+  }
+
+  void _handleIosCapturePerformance(double actualFps, int requestedFps) {
+    if (!Platform.isIOS ||
+        _stopping ||
+        _recovering ||
+        _profileSwitching ||
+        _thermalThrottled ||
+        !_cameraEnabled ||
+        _resolutionProfile.preset != CameraResolutionPreset.ultraHd4k ||
+        requestedFps != _resolutionProfile.fps) {
+      return;
+    }
+    // Sustaining at least 90% avoids reacting to normal measurement jitter,
+    // while still catching the repeated frame loss visible in saved sports
+    // footage (for example 22 FPS delivered for a 30 FPS request).
+    if (actualFps >= requestedFps * 0.90) {
+      _iosLowFpsReports = 0;
+      return;
+    }
+    _iosLowFpsReports++;
+    if (_iosLowFpsReports < 2) return;
+    final now = DateTime.now();
+    final lastAdjustment = _lastIosFpsAdjustmentAt;
+    if (lastAdjustment != null &&
+        now.difference(lastAdjustment) < const Duration(seconds: 30)) {
+      return;
+    }
+    final nextFps = nextLowerIos4kFps(_resolutionProfile.fps);
+    if (nextFps == null) return;
+    _iosLowFpsReports = 0;
+    _lastIosFpsAdjustmentAt = now;
+    developer.log(
+      '[CAMERA] iOS 4K delivered ${actualFps.toStringAsFixed(1)}/$requestedFps FPS; '
+      'adapting to $nextFps FPS',
+      name: 'CameraStationRuntime',
+    );
+    unawaited(
+      setResolutionProfile(_resolutionProfile.withFps(nextFps)).catchError((
+        Object error,
+        StackTrace stackTrace,
+      ) {
+        developer.log(
+          '[CAMERA] Unable to apply adaptive iOS FPS',
+          error: error,
+          stackTrace: stackTrace,
+          name: 'CameraStationRuntime',
+        );
+      }),
+    );
   }
 
   void _startHealthMonitor() {
@@ -1155,6 +1239,7 @@ class CameraStationRuntime {
 
       try {
         await webRtc.initializeCamera();
+        await _waitForIosCaptureWarmup();
         await server.ensureRecording();
         developer.log(
           '[CAMERA] Recovery successful on attempt ${attempt + 1}',

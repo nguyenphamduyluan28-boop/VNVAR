@@ -40,10 +40,9 @@ class CameraResolutionProfile {
     preset: CameraResolutionPreset.ultraHd4k,
     width: 3840,
     height: 2160,
-    // Sustained 4K/24 still drops frames on iPhone when the recorder, preview
-    // and RTSP path are active together. 20 fps leaves enough headroom for a
-    // stable timeline instead of a nominal rate with repeated frame drops.
-    fps: 20,
+    // iOS reports the actual per-camera ceiling and the runtime steps down
+    // adaptively when a device cannot sustain this rate under recording load.
+    fps: 30,
     bitrate: 10000000,
   );
 

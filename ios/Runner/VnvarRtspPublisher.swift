@@ -5,6 +5,7 @@ final class VnvarRtspPublisher: NSObject, RTCVideoRenderer {
   var onEncoderConfigured: (() -> Void)?
   var onEncoderError: ((String) -> Void)?
   var onServerReady: (() -> Void)?
+  var onCapturePerformance: ((_ actualFps: Double, _ requestedFps: Int) -> Void)?
 
   private let track: RTCVideoTrack
   private let audioSink: VnvarWebRtcAudioSink?
@@ -17,6 +18,9 @@ final class VnvarRtspPublisher: NSObject, RTCVideoRenderer {
   private var framePending = false
   private var errorReported = false
   private var bitrateController: VnvarRtspBitrateController
+  private var performanceWindowStart = ProcessInfo.processInfo.systemUptime
+  private var performanceFrameCount = 0
+  private let requestedFps: Int
   var audioAvailable: Bool { audioSink != nil }
 
   init(
@@ -31,6 +35,7 @@ final class VnvarRtspPublisher: NSObject, RTCVideoRenderer {
     server = VnvarRtspServer(port: port)
     encoder = VnvarH264Encoder(bitrate: bitrate, fps: fps)
     bitrateController = VnvarRtspBitrateController(maximumBitrate: bitrate)
+    requestedFps = max(1, fps)
     super.init()
 
     encoder.onFormat = { [weak self] sps, pps in
@@ -114,6 +119,7 @@ final class VnvarRtspPublisher: NSObject, RTCVideoRenderer {
 
   func renderFrame(_ frame: RTCVideoFrame?) {
     guard let frame = frame else { return }
+    observeCaptureFrame()
     let state = stateQueue.sync { () -> (running: Bool, ready: Bool, accept: Bool) in
       guard running, !framePending else { return (running, formatReady, false) }
       framePending = true
@@ -140,6 +146,22 @@ final class VnvarRtspPublisher: NSObject, RTCVideoRenderer {
         timestampNs: frame.timeStampNs
       ) { [weak self] in
         self?.stateQueue.async { self?.framePending = false }
+      }
+    }
+  }
+
+  private func observeCaptureFrame() {
+    stateQueue.async { [weak self] in
+      guard let self = self, self.running else { return }
+      self.performanceFrameCount += 1
+      let now = ProcessInfo.processInfo.systemUptime
+      let elapsed = now - self.performanceWindowStart
+      guard elapsed >= 5 else { return }
+      let actualFps = Double(self.performanceFrameCount) / elapsed
+      self.performanceFrameCount = 0
+      self.performanceWindowStart = now
+      DispatchQueue.main.async {
+        self.onCapturePerformance?(actualFps, self.requestedFps)
       }
     }
   }
