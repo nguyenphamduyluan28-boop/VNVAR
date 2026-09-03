@@ -14,6 +14,24 @@ import 'package:shared_preferences/shared_preferences.dart';
 
 import 'video_storage_service.dart';
 
+/// Converts native/FFmpeg failures into a bounded string safe for a Flutter
+/// Text widget. Full command output remains available in debug logs.
+String userFacingError(Object error) {
+  var message = error.toString().trim();
+  message = message.replaceFirst(RegExp(r'^Bad state:\s*'), '');
+  final lines = message
+      .split('\n')
+      .map((line) => line.trim())
+      .where((line) => line.isNotEmpty)
+      .where((line) => !line.startsWith('ffmpeg version'))
+      .where((line) => !line.startsWith('built with '))
+      .where((line) => !line.startsWith('configuration:'))
+      .toList();
+  message = lines.isEmpty ? message : lines.first;
+  if (message.length > 240) message = '${message.substring(0, 237)}...';
+  return message.isEmpty ? 'Đã xảy ra lỗi không xác định.' : message;
+}
+
 String normalizeCameraKey(String cameraId) {
   final cameraNumber = RegExp(r'(\d+)$').firstMatch(cameraId.trim())?.group(1);
   final normalized = cameraNumber == null
@@ -584,7 +602,8 @@ class RecordingService {
         !await _isPlayableVideo(target)) {
       if (await target.exists()) await target.delete();
       // Rebuild timestamps for short iOS segments that AVPlayer cannot open
-      // safely after a direct MPEG-TS stream copy.
+      // safely after a direct MPEG-TS stream copy. The bundled iOS FFmpeg is
+      // built without VideoToolbox, so do not request h264_videotoolbox here.
       session = await FFmpegKit.executeWithArguments([
         '-y',
         '-fflags',
@@ -600,7 +619,7 @@ class RecordingService {
         '-map',
         '0:a:0?',
         '-c:v',
-        'h264_videotoolbox',
+        'mpeg4',
         '-b:v',
         '8M',
         '-c:a',

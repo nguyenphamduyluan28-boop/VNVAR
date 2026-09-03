@@ -16,7 +16,7 @@ void main() {
     expect(CameraResolutionProfile.hd720.rtspBitrate, 3000000);
     expect(CameraResolutionProfile.fullHd1080.rtspBitrate, 5000000);
     expect(CameraResolutionProfile.qhd2k.rtspBitrate, 7000000);
-    expect(CameraResolutionProfile.ultraHd4k.fps, 24);
+    expect(CameraResolutionProfile.ultraHd4k.fps, 20);
     expect(CameraResolutionProfile.ultraHd4k.bitrate, 10000000);
     expect(CameraResolutionProfile.ultraHd4k.rtspBitrate, 8000000);
     expect(CameraResolutionProfile.qhd2k.width, 2560);

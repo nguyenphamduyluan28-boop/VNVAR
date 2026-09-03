@@ -40,10 +40,10 @@ class CameraResolutionProfile {
     preset: CameraResolutionPreset.ultraHd4k,
     width: 3840,
     height: 2160,
-    // Sustained 4K/30 makes iOS encode the recorder, preview and RTSP path at
-    // the same time. A stable 24 fps produces smoother saved footage than a
-    // nominal 30 fps stream with repeated frame drops.
-    fps: 24,
+    // Sustained 4K/24 still drops frames on iPhone when the recorder, preview
+    // and RTSP path are active together. 20 fps leaves enough headroom for a
+    // stable timeline instead of a nominal rate with repeated frame drops.
+    fps: 20,
     bitrate: 10000000,
   );
 

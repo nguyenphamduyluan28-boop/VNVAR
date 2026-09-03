@@ -26,6 +26,7 @@ struct VnvarVideoRecoveryGate {
 final class VnvarRtspServer {
   var onPlayRequested: (() -> Void)?
   var onError: ((String) -> Void)?
+  var onReady: (() -> Void)?
 
   private let queue = DispatchQueue(label: "vnvar.rtsp.server")
   private let port: Int
@@ -52,9 +53,14 @@ final class VnvarRtspServer {
     self.listener = listener
     listener.stateUpdateHandler = { [weak self] state in
       guard let self = self else { return }
-      if case let .failed(error) = state {
+      switch state {
+      case .ready:
+        self.onReady?()
+      case let .failed(error):
         self.onError?("RTSP listener failed: \(error)")
         self.stopLocked()
+      default:
+        break
       }
     }
     listener.newConnectionHandler = { [weak self] connection in

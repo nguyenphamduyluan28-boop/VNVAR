@@ -9,6 +9,7 @@ import '../models/camera_resolution_profile.dart';
 import '../models/station_identity.dart';
 import '../services/camera_station_foreground_service.dart';
 import '../services/camera_station_runtime.dart';
+import '../services/recording_service.dart';
 import '../services/station_config_service.dart';
 import '../services/station_display_service.dart';
 import 'setup_screen.dart';
@@ -305,7 +306,7 @@ class _StationScreenState extends State<StationScreen>
 
       setState(() {
         _loading = false;
-        _error = error.toString();
+        _error = userFacingError(error);
       });
     }
   }
@@ -354,7 +355,7 @@ class _StationScreenState extends State<StationScreen>
 
       setState(() {
         _loading = false;
-        _error = error.toString();
+        _error = userFacingError(error);
       });
     }
   }
@@ -513,7 +514,7 @@ class _StationScreenState extends State<StationScreen>
 
       setState(() {
         _loading = false;
-        _error = error.toString();
+        _error = userFacingError(error);
       });
     }
   }

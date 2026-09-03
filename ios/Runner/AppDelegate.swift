@@ -130,6 +130,7 @@ import UIKit
       fps: fps
     )
     let generation = rtspGeneration
+    var startResultSent = false
     publisher.onEncoderConfigured = { [weak self] in
       guard let self = self, self.rtspGeneration == generation else { return }
       self.stationChannel?.invokeMethod(
@@ -139,20 +140,38 @@ import UIKit
     }
     publisher.onEncoderError = { [weak self] message in
       guard let self = self, self.rtspGeneration == generation else { return }
+      if !startResultSent {
+        startResultSent = true
+        result(
+          FlutterError(
+            code: "RTSP_START_FAILED",
+            message: message,
+            details: nil
+          )
+        )
+      }
       self.stationChannel?.invokeMethod(
         "onRtspEncoderError",
         arguments: ["error": message, "platform": "ios"]
       )
     }
-    do {
-      try publisher.start()
-      rtspPublisher = publisher
+    publisher.onServerReady = { [weak self] in
+      guard let self = self,
+            let publisher = self.rtspPublisher,
+            self.rtspGeneration == generation,
+            !startResultSent else { return }
+      startResultSent = true
+      self.rtspPublisher = publisher
       result([
         "started": true,
         "port": port,
         "path": "/camera",
         "audio": publisher.audioAvailable,
       ])
+    }
+    rtspPublisher = publisher
+    do {
+      try publisher.start()
     } catch {
       publisher.stop()
       result(
@@ -304,7 +323,7 @@ import UIKit
         let dimensions = CMVideoFormatDescriptionGetDimensions(format.formatDescription)
         guard dimensions.width == candidate.width,
               dimensions.height == candidate.height else { continue }
-        let sustainedFps = candidate.id == "ultraHd4k" ? 24 : 30
+        let sustainedFps = candidate.id == "ultraHd4k" ? 20 : 30
         let formatFps = format.videoSupportedFrameRateRanges.compactMap { range -> Int? in
           let value = min(Int(range.maxFrameRate.rounded(.down)), sustainedFps)
           return Double(value) >= range.minFrameRate ? value : nil

@@ -4,6 +4,7 @@ import Foundation
 final class VnvarRtspPublisher: NSObject, RTCVideoRenderer {
   var onEncoderConfigured: (() -> Void)?
   var onEncoderError: ((String) -> Void)?
+  var onServerReady: (() -> Void)?
 
   private let track: RTCVideoTrack
   private let audioSink: VnvarWebRtcAudioSink?
@@ -52,6 +53,9 @@ final class VnvarRtspPublisher: NSObject, RTCVideoRenderer {
     encoder.onError = { [weak self] message in self?.reportError(message) }
     server.onPlayRequested = { [weak self] in self?.encoder.requestKeyFrame() }
     server.onError = { [weak self] message in self?.reportError(message) }
+    server.onReady = { [weak self] in
+      DispatchQueue.main.async { self?.onServerReady?() }
+    }
     server.setAudioAvailable(audioSink != nil)
     audioSink?.onPcm = { [weak self] pcm, sampleRate, channels, bits in
       self?.handleAudio(

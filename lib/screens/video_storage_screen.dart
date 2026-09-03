@@ -1016,7 +1016,7 @@ class _VideoPlayerScreenState extends State<_VideoPlayerScreen> {
               child: Padding(
                 padding: const EdgeInsets.all(24),
                 child: Text(
-                  'Không thể phát video: ${snapshot.error}',
+                  'Không thể phát video: ${userFacingError(snapshot.error!)}',
                   textAlign: TextAlign.center,
                   style: const TextStyle(color: Colors.white),
                 ),
