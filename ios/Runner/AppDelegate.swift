@@ -7,6 +7,7 @@ import UIKit
 @objc class AppDelegate: FlutterAppDelegate, FlutterImplicitEngineDelegate {
   private var stationChannel: FlutterMethodChannel?
   private var rtspPublisher: VnvarRtspPublisher?
+  private let audioSegmentRecorder = VnvarAudioSegmentRecorder()
   private var rtspGeneration: UInt64 = 0
   private var finalizationTask: UIBackgroundTaskIdentifier = .invalid
   private var brightnessBeforeDimming: CGFloat?
@@ -46,6 +47,16 @@ import UIKit
         result(nil)
       case "requestMicrophonePermission":
         self.requestMicrophonePermission(result)
+      case "startNativeAudioSegment":
+        self.startNativeAudioSegment(call, result)
+      case "stopNativeAudioSegment":
+        do {
+          result(try self.audioSegmentRecorder.stop())
+        } catch {
+          result(FlutterError(code: "AUDIO_STOP_FAILED", message: error.localizedDescription, details: nil))
+        }
+      case "getNativeAudioSegmentStatus":
+        result(self.audioSegmentRecorder.status())
       case "getAvailableStorageBytes":
         self.getAvailableStorageBytes(result)
       case "getThermalStatus":
@@ -173,6 +184,27 @@ import UIKit
       }
     @unknown default:
       result(false)
+    }
+  }
+
+  private func startNativeAudioSegment(_ call: FlutterMethodCall, _ result: FlutterResult) {
+    guard let arguments = call.arguments as? [String: Any],
+          let path = arguments["path"] as? String, !path.isEmpty else {
+      result(FlutterError(code: "AUDIO_PATH_REQUIRED", message: "Audio path is required.", details: nil))
+      return
+    }
+    guard let trackId = arguments["audioTrackId"] as? String, !trackId.isEmpty else {
+      result(FlutterError(code: "AUDIO_TRACK_REQUIRED", message: "Local WebRTC audio track is required.", details: nil))
+      return
+    }
+    guard AVAudioSession.sharedInstance().recordPermission == .granted else {
+      result(FlutterError(code: "MICROPHONE_PERMISSION_DENIED", message: "Microphone permission is not granted.", details: nil))
+      return
+    }
+    do {
+      result(try audioSegmentRecorder.start(path: path, trackId: trackId))
+    } catch {
+      result(FlutterError(code: "AUDIO_START_FAILED", message: error.localizedDescription, details: nil))
     }
   }
 

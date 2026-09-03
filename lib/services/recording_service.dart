@@ -150,7 +150,7 @@ class RecordedSegment {
 // ============================================================
 
 class RecordingService {
-  static const MethodChannel _androidChannel = MethodChannel(
+  static const MethodChannel _platformChannel = MethodChannel(
     'vnvar/camera_station_service',
   );
   final String cameraId;
@@ -219,6 +219,7 @@ class RecordingService {
   MediaRecorder? _recorder;
 
   MediaStreamTrack? _videoTrack;
+  String? _audioTrackId;
 
   bool _recordAudio = false;
 
@@ -498,9 +499,12 @@ class RecordingService {
 
   Future<({String? path, int bytes, bool active})?>
   currentAudioProgress() async {
-    if (!Platform.isAndroid || !_currentSegmentHasAudio) return null;
+    if (!(Platform.isAndroid || Platform.isIOS) ||
+        !_currentSegmentHasAudio) {
+      return null;
+    }
     try {
-      final raw = await _androidChannel.invokeMapMethod<String, dynamic>(
+      final raw = await _platformChannel.invokeMapMethod<String, dynamic>(
         'getNativeAudioSegmentStatus',
       );
       if (raw == null) return null;
@@ -944,6 +948,7 @@ class RecordingService {
 
   Future<void> start({
     required MediaStreamTrack videoTrack,
+    String? audioTrackId,
     bool audioAvailable = true,
   }) async {
     final stopping = _stopOperation;
@@ -960,9 +965,13 @@ class RecordingService {
     }
 
     _videoTrack = videoTrack;
-    // Capture capability, not a user-facing microphone toggle. Android checks
-    // native permission per segment; iOS supplies false after permission denial.
-    _recordAudio = Platform.isAndroid || audioAvailable;
+    _audioTrackId = audioTrackId;
+    // Both mobile platforms record microphone PCM beside the WebRTC video and
+    // mux it while finalizing. On iOS this bypasses flutter_webrtc 1.6.0's
+    // receiver-only audio lookup while reusing the already captured local
+    // WebRTC audio track (no second AVAudioSession input).
+    _recordAudio = Platform.isAndroid ||
+        (Platform.isIOS && audioAvailable && audioTrackId != null);
 
     _recording = true;
 
@@ -991,6 +1000,7 @@ class RecordingService {
       _recording = false;
 
       _videoTrack = null;
+      _audioTrackId = null;
       _recordAudio = false;
 
       _segmentTimer?.cancel();
@@ -1058,7 +1068,7 @@ class RecordingService {
       await recorder.start(
         path,
         videoTrack: videoTrack,
-        audioChannel: _recordAudio && !Platform.isAndroid
+        audioChannel: _recordAudio && !Platform.isAndroid && !Platform.isIOS
             ? RecorderAudioChannel.INPUT
             : null,
       );
@@ -1084,7 +1094,7 @@ class RecordingService {
           'cameraId': cameraId,
           'startedAtMs': now.millisecondsSinceEpoch,
           'videoPath': path,
-          'audioPath': _recordAudio && Platform.isAndroid
+          'audioPath': _recordAudio && (Platform.isAndroid || Platform.isIOS)
               ? path.replaceFirst(RegExp(r'\.mp4$'), '.wav')
               : null,
           'state': 'recording',
@@ -1101,12 +1111,13 @@ class RecordingService {
     }
 
     _segmentStartedAt = now;
-    _currentSegmentHasAudio = _recordAudio && !Platform.isAndroid;
-    if (_recordAudio && Platform.isAndroid) {
+    _currentSegmentHasAudio = false;
+    if (_recordAudio && (Platform.isAndroid || Platform.isIOS)) {
       final audioPath = path.replaceFirst(RegExp(r'\.mp4$'), '.wav');
       try {
-        await _androidChannel.invokeMethod<void>('startNativeAudioSegment', {
+        await _platformChannel.invokeMethod<void>('startNativeAudioSegment', {
           'path': audioPath,
+          if (Platform.isIOS) 'audioTrackId': _audioTrackId,
         });
         _currentAudioPath = audioPath;
         _currentSegmentHasAudio = true;
@@ -1137,7 +1148,7 @@ class RecordingService {
         final journal = _currentJournal;
         _currentJournal = null;
         try {
-          await _androidChannel.invokeMethod<void>('stopNativeAudioSegment');
+          await _platformChannel.invokeMethod<void>('stopNativeAudioSegment');
         } catch (_) {}
         try {
           await recorder.stop();
@@ -1162,7 +1173,7 @@ class RecordingService {
     debugPrint(
       '[VNVAR] RECORDER STARTED: $path | '
       'audio=${_currentSegmentHasAudio ? 'on' : 'off'} | '
-      'microphoneRequested=on',
+      'microphoneRequested=${_recordAudio ? 'on' : 'unsupported'}',
     );
   }
 
@@ -1370,9 +1381,9 @@ class RecordingService {
     developer.log('Finishing segment: $path', name: 'RecordingService');
     await _writeJournalState(journal, 'finalizing');
 
-    if (Platform.isAndroid && audioPath != null) {
+    if ((Platform.isAndroid || Platform.isIOS) && audioPath != null) {
       try {
-        await _androidChannel.invokeMethod<void>('stopNativeAudioSegment');
+        await _platformChannel.invokeMethod<void>('stopNativeAudioSegment');
         debugPrint('[VNVAR] NATIVE AUDIO STOPPED: $audioPath');
       } catch (error, stackTrace) {
         developer.log(
@@ -2641,6 +2652,7 @@ class RecordingService {
     } finally {
       _recording = false;
       _videoTrack = null;
+      _audioTrackId = null;
       _recordAudio = false;
       _stopping = false;
     }
@@ -2667,6 +2679,7 @@ class RecordingService {
     }
 
     _videoTrack = null;
+    _audioTrackId = null;
     _recordAudio = false;
 
     await cleanupExportDownloads();

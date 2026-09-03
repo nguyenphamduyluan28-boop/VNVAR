@@ -8,6 +8,43 @@ import 'package:flutter_webrtc/flutter_webrtc.dart';
 
 import '../models/camera_resolution_profile.dart';
 
+Map<String, dynamic> buildCameraVideoConstraints({
+  required bool isEmulator,
+  required bool isIos,
+  required String facingMode,
+  required String? preferredDeviceId,
+  required CameraResolutionProfile profile,
+}) {
+  if (isEmulator) {
+    return <String, dynamic>{
+      'facingMode': facingMode,
+      'width': {'min': 320, 'ideal': 640, 'max': 640},
+      'height': {'min': 240, 'ideal': 480, 'max': 480},
+      'frameRate': {'ideal': 15, 'max': 20},
+    };
+  }
+  if (isIos) {
+    // flutter_webrtc 1.6.0 only reads numeric constraints at the top level;
+    // numeric values nested under `ideal` are ignored on Darwin and become
+    // 0x0@0fps, which then falls back to 640x480 with an invalid frame rate.
+    return <String, dynamic>{
+      'facingMode': facingMode,
+      'deviceId': ?preferredDeviceId,
+      'width': profile.width,
+      'height': profile.height,
+      'frameRate': profile.fps,
+    };
+  }
+  return <String, dynamic>{
+    'facingMode': facingMode,
+    'deviceId': ?preferredDeviceId,
+    'width': {'ideal': profile.width, 'max': profile.width},
+    'height': {'ideal': profile.height, 'max': profile.height},
+    'frameRate': {'ideal': profile.fps, 'max': profile.fps},
+    'focusMode': 'continuous',
+  };
+}
+
 class WebRtcService {
   static const MethodChannel _platformChannel = MethodChannel(
     'vnvar/camera_station_service',
@@ -50,6 +87,7 @@ class WebRtcService {
   Timer? _muteFailureTimer;
   Timer? _audioFailureTimer;
   Timer? _firstFrameFailureTimer;
+  Completer<void>? _firstFrameCompleter;
   Timer? _rtspRetryTimer;
   int _rtspRetryAttempt = 0;
   bool _rtspStarting = false;
@@ -248,6 +286,8 @@ class WebRtcService {
 
     localRenderer.onFirstFrameRendered = () {
       _receivedFirstFrame = true;
+      final completer = _firstFrameCompleter;
+      if (completer != null && !completer.isCompleted) completer.complete();
       _firstFrameFailureTimer?.cancel();
       _firstFrameFailureTimer = null;
       developer.log(
@@ -313,30 +353,13 @@ class WebRtcService {
       name: 'WebRtcService',
     );
 
-    final videoConstraints = _isEmulator == true
-        ? <String, dynamic>{
-            'facingMode': selectedFacingMode,
-            'width': {'min': 320, 'ideal': 640, 'max': 640},
-            'height': {'min': 240, 'ideal': 480, 'max': 480},
-            'frameRate': {'ideal': 15, 'max': 20},
-          }
-        : <String, dynamic>{
-            'facingMode': selectedFacingMode,
-            'deviceId': ?preferredDeviceId,
-            'width': {
-              'ideal': _resolutionProfile.width,
-              'max': _resolutionProfile.width,
-            },
-            'height': {
-              'ideal': _resolutionProfile.height,
-              'max': _resolutionProfile.height,
-            },
-            'frameRate': {
-              'ideal': _resolutionProfile.fps,
-              'max': _resolutionProfile.fps,
-            },
-            'focusMode': 'continuous',
-          };
+    final videoConstraints = buildCameraVideoConstraints(
+      isEmulator: _isEmulator == true,
+      isIos: Platform.isIOS,
+      facingMode: selectedFacingMode,
+      preferredDeviceId: preferredDeviceId,
+      profile: _resolutionProfile,
+    );
 
     final captureAudio = await _shouldCaptureMicrophone();
     final streamFuture = navigator.mediaDevices.getUserMedia({
@@ -376,22 +399,6 @@ class WebRtcService {
     _localStream = stream;
 
     // ==========================================================
-    // LOCAL PREVIEW
-    // ==========================================================
-
-    _receivedFirstFrame = false;
-    _firstFrameFailureTimer?.cancel();
-    localRenderer.srcObject = stream;
-    _firstFrameFailureTimer = Timer(const Duration(seconds: 6), () {
-      if (_receivedFirstFrame || _localStream != stream) return;
-      developer.log(
-        '[CAMERA] No frame received; switching camera source',
-        name: 'WebRtcService',
-      );
-      onCameraFailure?.call('first_frame_timeout');
-    });
-
-    // ==========================================================
     // VALIDATE TRACK
     // ==========================================================
 
@@ -411,7 +418,23 @@ class WebRtcService {
       videoTrack.enabled = true;
     }
 
+    // Bind only after validating the track, then keep initialization pending
+    // until the new capture source has produced a real frame.
+    final firstFrame = _bindRendererAndWaitForFirstFrame(stream);
     await _configureNaturalCameraMetering(videoTrack);
+
+    try {
+      await firstFrame;
+    } on TimeoutException {
+      if (_localStream == stream) {
+        localRenderer.srcObject = null;
+        _localStream = null;
+      }
+      await _disposeMediaStream(stream);
+      throw TimeoutException(
+        'Camera $selectedFacingMode không phát frame đầu tiên sau 6 giây.',
+      );
+    }
 
     final audioTracks = stream.getAudioTracks();
     for (final track in audioTracks) {
@@ -726,6 +749,11 @@ class WebRtcService {
     if (!switched) {
       throw StateError('Thiết bị không có camera khác để chuyển.');
     }
+    final stream = _localStream;
+    if (stream == null) throw StateError('Camera stream không còn tồn tại.');
+    final firstFrame = _bindRendererAndWaitForFirstFrame(stream, rebind: true);
+    await _configureNaturalCameraMetering(track);
+    await firstFrame;
     _currentFacingMode = currentFacingMode == 'environment'
         ? 'user'
         : 'environment';
@@ -733,6 +761,38 @@ class WebRtcService {
       '[CAMERA] Switched front/back on the current VideoTrack',
       name: 'WebRtcService',
     );
+  }
+
+  Future<void> _bindRendererAndWaitForFirstFrame(
+    MediaStream stream, {
+    bool rebind = false,
+  }) async {
+    _receivedFirstFrame = false;
+    _firstFrameFailureTimer?.cancel();
+    if (rebind) {
+      localRenderer.srcObject = null;
+      // Let the native renderer detach the old camera texture before binding
+      // the same VideoTrack again, otherwise its one-shot first-frame event can
+      // belong to the lens that has just stopped.
+      await Future<void>.delayed(const Duration(milliseconds: 16));
+      if (_localStream != stream) {
+        throw StateError('Camera stream changed while waiting for rebind.');
+      }
+    }
+    final completer = Completer<void>();
+    _firstFrameCompleter = completer;
+    localRenderer.srcObject = stream;
+    _firstFrameFailureTimer = Timer(const Duration(seconds: 6), () {
+      if (_receivedFirstFrame) return;
+      if (!completer.isCompleted) {
+        completer.completeError(
+          _localStream == stream
+              ? TimeoutException('Camera did not render a fresh frame.')
+              : StateError('Camera stream changed before its first frame.'),
+        );
+      }
+    });
+    await completer.future;
   }
 
   // ============================================================
@@ -1060,6 +1120,13 @@ class WebRtcService {
     _audioFailureTimer = null;
     _firstFrameFailureTimer?.cancel();
     _firstFrameFailureTimer = null;
+    final firstFrameCompleter = _firstFrameCompleter;
+    if (firstFrameCompleter != null && !firstFrameCompleter.isCompleted) {
+      firstFrameCompleter.completeError(
+        StateError('Camera disposed before its first frame.'),
+      );
+    }
+    _firstFrameCompleter = null;
     _receivedFirstFrame = false;
     localRenderer.srcObject = null;
 
