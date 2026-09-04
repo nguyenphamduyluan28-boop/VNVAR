@@ -705,6 +705,22 @@ class CameraServer {
       '(${segment.durationMs}ms)',
       name: 'CameraServer',
     );
+    // Đảm bảo recording tiếp tục ngay sau checkpoint. Nếu _startNewSegment()
+    // bên trong rotation thất bại (ví dụ: lỗi audio tạm thời trên Android),
+    // recording bị dừng nhưng caller không biết. Gọi ensureRecording() ở đây
+    // để phục hồi ngay thay vì chờ health monitor retry sau 10 giây.
+    if (!recordingService.recording && !recordingService.rotating) {
+      try {
+        await ensureRecording();
+      } catch (error, stackTrace) {
+        developer.log(
+          '[CHECKVAR] Failed to restart recording after checkpoint',
+          error: error,
+          stackTrace: stackTrace,
+          name: 'CameraServer',
+        );
+      }
+    }
     RecordedSegment checkpoint = segment;
     var autoTrimmed = false;
     String? trimError;
