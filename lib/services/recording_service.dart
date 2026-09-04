@@ -14,6 +14,46 @@ import 'package:shared_preferences/shared_preferences.dart';
 
 import 'video_storage_service.dart';
 
+bool isPublishableVideoProbe({
+  required bool hasVideo,
+  required double? durationSeconds,
+}) => hasVideo && durationSeconds != null && durationSeconds >= 1.0;
+
+bool isDecodableVideoProbe({
+  required bool hasVideo,
+  required double? durationSeconds,
+}) => hasVideo && durationSeconds != null && durationSeconds > 0.05;
+
+bool shouldUsePreviousCheckpointSegment({
+  required DateTime? currentStartedAt,
+  required DateTime requestedAt,
+}) {
+  if (currentStartedAt == null || requestedAt.isBefore(currentStartedAt)) {
+    return false;
+  }
+  // Allow for recorder start-up/FFprobe timestamp rounding around the exact
+  // one-second publication threshold.
+  return requestedAt.difference(currentStartedAt) < const Duration(seconds: 2);
+}
+
+List<String> fragmentCompanionPaths(String videoPath) {
+  final normalized = videoPath.replaceAll('\\', '/');
+  if (!normalized.toUpperCase().contains('/FRAGMENTS/') ||
+      !normalized.toLowerCase().endsWith('.mp4')) {
+    return [videoPath];
+  }
+  final base = videoPath.substring(0, videoPath.length - 4);
+  return [videoPath, '$base.wav', '$base.json'];
+}
+
+bool isManagedStorageFilePath(String path) {
+  final normalized = path.replaceAll('\\', '/').toLowerCase();
+  return normalized.endsWith('.ts') ||
+      normalized.endsWith('.mp4') ||
+      (normalized.contains('/fragments/') &&
+          (normalized.endsWith('.wav') || normalized.endsWith('.json')));
+}
+
 /// Converts native/FFmpeg failures into a bounded string safe for a Flutter
 /// Text widget. Full command output remains available in debug logs.
 String userFacingError(Object error) {
@@ -320,6 +360,7 @@ class RecordingService {
   // ============================================================
 
   final List<RecordedSegment> _segments = [];
+  bool _lastCheckpointUsedPrevious = false;
   final Map<String, RecordedSegment> _exportSegments = {};
   final StreamController<void> _videoChanges =
       StreamController<void>.broadcast();
@@ -338,6 +379,8 @@ class RecordingService {
 
     return List.unmodifiable(result);
   }
+
+  bool get lastCheckpointUsedPrevious => _lastCheckpointUsedPrevious;
 
   Future<RecordedSegment> trimSegment({
     required String segmentId,
@@ -515,8 +558,7 @@ class RecordingService {
 
   Future<({String? path, int bytes, bool active})?>
   currentAudioProgress() async {
-    if (!(Platform.isAndroid || Platform.isIOS) ||
-        !_currentSegmentHasAudio) {
+    if (!(Platform.isAndroid || Platform.isIOS) || !_currentSegmentHasAudio) {
       return null;
     }
     try {
@@ -1001,16 +1043,27 @@ class RecordingService {
   }
 
   Future<bool> _isPlayableVideo(File file) async {
+    final probe = await _probeVideo(file);
+    return probe != null &&
+        isDecodableVideoProbe(
+          hasVideo: probe.hasVideo,
+          durationSeconds: probe.durationSeconds,
+        );
+  }
+
+  Future<({bool hasVideo, double? durationSeconds})?> _probeVideo(
+    File file,
+  ) async {
     try {
-      if (!await file.exists() || await file.length() <= 0) return false;
+      if (!await file.exists() || await file.length() <= 0) return null;
       final session = await FFprobeKit.getMediaInformation(file.path);
       final information = session.getMediaInformation();
-      if (information == null) return false;
+      if (information == null) return null;
       final duration = double.tryParse(information.getDuration() ?? '');
       final hasVideo = information.getStreams().any(
         (stream) => stream.getType() == 'video',
       );
-      return hasVideo && duration != null && duration > 0.05;
+      return (hasVideo: hasVideo, durationSeconds: duration);
     } catch (error, stackTrace) {
       developer.log(
         'FFprobe validation failed: ${file.path}',
@@ -1018,8 +1071,67 @@ class RecordingService {
         stackTrace: stackTrace,
         name: 'RecordingService',
       );
-      return false;
+      return null;
     }
+  }
+
+  Future<File> _preserveShortFragment({
+    required File video,
+    required File? audio,
+    required DateTime startedAt,
+    required DateTime endedAt,
+    required double durationSeconds,
+  }) async {
+    final videoDirectory = await _videoDirectory(date: endedAt);
+    final fragmentDirectory = Directory(
+      '${videoDirectory.path}${Platform.pathSeparator}FRAGMENTS',
+    );
+    await fragmentDirectory.create(recursive: true);
+    final baseName =
+        'FRAGMENT_${startedAt.millisecondsSinceEpoch}_${endedAt.millisecondsSinceEpoch}';
+    final preservedVideo = File(
+      '${fragmentDirectory.path}${Platform.pathSeparator}$baseName.mp4',
+    );
+    final temporaryVideo = File('${preservedVideo.path}.partial');
+    if (await temporaryVideo.exists()) await temporaryVideo.delete();
+    await video.copy(temporaryVideo.path);
+    await temporaryVideo.rename(preservedVideo.path);
+
+    String? preservedAudioPath;
+    if (audio != null && await audio.exists() && await audio.length() > 44) {
+      final preservedAudio = File(
+        '${fragmentDirectory.path}${Platform.pathSeparator}$baseName.wav',
+      );
+      final temporaryAudio = File('${preservedAudio.path}.partial');
+      if (await temporaryAudio.exists()) await temporaryAudio.delete();
+      await audio.copy(temporaryAudio.path);
+      await temporaryAudio.rename(preservedAudio.path);
+      preservedAudioPath = preservedAudio.path;
+    }
+
+    final metadata = File(
+      '${fragmentDirectory.path}${Platform.pathSeparator}$baseName.json',
+    );
+    await metadata.writeAsString(
+      jsonEncode({
+        'type': 'VNVAR_PRESERVED_FRAGMENT_V1',
+        'cameraId': cameraId,
+        'startedAt': startedAt.toIso8601String(),
+        'endedAt': endedAt.toIso8601String(),
+        'durationSeconds': durationSeconds,
+        'videoPath': preservedVideo.path,
+        'audioPath': preservedAudioPath,
+      }),
+      flush: true,
+    );
+    if (await video.exists()) await video.delete();
+    if (audio != null && await audio.exists()) await audio.delete();
+    developer.log(
+      'SHORT FRAGMENT PRESERVED: ${preservedVideo.path}',
+      name: 'RecordingService',
+    );
+    debugPrint('[VNVAR] SHORT FRAGMENT PRESERVED: ${preservedVideo.path}');
+    return preservedVideo;
   }
 
   Future<void> _writeJournalState(
@@ -1366,6 +1478,10 @@ class RecordingService {
     if (!_recording) {
       throw StateError('Camera chưa bắt đầu ghi video.');
     }
+    _lastCheckpointUsedPrevious = false;
+    final checkpointRequestedAt = DateTime.now();
+    final currentStartedAt = _segmentStartedAt;
+    final previousSegment = _segments.isEmpty ? null : _segments.last;
     Object? handoffError;
     StackTrace? handoffStackTrace;
     final segment = await _requestSegmentRotation(
@@ -1385,6 +1501,26 @@ class RecordingService {
       Error.throwWithStackTrace(handoffError!, handoffStackTrace!);
     }
     if (segment == null) {
+      // A Check VAR press can land immediately after the periodic recorder
+      // rotation. The new file may contain less than one publishable second,
+      // while the relevant action is still at the end of the previous file.
+      // Return that completed file instead of exposing the aborted fragment or
+      // failing the request. Other rotation paths continue to reject it.
+      final requestedDuringFreshSegment = shouldUsePreviousCheckpointSegment(
+        currentStartedAt: currentStartedAt,
+        requestedAt: checkpointRequestedAt,
+      );
+      if (requestedDuringFreshSegment &&
+          previousSegment != null &&
+          await File(previousSegment.path).exists()) {
+        developer.log(
+          'CHECK VAR landed on a sub-second segment; using previous segment: '
+          '${previousSegment.fileName}',
+          name: 'RecordingService',
+        );
+        _lastCheckpointUsedPrevious = true;
+        return previousSegment;
+      }
       throw StateError('Không có file đang quay để chốt Check VAR.');
     }
     return segment;
@@ -1592,7 +1728,12 @@ class RecordingService {
       return null;
     }
 
-    if (!await _isPlayableVideo(file)) {
+    final videoProbe = await _probeVideo(file);
+    if (videoProbe == null ||
+        !isDecodableVideoProbe(
+          hasVideo: videoProbe.hasVideo,
+          durationSeconds: videoProbe.durationSeconds,
+        )) {
       await _writeJournalState(
         journal,
         'invalid',
@@ -1602,6 +1743,26 @@ class RecordingService {
         'Recorded segment is not playable and remains in staging for forensic recovery: $path',
         name: 'RecordingService',
       );
+      return null;
+    }
+
+    if (!isPublishableVideoProbe(
+      hasVideo: videoProbe.hasVideo,
+      durationSeconds: videoProbe.durationSeconds,
+    )) {
+      final preserved = await _preserveShortFragment(
+        video: file,
+        audio: audioPath == null ? null : File(audioPath),
+        startedAt: startedAt,
+        endedAt: endedAt,
+        durationSeconds: videoProbe.durationSeconds!,
+      );
+      await _writeJournalState(
+        journal,
+        'short_preserved',
+        finalPath: preserved.path,
+      );
+      if (journal != null && await journal.exists()) await journal.delete();
       return null;
     }
 
@@ -2029,7 +2190,12 @@ class RecordingService {
             }
           }
           await _writeJournalState(journal, 'recovering');
-          if (!await _isPlayableVideo(entity)) {
+          final recoveredProbe = await _probeVideo(entity);
+          if (recoveredProbe == null ||
+              !isDecodableVideoProbe(
+                hasVideo: recoveredProbe.hasVideo,
+                durationSeconds: recoveredProbe.durationSeconds,
+              )) {
             await _writeJournalState(
               journal,
               'invalid',
@@ -2050,6 +2216,20 @@ class RecordingService {
               '.wav',
             ),
           );
+          if (!isPublishableVideoProbe(
+            hasVideo: recoveredProbe.hasVideo,
+            durationSeconds: recoveredProbe.durationSeconds,
+          )) {
+            await _preserveShortFragment(
+              video: entity,
+              audio: await wav.exists() ? wav : null,
+              startedAt: startedAt,
+              endedAt: endedAt,
+              durationSeconds: recoveredProbe.durationSeconds!,
+            );
+            if (await journal.exists()) await journal.delete();
+            continue;
+          }
           final recovered = await _convertRecordingToTs(
             entity,
             startedAt,
@@ -2129,9 +2309,7 @@ class RecordingService {
     final root = await _videoRootDirectory();
     var total = 0;
     await for (final entity in root.list(recursive: true)) {
-      if (entity is File &&
-          (entity.path.toLowerCase().endsWith('.ts') ||
-              entity.path.toLowerCase().endsWith('.mp4'))) {
+      if (entity is File && isManagedStorageFilePath(entity.path)) {
         try {
           total += await entity.length();
         } catch (_) {}
@@ -2507,7 +2685,10 @@ class RecordingService {
     try {
       if (isFileReadActive(file.path)) return false;
       if (!await file.exists()) return false;
-      await file.delete();
+      for (final path in fragmentCompanionPaths(file.path)) {
+        final companion = File(path);
+        if (await companion.exists()) await companion.delete();
+      }
       _segments.removeWhere((segment) => segment.path == file.path);
       _notifyVideoChanges();
       return true;
@@ -2582,17 +2763,17 @@ class RecordingService {
     await for (final entity in root.list(recursive: true)) {
       if (entity is! File) continue;
       final lower = entity.path.toLowerCase();
-      if (!lower.endsWith('.ts') && !lower.endsWith('.mp4')) continue;
       final normalizedPath = entity.path.replaceAll('\\', '/').toLowerCase();
       if (normalizedPath.contains('/download/')) continue;
       try {
         final stat = await entity.stat();
+        if (isManagedStorageFilePath(entity.path)) total += stat.size;
+        if (!lower.endsWith('.ts') && !lower.endsWith('.mp4')) continue;
         final normalized = entity.path.replaceAll('\\', '/');
         final match = RegExp(
           r'/([0-9]{2}-[0-9]{2}-[0-9]{4})/',
         ).firstMatch(normalized);
         files.add((file: entity, stat: stat, day: match?.group(1) ?? ''));
-        total += stat.size;
       } catch (_) {}
     }
 
@@ -2661,8 +2842,14 @@ class RecordingService {
         if (isFileReadActive(item.file.path)) return;
         // Một dịch vụ camera khác có thể vừa xóa cùng file trong thư mục dùng
         // chung. Khi đó vẫn loại kích thước đã thống kê khỏi tổng hiện tại.
-        if (await item.file.exists()) await item.file.delete();
-        total -= item.stat.size;
+        var deletedBytes = 0;
+        for (final path in fragmentCompanionPaths(item.file.path)) {
+          final companion = File(path);
+          if (!await companion.exists()) continue;
+          deletedBytes += await companion.length();
+          await companion.delete();
+        }
+        total -= deletedBytes;
         if (total < 0) total = 0;
         _segments.removeWhere((segment) => segment.path == item.file.path);
         _notifyVideoChanges();

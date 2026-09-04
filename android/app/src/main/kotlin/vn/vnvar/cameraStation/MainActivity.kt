@@ -2,7 +2,6 @@ package vn.vnvar.cameraStation
 
 import android.Manifest
 import android.content.Intent
-import android.net.Uri
 import android.content.pm.PackageManager
 import android.graphics.SurfaceTexture
 import android.hardware.camera2.CameraCharacteristics
@@ -12,7 +11,6 @@ import android.os.Environment
 import android.os.StatFs
 import android.os.PowerManager
 import android.provider.DocumentsContract
-import android.provider.Settings
 import androidx.core.content.ContextCompat
 import com.cloudwebrtc.webrtc.FlutterWebRTCPlugin
 import io.flutter.embedding.android.FlutterActivity
@@ -27,7 +25,6 @@ class MainActivity : FlutterActivity() {
     private var activityResumed = false
     private var rtspPublisher: VnvarRtspPublisher? = null
     private var pendingFolderResult: MethodChannel.Result? = null
-    private var waitingStoragePermission = false
     private val nativeAudioRecorder: NativeAudioSegmentRecorder
         get() = sharedAudioRecorder ?: synchronized(MainActivity::class.java) {
             sharedAudioRecorder ?: NativeAudioSegmentRecorder(applicationContext).also {
@@ -192,6 +189,9 @@ class MainActivity : FlutterActivity() {
 
                 "selectVideoFolder" -> selectVideoFolder(result)
 
+                "supportsVideoFolderSelection" ->
+                    result.success(Build.VERSION.SDK_INT <= Build.VERSION_CODES.Q)
+
                 "getAvailableStorageBytes" -> {
                     val path = call.argument<String>("path")
                     if (path.isNullOrBlank()) {
@@ -286,20 +286,6 @@ class MainActivity : FlutterActivity() {
         refreshCameraStationForegroundTypes()
         CameraExposureController.reapplyAfterLifecycleChange("foreground")
         completePendingStartIfPossible()
-        if (waitingStoragePermission &&
-            (Build.VERSION.SDK_INT < Build.VERSION_CODES.R || Environment.isExternalStorageManager())
-        ) {
-            waitingStoragePermission = false
-            launchFolderPicker()
-        } else if (waitingStoragePermission && Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-            waitingStoragePermission = false
-            pendingFolderResult?.error(
-                "STORAGE_PERMISSION_DENIED",
-                "Cần cho phép quản lý tệp để lưu MPEG-TS vào thư mục đã chọn.",
-                null,
-            )
-            pendingFolderResult = null
-        }
     }
 
     private fun selectVideoFolder(result: MethodChannel.Result) {
@@ -308,6 +294,15 @@ class MainActivity : FlutterActivity() {
             return
         }
         pendingFolderResult = result
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            pendingFolderResult = null
+            result.error(
+                "CUSTOM_STORAGE_UNSUPPORTED",
+                "Android 11+ sử dụng thư mục ứng dụng để không cần quyền quản lý toàn bộ tệp.",
+                null,
+            )
+            return
+        }
         if (Build.VERSION.SDK_INT <= Build.VERSION_CODES.Q &&
             ContextCompat.checkSelfPermission(this, Manifest.permission.WRITE_EXTERNAL_STORAGE) !=
             PackageManager.PERMISSION_GRANTED
@@ -316,15 +311,6 @@ class MainActivity : FlutterActivity() {
                 arrayOf(Manifest.permission.WRITE_EXTERNAL_STORAGE),
                 STORAGE_PERMISSION_REQUEST,
             )
-            return
-        }
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R && !Environment.isExternalStorageManager()) {
-            waitingStoragePermission = true
-            val intent = Intent(
-                Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION,
-                Uri.parse("package:$packageName"),
-            )
-            startActivity(intent)
             return
         }
         launchFolderPicker()

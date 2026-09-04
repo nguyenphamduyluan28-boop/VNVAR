@@ -16,11 +16,25 @@ class VideoStorageService {
   );
 
   String? _selectedPath;
+  bool _supportsFolderPicker = Platform.isAndroid;
 
   String? get selectedPath => _selectedPath;
-  bool get supportsFolderPicker => Platform.isAndroid;
+  bool get supportsFolderPicker => _supportsFolderPicker;
 
   Future<void> load() async {
+    if (Platform.isAndroid) {
+      try {
+        _supportsFolderPicker =
+            await _androidChannel.invokeMethod<bool>(
+              'supportsVideoFolderSelection',
+            ) ??
+            false;
+      } on MissingPluginException {
+        _supportsFolderPicker = false;
+      }
+    } else {
+      _supportsFolderPicker = false;
+    }
     final prefs = await SharedPreferences.getInstance();
     final savedPath = prefs.getString(_storagePathKey)?.trim();
     if (savedPath == null || savedPath.isEmpty) {

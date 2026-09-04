@@ -37,6 +37,10 @@ void main() {
         );
       }
     });
+
+    test('resumed state never requests another suspension', () {
+      expect(shouldSuspendIosCapture(AppLifecycleState.resumed), isFalse);
+    });
   });
 
   group('iOS lens handoff policy', () {
@@ -89,6 +93,29 @@ void main() {
 
     test('stops reducing at the safe floor', () {
       expect(nextLowerIos4kFps(15), isNull);
+    });
+
+    test('falls back to 1080p after the 4K safe floor also fails', () {
+      final result = nextIosOverloadProfile(
+        CameraResolutionProfile.ultraHd4k.withFps(15),
+        const [
+          CameraResolutionProfile.hd720,
+          CameraResolutionProfile.fullHd1080,
+          CameraResolutionProfile.ultraHd4k,
+        ],
+      );
+
+      expect(result, CameraResolutionProfile.fullHd1080);
+    });
+
+    test('does not adapt a non-4K profile', () {
+      expect(
+        nextIosOverloadProfile(
+          CameraResolutionProfile.fullHd1080,
+          CameraResolutionProfile.values,
+        ),
+        isNull,
+      );
     });
   });
 }

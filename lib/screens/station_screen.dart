@@ -187,7 +187,7 @@ class _StationScreenState extends State<StationScreen>
   void didChangeAppLifecycleState(AppLifecycleState state) {
     if (!Platform.isIOS) return;
     if (state == AppLifecycleState.resumed) {
-      unawaited(_runtime.resumeFromIosBackground());
+      unawaited(_resumeIosCapture());
       return;
     }
     // `inactive` is transient on iOS (Control Center, notification shade,
@@ -196,7 +196,23 @@ class _StationScreenState extends State<StationScreen>
     // camera is recreated. Only suspend once the app is actually hidden or
     // backgrounded.
     if (shouldSuspendIosCapture(state)) {
-      unawaited(_runtime.suspendForIosBackground());
+      unawaited(_suspendIosCapture());
+    }
+  }
+
+  Future<void> _suspendIosCapture() async {
+    try {
+      await _runtime.suspendForIosBackground();
+    } catch (error) {
+      debugPrint('[LIFECYCLE] Không thể chốt camera iOS: $error');
+    }
+  }
+
+  Future<void> _resumeIosCapture() async {
+    try {
+      await _runtime.resumeFromIosBackground();
+    } catch (error) {
+      debugPrint('[LIFECYCLE] Không thể phục hồi camera iOS: $error');
     }
   }
 
@@ -947,6 +963,40 @@ class _StationScreenState extends State<StationScreen>
                   child: Column(
                     mainAxisSize: MainAxisSize.min,
                     children: [
+                      if (Platform.isIOS &&
+                          (_runtime.lifecycleSuspended ||
+                              _runtime.lifecycleResuming ||
+                              _runtime.captureState == 'recovering'))
+                        Container(
+                          width: double.infinity,
+                          margin: EdgeInsets.only(bottom: compact ? 6 : 8),
+                          padding: EdgeInsets.symmetric(
+                            horizontal: compact ? 10 : 12,
+                            vertical: compact ? 6 : 8,
+                          ),
+                          decoration: BoxDecoration(
+                            color: const Color(
+                              0xFF1565C0,
+                            ).withValues(alpha: 0.94),
+                            borderRadius: BorderRadius.circular(
+                              compact ? 10 : 12,
+                            ),
+                          ),
+                          child: Text(
+                            _runtime.lifecycleResuming ||
+                                    _runtime.captureState == 'recovering'
+                                ? 'Đang khôi phục camera và ghi hình sau khi quay lại ứng dụng…'
+                                : 'iOS đã tạm dừng camera khi ứng dụng ở nền. Hãy giữ Camera Station trên màn hình để ghi liên tục.',
+                            maxLines: compact ? 2 : 1,
+                            overflow: TextOverflow.ellipsis,
+                            textAlign: TextAlign.center,
+                            style: TextStyle(
+                              color: Colors.white,
+                              fontSize: compact ? 11 : 12,
+                              fontWeight: FontWeight.w700,
+                            ),
+                          ),
+                        ),
                       if (_runtime.thermalWarning || _runtime.storageWarning)
                         Container(
                           width: double.infinity,

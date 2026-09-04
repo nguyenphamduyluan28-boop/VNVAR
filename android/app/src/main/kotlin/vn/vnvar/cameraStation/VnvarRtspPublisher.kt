@@ -42,6 +42,10 @@ class VnvarRtspPublisher(
     private var sps: ByteArray? = null
     private var pps: ByteArray? = null
     private val codecLock = Any()
+    private val feedbackLock = Any()
+    private var currentBitrate = bitrate.coerceAtLeast(MIN_RTSP_BITRATE)
+    private var maximumAdaptiveBitrate = currentBitrate
+    private var healthyReceiverReports = 0
     private val encoderExecutor = Executors.newSingleThreadExecutor { task ->
         Thread(task, "VNVAR-RTSP-Encoder").apply { isDaemon = true }
     }
@@ -226,6 +230,11 @@ class VnvarRtspPublisher(
             videoCapabilities.bitrateRange.lower,
             videoCapabilities.bitrateRange.upper,
         )
+        synchronized(feedbackLock) {
+            currentBitrate = supportedBitrate
+            maximumAdaptiveBitrate = supportedBitrate
+            healthyReceiverReports = 0
+        }
         val bitrateMode = if (
             capabilities.encoderCapabilities.isBitrateModeSupported(
                 MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_CBR,
@@ -372,7 +381,7 @@ class VnvarRtspPublisher(
         val socket = session.socket
         try {
             while (running.get() && !socket.isClosed) {
-                val request = readRtspRequest(socket.getInputStream()) ?: break
+                val request = readRtspRequest(socket.getInputStream(), session) ?: break
                 val cseq = request.headers["cseq"] ?: "0"
                 when (request.method) {
                     "OPTIONS" -> session.respond(
@@ -419,7 +428,7 @@ class VnvarRtspPublisher(
     )
 
     /** Reads RTSP text while consuming interleaved RTP/RTCP binary frames. */
-    private fun readRtspRequest(input: InputStream): RtspRequest? {
+    private fun readRtspRequest(input: InputStream, session: Session): RtspRequest? {
         val request = ArrayList<Byte>(1024)
         var matchedHeaderEnd = 0
         while (running.get()) {
@@ -430,12 +439,15 @@ class VnvarRtspPublisher(
                 val high = input.read()
                 val low = input.read()
                 if (channel < 0 || high < 0 || low < 0) return null
-                var remaining = (high shl 8) or low
-                while (remaining > 0) {
-                    val skipped = input.skip(remaining.toLong())
-                    if (skipped > 0) remaining -= skipped.toInt()
-                    else if (input.read() < 0) return null else remaining--
+                val length = (high shl 8) or low
+                val payload = ByteArray(length)
+                var offset = 0
+                while (offset < length) {
+                    val count = input.read(payload, offset, length - offset)
+                    if (count < 0) return null
+                    offset += count
                 }
+                session.handleInterleaved(channel, payload)
                 continue
             }
 
@@ -457,7 +469,7 @@ class VnvarRtspPublisher(
         val text = request.toByteArray().toString(Charsets.ISO_8859_1)
         val lines = text.split("\r\n")
         val requestLine = lines.firstOrNull()?.trim().orEmpty()
-        if (requestLine.isEmpty()) return readRtspRequest(input)
+        if (requestLine.isEmpty()) return readRtspRequest(input, session)
         val headers = mutableMapOf<String, String>()
         for (line in lines.drop(1)) {
             val separator = line.indexOf(':')
@@ -477,6 +489,40 @@ class VnvarRtspPublisher(
                 })
             } catch (error: Exception) {
                 Log.w(TAG, "Unable to request H264 sync frame", error)
+            }
+        }
+    }
+
+    private fun handleReceiverReport(fractionLost: Int) {
+        val target = synchronized(feedbackLock) {
+            val loss = fractionLost.coerceIn(0, 255) / 256.0
+            val minimum = maxOf(MIN_RTSP_BITRATE, bitrate / 4)
+            when {
+                loss >= 0.10 -> {
+                    healthyReceiverReports = 0
+                    maxOf(minimum, (currentBitrate * 0.75).toInt())
+                }
+                loss <= 0.02 -> {
+                    healthyReceiverReports++
+                    if (healthyReceiverReports < 3) currentBitrate
+                    else {
+                        healthyReceiverReports = 0
+                        minOf(maximumAdaptiveBitrate, (currentBitrate * 1.10).toInt())
+                    }
+                }
+                else -> {
+                    healthyReceiverReports = 0
+                    currentBitrate
+                }
+            }.also { currentBitrate = it }
+        }
+        synchronized(codecLock) {
+            try {
+                codec?.setParameters(Bundle().apply {
+                    putInt(MediaCodec.PARAMETER_KEY_VIDEO_BITRATE, target)
+                })
+            } catch (error: Exception) {
+                Log.w(TAG, "Unable to apply RTCP bitrate $target", error)
             }
         }
     }
@@ -520,6 +566,37 @@ class VnvarRtspPublisher(
             } else {
                 writeRtsp("RTSP/1.0 461 Unsupported Transport\r\nCSeq: $cseq\r\n\r\n")
             }
+        }
+
+        fun handleInterleaved(channel: Int, payload: ByteArray) {
+            if (channel != rtpChannel + 1 || payload.size < 4) return
+            var offset = 0
+            var worstFractionLost: Int? = null
+            var pictureLoss = false
+            while (offset + 4 <= payload.size) {
+                val first = payload[offset].toInt() and 0xff
+                if (first ushr 6 != 2) return
+                val countOrFormat = first and 0x1f
+                val packetType = payload[offset + 1].toInt() and 0xff
+                val words = ((payload[offset + 2].toInt() and 0xff) shl 8) or
+                    (payload[offset + 3].toInt() and 0xff)
+                val packetLength = (words + 1) * 4
+                if (packetLength < 4 || offset + packetLength > payload.size) return
+                if (packetType == 201 && countOrFormat > 0 && packetLength >= 32) {
+                    for (index in 0 until countOrFormat) {
+                        val block = offset + 8 + index * 24
+                        if (block + 24 > offset + packetLength) break
+                        val lost = payload[block + 4].toInt() and 0xff
+                        worstFractionLost = maxOf(worstFractionLost ?: 0, lost)
+                    }
+                } else if (packetType == 206 && countOrFormat == 1 && packetLength >= 12) {
+                    pictureLoss = true
+                }
+                offset += packetLength
+            }
+            if (offset != payload.size) return
+            if (pictureLoss) requestSyncFrame()
+            worstFractionLost?.let(::handleReceiverReport)
         }
 
         fun describe(cseq: String) {
@@ -753,5 +830,6 @@ class VnvarRtspPublisher(
         private const val CLIENT_WRITE_STALL_NANOS = 2_000_000_000L
         private const val MAX_RTSP_CLIENTS = 4
         private const val MAX_RTSP_HEADER_BYTES = 64 * 1024
+        private const val MIN_RTSP_BITRATE = 500_000
     }
 }

@@ -8,6 +8,7 @@ import 'package:flutter_webrtc/flutter_webrtc.dart';
 import 'bounded_json_body.dart';
 import 'discovery_service.dart';
 import 'recording_service.dart';
+import 'request_rate_limiter.dart';
 import 'webrtc_service.dart';
 
 class CameraServer {
@@ -39,6 +40,7 @@ class CameraServer {
   final String Function()? captureStateProvider;
   final String Function()? thermalStateProvider;
   final double? Function()? temperatureProvider;
+  final Map<String, dynamic> Function()? captureMetricsProvider;
 
   final DiscoveryService _discovery = DiscoveryService();
 
@@ -49,6 +51,8 @@ class CameraServer {
   bool recording = false;
   Future<void>? _ensureRecordingOperation;
   Future<void> _recordingRequestTail = Future<void>.value();
+  final RequestRateLimiter _rateLimiter = RequestRateLimiter();
+  bool _webRtcOfferInProgress = false;
 
   bool get running => _server != null;
 
@@ -66,6 +70,7 @@ class CameraServer {
     this.captureStateProvider,
     this.thermalStateProvider,
     this.temperatureProvider,
+    this.captureMetricsProvider,
   });
 
   // ============================================================
@@ -201,6 +206,8 @@ class CameraServer {
     developer.log('$method $path', name: 'CameraServer');
 
     try {
+      if (!await _admitRequest(request, path: path, method: method)) return;
+
       if ((path == '/' || path == '/viewer') && method == 'GET') {
         await _viewerPage(request);
         return;
@@ -402,6 +409,40 @@ class CameraServer {
     }
   }
 
+  Future<bool> _admitRequest(
+    HttpRequest request, {
+    required String path,
+    required String method,
+  }) async {
+    final client = request.connectionInfo?.remoteAddress.address ?? 'unknown';
+    var bucket = 'general';
+    var maximum = 240;
+    var window = const Duration(minutes: 1);
+    if (path == '/webrtc/offer') {
+      bucket = 'webrtc-offer';
+      maximum = 6;
+      window = const Duration(minutes: 1);
+    } else if (path == '/webrtc/ice') {
+      bucket = 'webrtc-ice';
+      maximum = 120;
+    } else if (method != 'GET') {
+      bucket = 'control';
+      maximum = 30;
+    }
+    final allowed = _rateLimiter.allow(
+      '$client:$bucket',
+      maximumRequests: maximum,
+      window: window,
+    );
+    if (allowed) return true;
+    request.response.headers.set(HttpHeaders.retryAfterHeader, '5');
+    await _sendJson(request.response, HttpStatus.tooManyRequests, {
+      'error': 'Too Many Requests',
+      'message': 'Thiết bị gửi yêu cầu quá nhanh. Vui lòng thử lại.',
+    });
+    return false;
+  }
+
   Future<void> _serializeRecordingRequest(Future<void> Function() operation) {
     final previous = _recordingRequestTail;
     final current = previous.catchError((Object _) {}).then((_) => operation());
@@ -464,6 +505,13 @@ class CameraServer {
           (recordingService.recording ? 'recording' : 'ready'),
       'thermalState': thermalStateProvider?.call() ?? 'unknown',
       'temperatureC': temperatureProvider?.call(),
+      'captureMetrics': captureMetricsProvider?.call() ?? const {},
+      'capabilities': {
+        'continuousBackgroundCapture': Platform.isAndroid,
+        'foregroundCaptureRequired': Platform.isIOS,
+        'rtspFeedback': Platform.isAndroid || Platform.isIOS,
+        'preservedShortFragments': true,
+      },
 
       'apiPort': apiPort,
     });
@@ -632,6 +680,7 @@ class CameraServer {
     final segment = await recordingService.checkpointCurrentSegment();
     await _sendJson(request.response, HttpStatus.ok, {
       'success': true,
+      'usedPreviousSegment': recordingService.lastCheckpointUsedPrevious,
       'checkpointSegment': {
         'id': segment.id,
         'fileName': segment.fileName,
@@ -1024,35 +1073,46 @@ class CameraServer {
   // ============================================================
 
   Future<void> _handleWebRtcOffer(HttpRequest request) async {
-    final body = await _readJson(request);
-
-    final sdp = body['sdp'] as String?;
-
-    final type = body['type'] as String?;
-
-    if (sdp == null || sdp.isEmpty || type == null || type.isEmpty) {
-      await _sendJson(request.response, HttpStatus.badRequest, {
-        'error': 'Invalid WebRTC offer',
+    if (_webRtcOfferInProgress) {
+      await _sendJson(request.response, HttpStatus.conflict, {
+        'error': 'WebRTC Offer In Progress',
       });
-
       return;
     }
+    _webRtcOfferInProgress = true;
+    try {
+      final body = await _readJson(request);
 
-    developer.log('Received WebRTC offer', name: 'CameraServer');
+      final sdp = body['sdp'] as String?;
 
-    final RTCSessionDescription answer = await webRtcService.handleOffer(
-      sdp: sdp,
+      final type = body['type'] as String?;
 
-      type: type,
-    );
+      if (sdp == null || sdp.isEmpty || type == null || type.isEmpty) {
+        await _sendJson(request.response, HttpStatus.badRequest, {
+          'error': 'Invalid WebRTC offer',
+        });
 
-    await _sendJson(request.response, HttpStatus.ok, {
-      'sdp': answer.sdp,
+        return;
+      }
 
-      'type': answer.type,
-    });
+      developer.log('Received WebRTC offer', name: 'CameraServer');
 
-    developer.log('WebRTC answer returned', name: 'CameraServer');
+      final RTCSessionDescription answer = await webRtcService.handleOffer(
+        sdp: sdp,
+
+        type: type,
+      );
+
+      await _sendJson(request.response, HttpStatus.ok, {
+        'sdp': answer.sdp,
+
+        'type': answer.type,
+      });
+
+      developer.log('WebRTC answer returned', name: 'CameraServer');
+    } finally {
+      _webRtcOfferInProgress = false;
+    }
   }
 
   // ============================================================

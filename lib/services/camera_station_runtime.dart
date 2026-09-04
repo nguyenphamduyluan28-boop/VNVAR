@@ -32,6 +32,19 @@ int? nextLowerIos4kFps(int currentFps) {
   return null;
 }
 
+CameraResolutionProfile? nextIosOverloadProfile(
+  CameraResolutionProfile current,
+  List<CameraResolutionProfile> supported,
+) {
+  if (current.preset != CameraResolutionPreset.ultraHd4k) return null;
+  final lowerFps = nextLowerIos4kFps(current.fps);
+  if (lowerFps != null) return current.withFps(lowerFps);
+  for (final profile in supported) {
+    if (profile.preset == CameraResolutionPreset.fullHd1080) return profile;
+  }
+  return null;
+}
+
 class CameraStationRuntime {
   CameraStationRuntime._();
 
@@ -62,9 +75,14 @@ class CameraStationRuntime {
   bool _cameraEnabled = true;
   bool _profileSwitching = false;
   bool _iosLifecycleSuspended = false;
+  bool _iosResumeQueued = false;
+  bool _iosAppInForeground = true;
   bool _healthCheckRunning = false;
   int _iosLowFpsReports = 0;
   DateTime? _lastIosFpsAdjustmentAt;
+  double? _iosActualFps;
+  int? _iosRequestedFps;
+  DateTime? _iosPerformanceMeasuredAt;
   String? _lastRecordingPath;
   int? _lastRecordingBytes;
   DateTime? _lastRecordingProgressAt;
@@ -118,11 +136,13 @@ class CameraStationRuntime {
   bool get thermalWarning => _thermalThrottled;
   bool get storageWarning => _recordingService?.lowStorageWarning ?? false;
   bool get lifecycleSuspended => _iosLifecycleSuspended;
+  bool get lifecycleResuming => _iosResumeQueued;
   String get captureState {
     if (_thermalCriticalSuspended) return 'thermal_suspended';
     if (_recordingService?.storageSuspended == true) {
       return 'storage_suspended';
     }
+    if (_iosResumeQueued) return 'lifecycle_resuming';
     if (_iosLifecycleSuspended) return 'lifecycle_suspended';
     if (_recovering) return 'recovering';
     if (_profileSwitching) return 'profile_switching';
@@ -135,6 +155,15 @@ class CameraStationRuntime {
     if (_thermalThrottled) return 'hot';
     return _temperatureC == null ? 'unknown' : 'normal';
   }
+
+  Map<String, dynamic> get captureMetrics => {
+    'actualFps': _iosActualFps,
+    'requestedFps': _iosRequestedFps ?? _resolutionProfile.fps,
+    'lowFpsReports': _iosLowFpsReports,
+    'lastMeasuredAt': _iosPerformanceMeasuredAt?.toIso8601String(),
+    'lastAdaptedAt': _lastIosFpsAdjustmentAt?.toIso8601String(),
+    'adaptive': Platform.isIOS,
+  };
 
   CameraResolutionProfile get resolutionProfile => _resolutionProfile;
   List<CameraResolutionProfile> get supportedResolutionProfiles =>
@@ -190,6 +219,8 @@ class CameraStationRuntime {
     _stopping = false;
     _cameraEnabled = true;
     _iosLifecycleSuspended = false;
+    _iosResumeQueued = false;
+    _iosAppInForeground = true;
     if (_cameraId != null &&
         (_cameraId != cameraId ||
             _courtId != courtId ||
@@ -265,6 +296,7 @@ class CameraStationRuntime {
         captureStateProvider: () => captureState,
         thermalStateProvider: () => thermalState,
         temperatureProvider: () => _temperatureC,
+        captureMetricsProvider: () => captureMetrics,
       );
       _cameraServer = server;
 
@@ -347,6 +379,11 @@ class CameraStationRuntime {
     _storageCleanupTimer?.cancel();
     _storageCleanupTimer = null;
     _healthCheckRunning = false;
+    _iosLowFpsReports = 0;
+    _iosActualFps = null;
+    _iosRequestedFps = null;
+    _iosPerformanceMeasuredAt = null;
+    _lastIosFpsAdjustmentAt = null;
     _resetRecordingProgressWatchdog();
 
     final server = _cameraServer;
@@ -360,6 +397,8 @@ class CameraStationRuntime {
     _deviceId = null;
     _cameraEnabled = false;
     _iosLifecycleSuspended = false;
+    _iosResumeQueued = false;
+    _iosAppInForeground = true;
 
     try {
       await server?.stop();
@@ -389,7 +428,12 @@ class CameraStationRuntime {
   }
 
   Future<void> suspendForIosBackground() {
-    if (!Platform.isIOS || _iosLifecycleSuspended || !_cameraEnabled) {
+    if (!Platform.isIOS) return Future<void>.value();
+    // Update this synchronously even when capture is already suspended. A
+    // queued resume can otherwise reopen AVCaptureSession after the app has
+    // immediately moved back to the background.
+    _iosAppInForeground = false;
+    if (_iosLifecycleSuspended || !_cameraEnabled) {
       return Future<void>.value();
     }
     _iosLifecycleSuspended = true;
@@ -409,7 +453,20 @@ class CameraStationRuntime {
     );
     await _beginIosBackgroundFinalization();
     try {
-      await recording.stop();
+      try {
+        await recording.stop();
+      } catch (error, stackTrace) {
+        // iOS grants only a short background execution window. A recorder
+        // finalization failure must not prevent the capture session from
+        // being released, otherwise the next foreground resume can collide
+        // with the old AVCaptureSession and leave a black preview.
+        developer.log(
+          '[LIFECYCLE] Unable to finalize iOS segment before background',
+          error: error,
+          stackTrace: stackTrace,
+          name: 'CameraStationRuntime',
+        );
+      }
     } finally {
       try {
         try {
@@ -428,21 +485,42 @@ class CameraStationRuntime {
   }
 
   Future<void> resumeFromIosBackground() {
-    if (!Platform.isIOS || !_iosLifecycleSuspended || !_cameraEnabled) {
+    if (!Platform.isIOS) return Future<void>.value();
+    _iosAppInForeground = true;
+    if (!_iosLifecycleSuspended ||
+        _iosResumeQueued ||
+        !_cameraEnabled) {
       return Future<void>.value();
     }
-    return _serializeLifecycle(_resumeFromIosBackgroundInternal);
+    _iosResumeQueued = true;
+    _emitState();
+    return _serializeLifecycle(_resumeFromIosBackgroundInternal).whenComplete(
+      () {
+        _iosResumeQueued = false;
+        _emitState();
+      },
+    );
   }
 
   Future<void> _resumeFromIosBackgroundInternal() async {
-    if (!Platform.isIOS || !_iosLifecycleSuspended || !_cameraEnabled) return;
+    if (!Platform.isIOS ||
+        !_iosLifecycleSuspended ||
+        !_cameraEnabled ||
+        !_iosAppInForeground) {
+      return;
+    }
     final webRtc = _webRtcService;
     final server = _cameraServer;
     if (webRtc == null || server == null) return;
     if (_thermalCriticalSuspended) {
-      _iosLifecycleSuspended = false;
       await WakelockPlus.enable();
       await _setIosStationActive(true);
+      if (!_iosAppInForeground) {
+        await WakelockPlus.disable();
+        await _setIosStationActive(false);
+        return;
+      }
+      _iosLifecycleSuspended = false;
       _emitState();
       return;
     }
@@ -450,11 +528,31 @@ class CameraStationRuntime {
       // Recreating the stream also rechecks microphone permission. A grant
       // made in iOS Settings therefore takes effect on the first new segment.
       await webRtc.initializeCamera();
+      if (!_iosAppInForeground) {
+        await webRtc.disposeCamera();
+        return;
+      }
       await webRtc.ensureMicrophoneEnabled();
       await _waitForIosCaptureWarmup();
+      if (!_iosAppInForeground) {
+        await webRtc.disposeCamera();
+        return;
+      }
       await server.ensureRecording();
+      if (!_iosAppInForeground) {
+        await _recordingService?.stop();
+        await webRtc.disposeCamera();
+        return;
+      }
       await WakelockPlus.enable();
       await _setIosStationActive(true);
+      if (!_iosAppInForeground) {
+        await _recordingService?.stop();
+        await webRtc.disposeCamera();
+        await WakelockPlus.disable();
+        await _setIosStationActive(false);
+        return;
+      }
       _iosLifecycleSuspended = false;
       developer.log(
         '[LIFECYCLE] iOS foreground capture resumed',
@@ -467,8 +565,10 @@ class CameraStationRuntime {
         stackTrace: stackTrace,
         name: 'CameraStationRuntime',
       );
-      _iosLifecycleSuspended = false;
-      _scheduleRecovery('ios_foreground_resume_failed');
+      if (_iosAppInForeground) {
+        _iosLifecycleSuspended = false;
+        _scheduleRecovery('ios_foreground_resume_failed');
+      }
     } finally {
       _emitState();
     }
@@ -672,8 +772,9 @@ class CameraStationRuntime {
   }
 
   Future<void> _setResolutionProfileInternal(
-    CameraResolutionProfile profile,
-  ) async {
+    CameraResolutionProfile profile, {
+    bool persistSelection = true,
+  }) async {
     if (_profileSwitching || profile == _resolutionProfile) {
       return;
     }
@@ -713,7 +814,9 @@ class CameraStationRuntime {
       await _waitForIosCaptureWarmup(profile: selected);
       await server.ensureRecording();
       _resolutionProfile = selected;
-      await StationConfigService().saveResolutionProfile(selected);
+      if (persistSelection) {
+        await StationConfigService().saveResolutionProfile(selected);
+      }
       developer.log(
         '[CAMERA] Resolution changed to ${selected.shortLabel} '
         '${selected.fps} FPS',
@@ -753,6 +856,10 @@ class CameraStationRuntime {
   }
 
   void _handleIosCapturePerformance(double actualFps, int requestedFps) {
+    _iosActualFps = actualFps;
+    _iosRequestedFps = requestedFps;
+    _iosPerformanceMeasuredAt = DateTime.now();
+    _emitState();
     if (!Platform.isIOS ||
         _stopping ||
         _recovering ||
@@ -778,21 +885,28 @@ class CameraStationRuntime {
         now.difference(lastAdjustment) < const Duration(seconds: 30)) {
       return;
     }
-    final nextFps = nextLowerIos4kFps(_resolutionProfile.fps);
-    if (nextFps == null) return;
+    final adjusted = nextIosOverloadProfile(
+      _resolutionProfile,
+      _supportedResolutionProfiles,
+    );
+    if (adjusted == null) return;
     _iosLowFpsReports = 0;
     _lastIosFpsAdjustmentAt = now;
     developer.log(
       '[CAMERA] iOS 4K delivered ${actualFps.toStringAsFixed(1)}/$requestedFps FPS; '
-      'adapting to $nextFps FPS',
+      'adapting to ${adjusted.shortLabel}/${adjusted.fps} FPS',
       name: 'CameraStationRuntime',
     );
-    final adjusted = _resolutionProfile.withFps(nextFps);
     unawaited(() async {
       try {
-        await setResolutionProfile(adjusted);
+        _interruptRecovery();
+        await _serializeLifecycle(
+          () =>
+              _setResolutionProfileInternal(adjusted, persistSelection: false),
+        );
         final deviceId = _deviceId;
-        if (deviceId != null) {
+        if (deviceId != null &&
+            adjusted.preset == CameraResolutionPreset.ultraHd4k) {
           await StationConfigService().saveAdaptiveIosFps(
             deviceId: deviceId,
             facingMode: _webRtcService?.currentFacingMode ?? 'environment',

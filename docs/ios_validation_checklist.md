@@ -16,6 +16,8 @@ cd ..
 Pass criteria:
 
 - `pod install` exits with code 0.
+- `ios/Podfile.lock` is generated, reviewed and committed so CI/release machines
+  resolve the same native dependencies. Do not create this file manually.
 - `ios/Runner.xcworkspace` opens without missing pod references.
 - All pods use an iOS deployment target of at least 14.0.
 
@@ -54,7 +56,10 @@ session after returning to the app.
 2. Verify discovery and `GET /status`.
 3. Open `/viewer` and the Tablet WebRTC client.
 4. Disconnect/reconnect Wi-Fi and repeat three times.
-5. Confirm `rtspSupported: false` on iOS; RTSP must not block WebRTC.
+5. Confirm `rtspSupported: true`, `rtspRunning: true` and connect CheckVAR to
+   `rtsp://<iphone-ip>:8554/camera`.
+6. Keep WebRTC connected while RTSP is playing and verify neither transport
+   restarts the shared camera track.
 
 Pass criteria: live video appears, reconnects without restarting the app and
 latency does not continuously increase.
@@ -85,5 +90,16 @@ retained and memory usage does not grow continuously.
 
 ## 12. RTSP native iOS
 
-Do not implement until steps 7–11 pass and an actual iOS RTSP consumer is
-confirmed. WebRTC and HTTP video APIs remain the supported iOS transport.
+1. Connect and disconnect the actual CheckVAR RTSP consumer at least 20 times.
+2. Verify PLAY begins on an IDR frame and no green/yellow macroblocks appear.
+3. Simulate weak Wi-Fi and verify slow clients are removed without stopping
+   recording or WebRTC.
+4. Verify RTCP Sender Report is emitted and CheckVAR Receiver Report changes
+   the native encoder bitrate.
+5. Force decoder recovery and verify PLI requests a new keyframe.
+6. Test one through four simultaneous RTSP clients; a fifth client must be
+   rejected without affecting existing viewers.
+
+Pass criteria: RTSP, WebRTC and recording share one capture track, reconnects
+do not crash Network.framework, latency remains bounded and saved video keeps
+recording throughout the test.
