@@ -498,9 +498,7 @@ class CameraStationRuntime {
   Future<void> resumeFromIosBackground() {
     if (!Platform.isIOS) return Future<void>.value();
     _iosAppInForeground = true;
-    if (!_iosLifecycleSuspended ||
-        _iosResumeQueued ||
-        !_cameraEnabled) {
+    if (!_iosLifecycleSuspended || _iosResumeQueued || !_cameraEnabled) {
       return Future<void>.value();
     }
     _iosResumeQueued = true;
@@ -1033,10 +1031,7 @@ class CameraStationRuntime {
 
       final progress = await recording.currentRecordingProgress();
       if (progress == null) {
-        _reportHealthFailure(
-          'recording_progress_missing',
-          requiredFailures: 2,
-        );
+        _reportHealthFailure('recording_progress_missing', requiredFailures: 2);
         return;
       }
       final now = DateTime.now();
@@ -1092,11 +1087,10 @@ class CameraStationRuntime {
           '[RECORDING] Native audio stopped growing at ${audioProgress?.bytes} bytes',
           name: 'CameraStationRuntime',
         );
-        _reportHealthFailure(
-          'recording_audio_stalled',
-          requiredFailures: 2,
-        );
-      } else if (videoStalled && (audioProgress == null || videoHardStalled)) {
+        _reportHealthFailure('recording_audio_stalled', requiredFailures: 2);
+      } else if (videoStalled &&
+          !_hasRecentHealthyIosCapture(now) &&
+          (audioProgress == null || videoHardStalled)) {
         // MP4 writers may buffer metadata/video writes. On Android, continuing
         // WAV progress proves the capture pipeline is alive and avoids a false
         // recovery. Video-only/iOS segments still rely on MP4 growth.
@@ -1104,10 +1098,7 @@ class CameraStationRuntime {
           '[RECORDING] Staging file stopped growing at ${progress.bytes} bytes',
           name: 'CameraStationRuntime',
         );
-        _reportHealthFailure(
-          'recording_file_stalled',
-          requiredFailures: 2,
-        );
+        _reportHealthFailure('recording_file_stalled', requiredFailures: 2);
       } else {
         _healthFailureCounts.clear();
       }
@@ -1123,6 +1114,14 @@ class CameraStationRuntime {
     }
   }
 
+  bool _hasRecentHealthyIosCapture(DateTime now) {
+    if (!Platform.isIOS) return false;
+    final measuredAt = _iosPerformanceMeasuredAt;
+    final actualFps = _iosActualFps;
+    if (measuredAt == null || actualFps == null || actualFps < 1) return false;
+    return now.difference(measuredAt) <= const Duration(seconds: 30);
+  }
+
   void _resetRecordingProgressWatchdog() {
     _lastRecordingPath = null;
     _lastRecordingBytes = null;
@@ -1134,9 +1133,7 @@ class CameraStationRuntime {
   }
 
   void _beginRecordingTransitionGrace({DateTime? now}) {
-    _healthGraceUntil = (now ?? DateTime.now()).add(
-      _recordingTransitionGrace,
-    );
+    _healthGraceUntil = (now ?? DateTime.now()).add(_recordingTransitionGrace);
     _healthFailureCounts.clear();
   }
 
@@ -1145,10 +1142,7 @@ class CameraStationRuntime {
     return until != null && now.isBefore(until);
   }
 
-  void _reportHealthFailure(
-    String reason, {
-    required int requiredFailures,
-  }) {
+  void _reportHealthFailure(String reason, {required int requiredFailures}) {
     if (_inRecordingTransitionGrace(DateTime.now())) return;
     final failures = (_healthFailureCounts[reason] ?? 0) + 1;
     _healthFailureCounts
@@ -1472,6 +1466,27 @@ class CameraStationRuntime {
   }
 
   void _scheduleRecovery(String reason) {
+    final recording = _recordingService;
+    if (Platform.isIOS &&
+        reason == 'video_track_ended' &&
+        recording?.recording == true) {
+      developer.log(
+        '[CAMERA] Ignoring iOS recorder-boundary video_track_ended; '
+        'waiting for health confirmation.',
+        name: 'CameraStationRuntime',
+      );
+      _beginRecordingTransitionGrace();
+      return;
+    }
+    if (recording?.rotating == true) {
+      developer.log(
+        '[CAMERA] Ignoring transient $reason during recorder hand-off; '
+        'the health monitor will confirm a persistent failure.',
+        name: 'CameraStationRuntime',
+      );
+      _beginRecordingTransitionGrace();
+      return;
+    }
     if (_stopping ||
         _recovering ||
         _thermalCriticalSuspended ||

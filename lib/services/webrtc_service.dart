@@ -87,6 +87,7 @@ class WebRtcService {
   bool _microphoneEnabled = true;
   bool _iosMicrophonePermissionGranted = false;
   Timer? _muteFailureTimer;
+  Timer? _endedFailureTimer;
   Timer? _audioFailureTimer;
   Timer? _firstFrameFailureTimer;
   Completer<void>? _firstFrameCompleter;
@@ -483,9 +484,20 @@ class WebRtcService {
     }
 
     videoTrack.onEnded = () {
-      _cameraInitialized = false;
-      developer.log('[CAMERA] Video track ended', name: 'WebRtcService');
-      onCameraFailure?.call('video_track_ended');
+      developer.log(
+        '[CAMERA] Video track ended; waiting for transition confirmation',
+        name: 'WebRtcService',
+      );
+      _endedFailureTimer?.cancel();
+      final observedGeneration = cameraGeneration;
+      _endedFailureTimer = Timer(const Duration(seconds: 8), () {
+        if (observedGeneration != _cameraLifecycleGeneration ||
+            _localStream != stream) {
+          return;
+        }
+        _cameraInitialized = false;
+        onCameraFailure?.call('video_track_ended');
+      });
     };
 
     videoTrack.onMute = () {
@@ -497,6 +509,8 @@ class WebRtcService {
     };
 
     videoTrack.onUnMute = () {
+      _endedFailureTimer?.cancel();
+      _endedFailureTimer = null;
       _muteFailureTimer?.cancel();
       _muteFailureTimer = null;
       developer.log('[CAMERA] Video track unmuted', name: 'WebRtcService');
@@ -1145,6 +1159,8 @@ class WebRtcService {
     await _stopRtsp();
     _muteFailureTimer?.cancel();
     _muteFailureTimer = null;
+    _endedFailureTimer?.cancel();
+    _endedFailureTimer = null;
     _audioFailureTimer?.cancel();
     _audioFailureTimer = null;
     _firstFrameFailureTimer?.cancel();
