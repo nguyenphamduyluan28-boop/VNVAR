@@ -5,14 +5,16 @@ import 'screens/court_count_screen.dart';
 import 'screens/setup_screen.dart';
 import 'screens/station_screen.dart';
 import 'screens/station_splash_screen.dart';
-import 'services/station_config_service.dart';
+import 'services/app_language_service.dart';
 import 'services/camera_station_foreground_service.dart';
 import 'services/camera_station_runtime.dart';
+import 'services/station_config_service.dart';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
 
   StationIdentity? savedIdentity;
+  await AppLanguageService.instance.load();
   try {
     savedIdentity = await StationConfigService().loadIdentity();
   } catch (error, stackTrace) {
@@ -124,18 +126,21 @@ class _VnvarCameraStationAppState extends State<VnvarCameraStationApp> {
 
   @override
   Widget build(BuildContext context) {
-    return MaterialApp(
-      title: 'VNVAR Camera Station',
-      debugShowCheckedModeBanner: false,
-      theme: ThemeData(
-        colorScheme: ColorScheme.fromSeed(seedColor: const Color(0xFF1565C0)),
-        useMaterial3: true,
-      ),
-      home: PopScope(
-        canPop:
-            _step == _StartupStep.splash || _step == _StartupStep.courtSetup,
-        onPopInvokedWithResult: (didPop, _) => _handleSystemBack(didPop),
-        child: _buildCurrentScreen(),
+    return AppLanguageScope(
+      service: AppLanguageService.instance,
+      child: MaterialApp(
+        title: 'VNVAR Camera Station',
+        debugShowCheckedModeBanner: false,
+        theme: ThemeData(
+          colorScheme: ColorScheme.fromSeed(seedColor: const Color(0xFF1565C0)),
+          useMaterial3: true,
+        ),
+        home: PopScope(
+          canPop:
+              _step == _StartupStep.splash || _step == _StartupStep.courtSetup,
+          onPopInvokedWithResult: (didPop, _) => _handleSystemBack(didPop),
+          child: _buildCurrentScreen(),
+        ),
       ),
     );
   }

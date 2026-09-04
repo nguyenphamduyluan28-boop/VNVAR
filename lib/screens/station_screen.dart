@@ -8,6 +8,7 @@ import 'package:flutter_webrtc/flutter_webrtc.dart';
 import '../models/camera_resolution_profile.dart';
 import '../models/station_identity.dart';
 import '../services/camera_station_foreground_service.dart';
+import '../services/app_language_service.dart';
 import '../services/camera_station_runtime.dart';
 import '../services/recording_service.dart';
 import '../services/station_config_service.dart';
@@ -102,7 +103,15 @@ class _StationScreenState extends State<StationScreen>
       }
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Không thể đổi trạng thái camera: $error')),
+          SnackBar(
+            content: Text(
+              appText(
+                context,
+                'Không thể đổi trạng thái camera: $error',
+                'Cannot change camera state: $error',
+              ),
+            ),
+          ),
         );
       }
     } finally {
@@ -122,7 +131,13 @@ class _StationScreenState extends State<StationScreen>
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(
-            content: Text('Không thể thay đổi độ sáng màn hình: $error'),
+            content: Text(
+              appText(
+                context,
+                'Không thể thay đổi độ sáng màn hình: $error',
+                'Cannot change screen brightness: $error',
+              ),
+            ),
           ),
         );
       }
@@ -140,7 +155,11 @@ class _StationScreenState extends State<StationScreen>
     ScaffoldMessenger.of(context).showSnackBar(
       SnackBar(
         content: Text(
-          'Camera vẫn hoạt động nhưng RTSP không thể khởi động: $error',
+          appText(
+            context,
+            'Camera vẫn hoạt động nhưng RTSP không thể khởi động: $error',
+            'The camera is running, but RTSP could not start: $error',
+          ),
         ),
       ),
     );
@@ -412,16 +431,19 @@ class _StationScreenState extends State<StationScreen>
             color: Color(0xFF1565C0),
             size: 42,
           ),
-          title: const Text(
-            'ÁP DỤNG CẤU HÌNH MỚI?',
+          title: Text(
+            appText(context, 'ÁP DỤNG CẤU HÌNH MỚI?', 'APPLY NEW SETTINGS?'),
             textAlign: TextAlign.center,
           ),
           content: Column(
             mainAxisSize: MainAxisSize.min,
             children: [
-              const Text(
-                'Camera Station sẽ khởi động lại '
-                'dịch vụ với cấu hình mới.',
+              Text(
+                appText(
+                  context,
+                  'Camera Station sẽ khởi động lại dịch vụ với cấu hình mới.',
+                  'Camera Station will restart its services with the new settings.',
+                ),
                 textAlign: TextAlign.center,
               ),
               const SizedBox(height: 16),
@@ -434,14 +456,17 @@ class _StationScreenState extends State<StationScreen>
                 ),
                 child: Column(
                   children: [
-                    _ConfigLine(title: 'Tên', value: newIdentity.cameraName),
+                    _ConfigLine(
+                      title: appText(context, 'Tên', 'Name'),
+                      value: newIdentity.cameraName,
+                    ),
                     _ConfigLine(title: 'Camera', value: newIdentity.cameraId),
                     _ConfigLine(
-                      title: 'Sân',
+                      title: appText(context, 'Sân', 'Court'),
                       value: _courtLabel(newIdentity.courtId),
                     ),
                     _ConfigLine(
-                      title: 'Vị trí',
+                      title: appText(context, 'Vị trí', 'Position'),
                       value: newIdentity.cameraPosition,
                     ),
                   ],
@@ -455,14 +480,14 @@ class _StationScreenState extends State<StationScreen>
               onPressed: () {
                 Navigator.pop(dialogContext, false);
               },
-              child: const Text('HỦY'),
+              child: Text(appText(context, 'HỦY', 'CANCEL')),
             ),
             FilledButton.icon(
               onPressed: () {
                 Navigator.pop(dialogContext, true);
               },
               icon: const Icon(Icons.check_rounded),
-              label: const Text('ÁP DỤNG'),
+              label: Text(appText(context, 'ÁP DỤNG', 'APPLY')),
             ),
           ],
         );
@@ -563,9 +588,9 @@ class _StationScreenState extends State<StationScreen>
               mainAxisSize: MainAxisSize.min,
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                const Text(
-                  'CHẤT LƯỢNG CAMERA',
-                  style: TextStyle(
+                Text(
+                  appText(context, 'CHẤT LƯỢNG CAMERA', 'CAMERA QUALITY'),
+                  style: const TextStyle(
                     color: Colors.white,
                     fontSize: 17,
                     fontWeight: FontWeight.w900,
@@ -616,7 +641,15 @@ class _StationScreenState extends State<StationScreen>
     } catch (error) {
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Không thể đổi chất lượng camera: $error')),
+          SnackBar(
+            content: Text(
+              appText(
+                context,
+                'Không thể đổi chất lượng camera: $error',
+                'Cannot change camera quality: $error',
+              ),
+            ),
+          ),
         );
       }
     }
@@ -629,9 +662,15 @@ class _StationScreenState extends State<StationScreen>
         ..showSnackBar(
           SnackBar(
             content: Text(
-              'Thiết bị đang nóng. Chất lượng tạm khóa ở '
-              '${_runtime.resolutionProfile.shortLabel}/'
-              '${_runtime.resolutionProfile.fps} FPS và sẽ tự khôi phục khi nhiệt độ ổn định.',
+              appText(
+                context,
+                'Thiết bị đang nóng. Chất lượng tạm khóa ở '
+                    '${_runtime.resolutionProfile.shortLabel}/'
+                    '${_runtime.resolutionProfile.fps} FPS và sẽ tự khôi phục khi nhiệt độ ổn định.',
+                'Device temperature is high. Quality is temporarily locked at '
+                    '${_runtime.resolutionProfile.shortLabel}/'
+                    '${_runtime.resolutionProfile.fps} FPS and will recover when temperature is stable.',
+              ),
             ),
           ),
         );
@@ -731,9 +770,13 @@ class _StationScreenState extends State<StationScreen>
                 strokeWidth: 2.6,
               ),
               const SizedBox(height: 18),
-              const Text(
-                'ĐANG KHỞI ĐỘNG CAMERA STATION...',
-                style: TextStyle(
+              Text(
+                appText(
+                  context,
+                  'ĐANG KHỞI ĐỘNG CAMERA STATION...',
+                  'STARTING CAMERA STATION...',
+                ),
+                style: const TextStyle(
                   color: Colors.white70,
                   fontSize: 13,
                   fontWeight: FontWeight.w800,
@@ -814,9 +857,9 @@ class _StationScreenState extends State<StationScreen>
                       ),
                       onPressed: _retry,
                       icon: const Icon(Icons.refresh_rounded),
-                      label: const Text(
-                        'THỬ LẠI',
-                        style: TextStyle(fontWeight: FontWeight.w800),
+                      label: Text(
+                        appText(context, 'THỬ LẠI', 'TRY AGAIN'),
+                        style: const TextStyle(fontWeight: FontWeight.w800),
                       ),
                     ),
                   ),
@@ -985,8 +1028,16 @@ class _StationScreenState extends State<StationScreen>
                           child: Text(
                             _runtime.lifecycleResuming ||
                                     _runtime.captureState == 'recovering'
-                                ? 'Đang khôi phục camera và ghi hình sau khi quay lại ứng dụng…'
-                                : 'iOS đã tạm dừng camera khi ứng dụng ở nền. Hãy giữ Camera Station trên màn hình để ghi liên tục.',
+                                ? appText(
+                                    context,
+                                    'Đang khôi phục camera và ghi hình sau khi quay lại ứng dụng…',
+                                    'Restoring camera and recording…',
+                                  )
+                                : appText(
+                                    context,
+                                    'iOS đã tạm dừng camera khi ứng dụng ở nền. Hãy giữ Camera Station trên màn hình để ghi liên tục.',
+                                    'iOS paused the camera in the background. Keep Camera Station visible for continuous recording.',
+                                  ),
                             maxLines: compact ? 2 : 1,
                             overflow: TextOverflow.ellipsis,
                             textAlign: TextAlign.center,
@@ -1013,8 +1064,16 @@ class _StationScreenState extends State<StationScreen>
                           ),
                           child: Text(
                             _runtime.thermalWarning
-                                ? 'Thiết bị đang nóng${_runtime.temperatureC == null ? '' : ' (${_runtime.temperatureC!.toStringAsFixed(1)}°C)'}. Đã giảm xuống ${_runtime.resolutionProfile.shortLabel}/${_runtime.resolutionProfile.fps} FPS để bảo vệ camera.'
-                                : 'Dung lượng lưu trữ thấp. Hệ thống sẽ dọn video cũ theo chính sách lưu trữ.',
+                                ? appText(
+                                    context,
+                                    'Thiết bị đang nóng${_runtime.temperatureC == null ? '' : ' (${_runtime.temperatureC!.toStringAsFixed(1)}°C)'}. Đã giảm xuống ${_runtime.resolutionProfile.shortLabel}/${_runtime.resolutionProfile.fps} FPS để bảo vệ camera.',
+                                    'Device temperature is high${_runtime.temperatureC == null ? '' : ' (${_runtime.temperatureC!.toStringAsFixed(1)}°C)'}. Reduced to ${_runtime.resolutionProfile.shortLabel}/${_runtime.resolutionProfile.fps} FPS to protect the camera.',
+                                  )
+                                : appText(
+                                    context,
+                                    'Dung lượng lưu trữ thấp. Hệ thống sẽ dọn video cũ theo chính sách lưu trữ.',
+                                    'Storage is low. Old videos will be cleaned according to the retention policy.',
+                                  ),
                             maxLines: compact ? 2 : 1,
                             overflow: TextOverflow.ellipsis,
                             textAlign: TextAlign.center,
@@ -1126,14 +1185,23 @@ class _StationHeader extends StatelessWidget {
               SizedBox(width: compact ? 6 : 8),
               _HeaderIconButton(
                 icon: Icons.video_settings_rounded,
-                tooltip: 'Kho video',
+                tooltip: appText(context, 'Kho video', 'Video storage'),
                 size: actionSize,
                 onTap: onVideoStorage,
               ),
               SizedBox(width: compact ? 4 : 6),
+              AppLanguageButton(
+                foregroundColor: Colors.white,
+                size: actionSize,
+              ),
+              SizedBox(width: compact ? 4 : 6),
               _HeaderIconButton(
                 icon: Icons.settings_rounded,
-                tooltip: 'Cấu hình Camera Station',
+                tooltip: appText(
+                  context,
+                  'Cấu hình Camera Station',
+                  'Camera Station settings',
+                ),
                 size: actionSize,
                 onTap: onSettings,
               ),
@@ -1402,14 +1470,22 @@ class _CameraControlDock extends StatelessWidget {
         children: [
           _DockButton(
             icon: Icons.rotate_90_degrees_cw_rounded,
-            tooltip: 'Xoay hình camera 90°',
+            tooltip: appText(
+              context,
+              'Xoay hình camera 90°',
+              'Rotate camera 90°',
+            ),
             size: buttonSize,
             onPressed: onRotate,
           ),
           SizedBox(height: gap),
           _DockButton(
             icon: Icons.cameraswitch_rounded,
-            tooltip: 'Đổi camera trước/sau',
+            tooltip: appText(
+              context,
+              'Đổi camera trước/sau',
+              'Switch front/rear camera',
+            ),
             size: buttonSize,
             onPressed: onSwitchLens,
             loading: lensSwitching,
@@ -1419,7 +1495,9 @@ class _CameraControlDock extends StatelessWidget {
             icon: cameraEnabled
                 ? Icons.videocam_off_rounded
                 : Icons.videocam_rounded,
-            tooltip: cameraEnabled ? 'Tắt camera' : 'Bật camera',
+            tooltip: cameraEnabled
+                ? appText(context, 'Tắt camera', 'Turn camera off')
+                : appText(context, 'Bật camera', 'Turn camera on'),
             size: buttonSize,
             onPressed: onToggleCamera,
             loading: cameraSwitching,
@@ -1433,8 +1511,16 @@ class _CameraControlDock extends StatelessWidget {
                 ? Icons.brightness_7_rounded
                 : Icons.dark_mode_rounded,
             tooltip: screenDimmed
-                ? 'Khôi phục độ sáng màn hình'
-                : 'Làm mờ màn hình để giảm nhiệt',
+                ? appText(
+                    context,
+                    'Khôi phục độ sáng màn hình',
+                    'Restore screen brightness',
+                  )
+                : appText(
+                    context,
+                    'Làm mờ màn hình để giảm nhiệt',
+                    'Dim screen to reduce heat',
+                  ),
             size: buttonSize,
             onPressed: onToggleScreenDim,
             loading: screenDimSwitching,
@@ -1534,7 +1620,9 @@ class _BottomStatusBar extends StatelessWidget {
           Expanded(
             child: _CompactStatus(
               icon: Icons.videocam_rounded,
-              text: cameraReady ? 'CAMERA READY' : 'CAMERA OFF',
+              text: cameraReady
+                  ? appText(context, 'CAMERA SẴN SÀNG', 'CAMERA READY')
+                  : appText(context, 'CAMERA TẮT', 'CAMERA OFF'),
               color: cameraReady ? Colors.greenAccent : Colors.orangeAccent,
               compact: compact,
             ),
@@ -1547,7 +1635,9 @@ class _BottomStatusBar extends StatelessWidget {
           Expanded(
             child: _CompactStatus(
               icon: Icons.fiber_manual_record_rounded,
-              text: recording ? 'RECORDING' : 'READY',
+              text: recording
+                  ? appText(context, 'ĐANG GHI', 'RECORDING')
+                  : appText(context, 'SẴN SÀNG', 'READY'),
               color: recording ? Colors.redAccent : Colors.greenAccent,
               compact: compact,
             ),

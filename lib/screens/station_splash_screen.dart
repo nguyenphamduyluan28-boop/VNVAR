@@ -2,6 +2,8 @@ import 'dart:async';
 
 import 'package:flutter/material.dart';
 
+import '../services/app_language_service.dart';
+
 class StationSplashScreen extends StatefulWidget {
   final VoidCallback onFinished;
 
@@ -44,33 +46,44 @@ class _StationSplashScreenState extends State<StationSplashScreen> {
               child: Center(
                 child: Column(
                   mainAxisSize: MainAxisSize.min,
-                  children: const [
-                    Image(
+                  children: [
+                    const Image(
                       image: AssetImage('assets/images/vnvar_logo.png'),
                       width: 260,
                       height: 150,
                       fit: BoxFit.contain,
                     ),
-                    SizedBox(height: 24),
-                    SizedBox(
+                    const SizedBox(height: 24),
+                    const SizedBox(
                       width: 34,
                       height: 34,
                       child: CircularProgressIndicator(strokeWidth: 3),
                     ),
-                    SizedBox(height: 18),
+                    const SizedBox(height: 18),
                     Text(
-                      'CAMERA ĐANG KHỞI TẠO...',
-                      style: TextStyle(
+                      appText(
+                        context,
+                        'CAMERA ĐANG KHỞI TẠO...',
+                        'INITIALIZING CAMERA...',
+                      ),
+                      style: const TextStyle(
                         color: Color(0xFF12223F),
                         fontSize: 18,
                         fontWeight: FontWeight.w900,
                         letterSpacing: 1.2,
                       ),
                     ),
-                    SizedBox(height: 6),
+                    const SizedBox(height: 6),
                     Text(
-                      'VNVAR Camera Station đang chuẩn bị',
-                      style: TextStyle(color: Colors.black54, fontSize: 13),
+                      appText(
+                        context,
+                        'VNVAR Camera Station đang chuẩn bị',
+                        'VNVAR Camera Station is getting ready',
+                      ),
+                      style: const TextStyle(
+                        color: Colors.black54,
+                        fontSize: 13,
+                      ),
                     ),
                   ],
                 ),

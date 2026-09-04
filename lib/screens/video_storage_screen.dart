@@ -5,6 +5,7 @@ import 'package:flutter/material.dart';
 import 'package:video_player/video_player.dart';
 
 import '../services/recording_service.dart';
+import '../services/app_language_service.dart';
 
 class VideoStorageScreen extends StatefulWidget {
   final RecordingService recordingService;
@@ -93,12 +94,20 @@ class _VideoStorageScreenState extends State<VideoStorageScreen> {
           shape: RoundedRectangleBorder(
             borderRadius: BorderRadius.circular(20),
           ),
-          title: const Text('Xác nhận thư mục lưu'),
+          title: Text(
+            appText(context, 'Xác nhận thư mục lưu', 'Confirm storage folder'),
+          ),
           content: Column(
             mainAxisSize: MainAxisSize.min,
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
-              const Text('Video .ts sẽ được lưu tại:'),
+              Text(
+                appText(
+                  context,
+                  'Video .ts sẽ được lưu tại:',
+                  'The .ts videos will be saved to:',
+                ),
+              ),
               const SizedBox(height: 10),
               Container(
                 width: double.infinity,
@@ -126,8 +135,12 @@ class _VideoStorageScreenState extends State<VideoStorageScreen> {
                             style: const TextStyle(fontWeight: FontWeight.w800),
                           ),
                           const SizedBox(height: 2),
-                          const Text(
-                            'Tự động sắp xếp theo ngày · AUTOMODE',
+                          Text(
+                            appText(
+                              context,
+                              'Tự động sắp xếp theo ngày · AUTOMODE',
+                              'Automatically organized by date · AUTOMODE',
+                            ),
                             style: TextStyle(
                               color: Colors.black54,
                               fontSize: 12,
@@ -144,11 +157,11 @@ class _VideoStorageScreenState extends State<VideoStorageScreen> {
           actions: [
             TextButton(
               onPressed: () => Navigator.pop(context, false),
-              child: const Text('CHỌN LẠI'),
+              child: Text(appText(context, 'CHỌN LẠI', 'CHOOSE AGAIN')),
             ),
             FilledButton(
               onPressed: () => Navigator.pop(context, true),
-              child: const Text('SỬ DỤNG'),
+              child: Text(appText(context, 'SỬ DỤNG', 'USE')),
             ),
           ],
         ),
@@ -160,7 +173,15 @@ class _VideoStorageScreenState extends State<VideoStorageScreen> {
     } catch (error) {
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('Không thể sử dụng thư mục này: $error')),
+        SnackBar(
+          content: Text(
+            appText(
+              context,
+              'Không thể sử dụng thư mục này: $error',
+              'Cannot use this folder: $error',
+            ),
+          ),
+        ),
       );
     }
   }
@@ -171,7 +192,15 @@ class _VideoStorageScreenState extends State<VideoStorageScreen> {
     if (!mounted) return;
     setState(() => _segmentMinutes = minutes);
     ScaffoldMessenger.of(context).showSnackBar(
-      const SnackBar(content: Text('Thời lượng mới áp dụng từ đoạn kế tiếp.')),
+      SnackBar(
+        content: Text(
+          appText(
+            context,
+            'Thời lượng mới áp dụng từ đoạn kế tiếp.',
+            'The new duration applies to the next segment.',
+          ),
+        ),
+      ),
     );
   }
 
@@ -214,19 +243,25 @@ class _VideoStorageScreenState extends State<VideoStorageScreen> {
   @override
   Widget build(BuildContext context) {
     final host = Uri.tryParse(widget.viewerAddress)?.host ?? '';
-    final apiBase = host.isEmpty ? 'Chưa có kết nối LAN' : 'http://$host:8080';
+    final apiBase = host.isEmpty
+        ? appText(context, 'Chưa có kết nối LAN', 'No LAN connection')
+        : 'http://$host:8080';
     return Scaffold(
       backgroundColor: const Color(0xFFF6F8FB),
       appBar: AppBar(
         elevation: 0,
         scrolledUnderElevation: 1,
-        title: const Text(
-          'LƯU VIDEO',
-          style: TextStyle(fontWeight: FontWeight.w900, letterSpacing: 0.4),
+        title: Text(
+          appText(context, 'LƯU VIDEO', 'VIDEO STORAGE'),
+          style: const TextStyle(
+            fontWeight: FontWeight.w900,
+            letterSpacing: 0.4,
+          ),
         ),
         actions: [
+          const AppLanguageButton(),
           IconButton(
-            tooltip: 'Làm mới',
+            tooltip: appText(context, 'Làm mới', 'Refresh'),
             onPressed: _refresh,
             icon: const Icon(Icons.refresh_rounded),
           ),
@@ -390,9 +425,13 @@ class _InformationPanel extends StatelessWidget {
               // ------------------------------------------------
               // SEGMENT DURATION
               // ------------------------------------------------
-              const _SectionLabel(
+              _SectionLabel(
                 icon: Icons.timer_outlined,
-                text: 'CHIA VIDEO TỰ ĐỘNG',
+                text: appText(
+                  context,
+                  'CHIA VIDEO TỰ ĐỘNG',
+                  'AUTOMATIC VIDEO SEGMENTS',
+                ),
               ),
               const SizedBox(height: 10),
               DropdownButtonFormField<int>(
@@ -414,7 +453,9 @@ class _InformationPanel extends StatelessWidget {
                     .map(
                       (minutes) => DropdownMenuItem(
                         value: minutes,
-                        child: Text('$minutes phút'),
+                        child: Text(
+                          appText(context, '$minutes phút', '$minutes minutes'),
+                        ),
                       ),
                     )
                     .toList(),
@@ -426,9 +467,9 @@ class _InformationPanel extends StatelessWidget {
               // ------------------------------------------------
               // STORAGE PATH
               // ------------------------------------------------
-              const _SectionLabel(
+              _SectionLabel(
                 icon: Icons.folder_rounded,
-                text: 'THƯ MỤC ĐANG LƯU',
+                text: appText(context, 'THƯ MỤC ĐANG LƯU', 'STORAGE FOLDER'),
               ),
               const SizedBox(height: 10),
               Row(
@@ -471,8 +512,16 @@ class _InformationPanel extends StatelessWidget {
                                 const SizedBox(height: 2),
                                 Text(
                                   storagePath.isEmpty
-                                      ? 'Chọn thư mục để bắt đầu lưu video'
-                                      : 'Theo ngày · AUTOMODE',
+                                      ? appText(
+                                          context,
+                                          'Chọn thư mục để bắt đầu lưu video',
+                                          'Choose a folder to start saving videos',
+                                        )
+                                      : appText(
+                                          context,
+                                          'Theo ngày · AUTOMODE',
+                                          'By date · AUTOMODE',
+                                        ),
                                   style: const TextStyle(
                                     color: Colors.black54,
                                     fontSize: 12,
@@ -498,7 +547,9 @@ class _InformationPanel extends StatelessWidget {
                       onPressed: onChooseStorage,
                       icon: const Icon(Icons.folder_open_rounded, size: 18),
                       label: Text(
-                        storagePath.isEmpty ? 'CHỌN THƯ MỤC' : 'ĐỔI THƯ MỤC',
+                        storagePath.isEmpty
+                            ? appText(context, 'CHỌN THƯ MỤC', 'CHOOSE FOLDER')
+                            : appText(context, 'ĐỔI THƯ MỤC', 'CHANGE FOLDER'),
                         style: const TextStyle(
                           fontSize: 11,
                           fontWeight: FontWeight.w900,
@@ -514,19 +565,19 @@ class _InformationPanel extends StatelessWidget {
               // ------------------------------------------------
               // API ENDPOINTS
               // ------------------------------------------------
-              const _SectionLabel(
+              _SectionLabel(
                 icon: Icons.api_rounded,
-                text: 'KẾT NỐI MẠNG',
+                text: appText(context, 'KẾT NỐI MẠNG', 'NETWORK CONNECTION'),
               ),
               const SizedBox(height: 10),
               _SettingLine(
                 icon: Icons.lan_rounded,
-                title: 'Danh sách qua IP',
+                title: appText(context, 'Danh sách qua IP', 'List via IP'),
                 value: '$apiBase/segments',
               ),
               _SettingLine(
                 icon: Icons.content_cut_rounded,
-                title: 'API cắt video',
+                title: appText(context, 'API cắt video', 'Video clipping API'),
                 value: '$apiBase/trim',
                 last: true,
               ),
@@ -709,8 +760,11 @@ class VideoList extends StatelessWidget {
               child: TabBarView(
                 children: cameraIds
                     .map(
-                      (cameraId) =>
-                          _buildCameraList(cameraId, videosByCamera[cameraId]!),
+                      (cameraId) => _buildCameraList(
+                        context,
+                        cameraId,
+                        videosByCamera[cameraId]!,
+                      ),
                     )
                     .toList(),
               ),
@@ -731,21 +785,33 @@ class VideoList extends StatelessWidget {
     return number == null ? cameraId.toUpperCase() : 'CAM${int.parse(number)}';
   }
 
-  Widget _buildCameraList(String cameraId, List<RecordedSegment> cameraVideos) {
+  Widget _buildCameraList(
+    BuildContext context,
+    String cameraId,
+    List<RecordedSegment> cameraVideos,
+  ) {
     final isActivelyRecording =
         _cameraKey(activeCameraId) == cameraId &&
         activeRecordingPath != null &&
         activeRecordingStartedAt != null;
     if (cameraVideos.isEmpty && !isActivelyRecording) {
-      return const Center(
+      return Center(
         child: Column(
           mainAxisSize: MainAxisSize.min,
           children: [
-            Icon(Icons.videocam_off_rounded, size: 44, color: Colors.black26),
-            SizedBox(height: 10),
+            const Icon(
+              Icons.videocam_off_rounded,
+              size: 44,
+              color: Colors.black26,
+            ),
+            const SizedBox(height: 10),
             Text(
-              'Camera này chưa có video',
-              style: TextStyle(
+              appText(
+                context,
+                'Camera này chưa có video',
+                'This camera has no videos',
+              ),
+              style: const TextStyle(
                 color: Colors.black45,
                 fontWeight: FontWeight.w700,
               ),
@@ -830,7 +896,7 @@ class VideoList extends StatelessWidget {
               ),
             ),
             trailing: IconButton(
-              tooltip: 'Xem video',
+              tooltip: appText(context, 'Xem video', 'Play video'),
               onPressed: () => onView(video),
               icon: const Icon(
                 Icons.visibility_rounded,
@@ -911,9 +977,9 @@ class _ActiveRecordingTileState extends State<_ActiveRecordingTile> {
           color: Colors.red.withValues(alpha: 0.12),
           borderRadius: BorderRadius.circular(20),
         ),
-        child: const Text(
-          'ĐANG GHI',
-          style: TextStyle(
+        child: Text(
+          appText(context, 'ĐANG GHI', 'RECORDING'),
+          style: const TextStyle(
             color: Colors.red,
             fontSize: 10,
             fontWeight: FontWeight.w900,
@@ -1016,7 +1082,11 @@ class _VideoPlayerScreenState extends State<_VideoPlayerScreen> {
               child: Padding(
                 padding: const EdgeInsets.all(24),
                 child: Text(
-                  'Không thể phát video: ${userFacingError(snapshot.error!)}',
+                  appText(
+                    context,
+                    'Không thể phát video: ${userFacingError(snapshot.error!)}',
+                    'Cannot play video: ${userFacingError(snapshot.error!)}',
+                  ),
                   textAlign: TextAlign.center,
                   style: const TextStyle(color: Colors.white),
                 ),

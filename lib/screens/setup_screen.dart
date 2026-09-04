@@ -4,6 +4,7 @@ import 'package:flutter/material.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import '../models/station_identity.dart';
+import '../services/app_language_service.dart';
 import '../services/station_config_service.dart';
 
 class SetupScreen extends StatefulWidget {
@@ -112,7 +113,24 @@ class _SetupScreenState extends State<SetupScreen> {
 
   String _courtLabel(String courtId) {
     final number = int.tryParse(courtId.split('-').last) ?? 1;
-    return _venueName.isEmpty ? 'SÂN $number' : 'SÂN $number · $_venueName';
+    final prefix = appText(context, 'SÂN', 'COURT');
+    return _venueName.isEmpty
+        ? '$prefix $number'
+        : '$prefix $number · $_venueName';
+  }
+
+  String _positionLabel(String position) {
+    if (!AppLanguageService.instance.isEnglish) return position;
+    return switch (position) {
+      'Góc trái sân' => 'Left court corner',
+      'Góc phải sân' => 'Right court corner',
+      'Giữa sân' => 'Court center',
+      'Trên cao trung tâm' => 'High center',
+      'Góc A' => 'Corner A',
+      'Góc B' => 'Corner B',
+      'Tùy chỉnh' => 'Custom',
+      _ => position,
+    };
   }
 
   String _generateDeviceId() {
@@ -126,7 +144,11 @@ class _SetupScreenState extends State<SetupScreen> {
 
   String? _requiredValidator(String? value) {
     if (value == null || value.trim().isEmpty) {
-      return 'Vui lòng nhập thông tin này.';
+      return appText(
+        context,
+        'Vui lòng nhập thông tin này.',
+        'Required field.',
+      );
     }
     return null;
   }
@@ -141,7 +163,15 @@ class _SetupScreenState extends State<SetupScreen> {
 
     if (cameraPosition.isEmpty) {
       ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Vui lòng nhập vị trí Camera.')),
+        SnackBar(
+          content: Text(
+            appText(
+              context,
+              'Vui lòng nhập vị trí Camera.',
+              'Enter the camera position.',
+            ),
+          ),
+        ),
       );
       return;
     }
@@ -161,9 +191,17 @@ class _SetupScreenState extends State<SetupScreen> {
       widget.onConfigured(identity);
     } catch (error) {
       if (!mounted) return;
-      ScaffoldMessenger.of(
-        context,
-      ).showSnackBar(SnackBar(content: Text('Không thể lưu cấu hình: $error')));
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+            appText(
+              context,
+              'Không thể lưu cấu hình: $error',
+              'Cannot save settings: $error',
+            ),
+          ),
+        ),
+      );
     } finally {
       if (mounted) setState(() => _saving = false);
     }
@@ -178,14 +216,19 @@ class _SetupScreenState extends State<SetupScreen> {
       backgroundColor: const Color(0xFFF3F6FA),
       appBar: AppBar(
         automaticallyImplyLeading: false,
+        actions: const [AppLanguageButton(), SizedBox(width: 8)],
         leading: widget.onBack == null
             ? null
             : IconButton(
                 onPressed: widget.onBack,
-                tooltip: 'Quay lại thông tin sân',
+                tooltip: appText(
+                  context,
+                  'Quay lại thông tin sân',
+                  'Back to venue information',
+                ),
                 icon: const Icon(Icons.arrow_back_rounded),
               ),
-        title: const Text('THIẾT LẬP CAMERA'),
+        title: Text(appText(context, 'THIẾT LẬP CAMERA', 'CAMERA SETUP')),
       ),
       body: SafeArea(
         child: Center(
@@ -225,8 +268,8 @@ class _SetupScreenState extends State<SetupScreen> {
                           ),
                         ),
                         const SizedBox(height: 28),
-                        const Text(
-                          'THIẾT LẬP CAMERA',
+                        Text(
+                          appText(context, 'THIẾT LẬP CAMERA', 'CAMERA SETUP'),
                           textAlign: TextAlign.center,
                           style: TextStyle(
                             fontSize: 22,
@@ -238,11 +281,19 @@ class _SetupScreenState extends State<SetupScreen> {
                           controller: _cameraNameController,
                           validator: _requiredValidator,
                           textInputAction: TextInputAction.next,
-                          decoration: const InputDecoration(
-                            labelText: 'Tên Camera',
-                            hintText: 'Ví dụ: Camera góc trái',
-                            prefixIcon: Icon(Icons.badge_outlined),
-                            border: OutlineInputBorder(),
+                          decoration: InputDecoration(
+                            labelText: appText(
+                              context,
+                              'Tên Camera',
+                              'Camera name',
+                            ),
+                            hintText: appText(
+                              context,
+                              'Ví dụ: Camera góc trái',
+                              'Example: Left-corner camera',
+                            ),
+                            prefixIcon: const Icon(Icons.badge_outlined),
+                            border: const OutlineInputBorder(),
                           ),
                         ),
                         const SizedBox(height: 18),
@@ -270,10 +321,10 @@ class _SetupScreenState extends State<SetupScreen> {
                         const SizedBox(height: 18),
                         DropdownButtonFormField<String>(
                           initialValue: _courtId,
-                          decoration: const InputDecoration(
-                            labelText: 'Sân',
-                            prefixIcon: Icon(Icons.stadium_outlined),
-                            border: OutlineInputBorder(),
+                          decoration: InputDecoration(
+                            labelText: appText(context, 'Sân', 'Court'),
+                            prefixIcon: const Icon(Icons.stadium_outlined),
+                            border: const OutlineInputBorder(),
                           ),
                           items: _courtIds
                               .map(
@@ -315,16 +366,20 @@ class _SetupScreenState extends State<SetupScreen> {
                         const SizedBox(height: 18),
                         DropdownButtonFormField<String>(
                           initialValue: _position,
-                          decoration: const InputDecoration(
-                            labelText: 'Vị trí Camera',
-                            prefixIcon: Icon(Icons.place_outlined),
-                            border: OutlineInputBorder(),
+                          decoration: InputDecoration(
+                            labelText: appText(
+                              context,
+                              'Vị trí Camera',
+                              'Camera position',
+                            ),
+                            prefixIcon: const Icon(Icons.place_outlined),
+                            border: const OutlineInputBorder(),
                           ),
                           items: _positions
                               .map(
                                 (position) => DropdownMenuItem(
                                   value: position,
-                                  child: Text(position),
+                                  child: Text(_positionLabel(position)),
                                 ),
                               )
                               .toList(),
@@ -340,12 +395,16 @@ class _SetupScreenState extends State<SetupScreen> {
                             controller: _customPositionController,
                             validator: _requiredValidator,
                             textInputAction: TextInputAction.done,
-                            decoration: const InputDecoration(
-                              labelText: 'Nhập vị trí Camera',
-                              prefixIcon: Icon(
+                            decoration: InputDecoration(
+                              labelText: appText(
+                                context,
+                                'Nhập vị trí Camera',
+                                'Enter camera position',
+                              ),
+                              prefixIcon: const Icon(
                                 Icons.edit_location_alt_outlined,
                               ),
-                              border: OutlineInputBorder(),
+                              border: const OutlineInputBorder(),
                             ),
                           ),
                         ],
@@ -385,7 +444,13 @@ class _SetupScreenState extends State<SetupScreen> {
                                 )
                               : const Icon(Icons.save_rounded),
                           label: Text(
-                            _saving ? 'ĐANG LƯU...' : 'LƯU & KHỞI ĐỘNG',
+                            _saving
+                                ? appText(context, 'ĐANG LƯU...', 'SAVING...')
+                                : appText(
+                                    context,
+                                    'LƯU & KHỞI ĐỘNG',
+                                    'SAVE & START',
+                                  ),
                           ),
                         ),
                       ],

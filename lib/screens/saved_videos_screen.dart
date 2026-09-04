@@ -3,6 +3,7 @@ import 'dart:io';
 import 'package:flutter/material.dart';
 
 import '../services/recording_service.dart';
+import '../services/app_language_service.dart';
 
 class SavedVideosScreen extends StatefulWidget {
   final RecordingService recordingService;
@@ -41,17 +42,23 @@ class _SavedVideosScreenState extends State<SavedVideosScreen> {
     final accepted = await showDialog<bool>(
       context: context,
       builder: (context) => AlertDialog(
-        title: const Text('Xóa video?'),
-        content: Text('File ${video.fileName} sẽ bị xóa khỏi điện thoại.'),
+        title: Text(appText(context, 'Xóa video?', 'Delete video?')),
+        content: Text(
+          appText(
+            context,
+            'File ${video.fileName} sẽ bị xóa khỏi điện thoại.',
+            'File ${video.fileName} will be deleted from this phone.',
+          ),
+        ),
         actions: [
           TextButton(
             onPressed: () => Navigator.pop(context, false),
-            child: const Text('HỦY'),
+            child: Text(appText(context, 'HỦY', 'CANCEL')),
           ),
           FilledButton(
             style: FilledButton.styleFrom(backgroundColor: Colors.redAccent),
             onPressed: () => Navigator.pop(context, true),
-            child: const Text('XÓA'),
+            child: Text(appText(context, 'XÓA', 'DELETE')),
           ),
         ],
       ),
@@ -86,11 +93,12 @@ class _SavedVideosScreenState extends State<SavedVideosScreen> {
     return Scaffold(
       backgroundColor: const Color(0xFFF6F8FB),
       appBar: AppBar(
-        title: const Text(
-          'VIDEO ĐÃ LƯU',
-          style: TextStyle(fontWeight: FontWeight.w900),
+        title: Text(
+          appText(context, 'VIDEO ĐÃ LƯU', 'SAVED VIDEOS'),
+          style: const TextStyle(fontWeight: FontWeight.w900),
         ),
         actions: [
+          const AppLanguageButton(),
           IconButton(onPressed: _refresh, icon: const Icon(Icons.refresh)),
         ],
       ),
@@ -141,7 +149,11 @@ class _SavedVideosScreenState extends State<SavedVideosScreen> {
   Widget _buildList() {
     if (_loading) return const Center(child: CircularProgressIndicator());
     if (_videos.isEmpty) {
-      return const Center(child: Text('Chưa có video đã lưu'));
+      return Center(
+        child: Text(
+          appText(context, 'Chưa có video đã lưu', 'No saved videos'),
+        ),
+      );
     }
     return ListView.separated(
       padding: const EdgeInsets.fromLTRB(16, 8, 16, 20),

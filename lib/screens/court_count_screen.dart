@@ -1,6 +1,8 @@
 import 'package:flutter/material.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
+import '../services/app_language_service.dart';
+
 class CourtCountScreen extends StatefulWidget {
   final ValueChanged<int> onSaved;
 
@@ -51,7 +53,7 @@ class _CourtCountScreenState extends State<CourtCountScreen> {
 
   String? _required(String? value) {
     return value == null || value.trim().isEmpty
-        ? 'Vui lòng nhập thông tin này.'
+        ? appText(context, 'Vui lòng nhập thông tin này.', 'Required field.')
         : null;
   }
 
@@ -67,6 +69,11 @@ class _CourtCountScreenState extends State<CourtCountScreen> {
   Widget build(BuildContext context) {
     return Scaffold(
       backgroundColor: const Color(0xFFF3F6FA),
+      appBar: AppBar(
+        backgroundColor: const Color(0xFFF3F6FA),
+        elevation: 0,
+        actions: const [AppLanguageButton(), SizedBox(width: 8)],
+      ),
       body: SafeArea(
         child: Center(
           child: ConstrainedBox(
@@ -86,8 +93,12 @@ class _CourtCountScreenState extends State<CourtCountScreen> {
                         fit: BoxFit.contain,
                       ),
                       const SizedBox(height: 20),
-                      const Text(
-                        'THIẾT LẬP HỆ THỐNG SÂN',
+                      Text(
+                        appText(
+                          context,
+                          'THIẾT LẬP HỆ THỐNG SÂN',
+                          'VENUE SETUP',
+                        ),
                         textAlign: TextAlign.center,
                         style: TextStyle(
                           fontSize: 22,
@@ -95,8 +106,8 @@ class _CourtCountScreenState extends State<CourtCountScreen> {
                         ),
                       ),
                       const SizedBox(height: 24),
-                      const Text(
-                        'THÔNG TIN SÂN',
+                      Text(
+                        appText(context, 'THÔNG TIN SÂN', 'VENUE INFORMATION'),
                         style: TextStyle(
                           fontSize: 15,
                           fontWeight: FontWeight.w900,
@@ -107,11 +118,19 @@ class _CourtCountScreenState extends State<CourtCountScreen> {
                       TextFormField(
                         controller: _venueNameController,
                         validator: _required,
-                        decoration: const InputDecoration(
-                          labelText: 'Tên sân Pickleball',
-                          hintText: 'Ví dụ: VNVAR Pickleball Center',
-                          prefixIcon: Icon(Icons.business_rounded),
-                          border: OutlineInputBorder(),
+                        decoration: InputDecoration(
+                          labelText: appText(
+                            context,
+                            'Tên sân Pickleball',
+                            'Pickleball venue name',
+                          ),
+                          hintText: appText(
+                            context,
+                            'Ví dụ: VNVAR Pickleball Center',
+                            'Example: VNVAR Pickleball Center',
+                          ),
+                          prefixIcon: const Icon(Icons.business_rounded),
+                          border: const OutlineInputBorder(),
                         ),
                       ),
                       const SizedBox(height: 14),
@@ -119,27 +138,47 @@ class _CourtCountScreenState extends State<CourtCountScreen> {
                         controller: _mapAddressController,
                         validator: _required,
                         maxLines: 2,
-                        decoration: const InputDecoration(
-                          labelText: 'Địa chỉ / vị trí trên bản đồ',
-                          hintText: 'Nhập địa chỉ',
-                          prefixIcon: Icon(Icons.location_on_rounded),
-                          border: OutlineInputBorder(),
+                        decoration: InputDecoration(
+                          labelText: appText(
+                            context,
+                            'Địa chỉ / vị trí trên bản đồ',
+                            'Address / map location',
+                          ),
+                          hintText: appText(
+                            context,
+                            'Nhập địa chỉ',
+                            'Enter address',
+                          ),
+                          prefixIcon: const Icon(Icons.location_on_rounded),
+                          border: const OutlineInputBorder(),
                         ),
                       ),
                       const SizedBox(height: 14),
                       TextFormField(
                         controller: _countController,
                         keyboardType: TextInputType.number,
-                        decoration: const InputDecoration(
-                          labelText: 'Số lượng sân Pickleball',
-                          hintText: 'Nhập số lượng ',
-                          prefixIcon: Icon(Icons.stadium_rounded),
-                          border: OutlineInputBorder(),
+                        decoration: InputDecoration(
+                          labelText: appText(
+                            context,
+                            'Số lượng sân Pickleball',
+                            'Number of Pickleball courts',
+                          ),
+                          hintText: appText(
+                            context,
+                            'Nhập số lượng',
+                            'Enter court count',
+                          ),
+                          prefixIcon: const Icon(Icons.stadium_rounded),
+                          border: const OutlineInputBorder(),
                         ),
                         validator: (value) {
                           final count = int.tryParse(value?.trim() ?? '');
                           return count == null || count <= 0 || count > 99
-                              ? 'Vui lòng nhập số từ 1 đến 99.'
+                              ? appText(
+                                  context,
+                                  'Vui lòng nhập số từ 1 đến 99.',
+                                  'Enter a number from 1 to 99.',
+                                )
                               : null;
                         },
                       ),
@@ -155,7 +194,13 @@ class _CourtCountScreenState extends State<CourtCountScreen> {
                                 ),
                               )
                             : const Icon(Icons.arrow_forward_rounded),
-                        label: const Text('TIẾP TỤC THIẾT LẬP CAMERA'),
+                        label: Text(
+                          appText(
+                            context,
+                            'TIẾP TỤC THIẾT LẬP CAMERA',
+                            'CONTINUE TO CAMERA SETUP',
+                          ),
+                        ),
                       ),
                     ],
                   ),
