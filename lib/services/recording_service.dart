@@ -36,6 +36,30 @@ bool shouldUsePreviousCheckpointSegment({
   return requestedAt.difference(currentStartedAt) < const Duration(seconds: 2);
 }
 
+({int startMs, int endMs}) checkVarClipRange({
+  required DateTime segmentStartedAt,
+  required DateTime segmentEndedAt,
+  required DateTime requestedAt,
+  required Duration lookback,
+  Duration keyframeSafetyMargin = Duration.zero,
+}) {
+  final durationMs = segmentEndedAt
+      .difference(segmentStartedAt)
+      .inMilliseconds
+      .clamp(0, 1 << 31)
+      .toInt();
+  final requestedOffsetMs = requestedAt
+      .difference(segmentStartedAt)
+      .inMilliseconds
+      .clamp(0, durationMs)
+      .toInt();
+  final endMs = requestedOffsetMs;
+  final requestedWindowMs =
+      lookback.inMilliseconds + keyframeSafetyMargin.inMilliseconds;
+  final startMs = (endMs - requestedWindowMs).clamp(0, endMs).toInt();
+  return (startMs: startMs, endMs: endMs);
+}
+
 List<String> fragmentCompanionPaths(String videoPath) {
   final normalized = videoPath.replaceAll('\\', '/');
   if (!normalized.toUpperCase().contains('/FRAGMENTS/') ||
@@ -386,6 +410,8 @@ class RecordingService {
     required String segmentId,
     required int startMs,
     required int endMs,
+    bool streamCopy = false,
+    int? minimumOutputDurationMs,
   }) {
     if (_trimOperation != null || _exportCleanupOperation != null) {
       return Future<RecordedSegment>.error(
@@ -398,6 +424,8 @@ class RecordingService {
       segmentId: segmentId,
       startMs: startMs,
       endMs: endMs,
+      streamCopy: streamCopy,
+      minimumOutputDurationMs: minimumOutputDurationMs,
     );
     _trimOperation = operation;
     return operation.whenComplete(() {
@@ -409,6 +437,8 @@ class RecordingService {
     required String segmentId,
     required int startMs,
     required int endMs,
+    required bool streamCopy,
+    required int? minimumOutputDurationMs,
   }) async {
     if (startMs < 0 || endMs <= startMs || endMs - startMs < 500) {
       throw const InvalidTrimRangeException('Khoảng cắt video không hợp lệ.');
@@ -429,7 +459,6 @@ class RecordingService {
     try {
       final now = DateTime.now();
       final startedAt = source.startedAt.add(Duration(milliseconds: startMs));
-      final endedAt = startedAt.add(Duration(milliseconds: endMs - startMs));
       final directory = await _exportDownloadDirectory();
       var timestampMs = now.millisecondsSinceEpoch;
       var fileName = buildTrimmedClipFileName(cameraId, timestampMs);
@@ -457,23 +486,46 @@ class RecordingService {
         '1',
       ];
       final hardwareEncoder = _hardwareH264Encoder;
-      var session = await FFmpegKit.executeWithArguments([
-        ...commonArguments,
-        '-c:v',
-        hardwareEncoder ?? 'mpeg4',
-        if (hardwareEncoder != null) ...['-b:v', '8M'] else ...['-q:v', '4'],
-        '-c:a',
-        'aac',
-        '-b:a',
-        '128k',
-        '-movflags',
-        '+faststart',
-        '-f',
-        'mp4',
-        target.path,
-      ]);
+      var session = await FFmpegKit.executeWithArguments(
+        streamCopy
+            ? [
+                ...commonArguments,
+                '-c',
+                'copy',
+                '-avoid_negative_ts',
+                'make_zero',
+                '-movflags',
+                '+faststart',
+                '-f',
+                'mp4',
+                target.path,
+              ]
+            : [
+                ...commonArguments,
+                '-c:v',
+                hardwareEncoder ?? 'mpeg4',
+                if (hardwareEncoder != null) ...[
+                  '-b:v',
+                  '8M',
+                ] else ...[
+                  '-q:v',
+                  '4',
+                ],
+                '-c:a',
+                'aac',
+                '-b:a',
+                '128k',
+                '-movflags',
+                '+faststart',
+                '-f',
+                'mp4',
+                target.path,
+              ],
+      );
       var returnCode = await session.getReturnCode();
-      if (hardwareEncoder != null && !ReturnCode.isSuccess(returnCode)) {
+      if (!streamCopy &&
+          hardwareEncoder != null &&
+          !ReturnCode.isSuccess(returnCode)) {
         if (await target.exists()) await target.delete();
         developer.log(
           '[FFMPEG] $hardwareEncoder unavailable; falling back to MPEG-4',
@@ -505,12 +557,35 @@ class RecordingService {
           'FFmpeg xử lý thất bại: ${details ?? returnCode}',
         );
       }
+      final outputProbe = await _probeVideo(target);
+      final actualDurationSeconds = outputProbe?.durationSeconds;
+      if (outputProbe == null ||
+          !outputProbe.hasVideo ||
+          actualDurationSeconds == null ||
+          actualDurationSeconds < 0.5) {
+        throw const TrimProcessingException(
+          'Clip output has no playable video or valid duration.',
+        );
+      }
+      // Stream-copy may align the beginning to a nearby H.264 keyframe. Use
+      // the duration measured from the output instead of claiming that the
+      // requested wall-clock range was produced exactly.
+      final actualDuration = Duration(
+        milliseconds: (actualDurationSeconds * 1000).round(),
+      );
+      if (minimumOutputDurationMs != null &&
+          actualDuration.inMilliseconds + 250 < minimumOutputDurationMs) {
+        throw TrimProcessingException(
+          'Trimmed clip is shorter than required: '
+          '${actualDuration.inMilliseconds}ms/$minimumOutputDurationMs ms.',
+        );
+      }
       final clip = RecordedSegment(
         id: id,
         cameraId: cameraId,
         path: target.path,
         startedAt: startedAt,
-        endedAt: endedAt,
+        endedAt: startedAt.add(actualDuration),
         type: 'CLIP',
       );
       _exportSegments[clip.fileName] = clip;
@@ -527,6 +602,13 @@ class RecordingService {
 
   DateTime? get currentSegmentStartedAt {
     return _segmentStartedAt;
+  }
+
+  Duration? get currentSegmentRemaining {
+    final startedAt = _segmentStartedAt;
+    if (!_recording || startedAt == null) return null;
+    final remaining = _segmentDuration - DateTime.now().difference(startedAt);
+    return remaining > Duration.zero ? remaining : Duration.zero;
   }
 
   String? get currentPath {
@@ -1635,9 +1717,30 @@ class RecordingService {
     }
 
     developer.log('Finishing segment: $path', name: 'RecordingService');
-    await _writeJournalState(journal, 'finalizing');
-
-    if ((Platform.isAndroid || Platform.isIOS) && audioPath != null) {
+    // Capture the boundary and ask both recorders to stop before awaiting any
+    // journal/filesystem work. Previously WAV finalization ran first, so the
+    // video recorder kept accepting frames for several extra seconds and a
+    // configured 3-minute file could become 3:05 or 3:06.
+    var endedAt = DateTime.now();
+    Object? capturedRecorderStopError;
+    StackTrace? capturedRecorderStopStack;
+    final videoStopFuture = Future<void>.sync(() async {
+      try {
+        await recorder.stop();
+      } catch (error, stackTrace) {
+        capturedRecorderStopError = error;
+        capturedRecorderStopStack = stackTrace;
+        developer.log(
+          'MediaRecorder.stop failed; attempting to recover the recorded file.',
+          error: error,
+          stackTrace: stackTrace,
+          name: 'RecordingService',
+        );
+        debugPrint('[VNVAR] RECORDER STOP ERROR, RECOVERING FILE: $error');
+      }
+    });
+    final audioStopFuture = Future<void>.sync(() async {
+      if (!(Platform.isAndroid || Platform.isIOS) || audioPath == null) return;
       try {
         await _platformChannel.invokeMethod<void>('stopNativeAudioSegment');
         debugPrint('[VNVAR] NATIVE AUDIO STOPPED: $audioPath');
@@ -1650,7 +1753,20 @@ class RecordingService {
         );
         debugPrint('[VNVAR] NATIVE AUDIO STOP FAILED: $error');
       }
+    });
+
+    try {
+      await _writeJournalState(journal, 'finalizing');
+    } catch (error, stackTrace) {
+      developer.log(
+        'Unable to mark the recording journal as finalizing.',
+        error: error,
+        stackTrace: stackTrace,
+        name: 'RecordingService',
+      );
     }
+
+    await Future.wait<void>([videoStopFuture, audioStopFuture]);
 
     // ==========================================================
     // STOP RECORDER
@@ -1659,7 +1775,7 @@ class RecordingService {
     Object? recorderStopError;
     StackTrace? recorderStopStack;
     try {
-      await recorder.stop();
+      await videoStopFuture;
     } catch (error, stackTrace) {
       // Một số codec Android/Unisoc ném lỗi khi drain buffer cuối dù container
       // MP4 đã được ghi ra đĩa. Không bỏ segment ngay tại đây; chờ filesystem
@@ -1675,8 +1791,12 @@ class RecordingService {
       debugPrint('[VNVAR] RECORDER STOP ERROR, RECOVERING FILE: $error');
       await Future<void>.delayed(const Duration(milliseconds: 500));
     }
+    recorderStopError ??= capturedRecorderStopError;
+    recorderStopStack ??= capturedRecorderStopStack;
+    if (capturedRecorderStopError != null) {
+      await Future<void>.delayed(const Duration(milliseconds: 500));
+    }
 
-    final endedAt = DateTime.now();
     if (onRecorderStopped != null) {
       try {
         await onRecorderStopped();
@@ -1745,6 +1865,11 @@ class RecordingService {
       );
       return null;
     }
+    // File names, API metadata and cleanup decisions must use the encoded
+    // media timeline, not time spent draining the recorder or probing files.
+    endedAt = startedAt.add(
+      Duration(milliseconds: (videoProbe.durationSeconds! * 1000).round()),
+    );
 
     if (!isPublishableVideoProbe(
       hasVideo: videoProbe.hasVideo,

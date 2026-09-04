@@ -49,6 +49,33 @@ void main() {
     );
   });
 
+  test('Check VAR clip ends at the press and keeps the configured lookback', () {
+    final startedAt = DateTime(2026, 9, 4, 10);
+    final range = checkVarClipRange(
+      segmentStartedAt: startedAt,
+      segmentEndedAt: startedAt.add(const Duration(seconds: 40)),
+      requestedAt: startedAt.add(const Duration(seconds: 32)),
+      lookback: const Duration(seconds: 15),
+      keyframeSafetyMargin: const Duration(seconds: 5),
+    );
+
+    expect(range.startMs, 12000);
+    expect(range.endMs, 32000);
+  });
+
+  test('Check VAR uses the source end when the previous segment is selected', () {
+    final startedAt = DateTime(2026, 9, 4, 10);
+    final range = checkVarClipRange(
+      segmentStartedAt: startedAt,
+      segmentEndedAt: startedAt.add(const Duration(seconds: 20)),
+      requestedAt: startedAt.add(const Duration(seconds: 21)),
+      lookback: const Duration(seconds: 10),
+    );
+
+    expect(range.startMs, 10000);
+    expect(range.endMs, 20000);
+  });
+
   test('fragment cleanup includes video, audio and metadata', () {
     expect(
       fragmentCompanionPaths('/VNVAR/04-09-2026/AUTOMODE/FRAGMENTS/F1.mp4'),

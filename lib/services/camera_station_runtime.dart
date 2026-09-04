@@ -64,6 +64,7 @@ class CameraStationRuntime {
   Timer? _healthTimer;
   Timer? _storageCleanupTimer;
   Timer? _thermalTimer;
+  Timer? _pendingThermalThrottleTimer;
   bool _thermalThrottled = false;
   bool _thermalCriticalSuspended = false;
   bool _thermalCheckRunning = false;
@@ -89,6 +90,8 @@ class CameraStationRuntime {
   String? _lastAudioPath;
   int? _lastAudioBytes;
   DateTime? _lastAudioProgressAt;
+  DateTime? _healthGraceUntil;
+  final Map<String, int> _healthFailureCounts = <String, int>{};
   CameraResolutionProfile _resolutionProfile =
       CameraResolutionProfile.fullHd1080;
   List<CameraResolutionProfile> _supportedResolutionProfiles = const [
@@ -103,7 +106,10 @@ class CameraStationRuntime {
     Duration(seconds: 30),
     Duration(seconds: 30),
   ];
-  static const Duration _thermalRestoreDelay = Duration(minutes: 2);
+  // Avoid oscillating between 4K and the safe profile. Every profile change
+  // recreates AVCaptureSession on iOS and therefore closes the current file.
+  static const Duration _thermalRestoreDelay = Duration(minutes: 10);
+  static const Duration _recordingTransitionGrace = Duration(seconds: 20);
   static const Duration _recordingStallTimeout = Duration(seconds: 45);
   static const Duration _bufferedVideoHardStallTimeout = Duration(minutes: 2);
   static const MethodChannel _platformChannel = MethodChannel(
@@ -370,6 +376,8 @@ class CameraStationRuntime {
     _healthTimer = null;
     _thermalTimer?.cancel();
     _thermalTimer = null;
+    _pendingThermalThrottleTimer?.cancel();
+    _pendingThermalThrottleTimer = null;
     _thermalThrottled = false;
     _thermalCriticalSuspended = false;
     _thermalCheckRunning = false;
@@ -992,7 +1000,7 @@ class CameraStationRuntime {
           !webRtc.cameraInitialized ||
           track == null ||
           !track.enabled) {
-        _scheduleRecovery('health_check_failed');
+        _reportHealthFailure('health_check_failed', requiredFailures: 2);
         return;
       }
 
@@ -1015,19 +1023,24 @@ class CameraStationRuntime {
         return;
       }
       if (recording.rotating) {
+        _beginRecordingTransitionGrace();
         _resetRecordingProgressWatchdog();
         return;
       }
 
       final progress = await recording.currentRecordingProgress();
       if (progress == null) {
-        _scheduleRecovery('recording_progress_missing');
+        _reportHealthFailure(
+          'recording_progress_missing',
+          requiredFailures: 2,
+        );
         return;
       }
       final now = DateTime.now();
       var videoStalled = false;
       var videoHardStalled = false;
       if (_lastRecordingPath != progress.path) {
+        _beginRecordingTransitionGrace(now: now);
         _lastRecordingPath = progress.path;
         _lastRecordingBytes = progress.bytes;
         _lastRecordingProgressAt = now;
@@ -1050,7 +1063,12 @@ class CameraStationRuntime {
       var audioStalled = false;
       if (audioProgress != null) {
         if (!audioProgress.active) {
-          _scheduleRecovery('recording_audio_inactive');
+          if (!_inRecordingTransitionGrace(now)) {
+            _reportHealthFailure(
+              'recording_audio_inactive',
+              requiredFailures: 3,
+            );
+          }
           return;
         }
         if (_lastAudioPath != audioProgress.path) {
@@ -1071,7 +1089,10 @@ class CameraStationRuntime {
           '[RECORDING] Native audio stopped growing at ${audioProgress?.bytes} bytes',
           name: 'CameraStationRuntime',
         );
-        _scheduleRecovery('recording_audio_stalled');
+        _reportHealthFailure(
+          'recording_audio_stalled',
+          requiredFailures: 2,
+        );
       } else if (videoStalled && (audioProgress == null || videoHardStalled)) {
         // MP4 writers may buffer metadata/video writes. On Android, continuing
         // WAV progress proves the capture pipeline is alive and avoids a false
@@ -1080,7 +1101,12 @@ class CameraStationRuntime {
           '[RECORDING] Staging file stopped growing at ${progress.bytes} bytes',
           name: 'CameraStationRuntime',
         );
-        _scheduleRecovery('recording_file_stalled');
+        _reportHealthFailure(
+          'recording_file_stalled',
+          requiredFailures: 2,
+        );
+      } else {
+        _healthFailureCounts.clear();
       }
     } catch (error, stackTrace) {
       developer.log(
@@ -1101,6 +1127,37 @@ class CameraStationRuntime {
     _lastAudioPath = null;
     _lastAudioBytes = null;
     _lastAudioProgressAt = null;
+    _healthFailureCounts.clear();
+  }
+
+  void _beginRecordingTransitionGrace({DateTime? now}) {
+    _healthGraceUntil = (now ?? DateTime.now()).add(
+      _recordingTransitionGrace,
+    );
+    _healthFailureCounts.clear();
+  }
+
+  bool _inRecordingTransitionGrace(DateTime now) {
+    final until = _healthGraceUntil;
+    return until != null && now.isBefore(until);
+  }
+
+  void _reportHealthFailure(
+    String reason, {
+    required int requiredFailures,
+  }) {
+    if (_inRecordingTransitionGrace(DateTime.now())) return;
+    final failures = (_healthFailureCounts[reason] ?? 0) + 1;
+    _healthFailureCounts
+      ..clear()
+      ..[reason] = failures;
+    developer.log(
+      '[HEALTH] $reason confirmation $failures/$requiredFailures',
+      name: 'CameraStationRuntime',
+    );
+    if (failures < requiredFailures) return;
+    _healthFailureCounts.clear();
+    _scheduleRecovery(reason);
   }
 
   void _startThermalMonitor() {
@@ -1127,12 +1184,19 @@ class CameraStationRuntime {
       final critical = snapshot.critical;
       final hot = snapshot.hot;
       if (critical) {
+        _pendingThermalThrottleTimer?.cancel();
+        _pendingThermalThrottleTimer = null;
         _thermalNormalSince = null;
         if (!_thermalCriticalSuspended && !_profileSwitching) {
           await _serializeLifecycle(_suspendForCriticalThermal);
         }
         _emitState();
         return;
+      }
+      if (!hot && !_thermalThrottled) {
+        _pendingThermalThrottleTimer?.cancel();
+        _pendingThermalThrottleTimer = null;
+        _profileBeforeThermalThrottle = null;
       }
       if (_thermalCriticalSuspended) {
         if (hot) {
@@ -1150,25 +1214,12 @@ class CameraStationRuntime {
         return;
       }
       if (hot) _thermalNormalSince = null;
-      if (hot && !_thermalThrottled && !_profileSwitching) {
+      if (hot &&
+          !_thermalThrottled &&
+          _pendingThermalThrottleTimer == null &&
+          !_profileSwitching) {
         _profileBeforeThermalThrottle = _resolutionProfile;
-        _thermalThrottled = true;
-        _emitState();
-        developer.log(
-          '[THERMAL] Hot device; reducing camera to 720p/15fps',
-          name: 'CameraStationRuntime',
-        );
-        try {
-          await setResolutionProfile(CameraResolutionProfile.hd720.withFps(15));
-        } catch (error, stackTrace) {
-          _thermalThrottled = false;
-          developer.log(
-            '[THERMAL] Failed to reduce camera profile',
-            error: error,
-            stackTrace: stackTrace,
-            name: 'CameraStationRuntime',
-          );
-        }
+        _scheduleThermalThrottleAtSegmentBoundary();
       } else if (!hot && _thermalThrottled && !_profileSwitching) {
         final now = DateTime.now();
         _thermalNormalSince ??= now;
@@ -1184,7 +1235,7 @@ class CameraStationRuntime {
             _profileBeforeThermalThrottle = null;
             _thermalNormalSince = null;
             developer.log(
-              '[THERMAL] Temperature stable for 2 minutes; restored camera profile',
+              '[THERMAL] Temperature stable for 10 minutes; restored camera profile',
               name: 'CameraStationRuntime',
             );
           } catch (error, stackTrace) {
@@ -1212,6 +1263,55 @@ class CameraStationRuntime {
       );
     } finally {
       _thermalCheckRunning = false;
+    }
+  }
+
+  void _scheduleThermalThrottleAtSegmentBoundary() {
+    final remaining = _recordingService?.currentSegmentRemaining;
+    // Finish the normal file just before its own rotation timer. Critical
+    // thermal state is handled separately and still stops capture at once.
+    final Duration delay;
+    if (remaining == null || remaining <= const Duration(milliseconds: 250)) {
+      delay = Duration.zero;
+    } else {
+      delay = remaining - const Duration(milliseconds: 250);
+    }
+    developer.log(
+      '[THERMAL] Hot device; scheduling 720p/15fps at the segment boundary '
+      'in ${delay.inSeconds}s',
+      name: 'CameraStationRuntime',
+    );
+    _pendingThermalThrottleTimer = Timer(delay, () {
+      _pendingThermalThrottleTimer = null;
+      unawaited(_applyPendingThermalThrottle());
+    });
+  }
+
+  Future<void> _applyPendingThermalThrottle() async {
+    if (_stopping ||
+        !_cameraEnabled ||
+        _thermalCriticalSuspended ||
+        _iosLifecycleSuspended ||
+        _thermalThrottled ||
+        _profileSwitching) {
+      return;
+    }
+    _thermalThrottled = true;
+    _emitState();
+    developer.log(
+      '[THERMAL] Segment boundary reached; reducing camera to 720p/15fps',
+      name: 'CameraStationRuntime',
+    );
+    try {
+      await setResolutionProfile(CameraResolutionProfile.hd720.withFps(15));
+    } catch (error, stackTrace) {
+      _thermalThrottled = false;
+      developer.log(
+        '[THERMAL] Failed to reduce camera profile',
+        error: error,
+        stackTrace: stackTrace,
+        name: 'CameraStationRuntime',
+      );
     }
   }
 

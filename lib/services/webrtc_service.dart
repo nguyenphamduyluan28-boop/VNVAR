@@ -471,7 +471,7 @@ class WebRtcService {
         };
         track.onMute = () {
           _audioFailureTimer?.cancel();
-          _audioFailureTimer = Timer(const Duration(seconds: 3), () {
+          _audioFailureTimer = Timer(const Duration(seconds: 8), () {
             onCameraFailure?.call('ios_audio_track_muted');
           });
         };
@@ -491,7 +491,7 @@ class WebRtcService {
     videoTrack.onMute = () {
       developer.log('[CAMERA] Video track muted', name: 'WebRtcService');
       _muteFailureTimer?.cancel();
-      _muteFailureTimer = Timer(const Duration(seconds: 2), () {
+      _muteFailureTimer = Timer(const Duration(seconds: 8), () {
         onCameraFailure?.call('video_track_muted');
       });
     };

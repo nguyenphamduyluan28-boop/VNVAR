@@ -1,6 +1,7 @@
 import 'dart:convert';
 import 'dart:developer' as developer;
 import 'dart:io';
+import 'dart:math' as math;
 
 import 'package:flutter/foundation.dart';
 import 'package:flutter_webrtc/flutter_webrtc.dart';
@@ -263,7 +264,10 @@ class CameraServer {
       // ========================================================
 
       if (path == '/checkvar' && method == 'POST') {
-        await _serializeRecordingRequest(() => _checkVar(request));
+        final requestedAt = DateTime.now();
+        await _serializeRecordingRequest(
+          () => _checkVar(request, requestedAt: requestedAt),
+        );
         return;
       }
 
@@ -676,17 +680,74 @@ class CameraServer {
   // Chốt ngay file đang quay và mở file kế tiếp để ghi liên tục.
   // ============================================================
 
-  Future<void> _checkVar(HttpRequest request) async {
+  Future<void> _checkVar(
+    HttpRequest request, {
+    required DateTime requestedAt,
+  }) async {
+    final requestedLookback = int.tryParse(
+      request.uri.queryParameters['lookbackSeconds'] ?? '',
+    );
+    final lookbackSeconds = (requestedLookback ?? 15).clamp(5, 60).toInt();
     final segment = await recordingService.checkpointCurrentSegment();
+    RecordedSegment checkpoint = segment;
+    var autoTrimmed = false;
+    String? trimError;
+    final range = checkVarClipRange(
+      segmentStartedAt: segment.startedAt,
+      segmentEndedAt: segment.endedAt,
+      requestedAt: requestedAt,
+      lookback: Duration(seconds: lookbackSeconds),
+      keyframeSafetyMargin: const Duration(seconds: 5),
+    );
+    if (range.endMs - range.startMs >= 500) {
+      try {
+        checkpoint = await recordingService.trimSegment(
+          segmentId: segment.id,
+          startMs: range.startMs,
+          endMs: range.endMs,
+          streamCopy: true,
+          minimumOutputDurationMs: math.min(
+            lookbackSeconds * 1000,
+            range.endMs,
+          ),
+        );
+        autoTrimmed = true;
+      } catch (error, stackTrace) {
+        trimError = userFacingError(error);
+        developer.log(
+          'Unable to create automatic Check VAR clip; returning source segment',
+          error: error,
+          stackTrace: stackTrace,
+          name: 'CameraServer',
+        );
+      }
+    }
+    final checkpointDownloadUrl = autoTrimmed
+        ? '/download/${checkpoint.fileName}'
+        : '/video/${checkpoint.fileName}';
     await _sendJson(request.response, HttpStatus.ok, {
       'success': true,
+      'requestedAt': requestedAt.toIso8601String(),
       'usedPreviousSegment': recordingService.lastCheckpointUsedPrevious,
+      'autoTrimmed': autoTrimmed,
+      'lookbackSeconds': lookbackSeconds,
+      'trimError': trimError,
       'checkpointSegment': {
         'id': segment.id,
         'fileName': segment.fileName,
         'durationMs': segment.durationMs,
         'downloadUrl': '/video/${segment.fileName}',
       },
+      'checkVarClip': autoTrimmed
+          ? {
+              'id': checkpoint.id,
+              'fileName': checkpoint.fileName,
+              'durationMs': checkpoint.durationMs,
+              'downloadUrl': checkpointDownloadUrl,
+              'eventOffsetMs': checkpoint.durationMs,
+            }
+          : null,
+      'preferredDownloadUrl': checkpointDownloadUrl,
     });
   }
 
