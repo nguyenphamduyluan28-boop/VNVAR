@@ -132,6 +132,19 @@ class MainActivity : FlutterActivity() {
                     result.success(null)
                 }
 
+                "getCameraZoom" -> {
+                    val trackId = call.argument<String>("trackId")
+                    if (trackId.isNullOrBlank()) result.error("INVALID_TRACK", "Video track is required", null)
+                    else CameraExposureController.zoomCapabilities(trackId) { response -> runOnUiThread { result.success(response) } }
+                }
+
+                "setCameraZoom" -> {
+                    val trackId = call.argument<String>("trackId")
+                    val zoom = call.argument<Double>("zoom")
+                    if (trackId.isNullOrBlank() || zoom == null) result.error("INVALID_ZOOM", "Track and zoom are required", null)
+                    else CameraExposureController.setZoom(trackId, zoom) { response -> runOnUiThread { result.success(response) } }
+                }
+
                 "startRtsp" -> {
                     val trackId = call.argument<String>("trackId")
                     val port = call.argument<Int>("port") ?: 8554
@@ -147,6 +160,7 @@ class MainActivity : FlutterActivity() {
                             rtspPublisher?.stop()
                             rtspPublisher = VnvarRtspPublisher(
                                 track = track,
+                                audioAvailable = ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED,
                                 port = port,
                                 bitrate = bitrate,
                                 fps = fps,
@@ -167,12 +181,13 @@ class MainActivity : FlutterActivity() {
                                     }
                                 },
                             ).also { it.start() }
+                            nativeAudioRecorder.onPcm = { pcm -> rtspPublisher?.sendAudioPcm(pcm) }
                             result.success(mapOf(
                                 "running" to true,
                                 "started" to true,
                                 "port" to port,
                                 "path" to "/camera",
-                                "audio" to false,
+                                "audio" to (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED),
                             ))
                         } catch (error: Exception) {
                             rtspPublisher = null
@@ -182,6 +197,7 @@ class MainActivity : FlutterActivity() {
                 }
 
                 "stopRtsp" -> {
+                    nativeAudioRecorder.onPcm = null
                     rtspPublisher?.stop()
                     rtspPublisher = null
                     result.success(null)

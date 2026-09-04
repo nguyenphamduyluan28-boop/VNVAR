@@ -21,17 +21,20 @@ final class VnvarRtspPublisher: NSObject, RTCVideoRenderer {
   private var performanceWindowStart = ProcessInfo.processInfo.systemUptime
   private var performanceFrameCount = 0
   private let requestedFps: Int
-  var audioAvailable: Bool { audioSink != nil }
+  var audioAvailable: Bool { audioSink != nil || nativeAudioAvailable }
+  private let nativeAudioAvailable: Bool
 
   init(
     track: RTCVideoTrack,
     audioTrackId: String?,
+    nativeAudioAvailable: Bool,
     port: Int,
     bitrate: Int,
     fps: Int
   ) {
     self.track = track
     audioSink = audioTrackId.flatMap { VnvarWebRtcAudioSink(trackId: $0) }
+    self.nativeAudioAvailable = nativeAudioAvailable
     server = VnvarRtspServer(port: port)
     encoder = VnvarH264Encoder(bitrate: bitrate, fps: fps)
     bitrateController = VnvarRtspBitrateController(maximumBitrate: bitrate)
@@ -74,7 +77,7 @@ final class VnvarRtspPublisher: NSObject, RTCVideoRenderer {
     server.onReady = { [weak self] in
       DispatchQueue.main.async { self?.onServerReady?() }
     }
-    server.setAudioAvailable(audioSink != nil)
+    server.setAudioAvailable(audioSink != nil || nativeAudioAvailable)
     audioSink?.onPcm = { [weak self] pcm, sampleRate, channels, bits in
       self?.handleAudio(
         pcm,
@@ -83,6 +86,11 @@ final class VnvarRtspPublisher: NSObject, RTCVideoRenderer {
         bitsPerSample: bits
       )
     }
+  }
+
+  func sendNativePcm(_ pcm: Data) {
+    guard nativeAudioAvailable else { return }
+    handleAudio(pcm, sampleRate: 48_000, channels: 1, bitsPerSample: 16)
   }
 
   func start() throws {

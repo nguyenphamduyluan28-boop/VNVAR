@@ -7,6 +7,7 @@ import android.hardware.camera2.CameraDevice
 import android.hardware.camera2.CameraManager
 import android.hardware.camera2.CaptureRequest
 import android.hardware.camera2.TotalCaptureResult
+import android.graphics.Rect
 import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
@@ -31,6 +32,7 @@ object CameraExposureController {
     private var activeTrackId: String? = null
     @Volatile
     private var activeTargetEv = 1.3
+    @Volatile private var activeZoom = 1.0
     @Volatile
     private var activeCamera2 = false
     @Volatile
@@ -116,6 +118,38 @@ object CameraExposureController {
         lifecycleHandler.removeCallbacks(captureWatchdog)
     }
 
+    fun zoomCapabilities(trackId: String, callback: (Map<String, Any>) -> Unit) {
+        try {
+            val plugin = FlutterWebRTCPlugin.sharedSingleton ?: error("plugin unavailable")
+            val handler = readField(plugin, "methodCallHandler")
+            val gum = readField(handler, "getUserMediaImpl") as GetUserMediaImpl
+            val info = gum.getCapturerInfo(trackId) ?: error("capturer unavailable")
+            when (val capturer = info.capturer) {
+                is Camera2Capturer -> {
+                    val session = readField(capturer, "currentSession")
+                    val device = readField(session, "cameraDevice") as CameraDevice
+                    val manager = readField(capturer, "cameraManager") as CameraManager
+                    val max = manager.getCameraCharacteristics(device.id)
+                        .get(CameraCharacteristics.SCALER_AVAILABLE_MAX_DIGITAL_ZOOM)?.toDouble() ?: 1.0
+                    callback(mapOf("supported" to (max > 1.0), "min" to 1.0, "max" to max.coerceAtMost(10.0), "current" to activeZoom.coerceIn(1.0, max)))
+                }
+                is Camera1Capturer -> {
+                    val camera = readField(readField(capturer, "currentSession"), "camera") as Camera
+                    val p = camera.parameters
+                    val max = if (p.isZoomSupported) p.zoomRatios[p.maxZoom] / 100.0 else 1.0
+                    callback(mapOf("supported" to p.isZoomSupported, "min" to 1.0, "max" to max, "current" to activeZoom.coerceIn(1.0, max)))
+                }
+                else -> callback(mapOf("supported" to false))
+            }
+        } catch (error: Throwable) { callback(mapOf("supported" to false, "reason" to error.javaClass.simpleName)) }
+    }
+
+    fun setZoom(trackId: String, zoom: Double, callback: (Map<String, Any>) -> Unit) {
+        activeZoom = zoom.coerceAtLeast(1.0)
+        apply(trackId, activeTargetEv) { response -> callback(response + ("zoom" to activeZoom)) }
+    }
+
+
     private fun startWatchdog() {
         lifecycleHandler.removeCallbacks(captureWatchdog)
         lifecycleHandler.postDelayed(captureWatchdog, WATCHDOG_INTERVAL_MS)
@@ -141,18 +175,16 @@ object CameraExposureController {
         val characteristics = cameraManager.getCameraCharacteristics(cameraDevice.id)
         val compensationRange = characteristics.get(
             CameraCharacteristics.CONTROL_AE_COMPENSATION_RANGE,
-        ) ?: return callback(result(false, reason = "compensation_unsupported"))
+        )
         val compensationStep = characteristics.get(
             CameraCharacteristics.CONTROL_AE_COMPENSATION_STEP,
         )?.toDouble() ?: 0.0
-        if (compensationStep <= 0.0 || compensationRange.upper <= 0) {
-            return callback(result(false, reason = "positive_compensation_unsupported"))
-        }
-
-        val compensation = (targetEv / compensationStep).roundToInt().coerceIn(
-            compensationRange.lower,
-            compensationRange.upper,
-        )
+        val compensation = if (compensationRange != null && compensationStep > 0.0) {
+            (targetEv / compensationStep).roundToInt().coerceIn(
+                compensationRange.lower,
+                compensationRange.upper,
+            )
+        } else 0
         val generation = ++requestGeneration
         cameraThread.post {
             if (activeTrackId != trackId || requestGeneration != generation) {
@@ -164,7 +196,9 @@ object CameraExposureController {
                     addTarget(surface)
                     set(CaptureRequest.CONTROL_MODE, CaptureRequest.CONTROL_MODE_AUTO)
                     set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_ON)
-                    set(CaptureRequest.CONTROL_AE_EXPOSURE_COMPENSATION, compensation)
+                    if (compensationRange != null && compensationStep > 0.0) {
+                        set(CaptureRequest.CONTROL_AE_EXPOSURE_COMPENSATION, compensation)
+                    }
                     set(
                         CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE,
                         Range(
@@ -174,6 +208,17 @@ object CameraExposureController {
                     )
                     set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_VIDEO)
                     set(CaptureRequest.CONTROL_AWB_MODE, CaptureRequest.CONTROL_AWB_MODE_AUTO)
+                    val sensor = characteristics.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE)
+                    val maxZoom = characteristics.get(CameraCharacteristics.SCALER_AVAILABLE_MAX_DIGITAL_ZOOM) ?: 1f
+                    if (sensor != null && maxZoom > 1f) {
+                        val zoom = activeZoom.coerceIn(1.0, maxZoom.toDouble())
+                        val width = (sensor.width() / zoom).roundToInt()
+                        val height = (sensor.height() / zoom).roundToInt()
+                        val left = sensor.centerX() - width / 2
+                        val top = sensor.centerY() - height / 2
+                        set(CaptureRequest.SCALER_CROP_REGION, Rect(left, top, left + width, top + height))
+                        activeZoom = zoom
+                    }
                     setFirstSupportedMode(
                         this,
                         CaptureRequest.NOISE_REDUCTION_MODE,
@@ -223,14 +268,19 @@ object CameraExposureController {
         val camera = readField(session, "camera") as Camera
         val parameters = camera.parameters
         val step = parameters.exposureCompensationStep.toDouble()
-        if (step <= 0.0 || parameters.maxExposureCompensation <= 0) {
-            return result(false, reason = "positive_compensation_unsupported")
+        val compensation = if (step > 0.0) {
+            (targetEv / step).roundToInt().coerceIn(
+                parameters.minExposureCompensation,
+                parameters.maxExposureCompensation,
+            )
+        } else 0
+        if (step > 0.0) parameters.exposureCompensation = compensation
+        if (parameters.isZoomSupported) {
+            val target = (activeZoom * 100).roundToInt()
+            val index = parameters.zoomRatios.indices.minByOrNull { kotlin.math.abs(parameters.zoomRatios[it] - target) } ?: 0
+            parameters.zoom = index
+            activeZoom = parameters.zoomRatios[index] / 100.0
         }
-        val compensation = (targetEv / step).roundToInt().coerceIn(
-            parameters.minExposureCompensation,
-            parameters.maxExposureCompensation,
-        )
-        parameters.exposureCompensation = compensation
         camera.parameters = parameters
         return result(true, compensation, compensation * step)
     }

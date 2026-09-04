@@ -14,6 +14,7 @@ import java.util.concurrent.atomic.AtomicLong
 
 /** Records microphone PCM independently from flutter_webrtc's video muxer. */
 class NativeAudioSegmentRecorder(private val context: Context) {
+    @Volatile var onPcm: ((ByteArray) -> Unit)? = null
     private val running = AtomicBoolean(false)
     private var audioRecord: AudioRecord? = null
     private var worker: Thread? = null
@@ -83,6 +84,7 @@ class NativeAudioSegmentRecorder(private val context: Context) {
                 when {
                     count > 0 -> try {
                         output?.write(buffer, 0, count)
+                        onPcm?.invoke(buffer.copyOf(count))
                         dataBytes.addAndGet(count.toLong())
                         lastProgressElapsedMs.set(android.os.SystemClock.elapsedRealtime())
                     } catch (_: Exception) {

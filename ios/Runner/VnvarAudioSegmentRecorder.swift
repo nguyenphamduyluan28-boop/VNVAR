@@ -21,8 +21,12 @@ private enum VnvarAudioSegmentError: LocalizedError {
 /// Records the iOS microphone directly into a linear-PCM WAV sidecar.
 /// RecordingService muxes the sidecar as AAC when finalizing the video.
 final class VnvarAudioSegmentRecorder {
+  var onPcm: ((Data) -> Void)?
   private var recorder: AVAudioRecorder?
   private var path: String?
+  private var pcmTimer: DispatchSourceTimer?
+  private var pcmOffset: UInt64 = 0
+  private var pcmGeneration: UInt64 = 0
 
   func start(path: String) throws -> [String: Any] {
     guard recorder == nil else { throw VnvarAudioSegmentError.alreadyRecording }
@@ -56,6 +60,8 @@ final class VnvarAudioSegmentRecorder {
     }
     recorder = newRecorder
     self.path = path
+    pcmGeneration &+= 1
+    startPcmTail(path: path)
     return ["path": path, "active": true, "bytes": fileSize(path)]
   }
 
@@ -63,6 +69,9 @@ final class VnvarAudioSegmentRecorder {
     guard let activeRecorder = recorder, let activePath = path else { return nil }
     recorder = nil
     path = nil
+    pcmTimer?.cancel()
+    pcmTimer = nil
+    pcmGeneration &+= 1
     let duration = activeRecorder.currentTime
     activeRecorder.stop()
     let bytes = fileSize(activePath)
@@ -71,6 +80,33 @@ final class VnvarAudioSegmentRecorder {
       throw VnvarAudioSegmentError.noAudioFrames
     }
     return ["path": activePath, "active": false, "bytes": bytes]
+  }
+
+  private func startPcmTail(path: String) {
+    pcmOffset = 0
+    let generation = pcmGeneration
+    let timer = DispatchSource.makeTimerSource(queue: DispatchQueue.global(qos: .userInitiated))
+    timer.schedule(deadline: .now() + .milliseconds(200), repeating: .milliseconds(100))
+    timer.setEventHandler { [weak self] in
+      guard let self = self, self.pcmGeneration == generation,
+            let handle = try? FileHandle(forReadingFrom: URL(fileURLWithPath: path)) else { return }
+      defer { handle.closeFile() }
+      if self.pcmOffset == 0 {
+        handle.seek(toFileOffset: 0)
+        let header = handle.readData(ofLength: 4_096)
+        guard let range = header.range(of: Data("data".utf8)) else { return }
+        self.pcmOffset = UInt64(range.upperBound + 4)
+      }
+      handle.seek(toFileOffset: self.pcmOffset)
+      let data = handle.readData(ofLength: 9_600)
+      guard !data.isEmpty else { return }
+      let aligned = data.count - (data.count % 2)
+      guard aligned > 0 else { return }
+      self.pcmOffset += UInt64(aligned)
+      self.onPcm?(Data(data.prefix(aligned)))
+    }
+    pcmTimer = timer
+    timer.resume()
   }
 
   func status() -> [String: Any] {

@@ -99,6 +99,50 @@ class WebRtcService {
   String? _currentFacingMode;
   final Map<String, String> _preferredCameraDeviceIds = <String, String>{};
   bool? _isEmulator;
+  double _cameraZoom = 1;
+  double _minimumCameraZoom = 1;
+  double _maximumCameraZoom = 1;
+  bool _cameraZoomSupported = false;
+
+  double get cameraZoom => _cameraZoom;
+  double get minimumCameraZoom => _minimumCameraZoom;
+  double get maximumCameraZoom => _maximumCameraZoom;
+  bool get cameraZoomSupported => _cameraZoomSupported;
+
+  Future<void> refreshCameraZoom() async {
+    final track = localVideoTrack;
+    if (track == null || (!Platform.isAndroid && !Platform.isIOS)) return;
+    final result = await _platformChannel
+        .invokeMapMethod<String, dynamic>('getCameraZoom', {
+          'trackId': track.id,
+          'facing': currentFacingMode,
+          'deviceId': _preferredCameraDeviceIds[currentFacingMode],
+        });
+    _cameraZoomSupported = result?['supported'] == true;
+    _minimumCameraZoom = (result?['min'] as num?)?.toDouble() ?? 1;
+    _maximumCameraZoom = (result?['max'] as num?)?.toDouble() ?? 1;
+    _cameraZoom = (result?['current'] as num?)?.toDouble() ?? 1;
+  }
+
+  Future<void> setCameraZoom(double value) async {
+    final track = localVideoTrack;
+    if (track == null || !_cameraZoomSupported) return;
+    final target = value
+        .clamp(_minimumCameraZoom, _maximumCameraZoom)
+        .toDouble();
+    final result = await _platformChannel
+        .invokeMapMethod<String, dynamic>('setCameraZoom', {
+          'trackId': track.id,
+          'facing': currentFacingMode,
+          'deviceId': _preferredCameraDeviceIds[currentFacingMode],
+          'zoom': target,
+        });
+    _cameraZoom =
+        (result?['current'] as num?)?.toDouble() ??
+        (result?['zoom'] as num?)?.toDouble() ??
+        target;
+  }
+
   bool _rtspRunning = false;
   bool _rtspAudio = false;
   bool _rtspServerStarted = false;
@@ -520,6 +564,11 @@ class WebRtcService {
     _currentFacingMode = selectedFacingMode;
 
     await _startRtsp(videoTrack);
+    try {
+      await refreshCameraZoom();
+    } catch (error) {
+      developer.log('[CAMERA] Zoom unavailable: $error', name: 'WebRtcService');
+    }
 
     if (cameraGeneration != _cameraLifecycleGeneration) {
       await disposeCamera();
@@ -800,6 +849,7 @@ class WebRtcService {
     _currentFacingMode = currentFacingMode == 'environment'
         ? 'user'
         : 'environment';
+    await refreshCameraZoom();
     developer.log(
       '[CAMERA] Switched front/back on the current VideoTrack',
       name: 'WebRtcService',

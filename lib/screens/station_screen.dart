@@ -63,6 +63,8 @@ class _StationScreenState extends State<StationScreen>
   bool _screenDimSwitching = false;
   String? _lastShownRtspError;
   String _viewerAddress = 'Đang kiểm tra mạng...';
+  Timer? _zoomDebounce;
+  double? _zoomValue;
 
   bool get _recording => _runtime.recordingService?.recording ?? false;
 
@@ -146,6 +148,21 @@ class _StationScreenState extends State<StationScreen>
     }
   }
 
+  void _changeZoom(double value) {
+    setState(() => _zoomValue = value);
+    _zoomDebounce?.cancel();
+    _zoomDebounce = Timer(const Duration(milliseconds: 50), () async {
+      final webRtc = _runtime.webRtcService;
+      if (webRtc == null) return;
+      try {
+        await webRtc.setCameraZoom(value);
+        if (mounted) setState(() => _zoomValue = webRtc.cameraZoom);
+      } catch (error) {
+        debugPrint('[CAMERA] Cannot set zoom: $error');
+      }
+    });
+  }
+
   void _showRtspWarningIfNeeded() {
     final webRtc = _runtime.webRtcService;
     if (webRtc == null || !webRtc.rtspSupported) return;
@@ -176,7 +193,12 @@ class _StationScreenState extends State<StationScreen>
       // lỗi vận hành của Station.
       debugPrint('[CAMERA] Bỏ qua yêu cầu đổi camera: $error');
     } finally {
-      if (mounted) setState(() => _lensSwitching = false);
+      if (mounted) {
+        setState(() {
+          _lensSwitching = false;
+          _zoomValue = null;
+        });
+      }
     }
   }
 
@@ -723,6 +745,7 @@ class _StationScreenState extends State<StationScreen>
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
     _runtimeSubscription?.cancel();
+    _zoomDebounce?.cancel();
     if (_screenDimmed) {
       unawaited(StationDisplayService.setDimmed(false));
     }
@@ -1084,6 +1107,17 @@ class _StationScreenState extends State<StationScreen>
                             ),
                           ),
                         ),
+                      if (_cameraReady &&
+                          (_runtime.webRtcService?.cameraZoomSupported ??
+                              false))
+                        _CameraZoomSlider(
+                          compact: compact,
+                          value:
+                              _zoomValue ?? _runtime.webRtcService!.cameraZoom,
+                          minimum: _runtime.webRtcService!.minimumCameraZoom,
+                          maximum: _runtime.webRtcService!.maximumCameraZoom,
+                          onChanged: _changeZoom,
+                        ),
                       _BottomStatusBar(
                         compact: compact,
                         cameraReady: _cameraReady,
@@ -1096,6 +1130,62 @@ class _StationScreenState extends State<StationScreen>
             ],
           );
         },
+      ),
+    );
+  }
+}
+
+class _CameraZoomSlider extends StatelessWidget {
+  const _CameraZoomSlider({
+    required this.compact,
+    required this.value,
+    required this.minimum,
+    required this.maximum,
+    required this.onChanged,
+  });
+
+  final bool compact;
+  final double value;
+  final double minimum;
+  final double maximum;
+  final ValueChanged<double> onChanged;
+
+  @override
+  Widget build(BuildContext context) {
+    final safeValue = value.clamp(minimum, maximum).toDouble();
+    return Container(
+      margin: EdgeInsets.only(bottom: compact ? 6 : 8),
+      padding: const EdgeInsets.symmetric(horizontal: 10),
+      decoration: BoxDecoration(
+        color: Colors.black.withValues(alpha: 0.68),
+        borderRadius: BorderRadius.circular(14),
+      ),
+      child: Row(
+        children: [
+          const Icon(Icons.zoom_out_rounded, color: Colors.white70, size: 20),
+          Expanded(
+            child: Slider(
+              value: safeValue,
+              min: minimum,
+              max: maximum,
+              divisions: ((maximum - minimum) * 10).round().clamp(1, 100),
+              onChanged: onChanged,
+            ),
+          ),
+          const Icon(Icons.zoom_in_rounded, color: Colors.white70, size: 20),
+          const SizedBox(width: 6),
+          SizedBox(
+            width: 42,
+            child: Text(
+              '${safeValue.toStringAsFixed(1)}×',
+              textAlign: TextAlign.end,
+              style: const TextStyle(
+                color: Colors.white,
+                fontWeight: FontWeight.w800,
+              ),
+            ),
+          ),
+        ],
       ),
     );
   }

@@ -28,6 +28,9 @@ import UIKit
       binaryMessenger: engineBridge.applicationRegistrar.messenger()
     )
     self.stationChannel = stationChannel
+    audioSegmentRecorder.onPcm = { [weak self] pcm in
+      self?.rtspPublisher?.sendNativePcm(pcm)
+    }
     stationChannel.setMethodCallHandler { [weak self] call, result in
       guard let self = self else {
         result(
@@ -77,10 +80,39 @@ import UIKit
         self.setStationActive(call, result)
       case "setScreenDimmed":
         self.setScreenDimmed(call, result)
+      case "getCameraZoom":
+        self.cameraZoom(call, result, apply: false)
+      case "setCameraZoom":
+        self.cameraZoom(call, result, apply: true)
       default:
         result(FlutterMethodNotImplemented)
       }
     }
+  }
+
+  private func cameraZoom(_ call: FlutterMethodCall, _ result: FlutterResult, apply: Bool) {
+    let arguments = call.arguments as? [String: Any]
+    let facing = arguments?["facing"] as? String ?? "environment"
+    let position: AVCaptureDevice.Position = facing == "user" ? .front : .back
+    let requestedId = arguments?["deviceId"] as? String
+    let exactDevice = requestedId.flatMap { id in
+      AVCaptureDevice.devices(for: .video).first { $0.uniqueID == id }
+    }
+    guard let device = exactDevice ?? AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: position) else {
+      result(["supported": false]); return
+    }
+    let minimum = max(1, device.minAvailableVideoZoomFactor)
+    let maximum = min(10, device.maxAvailableVideoZoomFactor)
+    if apply, let requested = (arguments?["zoom"] as? NSNumber)?.doubleValue {
+      do {
+        try device.lockForConfiguration()
+        device.videoZoomFactor = min(maximum, max(minimum, requested))
+        device.unlockForConfiguration()
+      } catch {
+        result(FlutterError(code: "ZOOM_FAILED", message: error.localizedDescription, details: nil)); return
+      }
+    }
+    result(["supported": maximum > minimum, "min": minimum, "max": maximum, "current": device.videoZoomFactor])
   }
 
   private func startRtsp(_ call: FlutterMethodCall, _ result: @escaping FlutterResult) {
@@ -125,6 +157,7 @@ import UIKit
     let publisher = VnvarRtspPublisher(
       track: track,
       audioTrackId: audioTrackId,
+      nativeAudioAvailable: AVAudioSession.sharedInstance().recordPermission == .granted,
       port: port,
       bitrate: bitrate,
       fps: fps

@@ -26,12 +26,31 @@ import kotlin.concurrent.thread
 /** Publishes the existing WebRTC VideoTrack as H.264 over RTSP without opening another camera. */
 class VnvarRtspPublisher(
     private val track: VideoTrack,
+    private val audioAvailable: Boolean = false,
     private val port: Int = 8554,
     private val bitrate: Int = 2_000_000,
     private val fps: Int = 30,
     private val onEncoderConfigured: () -> Unit = {},
     private val onEncoderError: (String) -> Unit = {},
 ) : VideoSink {
+    fun sendAudioPcm(pcm: ByteArray) {
+        if (!running.get() || !audioAvailable || pcm.isEmpty()) return
+        if (!audioPending.compareAndSet(false, true)) return
+        try {
+            audioExecutor.execute {
+                try {
+                    val timestamp = (System.nanoTime() * 48_000L / 1_000_000_000L) and 0xffffffffL
+                    sessions.values.filter { it.playing && it.audioConfigured }.forEach {
+                        it.sendAudio(pcm, timestamp)
+                    }
+                } finally {
+                    audioPending.set(false)
+                }
+            }
+        } catch (_: Exception) {
+            audioPending.set(false)
+        }
+    }
     private val running = AtomicBoolean(false)
     private val sessions = ConcurrentHashMap<String, Session>()
     private var serverSocket: ServerSocket? = null
@@ -49,6 +68,10 @@ class VnvarRtspPublisher(
     private val encoderExecutor = Executors.newSingleThreadExecutor { task ->
         Thread(task, "VNVAR-RTSP-Encoder").apply { isDaemon = true }
     }
+    private val audioExecutor = Executors.newSingleThreadExecutor { task ->
+        Thread(task, "VNVAR-RTSP-Audio").apply { isDaemon = true }
+    }
+    private val audioPending = AtomicBoolean(false)
     private val framePending = AtomicBoolean(false)
     private val encoderReady = AtomicBoolean(false)
     private val encoderErrorReported = AtomicBoolean(false)
@@ -389,13 +412,13 @@ class VnvarRtspPublisher(
                         "Public: OPTIONS, DESCRIBE, SETUP, PLAY, PAUSE, TEARDOWN\r\n",
                     )
                     "DESCRIBE" -> session.describe(cseq)
-                    "SETUP" -> session.setup(cseq, request.headers["transport"] ?: "")
+                    "SETUP" -> session.setup(cseq, request.uri, request.headers["transport"] ?: "")
                     "PLAY" -> {
                         // The RTSP response must be fully written before RTP is
                         // allowed onto the same interleaved TCP connection.
                         session.respond(
                             cseq,
-                            "Session: ${session.id}\r\nRTP-Info: url=track0\r\n",
+                            "Session: ${session.id}\r\nRTP-Info: url=track0${if (audioAvailable && session.audioConfigured) ",url=track1" else ""}\r\n",
                         )
                         session.beginPlaying()
                         requestSyncFrame()
@@ -424,6 +447,7 @@ class VnvarRtspPublisher(
 
     private data class RtspRequest(
         val method: String,
+        val uri: String,
         val headers: Map<String, String>,
     )
 
@@ -478,7 +502,11 @@ class VnvarRtspPublisher(
                     line.substring(separator + 1).trim()
             }
         }
-        return RtspRequest(requestLine.substringBefore(' ').uppercase(), headers)
+        return RtspRequest(
+            requestLine.substringBefore(' ').uppercase(),
+            requestLine.split(' ').getOrElse(1) { "" },
+            headers,
+        )
     }
 
     private fun requestSyncFrame() {
@@ -534,6 +562,7 @@ class VnvarRtspPublisher(
         sessions.values.forEach { it.close() }
         sessions.clear()
         encoderExecutor.shutdownNow()
+        audioExecutor.shutdownNow()
         synchronized(codecLock) {
             try { codec?.stop() } catch (_: Exception) {}
             codec?.release()
@@ -544,8 +573,11 @@ class VnvarRtspPublisher(
     private inner class Session(val socket: Socket) {
         val id = UUID.randomUUID().toString().replace("-", "").take(12)
         @Volatile var playing = false
+        @Volatile var audioConfigured = false
         private var rtpChannel = 0
+        private var audioRtpChannel = 2
         private var sequence = 0
+        private var audioSequence = 0
         private val output: OutputStream = socket.getOutputStream()
         private val outputLock = Any()
         private val sendStateLock = Any()
@@ -559,10 +591,17 @@ class VnvarRtspPublisher(
         private var closed = false
         @Volatile private var writeStartedNanos = 0L
 
-        fun setup(cseq: String, transport: String) {
+        fun setup(cseq: String, uri: String, transport: String) {
             if (transport.contains("TCP", true) || transport.contains("interleaved", true)) {
-                rtpChannel = Regex("interleaved=(\\d+)").find(transport)?.groupValues?.get(1)?.toIntOrNull() ?: 0
-                respond(cseq, "Session: $id\r\nTransport: RTP/AVP/TCP;unicast;interleaved=$rtpChannel-${rtpChannel + 1}\r\n")
+                val requested = Regex("interleaved=(\\d+)").find(transport)?.groupValues?.get(1)?.toIntOrNull()
+                val isAudio = uri.contains("track1", true)
+                if (isAudio && !audioAvailable) {
+                    writeRtsp("RTSP/1.0 404 Not Found\r\nCSeq: $cseq\r\n\r\n")
+                    return
+                }
+                val channel = requested ?: if (isAudio) 2 else 0
+                if (isAudio) { audioRtpChannel = channel; audioConfigured = true } else rtpChannel = channel
+                respond(cseq, "Session: $id\r\nTransport: RTP/AVP/TCP;unicast;interleaved=$channel-${channel + 1}\r\n")
             } else {
                 writeRtsp("RTSP/1.0 461 Unsupported Transport\r\nCSeq: $cseq\r\n\r\n")
             }
@@ -630,7 +669,8 @@ class VnvarRtspPublisher(
                 "a=fmtp:96 packetization-mode=1;profile-level-id=$profileLevelId;" +
                 "sprop-parameter-sets=${Base64.encodeToString(localSps, Base64.NO_WRAP)}," +
                 "${Base64.encodeToString(localPps, Base64.NO_WRAP)}\r\n" +
-                "a=control:track0\r\n"
+                "a=control:track0\r\n" +
+                if (audioAvailable) "m=audio 0 RTP/AVP 97\r\na=rtpmap:97 L16/48000/1\r\na=control:track1\r\n" else ""
             val response = "RTSP/1.0 200 OK\r\n" +
                 "CSeq: $cseq\r\n" +
                 "Content-Type: application/sdp\r\n" +
@@ -807,6 +847,32 @@ class VnvarRtspPublisher(
                     output.write(interleaved)
                 }
             } catch (_: Exception) { close() }
+        }
+
+        fun sendAudio(pcm: ByteArray, timestamp: Long) {
+            val networkPcm = ByteArray(pcm.size)
+            var index = 0
+            while (index + 1 < pcm.size) {
+                networkPcm[index] = pcm[index + 1]
+                networkPcm[index + 1] = pcm[index]
+                index += 2
+            }
+            var offset = 0
+            while (offset < networkPcm.size) {
+                val size = minOf(1_200, networkPcm.size - offset) and -2
+                if (size <= 0) break
+                val packet = ByteArray(12 + size)
+                packet[0] = 0x80.toByte(); packet[1] = 97
+                packet[2] = (audioSequence shr 8).toByte(); packet[3] = audioSequence.toByte(); audioSequence = (audioSequence + 1) and 0xffff
+                val ts = (timestamp + offset / 2).toInt(); packet[4] = (ts shr 24).toByte(); packet[5] = (ts shr 16).toByte(); packet[6] = (ts shr 8).toByte(); packet[7] = ts.toByte()
+                packet[8] = 0x56; packet[9] = 0x4e; packet[10] = 0x41; packet[11] = 0x55
+                System.arraycopy(networkPcm, offset, packet, 12, size)
+                val framed = ByteArray(packet.size + 4)
+                framed[0] = '$'.code.toByte(); framed[1] = audioRtpChannel.toByte(); framed[2] = (packet.size shr 8).toByte(); framed[3] = packet.size.toByte()
+                System.arraycopy(packet, 0, framed, 4, packet.size)
+                try { synchronized(outputLock) { output.write(framed) } } catch (_: Exception) { close(); return }
+                offset += size
+            }
         }
 
         fun close() {
