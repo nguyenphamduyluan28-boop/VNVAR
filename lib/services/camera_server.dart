@@ -263,8 +263,19 @@ class CameraServer {
       // video track đang chạy nên không được đóng camera/peer connection.
       // ========================================================
 
-      if (path == '/checkvar' && method == 'POST') {
+      const checkVarPaths = {
+        '/checkvar',
+        '/check-var',
+        '/checkpoint',
+        '/recording/checkvar',
+      };
+      if (checkVarPaths.contains(path) && method == 'POST') {
         final requestedAt = DateTime.now();
+        developer.log(
+          '[CHECKVAR] Request received at ${requestedAt.toIso8601String()} '
+          'from ${request.connectionInfo?.remoteAddress.address ?? 'unknown'}',
+          name: 'CameraServer',
+        );
         await _serializeRecordingRequest(
           () => _checkVar(request, requestedAt: requestedAt),
         );
@@ -689,6 +700,11 @@ class CameraServer {
     );
     final lookbackSeconds = (requestedLookback ?? 15).clamp(5, 60).toInt();
     final segment = await recordingService.checkpointCurrentSegment();
+    developer.log(
+      '[CHECKVAR] Source ready: ${segment.fileName} '
+      '(${segment.durationMs}ms)',
+      name: 'CameraServer',
+    );
     RecordedSegment checkpoint = segment;
     var autoTrimmed = false;
     String? trimError;
@@ -712,6 +728,11 @@ class CameraServer {
           ),
         );
         autoTrimmed = true;
+        developer.log(
+          '[CHECKVAR] Clip ready: ${checkpoint.fileName} '
+          '(${checkpoint.durationMs}ms)',
+          name: 'CameraServer',
+        );
       } catch (error, stackTrace) {
         trimError = userFacingError(error);
         developer.log(
@@ -749,6 +770,11 @@ class CameraServer {
           : null,
       'preferredDownloadUrl': checkpointDownloadUrl,
     });
+    developer.log(
+      '[CHECKVAR] Response sent: autoTrimmed=$autoTrimmed '
+      'url=$checkpointDownloadUrl',
+      name: 'CameraServer',
+    );
   }
 
   // ============================================================

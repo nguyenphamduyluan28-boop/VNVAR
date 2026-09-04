@@ -65,6 +65,7 @@ class CameraStationRuntime {
   Timer? _storageCleanupTimer;
   Timer? _thermalTimer;
   Timer? _pendingThermalThrottleTimer;
+  Timer? _pendingThermalRestoreTimer;
   bool _thermalThrottled = false;
   bool _thermalCriticalSuspended = false;
   bool _thermalCheckRunning = false;
@@ -378,6 +379,8 @@ class CameraStationRuntime {
     _thermalTimer = null;
     _pendingThermalThrottleTimer?.cancel();
     _pendingThermalThrottleTimer = null;
+    _pendingThermalRestoreTimer?.cancel();
+    _pendingThermalRestoreTimer = null;
     _thermalThrottled = false;
     _thermalCriticalSuspended = false;
     _thermalCheckRunning = false;
@@ -1186,6 +1189,8 @@ class CameraStationRuntime {
       if (critical) {
         _pendingThermalThrottleTimer?.cancel();
         _pendingThermalThrottleTimer = null;
+        _pendingThermalRestoreTimer?.cancel();
+        _pendingThermalRestoreTimer = null;
         _thermalNormalSince = null;
         if (!_thermalCriticalSuspended && !_profileSwitching) {
           await _serializeLifecycle(_suspendForCriticalThermal);
@@ -1214,6 +1219,10 @@ class CameraStationRuntime {
         return;
       }
       if (hot) _thermalNormalSince = null;
+      if (hot) {
+        _pendingThermalRestoreTimer?.cancel();
+        _pendingThermalRestoreTimer = null;
+      }
       if (hot &&
           !_thermalThrottled &&
           _pendingThermalThrottleTimer == null &&
@@ -1229,24 +1238,8 @@ class CameraStationRuntime {
         }
         final previous = _profileBeforeThermalThrottle;
         if (previous != null) {
-          try {
-            _thermalThrottled = false;
-            await setResolutionProfile(previous);
-            _profileBeforeThermalThrottle = null;
-            _thermalNormalSince = null;
-            developer.log(
-              '[THERMAL] Temperature stable for 10 minutes; restored camera profile',
-              name: 'CameraStationRuntime',
-            );
-          } catch (error, stackTrace) {
-            _thermalThrottled = true;
-            _thermalNormalSince = now;
-            developer.log(
-              '[THERMAL] Failed to restore camera profile',
-              error: error,
-              stackTrace: stackTrace,
-              name: 'CameraStationRuntime',
-            );
+          if (_pendingThermalRestoreTimer == null) {
+            _scheduleThermalRestoreAtSegmentBoundary(previous);
           }
         } else {
           _thermalThrottled = false;
@@ -1266,16 +1259,66 @@ class CameraStationRuntime {
     }
   }
 
-  void _scheduleThermalThrottleAtSegmentBoundary() {
+  void _scheduleThermalRestoreAtSegmentBoundary(
+    CameraResolutionProfile profile,
+  ) {
+    final delay = _delayUntilSegmentBoundary();
+    developer.log(
+      '[THERMAL] Temperature stable; scheduling ${profile.shortLabel}/'
+      '${profile.fps}fps restore at the segment boundary in ${delay.inSeconds}s',
+      name: 'CameraStationRuntime',
+    );
+    _pendingThermalRestoreTimer = Timer(delay, () {
+      _pendingThermalRestoreTimer = null;
+      unawaited(_applyPendingThermalRestore(profile));
+    });
+  }
+
+  Future<void> _applyPendingThermalRestore(
+    CameraResolutionProfile profile,
+  ) async {
+    if (_stopping ||
+        !_cameraEnabled ||
+        _thermalCriticalSuspended ||
+        _iosLifecycleSuspended ||
+        !_thermalThrottled ||
+        _profileSwitching) {
+      return;
+    }
+    _thermalThrottled = false;
+    try {
+      await setResolutionProfile(profile);
+      _profileBeforeThermalThrottle = null;
+      _thermalNormalSince = null;
+      developer.log(
+        '[THERMAL] Segment boundary reached; restored camera profile',
+        name: 'CameraStationRuntime',
+      );
+    } catch (error, stackTrace) {
+      _thermalThrottled = true;
+      _thermalNormalSince = DateTime.now();
+      developer.log(
+        '[THERMAL] Failed to restore camera profile',
+        error: error,
+        stackTrace: stackTrace,
+        name: 'CameraStationRuntime',
+      );
+    }
+    _emitState();
+  }
+
+  Duration _delayUntilSegmentBoundary() {
     final remaining = _recordingService?.currentSegmentRemaining;
+    if (remaining == null || remaining <= const Duration(milliseconds: 250)) {
+      return Duration.zero;
+    }
+    return remaining - const Duration(milliseconds: 250);
+  }
+
+  void _scheduleThermalThrottleAtSegmentBoundary() {
     // Finish the normal file just before its own rotation timer. Critical
     // thermal state is handled separately and still stops capture at once.
-    final Duration delay;
-    if (remaining == null || remaining <= const Duration(milliseconds: 250)) {
-      delay = Duration.zero;
-    } else {
-      delay = remaining - const Duration(milliseconds: 250);
-    }
+    final delay = _delayUntilSegmentBoundary();
     developer.log(
       '[THERMAL] Hot device; scheduling 720p/15fps at the segment boundary '
       'in ${delay.inSeconds}s',
@@ -1460,6 +1503,7 @@ class CameraStationRuntime {
       '[CAMERA] Recovery requested: $reason',
       name: 'CameraStationRuntime',
     );
+    debugPrint('[VNVAR] CAMERA RECOVERY REQUESTED: $reason');
 
     final webRtc = _webRtcService;
     final recording = _recordingService;
