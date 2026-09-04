@@ -2,13 +2,14 @@ import 'package:flutter/material.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 enum AppLanguage {
-  vietnamese('vi', 'Tiếng Việt'),
-  english('en', 'English');
+  vietnamese('vi', 'VI', '🇻🇳'),
+  english('en', 'EN', '🇬🇧');
 
-  const AppLanguage(this.code, this.label);
+  const AppLanguage(this.code, this.shortLabel, this.flag);
 
   final String code;
-  final String label;
+  final String shortLabel;
+  final String flag;
 }
 
 class AppLanguageService extends ChangeNotifier {
@@ -81,7 +82,7 @@ class AppLanguageButton extends StatelessWidget {
   Widget build(BuildContext context) {
     final service = AppLanguageScope.of(context);
     return SizedBox(
-      width: size,
+      width: size + 22,
       height: size,
       child: PopupMenuButton<AppLanguage>(
         tooltip: appText(context, 'Ngôn ngữ', 'Language'),
@@ -93,25 +94,37 @@ class AppLanguageButton extends StatelessWidget {
               (language) => PopupMenuItem<AppLanguage>(
                 value: language,
                 child: Row(
+                  mainAxisSize: MainAxisSize.min,
                   children: [
-                    Icon(
-                      language == service.language
-                          ? Icons.check_circle
-                          : Icons.circle_outlined,
-                      size: 19,
+                    Text(language.flag, style: const TextStyle(fontSize: 21)),
+                    const SizedBox(width: 8),
+                    Text(
+                      language.shortLabel,
+                      style: const TextStyle(fontWeight: FontWeight.w800),
                     ),
-                    const SizedBox(width: 10),
-                    Text(language.label),
                   ],
                 ),
               ),
             )
             .toList(),
         child: Center(
-          child: Icon(
-            Icons.language_rounded,
-            color: foregroundColor,
-            size: size * 0.58,
+          child: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Text(
+                service.language.flag,
+                style: TextStyle(fontSize: size * 0.42),
+              ),
+              const SizedBox(width: 4),
+              Text(
+                service.language.shortLabel,
+                style: TextStyle(
+                  color: foregroundColor,
+                  fontSize: size * 0.3,
+                  fontWeight: FontWeight.w900,
+                ),
+              ),
+            ],
           ),
         ),
       ),
