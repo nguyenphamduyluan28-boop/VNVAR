@@ -1,7 +1,6 @@
 import 'dart:convert';
 import 'dart:developer' as developer;
 import 'dart:io';
-import 'dart:math' as math;
 
 import 'package:flutter/foundation.dart';
 import 'package:flutter_webrtc/flutter_webrtc.dart';
@@ -269,10 +268,10 @@ class CameraServer {
         '/checkpoint',
         '/recording/checkvar',
       };
-      if (checkVarPaths.contains(path) && method == 'POST') {
+      if (checkVarPaths.contains(path) && (method == 'POST' || method == 'GET')) {
         final requestedAt = DateTime.now();
         developer.log(
-          '[CHECKVAR] Request received at ${requestedAt.toIso8601String()} '
+          '[CHECKVAR] Request received ($method) at ${requestedAt.toIso8601String()} '
           'from ${request.connectionInfo?.remoteAddress.address ?? 'unknown'}',
           name: 'CameraServer',
         );
@@ -695,9 +694,24 @@ class CameraServer {
     HttpRequest request, {
     required DateTime requestedAt,
   }) async {
-    final requestedLookback = int.tryParse(
-      request.uri.queryParameters['lookbackSeconds'] ?? '',
+    int? requestedLookback = int.tryParse(
+      request.uri.queryParameters['lookbackSeconds'] ??
+          request.uri.queryParameters['lookback'] ??
+          request.uri.queryParameters['duration'] ??
+          '',
     );
+    if (requestedLookback == null && request.contentLength > 0) {
+      try {
+        final body = await _readJson(request);
+        final raw = body['lookbackSeconds'] ??
+            body['lookback'] ??
+            body['duration'];
+        if (raw is num) requestedLookback = raw.toInt();
+        if (raw is String) requestedLookback = int.tryParse(raw);
+      } catch (_) {
+        // No or non-JSON body is safe to ignore.
+      }
+    }
     final lookbackSeconds = (requestedLookback ?? 15).clamp(5, 60).toInt();
     final segment = await recordingService.checkpointCurrentSegment();
     developer.log(
@@ -738,10 +752,7 @@ class CameraServer {
           startMs: range.startMs,
           endMs: range.endMs,
           streamCopy: true,
-          minimumOutputDurationMs: math.min(
-            lookbackSeconds * 1000,
-            range.endMs,
-          ),
+          minimumOutputDurationMs: 500,
         );
         autoTrimmed = true;
         developer.log(

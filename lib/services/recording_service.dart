@@ -470,8 +470,17 @@ class RecordingService {
       final target = output;
       final id = 'CLIP_${cameraId}_$timestampMs';
       final durationMs = endMs - startMs;
+      final isTsInput = source.path.toLowerCase().endsWith('.ts');
       final commonArguments = <String>[
         '-y',
+        if (isTsInput) ...[
+          '-fflags',
+          '+genpts+discardcorrupt',
+          '-analyzeduration',
+          '10000000',
+          '-probesize',
+          '10000000',
+        ],
         '-ss',
         (startMs / 1000).toStringAsFixed(3),
         '-i',
@@ -523,7 +532,41 @@ class RecordingService {
               ],
       );
       var returnCode = await session.getReturnCode();
-      if (!streamCopy &&
+      var outputProbe = await _probeVideo(target);
+
+      // Nếu streamCopy thất bại hoặc clip xuất ra không thể giải mã/quá ngắn,
+      // tự động fallback sang re-encode để không bao giờ làm mất clip Check VAR.
+      if (streamCopy &&
+          (!ReturnCode.isSuccess(returnCode) ||
+              !await target.exists() ||
+              await target.length() <= 0 ||
+              outputProbe == null ||
+              !outputProbe.hasVideo ||
+              (outputProbe.durationSeconds ?? 0) < 0.5)) {
+        if (await target.exists()) await target.delete();
+        developer.log(
+          '[FFMPEG] streamCopy trim failed; falling back to re-encode (mpeg4)',
+          name: 'RecordingService',
+        );
+        session = await FFmpegKit.executeWithArguments([
+          ...commonArguments,
+          '-c:v',
+          'mpeg4',
+          '-q:v',
+          '4',
+          '-c:a',
+          'aac',
+          '-b:a',
+          '128k',
+          '-movflags',
+          '+faststart',
+          '-f',
+          'mp4',
+          target.path,
+        ]);
+        returnCode = await session.getReturnCode();
+        outputProbe = await _probeVideo(target);
+      } else if (!streamCopy &&
           hardwareEncoder != null &&
           !ReturnCode.isSuccess(returnCode)) {
         if (await target.exists()) await target.delete();
@@ -548,7 +591,9 @@ class RecordingService {
           target.path,
         ]);
         returnCode = await session.getReturnCode();
+        outputProbe = await _probeVideo(target);
       }
+
       if (!ReturnCode.isSuccess(returnCode) ||
           !await target.exists() ||
           await target.length() <= 0) {
@@ -557,7 +602,6 @@ class RecordingService {
           'FFmpeg xử lý thất bại: ${details ?? returnCode}',
         );
       }
-      final outputProbe = await _probeVideo(target);
       final actualDurationSeconds = outputProbe?.durationSeconds;
       if (outputProbe == null ||
           !outputProbe.hasVideo ||
@@ -574,7 +618,7 @@ class RecordingService {
         milliseconds: (actualDurationSeconds * 1000).round(),
       );
       if (minimumOutputDurationMs != null &&
-          actualDuration.inMilliseconds + 250 < minimumOutputDurationMs) {
+          actualDuration.inMilliseconds + 500 < minimumOutputDurationMs) {
         throw TrimProcessingException(
           'Trimmed clip is shorter than required: '
           '${actualDuration.inMilliseconds}ms/$minimumOutputDurationMs ms.',
