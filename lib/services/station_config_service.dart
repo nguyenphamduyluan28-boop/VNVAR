@@ -15,6 +15,7 @@ class StationConfigService {
   static const String _courtCountKey = 'courtCount';
   static const String _resolutionProfileKey = 'camera_resolution_profile';
   static const String _adaptiveFpsPrefix = 'ios_adaptive_fps';
+  static const String _apiPortKey = 'camera_api_port';
 
   // ConfigService cũ đã lưu Camera ID bằng key này.
   static const String _legacyCameraKey = 'camera_id';
@@ -105,6 +106,24 @@ class StationConfigService {
     return CameraResolutionProfile.fromId(
       prefs.getString(_resolutionProfileKey),
     );
+  }
+
+  Future<int> loadApiPort() async {
+    final prefs = await SharedPreferences.getInstance();
+    final value = prefs.getInt(_apiPortKey);
+    return value != null && value > 0 && value <= 65535 ? value : 8080;
+  }
+
+  Future<void> saveApiPort(int port) async {
+    if (port <= 0 || port > 65535) {
+      throw ArgumentError.value(
+        port,
+        'port',
+        'Port must be between 1 and 65535',
+      );
+    }
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setInt(_apiPortKey, port);
   }
 
   Future<void> saveAdaptiveIosFps({

@@ -9,6 +9,7 @@ import '../models/camera_resolution_profile.dart';
 import '../models/station_identity.dart';
 import '../services/camera_station_foreground_service.dart';
 import '../services/app_language_service.dart';
+import '../services/camera_server.dart';
 import '../services/camera_station_runtime.dart';
 import '../services/recording_service.dart';
 import '../services/station_config_service.dart';
@@ -259,13 +260,15 @@ class _StationScreenState extends State<StationScreen>
 
   Future<void> _loadViewerAddress() async {
     var result = 'Chưa kết nối Wi-Fi/LAN';
+    final apiPort =
+        _runtime.cameraServer?.apiPort ?? CameraServer.defaultApiPort;
     try {
       if (Platform.isIOS) {
         final wifiIp = await _platformChannel
             .invokeMethod<String>('getWifiIpAddress')
             .timeout(const Duration(seconds: 2));
         if (wifiIp != null && wifiIp.isNotEmpty) {
-          result = 'http://$wifiIp:8080/viewer';
+          result = 'http://$wifiIp:$apiPort/viewer';
         }
         if (mounted) setState(() => _viewerAddress = result);
         return;
@@ -288,7 +291,7 @@ class _StationScreenState extends State<StationScreen>
         final address =
             (localAddresses.isNotEmpty ? localAddresses.first : addresses.first)
                 .address;
-        result = 'http://$address:8080/viewer';
+        result = 'http://$address:$apiPort/viewer';
       }
     } catch (_) {
       result = 'Không đọc được địa chỉ IP';
@@ -900,7 +903,9 @@ class _StationScreenState extends State<StationScreen>
   // ============================================================
 
   Widget _buildStation() {
-    final renderer = _runtime.webRtcService?.localRenderer;
+    final webRtc = _runtime.webRtcService;
+    final renderer = webRtc?.localRenderer;
+    final mirrorPreview = webRtc?.currentFacingMode == 'user';
 
     return Scaffold(
       backgroundColor: Colors.black,
@@ -931,7 +936,11 @@ class _StationScreenState extends State<StationScreen>
                   quarterTurns: _cameraQuarterTurns,
                   child: RTCVideoView(
                     renderer,
-                    mirror: false,
+                    // Match the phone's native camera preview: front camera is
+                    // mirrored for intuitive movement, while recorded/RTSP
+                    // frames remain unmirrored so text and court direction are
+                    // preserved for CheckVAR.
+                    mirror: mirrorPreview,
                     objectFit:
                         RTCVideoViewObjectFit.RTCVideoViewObjectFitContain,
                   ),

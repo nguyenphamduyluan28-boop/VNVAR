@@ -71,6 +71,7 @@ class WebRtcService {
   // ============================================================
 
   RTCPeerConnection? _peerConnection;
+  Future<void>? _disposeConnectionOperation;
 
   // ============================================================
   // LOCAL PREVIEW
@@ -1164,25 +1165,36 @@ class WebRtcService {
   // trong khi RecordingService vẫn ghi video.
   // ============================================================
 
-  Future<void> disposeConnection() async {
+  Future<void> disposeConnection() {
+    final activeDispose = _disposeConnectionOperation;
+    if (activeDispose != null) return activeDispose;
+
     final pc = _peerConnection;
-
     _peerConnection = null;
+    if (pc == null) return Future<void>.value();
 
-    if (pc != null) {
-      try {
-        await pc.close();
-      } catch (e, stackTrace) {
-        developer.log(
-          'Failed to close PeerConnection',
-          error: e,
-          stackTrace: stackTrace,
-          name: 'WebRtcService',
-        );
+    final operation = _closePeerConnection(pc);
+    _disposeConnectionOperation = operation;
+    return operation.whenComplete(() {
+      if (identical(_disposeConnectionOperation, operation)) {
+        _disposeConnectionOperation = null;
       }
+    });
+  }
 
-      developer.log('Station PeerConnection closed', name: 'WebRtcService');
+  Future<void> _closePeerConnection(RTCPeerConnection pc) async {
+    try {
+      await pc.close();
+    } catch (e, stackTrace) {
+      developer.log(
+        'Failed to close PeerConnection',
+        error: e,
+        stackTrace: stackTrace,
+        name: 'WebRtcService',
+      );
     }
+
+    developer.log('Station PeerConnection closed', name: 'WebRtcService');
   }
 
   // ============================================================

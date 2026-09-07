@@ -293,12 +293,14 @@ class CameraStationRuntime {
         await webRtc.ensureMicrophoneEnabled();
       }
 
+      final apiPort = await StationConfigService().loadApiPort();
       final server = CameraServer(
         courtId: courtId,
         cameraId: cameraId,
         deviceId: deviceId,
         webRtcService: webRtc,
         recordingService: recording,
+        apiPort: apiPort,
         onStateChanged: _emitState,
         captureStateProvider: () => captureState,
         thermalStateProvider: () => thermalState,
@@ -465,6 +467,10 @@ class CameraStationRuntime {
     await _beginIosBackgroundFinalization();
     try {
       try {
+        // Finish an already accepted CheckVAR request before stopping the
+        // recorder. Without this barrier, the lifecycle queue and HTTP queue
+        // could finalize the same recorder concurrently.
+        await _cameraServer?.prepareForIosBackground();
         await recording.stop();
       } catch (error, stackTrace) {
         // iOS grants only a short background execution window. A recorder
@@ -563,6 +569,7 @@ class CameraStationRuntime {
         return;
       }
       _iosLifecycleSuspended = false;
+      server.resumeAfterIosBackground();
       developer.log(
         '[LIFECYCLE] iOS foreground capture resumed',
         name: 'CameraStationRuntime',
@@ -1411,6 +1418,9 @@ class CameraStationRuntime {
       await webRtc.initializeCamera();
       await webRtc.ensureMicrophoneEnabled();
       await server.ensureRecording();
+      if (Platform.isIOS && _iosAppInForeground) {
+        server.resumeAfterIosBackground();
+      }
       _thermalCriticalSuspended = false;
       developer.log(
         '[THERMAL] Device stable; capture resumed at 720p/15fps',
@@ -1549,6 +1559,9 @@ class CameraStationRuntime {
         await webRtc.initializeCamera();
         await _waitForIosCaptureWarmup();
         await server.ensureRecording();
+        if (Platform.isIOS && _iosAppInForeground) {
+          server.resumeAfterIosBackground();
+        }
         developer.log(
           '[CAMERA] Recovery successful on attempt ${attempt + 1}',
           name: 'CameraStationRuntime',

@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:developer' as developer;
 import 'dart:io';
@@ -11,6 +12,26 @@ import 'recording_service.dart';
 import 'request_rate_limiter.dart';
 import 'webrtc_service.dart';
 
+String normalizeCheckVarRequestId(String? value, DateTime receivedAt) {
+  final trimmed = value?.trim() ?? '';
+  if (trimmed.isEmpty) return 'checkvar_${receivedAt.microsecondsSinceEpoch}';
+  final safe = trimmed.replaceAll(RegExp(r'[^a-zA-Z0-9._-]'), '_');
+  return safe.length <= 96 ? safe : safe.substring(0, 96);
+}
+
+DateTime checkVarEventTime(String? epochMilliseconds, DateTime receivedAt) {
+  final value = int.tryParse(epochMilliseconds ?? '');
+  if (value == null || value <= 0) return receivedAt;
+  final candidate = DateTime.fromMillisecondsSinceEpoch(value);
+  // Reject corrupt clocks and malicious values while still allowing a tablet
+  // to retry a recent event after a temporary LAN outage.
+  if (candidate.isBefore(receivedAt.subtract(const Duration(minutes: 10))) ||
+      candidate.isAfter(receivedAt.add(const Duration(seconds: 5)))) {
+    return receivedAt;
+  }
+  return candidate;
+}
+
 class CameraServer {
   // ============================================================
   // SERVER
@@ -18,8 +39,9 @@ class CameraServer {
 
   HttpServer? _server;
 
-  static const int apiPort = 8080;
+  static const int defaultApiPort = 8080;
   static const int maximumJsonBodyBytes = 256 * 1024;
+  final int apiPort;
 
   // ============================================================
   // IDENTITY
@@ -51,8 +73,13 @@ class CameraServer {
   bool recording = false;
   Future<void>? _ensureRecordingOperation;
   Future<void> _recordingRequestTail = Future<void>.value();
+  bool _iosLifecycleSuspended = false;
+  final Map<String, Future<Map<String, dynamic>>> _checkVarJobs = {};
+  final Map<String, Map<String, dynamic>> _checkVarResults = {};
   final RequestRateLimiter _rateLimiter = RequestRateLimiter();
-  bool _webRtcOfferInProgress = false;
+  Future<void> _webRtcOfferTail = Future<void>.value();
+  int _pendingWebRtcOffers = 0;
+  static const int maximumPendingWebRtcOffers = 2;
 
   bool get running => _server != null;
 
@@ -66,12 +93,13 @@ class CameraServer {
     required this.deviceId,
     required this.webRtcService,
     required this.recordingService,
+    this.apiPort = defaultApiPort,
     this.onStateChanged,
     this.captureStateProvider,
     this.thermalStateProvider,
     this.temperatureProvider,
     this.captureMetricsProvider,
-  });
+  }) : assert(apiPort > 0 && apiPort <= 65535);
 
   // ============================================================
   // START SERVER
@@ -82,7 +110,15 @@ class CameraServer {
       return;
     }
 
-    final server = await HttpServer.bind(InternetAddress.anyIPv4, apiPort);
+    final HttpServer server;
+    try {
+      server = await HttpServer.bind(InternetAddress.anyIPv4, apiPort);
+    } on SocketException catch (error) {
+      throw StateError(
+        'Không thể mở HTTP port $apiPort. '
+        'Port có thể đang được ứng dụng khác sử dụng: ${error.message}',
+      );
+    }
 
     _server = server;
 
@@ -111,13 +147,22 @@ class CameraServer {
     await recordingService.cleanupOldTempFiles();
 
     // Legacy tablet discovery uses a short TCP request/response on port 40404.
-    await _discovery.startTcpDiscovery(
-      courtId: courtId,
-      cameraId: cameraId,
-      deviceId: deviceId,
-      port: apiPort,
-      status: recordingService.recording ? 'RECORDING' : 'READY',
-    );
+    try {
+      await _discovery.startTcpDiscovery(
+        courtId: courtId,
+        cameraId: cameraId,
+        deviceId: deviceId,
+        port: apiPort,
+        status: recordingService.recording ? 'RECORDING' : 'READY',
+      );
+    } on SocketException catch (error) {
+      await server.close(force: true);
+      _server = null;
+      throw StateError(
+        'HTTP port $apiPort đã mở nhưng discovery port '
+        '${DiscoveryService.discoveryPort} không khả dụng: ${error.message}',
+      );
+    }
   }
 
   // ============================================================
@@ -268,16 +313,95 @@ class CameraServer {
         '/checkpoint',
         '/recording/checkvar',
       };
-      if (checkVarPaths.contains(path) && (method == 'POST' || method == 'GET')) {
-        final requestedAt = DateTime.now();
+      if (path.startsWith('/checkvar/jobs/') && method == 'GET') {
+        final requestId = normalizeCheckVarRequestId(
+          Uri.decodeComponent(path.substring('/checkvar/jobs/'.length)),
+          DateTime.now(),
+        );
+        final result = _checkVarResults[requestId];
+        final processing = _checkVarJobs.containsKey(requestId);
+        await _sendJson(
+          request.response,
+          result != null
+              ? HttpStatus.ok
+              : processing
+              ? HttpStatus.accepted
+              : HttpStatus.notFound,
+          result ??
+              {
+                'success': processing,
+                'requestId': requestId,
+                'status': processing ? 'PROCESSING' : 'NOT_FOUND',
+                'retryable': !processing,
+              },
+        );
+        return;
+      }
+      if (checkVarPaths.contains(path) &&
+          (method == 'POST' || method == 'GET')) {
+        if (_iosLifecycleSuspended) {
+          request.response.headers.set(HttpHeaders.retryAfterHeader, '2');
+          await _sendJson(request.response, HttpStatus.serviceUnavailable, {
+            'success': false,
+            'status': 'LIFECYCLE_SUSPENDED',
+            'retryable': true,
+            'message': 'Camera Station is entering the iOS background.',
+          });
+          return;
+        }
+        final receivedAt = DateTime.now();
+        final requestId = normalizeCheckVarRequestId(
+          request.headers.value('X-Request-ID') ??
+              request.uri.queryParameters['requestId'],
+          receivedAt,
+        );
+        final requestedAt = checkVarEventTime(
+          request.headers.value('X-Event-Time-Ms') ??
+              request.uri.queryParameters['eventTimeMs'],
+          receivedAt,
+        );
         developer.log(
           '[CHECKVAR] Request received ($method) at ${requestedAt.toIso8601String()} '
           'from ${request.connectionInfo?.remoteAddress.address ?? 'unknown'}',
           name: 'CameraServer',
         );
-        await _serializeRecordingRequest(
-          () => _checkVar(request, requestedAt: requestedAt),
-        );
+        final completed = _checkVarResults[requestId];
+        if (completed != null) {
+          if (request.contentLength != 0) await request.drain<void>();
+          await _sendJson(request.response, HttpStatus.ok, completed);
+          return;
+        }
+        var operation = _checkVarJobs[requestId];
+        if (operation == null) {
+          operation = _serializeRecordingRequest(
+            () => _checkVar(
+              request,
+              requestId: requestId,
+              requestedAt: requestedAt,
+            ),
+          );
+          _checkVarJobs[requestId] = operation;
+        } else if (request.contentLength != 0) {
+          // A retry has its own HTTP body even though it shares the original
+          // operation. Drain it so the keep-alive connection remains valid.
+          await request.drain<void>();
+        }
+        try {
+          final result = await operation;
+          _checkVarResults[requestId] = result;
+          if (identical(_checkVarJobs[requestId], operation)) {
+            _checkVarJobs.remove(requestId);
+          }
+          while (_checkVarResults.length > 100) {
+            _checkVarResults.remove(_checkVarResults.keys.first);
+          }
+          await _sendJson(request.response, HttpStatus.ok, result);
+        } catch (_) {
+          if (identical(_checkVarJobs[requestId], operation)) {
+            _checkVarJobs.remove(requestId);
+          }
+          rethrow;
+        }
         return;
       }
 
@@ -457,11 +581,39 @@ class CameraServer {
     return false;
   }
 
-  Future<void> _serializeRecordingRequest(Future<void> Function() operation) {
+  Future<T> _serializeRecordingRequest<T>(Future<T> Function() operation) {
     final previous = _recordingRequestTail;
     final current = previous.catchError((Object _) {}).then((_) => operation());
-    _recordingRequestTail = current;
+    _recordingRequestTail = current.then<void>((_) {}, onError: (_) {});
     return current;
+  }
+
+  /// Prevents a lifecycle stop from racing an accepted CheckVAR/recording
+  /// request. iOS calls this while a native background task is active, so an
+  /// already accepted checkpoint gets the best available chance to finish
+  /// before the camera session is released.
+  Future<void> prepareForIosBackground() async {
+    _iosLifecycleSuspended = true;
+    try {
+      await _recordingRequestTail.timeout(const Duration(seconds: 15));
+    } on TimeoutException {
+      developer.log(
+        '[LIFECYCLE] Pending recording request exceeded the iOS background '
+        'drain window; continuing camera finalization',
+        name: 'CameraServer',
+      );
+    } catch (error, stackTrace) {
+      developer.log(
+        '[LIFECYCLE] Pending recording request failed before iOS background',
+        error: error,
+        stackTrace: stackTrace,
+        name: 'CameraServer',
+      );
+    }
+  }
+
+  void resumeAfterIosBackground() {
+    _iosLifecycleSuspended = false;
   }
 
   // ============================================================
@@ -483,6 +635,7 @@ class CameraServer {
       'status': recordingService.recording ? 'RECORDING' : 'READY',
 
       'recording': recordingService.recording,
+      'acceptingCheckVar': !_iosLifecycleSuspended,
 
       'webrtc': true,
 
@@ -690,8 +843,9 @@ class CameraServer {
   // Chốt ngay file đang quay và mở file kế tiếp để ghi liên tục.
   // ============================================================
 
-  Future<void> _checkVar(
+  Future<Map<String, dynamic>> _checkVar(
     HttpRequest request, {
+    required String requestId,
     required DateTime requestedAt,
   }) async {
     int? requestedLookback = int.tryParse(
@@ -703,9 +857,8 @@ class CameraServer {
     if (requestedLookback == null && request.contentLength > 0) {
       try {
         final body = await _readJson(request);
-        final raw = body['lookbackSeconds'] ??
-            body['lookback'] ??
-            body['duration'];
+        final raw =
+            body['lookbackSeconds'] ?? body['lookback'] ?? body['duration'];
         if (raw is num) requestedLookback = raw.toInt();
         if (raw is String) requestedLookback = int.tryParse(raw);
       } catch (_) {
@@ -713,7 +866,21 @@ class CameraServer {
       }
     }
     final lookbackSeconds = (requestedLookback ?? 15).clamp(5, 60).toInt();
-    final segment = await recordingService.checkpointCurrentSegment();
+    final activeStartedAt = recordingService.currentSegmentStartedAt;
+    final historical =
+        activeStartedAt != null && requestedAt.isBefore(activeStartedAt)
+        ? recordingService.findByTime(requestedAt)
+        : null;
+    if (activeStartedAt != null &&
+        requestedAt.isBefore(activeStartedAt) &&
+        historical == null) {
+      throw StateError(
+        'Không còn segment chứa thời điểm CheckVAR '
+        '${requestedAt.toIso8601String()}.',
+      );
+    }
+    final segment =
+        historical ?? await recordingService.checkpointCurrentSegment();
     developer.log(
       '[CHECKVAR] Source ready: ${segment.fileName} '
       '(${segment.durationMs}ms)',
@@ -773,8 +940,10 @@ class CameraServer {
     final checkpointDownloadUrl = autoTrimmed
         ? '/download/${checkpoint.fileName}'
         : '/video/${checkpoint.fileName}';
-    await _sendJson(request.response, HttpStatus.ok, {
+    final result = <String, dynamic>{
       'success': true,
+      'requestId': requestId,
+      'status': 'READY',
       'requestedAt': requestedAt.toIso8601String(),
       'usedPreviousSegment': recordingService.lastCheckpointUsedPrevious,
       'autoTrimmed': autoTrimmed,
@@ -796,12 +965,13 @@ class CameraServer {
             }
           : null,
       'preferredDownloadUrl': checkpointDownloadUrl,
-    });
+    };
     developer.log(
       '[CHECKVAR] Response sent: autoTrimmed=$autoTrimmed '
       'url=$checkpointDownloadUrl',
       name: 'CameraServer',
     );
+    return result;
   }
 
   // ============================================================
@@ -1187,14 +1357,24 @@ class CameraServer {
   // ============================================================
 
   Future<void> _handleWebRtcOffer(HttpRequest request) async {
-    if (_webRtcOfferInProgress) {
-      await _sendJson(request.response, HttpStatus.conflict, {
-        'error': 'WebRTC Offer In Progress',
+    if (_pendingWebRtcOffers >= maximumPendingWebRtcOffers) {
+      request.response.headers.set(HttpHeaders.retryAfterHeader, '1');
+      await _sendJson(request.response, HttpStatus.serviceUnavailable, {
+        'error': 'WebRTC negotiation queue is full',
+        'retryable': true,
       });
       return;
     }
-    _webRtcOfferInProgress = true;
+    _pendingWebRtcOffers++;
+    final previous = _webRtcOfferTail;
+    final turn = Completer<void>();
+    _webRtcOfferTail = turn.future;
     try {
+      try {
+        await previous;
+      } catch (_) {
+        // A failed older offer must not poison the next handover.
+      }
       final body = await _readJson(request);
 
       final sdp = body['sdp'] as String?;
@@ -1225,7 +1405,8 @@ class CameraServer {
 
       developer.log('WebRTC answer returned', name: 'CameraServer');
     } finally {
-      _webRtcOfferInProgress = false;
+      _pendingWebRtcOffers--;
+      if (!turn.isCompleted) turn.complete();
     }
   }
 

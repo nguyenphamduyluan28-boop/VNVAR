@@ -44,6 +44,7 @@ class _SetupScreenState extends State<SetupScreen> {
   final StationConfigService _config = StationConfigService();
   late final TextEditingController _cameraNameController;
   late final TextEditingController _customPositionController;
+  late final TextEditingController _apiPortController;
 
   late String _cameraId;
   late String _courtId;
@@ -83,6 +84,7 @@ class _SetupScreenState extends State<SetupScreen> {
     _customPositionController = TextEditingController(
       text: _position == 'Tùy chỉnh' ? savedPosition : '',
     );
+    _apiPortController = TextEditingController(text: '8080');
     _loadCourts();
   }
 
@@ -91,6 +93,7 @@ class _SetupScreenState extends State<SetupScreen> {
     final count = prefs.getInt('courtCount') ?? 1;
     _venueName = prefs.getString('venueName')?.trim() ?? '';
     _venueMapAddress = prefs.getString('venueMapAddress')?.trim() ?? '';
+    _apiPortController.text = (await _config.loadApiPort()).toString();
     final courts = List.generate(
       count,
       (index) => 'COURT-${(index + 1).toString().padLeft(2, '0')}',
@@ -108,6 +111,7 @@ class _SetupScreenState extends State<SetupScreen> {
   void dispose() {
     _cameraNameController.dispose();
     _customPositionController.dispose();
+    _apiPortController.dispose();
     super.dispose();
   }
 
@@ -153,6 +157,18 @@ class _SetupScreenState extends State<SetupScreen> {
     return null;
   }
 
+  String? _portValidator(String? value) {
+    final port = int.tryParse(value?.trim() ?? '');
+    if (port == null || port <= 0 || port > 65535) {
+      return appText(
+        context,
+        'Port phải từ 1 đến 65535.',
+        'Port must be 1–65535.',
+      );
+    }
+    return null;
+  }
+
   Future<void> _save() async {
     if (_saving || !(_formKey.currentState?.validate() ?? false)) return;
 
@@ -186,7 +202,10 @@ class _SetupScreenState extends State<SetupScreen> {
         cameraName: cameraName,
         cameraPosition: cameraPosition,
       );
-      if (widget.persistOnSave) await _config.saveIdentity(identity);
+      if (widget.persistOnSave) {
+        await _config.saveIdentity(identity);
+        await _config.saveApiPort(int.parse(_apiPortController.text.trim()));
+      }
       if (!mounted) return;
       widget.onConfigured(identity);
     } catch (error) {
@@ -408,6 +427,27 @@ class _SetupScreenState extends State<SetupScreen> {
                             ),
                           ),
                         ],
+                        const SizedBox(height: 18),
+                        TextFormField(
+                          controller: _apiPortController,
+                          validator: _portValidator,
+                          keyboardType: TextInputType.number,
+                          textInputAction: TextInputAction.next,
+                          decoration: InputDecoration(
+                            labelText: appText(
+                              context,
+                              'Cổng HTTP Camera',
+                              'Camera HTTP port',
+                            ),
+                            helperText: appText(
+                              context,
+                              'Mặc định 8080 · CheckVAR tự nhận qua discovery',
+                              'Default 8080 · advertised through discovery',
+                            ),
+                            prefixIcon: const Icon(Icons.lan_outlined),
+                            border: const OutlineInputBorder(),
+                          ),
+                        ),
                         const SizedBox(height: 18),
                         InputDecorator(
                           decoration: const InputDecoration(

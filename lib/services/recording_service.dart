@@ -24,6 +24,63 @@ bool isDecodableVideoProbe({
   required double? durationSeconds,
 }) => hasVideo && durationSeconds != null && durationSeconds > 0.05;
 
+/// Returns the real recorder boundary used by file names and API metadata.
+///
+/// Camera/WebRTC timestamps can jump after an interruption, camera switch or
+/// foreground resume. FFprobe then reports a media duration much longer than
+/// the time for which this recorder was actually open. The probe duration is
+/// still useful for validating the file, but it must not move the wall-clock
+/// end of a segment.
+DateTime segmentBoundaryEndedAt({
+  required DateTime startedAt,
+  required DateTime recorderStoppedAt,
+}) {
+  if (recorderStoppedAt.isBefore(startedAt)) return startedAt;
+  return recorderStoppedAt;
+}
+
+Future<bool> waitForRecordingFileToSettle(
+  File file, {
+  Duration timeout = const Duration(seconds: 5),
+  Duration pollInterval = const Duration(milliseconds: 100),
+  int requiredStableSamples = 5,
+}) async {
+  if (requiredStableSamples < 1) {
+    throw ArgumentError.value(requiredStableSamples, 'requiredStableSamples');
+  }
+  final deadline = DateTime.now().add(timeout);
+  int? previousSize;
+  var stableSamples = 0;
+  while (DateTime.now().isBefore(deadline)) {
+    try {
+      final size = (await file.stat()).size;
+      if (size > 0 && size == previousSize) {
+        stableSamples++;
+        if (stableSamples >= requiredStableSamples) return true;
+      } else {
+        stableSamples = 0;
+      }
+      previousSize = size;
+    } on FileSystemException {
+      stableSamples = 0;
+      previousSize = null;
+    }
+    await Future<void>.delayed(pollInterval);
+  }
+  return false;
+}
+
+Duration nextSegmentRotationDelay({
+  required DateTime startedAt,
+  required DateTime now,
+  required Duration segmentDuration,
+}) {
+  final remaining = segmentDuration - now.difference(startedAt);
+  return remaining > Duration.zero
+      ? remaining
+      : const Duration(milliseconds: 100);
+}
+
 bool shouldUsePreviousCheckpointSegment({
   required DateTime? currentStartedAt,
   required DateTime requestedAt,
@@ -1425,6 +1482,11 @@ class RecordingService {
       rethrow;
     }
 
+    // The segment begins only after the native recorder has opened
+    // successfully. Using the timestamp captured before recorder.start() made
+    // the displayed/file-name start earlier than the first writable frame.
+    final recorderStartedAt = DateTime.now();
+
     _recorder = recorder;
 
     _currentPath = path;
@@ -1433,7 +1495,7 @@ class RecordingService {
       await _currentJournal!.writeAsString(
         jsonEncode({
           'cameraId': cameraId,
-          'startedAtMs': now.millisecondsSinceEpoch,
+          'startedAtMs': recorderStartedAt.millisecondsSinceEpoch,
           'videoPath': path,
           'audioPath': _recordAudio && (Platform.isAndroid || Platform.isIOS)
               ? path.replaceFirst(RegExp(r'\.mp4$'), '.wav')
@@ -1451,7 +1513,7 @@ class RecordingService {
       );
     }
 
-    _segmentStartedAt = now;
+    _segmentStartedAt = recorderStartedAt;
     _currentSegmentHasAudio = false;
     if (_recordAudio && (Platform.isAndroid || Platform.isIOS)) {
       final audioPath = path.replaceFirst(RegExp(r'\.mp4$'), '.wav');
@@ -1716,14 +1778,14 @@ class RecordingService {
       _rotating = false;
       if (_recording && !_stopping) {
         final startedAt = _segmentStartedAt;
-        final elapsed = startedAt == null
-            ? Duration.zero
-            : DateTime.now().difference(startedAt);
-        final remaining = _segmentDuration - elapsed;
         _segmentTimer = Timer(
-          remaining > Duration.zero
-              ? remaining
-              : const Duration(milliseconds: 100),
+          startedAt == null
+              ? _segmentDuration
+              : nextSegmentRotationDelay(
+                  startedAt: startedAt,
+                  now: DateTime.now(),
+                  segmentDuration: _segmentDuration,
+                ),
           _rotateSegment,
         );
       }
@@ -1816,29 +1878,17 @@ class RecordingService {
     // STOP RECORDER
     // ==========================================================
 
-    Object? recorderStopError;
-    StackTrace? recorderStopStack;
-    try {
-      await videoStopFuture;
-    } catch (error, stackTrace) {
-      // Một số codec Android/Unisoc ném lỗi khi drain buffer cuối dù container
-      // MP4 đã được ghi ra đĩa. Không bỏ segment ngay tại đây; chờ filesystem
-      // ổn định rồi xác thực file và tiếp tục lưu nếu dữ liệu vẫn hợp lệ.
-      recorderStopError = error;
-      recorderStopStack = stackTrace;
+    Object? recorderStopError = capturedRecorderStopError;
+    StackTrace? recorderStopStack = capturedRecorderStopStack;
+    if (capturedRecorderStopError != null) {
+      final settled = await waitForRecordingFileToSettle(File(path));
       developer.log(
-        'MediaRecorder.stop failed; attempting to recover the recorded file.',
-        error: error,
-        stackTrace: stackTrace,
+        'Recorder recovery file stability: ${settled ? 'stable' : 'timeout'}',
         name: 'RecordingService',
       );
-      debugPrint('[VNVAR] RECORDER STOP ERROR, RECOVERING FILE: $error');
-      await Future<void>.delayed(const Duration(milliseconds: 500));
-    }
-    recorderStopError ??= capturedRecorderStopError;
-    recorderStopStack ??= capturedRecorderStopStack;
-    if (capturedRecorderStopError != null) {
-      await Future<void>.delayed(const Duration(milliseconds: 500));
+      debugPrint(
+        '[VNVAR] RECORDER RECOVERY FILE: ${settled ? 'STABLE' : 'TIMEOUT'}',
+      );
     }
 
     if (onRecorderStopped != null) {
@@ -1909,11 +1959,31 @@ class RecordingService {
       );
       return null;
     }
-    // File names, API metadata and cleanup decisions must use the encoded
-    // media timeline, not time spent draining the recorder or probing files.
-    endedAt = startedAt.add(
-      Duration(milliseconds: (videoProbe.durationSeconds! * 1000).round()),
+    // File names and API metadata describe the actual recorder boundary.
+    // Do not derive this value from the encoded timeline: iOS/WebRTC may leave
+    // a large timestamp gap after an interruption, which previously produced
+    // names such as 17-21-17_17-55-24 for a short segment.
+    final mediaDuration = Duration(
+      milliseconds: (videoProbe.durationSeconds! * 1000).round(),
     );
+    final recorderStoppedAt = endedAt;
+    final wallDuration = recorderStoppedAt.difference(startedAt);
+    endedAt = segmentBoundaryEndedAt(
+      startedAt: startedAt,
+      recorderStoppedAt: recorderStoppedAt,
+    );
+    if ((mediaDuration - wallDuration).abs() > const Duration(seconds: 2)) {
+      developer.log(
+        'MEDIA TIMELINE MISMATCH: wall=${wallDuration.inMilliseconds}ms, '
+        'media=${mediaDuration.inMilliseconds}ms, path=$path',
+        name: 'RecordingService',
+      );
+      debugPrint(
+        '[VNVAR] MEDIA TIMELINE MISMATCH: '
+        'wall=${wallDuration.inMilliseconds}ms, '
+        'media=${mediaDuration.inMilliseconds}ms',
+      );
+    }
 
     if (!isPublishableVideoProbe(
       hasVideo: videoProbe.hasVideo,
@@ -2026,6 +2096,18 @@ class RecordingService {
       }
     }
 
+    return null;
+  }
+
+  /// Finds the finalized source that contains a wall-clock event. This lets a
+  /// CheckVAR retry after a temporary network outage use the original event
+  /// time without rotating or cutting the current recorder at the retry time.
+  RecordedSegment? findByTime(DateTime eventTime) {
+    for (final segment in _segments.reversed) {
+      final startsBeforeOrAt = !eventTime.isBefore(segment.startedAt);
+      final endsAfterOrAt = !eventTime.isAfter(segment.endedAt);
+      if (startsBeforeOrAt && endsAfterOrAt) return segment;
+    }
     return null;
   }
 
