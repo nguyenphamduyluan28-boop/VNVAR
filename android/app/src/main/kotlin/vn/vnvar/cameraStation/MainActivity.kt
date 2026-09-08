@@ -11,6 +11,8 @@ import android.os.Environment
 import android.os.StatFs
 import android.os.PowerManager
 import android.provider.DocumentsContract
+import android.provider.Settings
+import android.net.Uri
 import androidx.core.content.ContextCompat
 import com.cloudwebrtc.webrtc.FlutterWebRTCPlugin
 import io.flutter.embedding.android.FlutterActivity
@@ -25,6 +27,7 @@ class MainActivity : FlutterActivity() {
     private var activityResumed = false
     private var rtspPublisher: VnvarRtspPublisher? = null
     private var pendingFolderResult: MethodChannel.Result? = null
+    private var pendingPublicStorageResult: MethodChannel.Result? = null
     private val nativeAudioRecorder: NativeAudioSegmentRecorder
         get() = sharedAudioRecorder ?: synchronized(MainActivity::class.java) {
             sharedAudioRecorder ?: NativeAudioSegmentRecorder(applicationContext).also {
@@ -208,6 +211,8 @@ class MainActivity : FlutterActivity() {
                 "supportsVideoFolderSelection" ->
                     result.success(Build.VERSION.SDK_INT <= Build.VERSION_CODES.Q)
 
+                "ensurePublicVideoStorage" -> ensurePublicVideoStorage(result)
+
                 "getAvailableStorageBytes" -> {
                     val path = call.argument<String>("path")
                     if (path.isNullOrBlank()) {
@@ -265,6 +270,20 @@ class MainActivity : FlutterActivity() {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults)
 
         if (requestCode == STORAGE_PERMISSION_REQUEST) {
+            val publicStorageResult = pendingPublicStorageResult
+            if (publicStorageResult != null) {
+                pendingPublicStorageResult = null
+                if (grantResults.isNotEmpty() && grantResults.first() == PackageManager.PERMISSION_GRANTED) {
+                    completePublicVideoStorage(publicStorageResult)
+                } else {
+                    publicStorageResult.error(
+                        "PUBLIC_STORAGE_PERMISSION_DENIED",
+                        "Cần quyền bộ nhớ để lưu video trong Bộ nhớ trong/VNVAR.",
+                        null,
+                    )
+                }
+                return
+            }
             if (grantResults.isNotEmpty() && grantResults.first() == PackageManager.PERMISSION_GRANTED) {
                 launchFolderPicker()
             } else {
@@ -332,6 +351,65 @@ class MainActivity : FlutterActivity() {
         launchFolderPicker()
     }
 
+    private fun ensurePublicVideoStorage(result: MethodChannel.Result) {
+        if (pendingPublicStorageResult != null) {
+            result.error("PUBLIC_STORAGE_REQUEST_IN_PROGRESS", "Đang yêu cầu quyền lưu video.", null)
+            return
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            if (Environment.isExternalStorageManager()) {
+                completePublicVideoStorage(result)
+                return
+            }
+            pendingPublicStorageResult = result
+            try {
+                startActivityForResult(
+                    Intent(
+                        Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION,
+                        Uri.parse("package:$packageName"),
+                    ),
+                    PUBLIC_STORAGE_PERMISSION_REQUEST,
+                )
+            } catch (_: Exception) {
+                startActivityForResult(
+                    Intent(Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION),
+                    PUBLIC_STORAGE_PERMISSION_REQUEST,
+                )
+            }
+            return
+        }
+        if (
+            ContextCompat.checkSelfPermission(this, Manifest.permission.WRITE_EXTERNAL_STORAGE) !=
+            PackageManager.PERMISSION_GRANTED
+        ) {
+            pendingPublicStorageResult = result
+            requestPermissions(
+                arrayOf(Manifest.permission.WRITE_EXTERNAL_STORAGE),
+                STORAGE_PERMISSION_REQUEST,
+            )
+            return
+        }
+        completePublicVideoStorage(result)
+    }
+
+    private fun completePublicVideoStorage(result: MethodChannel.Result) {
+        try {
+            val storageRoot = Environment.getExternalStorageDirectory()
+            val directory = java.io.File(storageRoot, "VNVAR")
+            if (!directory.exists() && !directory.mkdirs()) {
+                result.error(
+                    "PUBLIC_STORAGE_CREATE_FAILED",
+                    "Không thể tạo thư mục Bộ nhớ trong/VNVAR.",
+                    directory.absolutePath,
+                )
+                return
+            }
+            result.success(directory.absolutePath)
+        } catch (error: Exception) {
+            result.error("PUBLIC_STORAGE_CREATE_FAILED", error.message, null)
+        }
+    }
+
     private fun launchFolderPicker() {
         startActivityForResult(
             Intent(Intent.ACTION_OPEN_DOCUMENT_TREE).apply {
@@ -361,6 +439,21 @@ class MainActivity : FlutterActivity() {
     }
 
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        if (requestCode == PUBLIC_STORAGE_PERMISSION_REQUEST) {
+            val result = pendingPublicStorageResult
+            pendingPublicStorageResult = null
+            if (result == null) return
+            if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R || Environment.isExternalStorageManager()) {
+                completePublicVideoStorage(result)
+            } else {
+                result.error(
+                    "PUBLIC_STORAGE_PERMISSION_DENIED",
+                    "Chưa cấp quyền lưu video trong Bộ nhớ trong/VNVAR.",
+                    null,
+                )
+            }
+            return
+        }
         if (requestCode != VIDEO_FOLDER_REQUEST) {
             super.onActivityResult(requestCode, resultCode, data)
             return
@@ -574,5 +667,6 @@ class MainActivity : FlutterActivity() {
         private const val NOTIFICATION_PERMISSION_REQUEST = 4102
         private const val VIDEO_FOLDER_REQUEST = 45186
         private const val STORAGE_PERMISSION_REQUEST = 45187
+        private const val PUBLIC_STORAGE_PERMISSION_REQUEST = 45188
     }
 }

@@ -317,9 +317,9 @@ class _VideoStorageScreenState extends State<VideoStorageScreen> {
                         ? Row(
                             crossAxisAlignment: CrossAxisAlignment.stretch,
                             children: [
-                              SizedBox(width: 480, child: information),
+                              Expanded(flex: 3, child: information),
                               const SizedBox(width: 16),
-                              Expanded(child: savedVideos),
+                              Expanded(flex: 7, child: savedVideos),
                             ],
                           )
                         : Column(

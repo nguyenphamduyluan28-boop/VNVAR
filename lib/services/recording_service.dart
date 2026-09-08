@@ -3147,18 +3147,20 @@ class RecordingService {
   // STOP RECORDING
   // ============================================================
 
-  Future<RecordedSegment?> stop() {
+  Future<RecordedSegment?> stop({Future<void> Function()? onRecorderStopped}) {
     final current = _stopOperation;
     if (current != null) return current;
 
-    final operation = _stopInternal();
+    final operation = _stopInternal(onRecorderStopped: onRecorderStopped);
     _stopOperation = operation;
     return operation.whenComplete(() {
       if (identical(_stopOperation, operation)) _stopOperation = null;
     });
   }
 
-  Future<RecordedSegment?> _stopInternal() async {
+  Future<RecordedSegment?> _stopInternal({
+    Future<void> Function()? onRecorderStopped,
+  }) async {
     _stopping = true;
     RecordedSegment? rotatedSegment;
 
@@ -3203,7 +3205,9 @@ class RecordingService {
       // thì vẫn lưu đoạn 1 phút 42 giây cuối.
       // ========================================================
 
-      final finalSegment = await _finishCurrentSegment();
+      final finalSegment = await _finishCurrentSegment(
+        onRecorderStopped: onRecorderStopped,
+      );
 
       developer.log('Recording stopped', name: 'RecordingService');
       return finalSegment ?? rotatedSegment;
@@ -3219,7 +3223,7 @@ class RecordingService {
   // DISPOSE
   // ============================================================
 
-  Future<void> dispose() async {
+  Future<void> dispose({Future<void> Function()? onRecorderStopped}) async {
     _segmentTimer?.cancel();
 
     _segmentTimer = null;
@@ -3229,7 +3233,7 @@ class RecordingService {
       if (stopping != null) {
         await stopping;
       } else if (_recording || _recorder != null) {
-        await stop();
+        await stop(onRecorderStopped: onRecorderStopped);
       }
     } finally {
       _stopOperation = null;

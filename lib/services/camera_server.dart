@@ -190,11 +190,11 @@ class CameraServer {
   // STOP SERVER
   // ============================================================
 
-  Future<void> stop() async {
+  Future<void> stop({Future<void> Function()? onRecorderStopped}) async {
     await _discovery.stop();
 
     try {
-      await recordingService.dispose();
+      await recordingService.dispose(onRecorderStopped: onRecorderStopped);
     } catch (error, stackTrace) {
       developer.log(
         'Recording dispose error',

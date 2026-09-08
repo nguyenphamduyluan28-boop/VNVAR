@@ -395,13 +395,17 @@ class CameraStationRuntime {
     });
   }
 
-  Future<void> stop() {
+  Future<void> stop({Future<void> Function()? onRecorderStopped}) {
     _stopping = true;
     _interruptRecovery();
-    return _serializeLifecycle(_stopInternal);
+    return _serializeLifecycle(
+      () => _stopInternal(onRecorderStopped: onRecorderStopped),
+    );
   }
 
-  Future<void> _stopInternal() async {
+  Future<void> _stopInternal({
+    Future<void> Function()? onRecorderStopped,
+  }) async {
     _stopping = true;
     _healthTimer?.cancel();
     _healthTimer = null;
@@ -449,7 +453,7 @@ class CameraStationRuntime {
     _iosAppInForeground = true;
 
     try {
-      await server?.stop();
+      await server?.stop(onRecorderStopped: onRecorderStopped);
     } finally {
       if (webRtc != null) {
         webRtc.onCameraFailure = null;
@@ -906,7 +910,16 @@ class CameraStationRuntime {
       '[SERVICE] Finalizing the active segment before Android exits',
       name: 'CameraStationRuntime',
     );
-    await stop();
+    final webRtc = _webRtcService;
+    await stop(
+      onRecorderStopped: () async {
+        // MediaRecorder and native audio have finalized their source files.
+        // Camera/live transports can now close immediately while FFmpeg
+        // continues remuxing the already-safe source into its final TS file.
+        await webRtc?.disposeConnection();
+        await webRtc?.disposeCamera();
+      },
+    );
   }
 
   void _startNetworkMonitor() {

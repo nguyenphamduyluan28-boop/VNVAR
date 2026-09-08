@@ -16,6 +16,7 @@ class VideoStorageService {
   );
 
   String? _selectedPath;
+  String? _androidPublicPath;
   bool _supportsFolderPicker = Platform.isAndroid;
 
   String? get selectedPath => _selectedPath;
@@ -34,6 +35,26 @@ class VideoStorageService {
       }
     } else {
       _supportsFolderPicker = false;
+    }
+    if (Platform.isAndroid) {
+      try {
+        final path = await _androidChannel.invokeMethod<String>(
+          'ensurePublicVideoStorage',
+        );
+        if (path != null && path.trim().isNotEmpty) {
+          _androidPublicPath = Directory(path).absolute.path;
+        }
+      } on PlatformException catch (error, stackTrace) {
+        developer.log(
+          '[STORAGE] Public internal-storage VNVAR access was not granted; '
+          'using application Documents.',
+          error: error,
+          stackTrace: stackTrace,
+          name: 'VideoStorageService',
+        );
+      } on MissingPluginException {
+        _androidPublicPath = null;
+      }
     }
     final prefs = await SharedPreferences.getInstance();
     final savedPath = prefs.getString(_storagePathKey)?.trim();
@@ -65,6 +86,8 @@ class VideoStorageService {
     final String rootPath;
     if (selectedPath != null) {
       rootPath = selectedPath;
+    } else if (Platform.isAndroid && _androidPublicPath != null) {
+      rootPath = _androidPublicPath!;
     } else {
       final defaultRoot = await getApplicationDocumentsDirectory();
       rootPath = '${defaultRoot.path}${Platform.pathSeparator}VNVAR';

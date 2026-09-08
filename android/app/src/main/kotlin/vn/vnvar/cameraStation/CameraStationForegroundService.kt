@@ -22,6 +22,7 @@ class CameraStationForegroundService : Service() {
     private var currentCourtId = "Chưa chọn sân"
     private val mainHandler = Handler(Looper.getMainLooper())
     private var taskRemovalShutdownStarted = false
+    private var taskRemovalShutdownFinished = false
     private val taskRemovalTimeout = Runnable {
         Log.w(TAG, "[SERVICE] Dart shutdown timed out after task removal")
         finishAfterTaskRemoval()
@@ -112,7 +113,17 @@ class CameraStationForegroundService : Service() {
     }
 
     private fun finishAfterTaskRemoval() {
+        if (taskRemovalShutdownFinished) return
+        taskRemovalShutdownFinished = true
         mainHandler.removeCallbacks(taskRemovalTimeout)
+        // The app deliberately caches its FlutterEngine for Activity
+        // recreation. Once the task is explicitly removed, keeping that
+        // engine alive would leave Dart timers/process state resident even
+        // after camera and recording have stopped.
+        val engineCache = FlutterEngineCache.getInstance()
+        val cachedEngine = engineCache.get(ENGINE_CACHE_KEY)
+        engineCache.remove(ENGINE_CACHE_KEY)
+        cachedEngine?.destroy()
         stopForeground(STOP_FOREGROUND_REMOVE)
         stopSelf()
     }
@@ -177,7 +188,10 @@ class CameraStationForegroundService : Service() {
         private const val ENGINE_CACHE_KEY = "vnvar_camera_station_engine"
         private const val CHANNEL_NAME = "vnvar/camera_station_service"
         private const val METHOD_ANDROID_TASK_REMOVED = "onAndroidTaskRemoved"
-        private const val TASK_REMOVAL_TIMEOUT_MS = 15_000L
+        // Final TS remux can take tens of seconds on slower storage. Camera is
+        // released as soon as MediaRecorder stops; this timeout only guards
+        // the remaining file finalization and engine shutdown.
+        private const val TASK_REMOVAL_TIMEOUT_MS = 60_000L
 
         private const val CHANNEL_ID = "vnvar_camera_station"
         private const val NOTIFICATION_ID = 1001

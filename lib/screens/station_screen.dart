@@ -1029,6 +1029,7 @@ class _StationScreenState extends State<StationScreen>
                       courtLabel: _courtLabel(widget.identity.courtId),
                       recording: _recording,
                       compact: compact,
+                      landscape: landscape,
                       resolutionProfile: _runtime.resolutionProfile,
                       resolutionSwitching: _runtime.profileSwitching,
                       onVideoStorage: _openVideoStorage,
@@ -1086,116 +1087,128 @@ class _StationScreenState extends State<StationScreen>
                 child: SafeArea(
                   top: false,
                   minimum: EdgeInsets.only(bottom: compact ? 10 : 14),
-                  child: Column(
-                    mainAxisSize: MainAxisSize.min,
-                    children: [
-                      if (_runtime.lanAddress == null ||
-                          _runtime.networkRecovering ||
-                          _runtime.networkError != null)
-                        _NetworkStatusBanner(
-                          compact: compact,
-                          connectedAddress: _runtime.lanAddress,
-                          recovering: _runtime.networkRecovering,
-                          hasError: _runtime.networkError != null,
-                          onReconnect: _runtime.networkRecovering
-                              ? null
-                              : _reconnectNetwork,
-                        ),
-                      if (Platform.isIOS &&
-                          (_runtime.lifecycleSuspended ||
-                              _runtime.lifecycleResuming ||
-                              _runtime.captureState == 'recovering'))
-                        Container(
-                          width: double.infinity,
-                          margin: EdgeInsets.only(bottom: compact ? 6 : 8),
-                          padding: EdgeInsets.symmetric(
-                            horizontal: compact ? 10 : 12,
-                            vertical: compact ? 6 : 8,
-                          ),
-                          decoration: BoxDecoration(
-                            color: const Color(
-                              0xFF1565C0,
-                            ).withValues(alpha: 0.94),
-                            borderRadius: BorderRadius.circular(
-                              compact ? 10 : 12,
-                            ),
-                          ),
-                          child: Text(
-                            _runtime.lifecycleResuming ||
-                                    _runtime.captureState == 'recovering'
-                                ? appText(
-                                    context,
-                                    'Đang khôi phục camera và ghi hình sau khi quay lại ứng dụng…',
-                                    'Restoring camera and recording…',
-                                  )
-                                : appText(
-                                    context,
-                                    'iOS đã tạm dừng camera khi ứng dụng ở nền. Hãy giữ Camera Station trên màn hình để ghi liên tục.',
-                                    'iOS paused the camera in the background. Keep Camera Station visible for continuous recording.',
-                                  ),
-                            maxLines: compact ? 2 : 1,
-                            overflow: TextOverflow.ellipsis,
-                            textAlign: TextAlign.center,
-                            style: TextStyle(
-                              color: Colors.white,
-                              fontSize: compact ? 11 : 12,
-                              fontWeight: FontWeight.w700,
-                            ),
-                          ),
-                        ),
-                      if (_runtime.thermalWarning || _runtime.storageWarning)
-                        Container(
-                          width: double.infinity,
-                          margin: EdgeInsets.only(bottom: compact ? 6 : 8),
-                          padding: EdgeInsets.symmetric(
-                            horizontal: compact ? 10 : 12,
-                            vertical: compact ? 6 : 8,
-                          ),
-                          decoration: BoxDecoration(
-                            color: Colors.orange.withValues(alpha: 0.92),
-                            borderRadius: BorderRadius.circular(
-                              compact ? 10 : 12,
-                            ),
-                          ),
-                          child: Text(
-                            _runtime.thermalWarning
-                                ? appText(
-                                    context,
-                                    'Thiết bị đang nóng${_runtime.temperatureC == null ? '' : ' (${_runtime.temperatureC!.toStringAsFixed(1)}°C)'}. Đã giảm xuống ${_runtime.resolutionProfile.shortLabel}/${_runtime.resolutionProfile.fps} FPS để bảo vệ camera.',
-                                    'Device temperature is high${_runtime.temperatureC == null ? '' : ' (${_runtime.temperatureC!.toStringAsFixed(1)}°C)'}. Reduced to ${_runtime.resolutionProfile.shortLabel}/${_runtime.resolutionProfile.fps} FPS to protect the camera.',
-                                  )
-                                : appText(
-                                    context,
-                                    'Dung lượng lưu trữ thấp. Hệ thống sẽ dọn video cũ theo chính sách lưu trữ.',
-                                    'Storage is low. Old videos will be cleaned according to the retention policy.',
-                                  ),
-                            maxLines: compact ? 2 : 1,
-                            overflow: TextOverflow.ellipsis,
-                            textAlign: TextAlign.center,
-                            style: TextStyle(
-                              color: Colors.black,
-                              fontSize: compact ? 11 : 12,
-                              fontWeight: FontWeight.w700,
-                            ),
-                          ),
-                        ),
-                      if (_cameraReady &&
-                          (_runtime.webRtcService?.cameraZoomSupported ??
-                              false))
-                        _CameraZoomSlider(
-                          compact: compact,
-                          value:
-                              _zoomValue ?? _runtime.webRtcService!.cameraZoom,
-                          minimum: _runtime.webRtcService!.minimumCameraZoom,
-                          maximum: _runtime.webRtcService!.maximumCameraZoom,
-                          onChanged: _changeZoom,
-                        ),
-                      _BottomStatusBar(
-                        compact: compact,
-                        cameraReady: _cameraReady,
-                        recording: _recording,
+                  child: Align(
+                    alignment: Alignment.bottomLeft,
+                    child: ConstrainedBox(
+                      constraints: BoxConstraints(
+                        maxWidth: landscape ? 520 : double.infinity,
                       ),
-                    ],
+                      child: Column(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          if (_runtime.lanAddress == null ||
+                              _runtime.networkRecovering ||
+                              _runtime.networkError != null)
+                            _NetworkStatusBanner(
+                              compact: compact,
+                              connectedAddress: _runtime.lanAddress,
+                              recovering: _runtime.networkRecovering,
+                              hasError: _runtime.networkError != null,
+                              onReconnect: _runtime.networkRecovering
+                                  ? null
+                                  : _reconnectNetwork,
+                            ),
+                          if (Platform.isIOS &&
+                              (_runtime.lifecycleSuspended ||
+                                  _runtime.lifecycleResuming ||
+                                  _runtime.captureState == 'recovering'))
+                            Container(
+                              width: double.infinity,
+                              margin: EdgeInsets.only(bottom: compact ? 6 : 8),
+                              padding: EdgeInsets.symmetric(
+                                horizontal: compact ? 10 : 12,
+                                vertical: compact ? 6 : 8,
+                              ),
+                              decoration: BoxDecoration(
+                                color: const Color(
+                                  0xFF1565C0,
+                                ).withValues(alpha: 0.94),
+                                borderRadius: BorderRadius.circular(
+                                  compact ? 10 : 12,
+                                ),
+                              ),
+                              child: Text(
+                                _runtime.lifecycleResuming ||
+                                        _runtime.captureState == 'recovering'
+                                    ? appText(
+                                        context,
+                                        'Đang khôi phục camera và ghi hình sau khi quay lại ứng dụng…',
+                                        'Restoring camera and recording…',
+                                      )
+                                    : appText(
+                                        context,
+                                        'iOS đã tạm dừng camera khi ứng dụng ở nền. Hãy giữ Camera Station trên màn hình để ghi liên tục.',
+                                        'iOS paused the camera in the background. Keep Camera Station visible for continuous recording.',
+                                      ),
+                                maxLines: compact ? 2 : 1,
+                                overflow: TextOverflow.ellipsis,
+                                textAlign: TextAlign.center,
+                                style: TextStyle(
+                                  color: Colors.white,
+                                  fontSize: compact ? 11 : 12,
+                                  fontWeight: FontWeight.w700,
+                                ),
+                              ),
+                            ),
+                          if (_runtime.thermalWarning ||
+                              _runtime.storageWarning)
+                            Container(
+                              width: double.infinity,
+                              margin: EdgeInsets.only(bottom: compact ? 6 : 8),
+                              padding: EdgeInsets.symmetric(
+                                horizontal: compact ? 10 : 12,
+                                vertical: compact ? 6 : 8,
+                              ),
+                              decoration: BoxDecoration(
+                                color: Colors.orange.withValues(alpha: 0.92),
+                                borderRadius: BorderRadius.circular(
+                                  compact ? 10 : 12,
+                                ),
+                              ),
+                              child: Text(
+                                _runtime.thermalWarning
+                                    ? appText(
+                                        context,
+                                        'Thiết bị đang nóng${_runtime.temperatureC == null ? '' : ' (${_runtime.temperatureC!.toStringAsFixed(1)}°C)'}. Đã giảm xuống ${_runtime.resolutionProfile.shortLabel}/${_runtime.resolutionProfile.fps} FPS để bảo vệ camera.',
+                                        'Device temperature is high${_runtime.temperatureC == null ? '' : ' (${_runtime.temperatureC!.toStringAsFixed(1)}°C)'}. Reduced to ${_runtime.resolutionProfile.shortLabel}/${_runtime.resolutionProfile.fps} FPS to protect the camera.',
+                                      )
+                                    : appText(
+                                        context,
+                                        'Dung lượng lưu trữ thấp. Hệ thống sẽ dọn video cũ theo chính sách lưu trữ.',
+                                        'Storage is low. Old videos will be cleaned according to the retention policy.',
+                                      ),
+                                maxLines: compact ? 2 : 1,
+                                overflow: TextOverflow.ellipsis,
+                                textAlign: TextAlign.center,
+                                style: TextStyle(
+                                  color: Colors.black,
+                                  fontSize: compact ? 11 : 12,
+                                  fontWeight: FontWeight.w700,
+                                ),
+                              ),
+                            ),
+                          if (_cameraReady &&
+                              (_runtime.webRtcService?.cameraZoomSupported ??
+                                  false))
+                            _CameraZoomSlider(
+                              compact: compact,
+                              value:
+                                  _zoomValue ??
+                                  _runtime.webRtcService!.cameraZoom,
+                              minimum:
+                                  _runtime.webRtcService!.minimumCameraZoom,
+                              maximum:
+                                  _runtime.webRtcService!.maximumCameraZoom,
+                              onChanged: _changeZoom,
+                            ),
+                          _BottomStatusBar(
+                            compact: compact,
+                            cameraReady: _cameraReady,
+                            recording: _recording,
+                          ),
+                        ],
+                      ),
+                    ),
                   ),
                 ),
               ),
@@ -1363,6 +1376,7 @@ class _StationHeader extends StatelessWidget {
   final String courtLabel;
   final bool recording;
   final bool compact;
+  final bool landscape;
   final CameraResolutionProfile resolutionProfile;
   final bool resolutionSwitching;
   final VoidCallback onVideoStorage;
@@ -1374,6 +1388,7 @@ class _StationHeader extends StatelessWidget {
     required this.courtLabel,
     required this.recording,
     required this.compact,
+    required this.landscape,
     required this.resolutionProfile,
     required this.resolutionSwitching,
     required this.onVideoStorage,
@@ -1385,6 +1400,67 @@ class _StationHeader extends StatelessWidget {
   Widget build(BuildContext context) {
     final logoSize = compact ? 34.0 : 42.0;
     final actionSize = compact ? 34.0 : 38.0;
+
+    // Phones with limited width use the same one-row header as landscape.
+    // Detailed identifiers remain available in Settings while the camera
+    // preview keeps most of the screen during normal operation.
+    if (landscape || compact) {
+      return Container(
+        width: double.infinity,
+        padding: const EdgeInsets.symmetric(horizontal: 9, vertical: 7),
+        decoration: BoxDecoration(
+          color: Colors.black.withValues(alpha: 0.68),
+          borderRadius: BorderRadius.circular(13),
+          border: Border.all(color: Colors.white.withValues(alpha: 0.10)),
+        ),
+        child: Row(
+          children: [
+            const Icon(Icons.videocam_rounded, color: Colors.white70, size: 18),
+            const SizedBox(width: 7),
+            Expanded(
+              child: Text(
+                '${identity.cameraName} · ${identity.cameraId} · $courtLabel',
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: const TextStyle(
+                  color: Colors.white,
+                  fontSize: 12,
+                  fontWeight: FontWeight.w800,
+                ),
+              ),
+            ),
+            const SizedBox(width: 6),
+            _RecordingChip(recording: recording, compact: true),
+            const SizedBox(width: 5),
+            _ResolutionChip(
+              profile: resolutionProfile,
+              switching: resolutionSwitching,
+              onTap: onResolution,
+            ),
+            const SizedBox(width: 5),
+            _HeaderIconButton(
+              icon: Icons.video_settings_rounded,
+              tooltip: appText(context, 'Kho video', 'Video storage'),
+              size: 32,
+              onTap: onVideoStorage,
+            ),
+            const SizedBox(width: 4),
+            AppLanguageButton(foregroundColor: Colors.white, size: 32),
+            const SizedBox(width: 4),
+            _HeaderIconButton(
+              icon: Icons.settings_rounded,
+              tooltip: appText(
+                context,
+                'Cấu hình Camera Station',
+                'Camera Station settings',
+              ),
+              size: 32,
+              onTap: onSettings,
+            ),
+          ],
+        ),
+      );
+    }
 
     return Container(
       width: double.infinity,
