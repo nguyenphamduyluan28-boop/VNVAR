@@ -10,12 +10,22 @@ import android.content.pm.ServiceInfo
 import android.content.pm.PackageManager
 import android.Manifest
 import android.os.Build
+import android.os.Handler
 import android.os.IBinder
+import android.os.Looper
 import android.util.Log
+import io.flutter.embedding.engine.FlutterEngineCache
+import io.flutter.plugin.common.MethodChannel
 
 class CameraStationForegroundService : Service() {
     private var currentCameraId = "Camera"
     private var currentCourtId = "Chưa chọn sân"
+    private val mainHandler = Handler(Looper.getMainLooper())
+    private var taskRemovalShutdownStarted = false
+    private val taskRemovalTimeout = Runnable {
+        Log.w(TAG, "[SERVICE] Dart shutdown timed out after task removal")
+        finishAfterTaskRemoval()
+    }
 
     override fun onCreate() {
         super.onCreate()
@@ -67,14 +77,48 @@ class CameraStationForegroundService : Service() {
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onTaskRemoved(rootIntent: Intent?) {
-        // Keep the already-running camera/microphone foreground service alive.
-        // The user can stop it explicitly from the app/API after Dart has
-        // finalized MP4, WAV and TS segments.
-        Log.i(TAG, "[SERVICE] App removed from recent tasks; keeping recording active")
+        if (taskRemovalShutdownStarted) {
+            super.onTaskRemoved(rootIntent)
+            return
+        }
+        taskRemovalShutdownStarted = true
+        Log.i(TAG, "[SERVICE] App removed from recent tasks; finalizing recording")
+        mainHandler.postDelayed(taskRemovalTimeout, TASK_REMOVAL_TIMEOUT_MS)
+
+        val engine = FlutterEngineCache.getInstance().get(ENGINE_CACHE_KEY)
+        if (engine == null) {
+            Log.w(TAG, "[SERVICE] Flutter engine unavailable during task removal")
+            finishAfterTaskRemoval()
+        } else {
+            MethodChannel(engine.dartExecutor.binaryMessenger, CHANNEL_NAME).invokeMethod(
+                METHOD_ANDROID_TASK_REMOVED,
+                null,
+                object : MethodChannel.Result {
+                    override fun success(result: Any?) = finishAfterTaskRemoval()
+
+                    override fun error(code: String, message: String?, details: Any?) {
+                        Log.e(TAG, "[SERVICE] Dart shutdown failed: $code $message")
+                        finishAfterTaskRemoval()
+                    }
+
+                    override fun notImplemented() {
+                        Log.w(TAG, "[SERVICE] Dart task-removal callback is not registered")
+                        finishAfterTaskRemoval()
+                    }
+                },
+            )
+        }
         super.onTaskRemoved(rootIntent)
     }
 
+    private fun finishAfterTaskRemoval() {
+        mainHandler.removeCallbacks(taskRemovalTimeout)
+        stopForeground(STOP_FOREGROUND_REMOVE)
+        stopSelf()
+    }
+
     override fun onDestroy() {
+        mainHandler.removeCallbacks(taskRemovalTimeout)
         isRunning = false
         stopForeground(STOP_FOREGROUND_REMOVE)
         Log.i(TAG, "[SERVICE] Camera Station foreground service destroyed")
@@ -129,6 +173,11 @@ class CameraStationForegroundService : Service() {
         const val ACTION_REFRESH_TYPES = "vn.vnvar.cameraStation.action.REFRESH_TYPES"
         const val EXTRA_CAMERA_ID = "camera_id"
         const val EXTRA_COURT_ID = "court_id"
+
+        private const val ENGINE_CACHE_KEY = "vnvar_camera_station_engine"
+        private const val CHANNEL_NAME = "vnvar/camera_station_service"
+        private const val METHOD_ANDROID_TASK_REMOVED = "onAndroidTaskRemoved"
+        private const val TASK_REMOVAL_TIMEOUT_MS = 15_000L
 
         private const val CHANNEL_ID = "vnvar_camera_station"
         private const val NOTIFICATION_ID = 1001

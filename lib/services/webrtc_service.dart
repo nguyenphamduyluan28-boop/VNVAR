@@ -53,6 +53,7 @@ class WebRtcService {
   void Function(String reason)? onCameraFailure;
   void Function()? onRtspStateChanged;
   void Function(double actualFps, int requestedFps)? onIosCapturePerformance;
+  Future<void> Function()? onAndroidTaskRemoved;
 
   WebRtcService() {
     if (Platform.isAndroid || Platform.isIOS) {
@@ -181,6 +182,14 @@ class WebRtcService {
   bool get rtspSupported => Platform.isAndroid || Platform.isIOS;
 
   Future<void> _handlePlatformCallback(MethodCall call) async {
+    if (call.method == 'onAndroidTaskRemoved') {
+      developer.log(
+        '[SERVICE] Android task removed; stopping station cleanly',
+        name: 'WebRtcService',
+      );
+      await onAndroidTaskRemoved?.call();
+      return;
+    }
     if (!_rtspServerStarted) return;
     switch (call.method) {
       case 'onRtspEncoderConfigured':
@@ -821,6 +830,17 @@ class WebRtcService {
     }
   }
 
+  /// Recreates only network-facing transports after Wi-Fi/IP changes.
+  /// The shared camera stream remains open, so recording is never finalized
+  /// or restarted by this operation.
+  Future<void> reconnectNetworkTransports() async {
+    await disposeConnection();
+    final track = localVideoTrack;
+    if (track == null || !_cameraInitialized) return;
+    await _stopRtsp();
+    await _startRtsp(track);
+  }
+
   void _scheduleRtspRetry() {
     if (!_rtspServerStarted ||
         _localStream == null ||
@@ -1407,6 +1427,7 @@ class WebRtcService {
 
     onRtspStateChanged = null;
     onIosCapturePerformance = null;
+    onAndroidTaskRemoved = null;
     if (Platform.isAndroid || Platform.isIOS) {
       _platformChannel.setMethodCallHandler(null);
     }

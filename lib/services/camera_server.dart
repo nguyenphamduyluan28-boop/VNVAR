@@ -224,6 +224,28 @@ class CameraServer {
     developer.log('Camera Server stopped', name: 'CameraServer');
   }
 
+  /// Rebinds discovery and native live transports without touching the
+  /// camera or RecordingService. HTTP is bound to anyIPv4 and automatically
+  /// becomes reachable when a Wi-Fi interface receives an address.
+  Future<void> reconnectNetworkServices() async {
+    if (_server == null) {
+      throw StateError('Camera Server is not running.');
+    }
+    await webRtcService.reconnectNetworkTransports();
+    await _discovery.stop();
+    await _discovery.startTcpDiscovery(
+      courtId: courtId,
+      cameraId: cameraId,
+      deviceId: deviceId,
+      port: apiPort,
+      status: recordingService.recording ? 'RECORDING' : 'READY',
+    );
+    developer.log(
+      'Network services rebound without restarting capture',
+      name: 'CameraServer',
+    );
+  }
+
   Future<void> _viewerPage(HttpRequest request) async {
     request.response.headers.contentType = ContentType.html;
     request.response.write('''<!doctype html>

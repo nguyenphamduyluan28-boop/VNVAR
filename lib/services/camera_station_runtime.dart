@@ -45,6 +45,23 @@ CameraResolutionProfile? nextIosOverloadProfile(
   return null;
 }
 
+String? selectPrivateLanIpv4(Iterable<String> addresses) {
+  for (final address in addresses) {
+    final parts = address.split('.');
+    if (parts.length != 4) continue;
+    final octets = parts.map(int.tryParse).toList(growable: false);
+    if (octets.any((value) => value == null)) continue;
+    final first = octets[0]!;
+    final second = octets[1]!;
+    if (first == 10 ||
+        (first == 192 && second == 168) ||
+        (first == 172 && second >= 16 && second <= 31)) {
+      return address;
+    }
+  }
+  return null;
+}
+
 class CameraStationRuntime {
   CameraStationRuntime._();
 
@@ -64,6 +81,7 @@ class CameraStationRuntime {
   Timer? _healthTimer;
   Timer? _storageCleanupTimer;
   Timer? _thermalTimer;
+  Timer? _networkTimer;
   Timer? _pendingThermalThrottleTimer;
   Timer? _pendingThermalRestoreTimer;
   bool _thermalThrottled = false;
@@ -80,6 +98,11 @@ class CameraStationRuntime {
   bool _iosResumeQueued = false;
   bool _iosAppInForeground = true;
   bool _healthCheckRunning = false;
+  bool _networkCheckRunning = false;
+  bool _networkObservationInitialized = false;
+  bool _networkRecovering = false;
+  String? _lanAddress;
+  String? _networkError;
   int _iosLowFpsReports = 0;
   DateTime? _lastIosFpsAdjustmentAt;
   double? _iosActualFps;
@@ -144,6 +167,9 @@ class CameraStationRuntime {
   bool get storageWarning => _recordingService?.lowStorageWarning ?? false;
   bool get lifecycleSuspended => _iosLifecycleSuspended;
   bool get lifecycleResuming => _iosResumeQueued;
+  bool get networkRecovering => _networkRecovering;
+  String? get lanAddress => _lanAddress;
+  String? get networkError => _networkError;
   String get captureState {
     if (_thermalCriticalSuspended) return 'thermal_suspended';
     if (_recordingService?.storageSuspended == true) {
@@ -249,6 +275,7 @@ class CameraStationRuntime {
     webRtc.onCameraFailure = _scheduleRecovery;
     webRtc.onRtspStateChanged = _emitState;
     webRtc.onIosCapturePerformance = _handleIosCapturePerformance;
+    webRtc.onAndroidTaskRemoved = _handleAndroidTaskRemoved;
     _webRtcService = webRtc;
     _recordingService = recording;
     _cameraId = cameraId;
@@ -325,6 +352,7 @@ class CameraStationRuntime {
       }
       _startHealthMonitor();
       _startThermalMonitor();
+      _startNetworkMonitor();
 
       // Giữ màn hình luôn sáng khi camera đang hoạt động.
       // Trên iOS, điều này đảm bảo app luôn ở foreground và camera
@@ -379,6 +407,13 @@ class CameraStationRuntime {
     _healthTimer = null;
     _thermalTimer?.cancel();
     _thermalTimer = null;
+    _networkTimer?.cancel();
+    _networkTimer = null;
+    _networkCheckRunning = false;
+    _networkObservationInitialized = false;
+    _networkRecovering = false;
+    _lanAddress = null;
+    _networkError = null;
     _pendingThermalThrottleTimer?.cancel();
     _pendingThermalThrottleTimer = null;
     _pendingThermalRestoreTimer?.cancel();
@@ -420,6 +455,7 @@ class CameraStationRuntime {
         webRtc.onCameraFailure = null;
         webRtc.onRtspStateChanged = null;
         webRtc.onIosCapturePerformance = null;
+        webRtc.onAndroidTaskRemoved = null;
       }
       await webRtc?.dispose();
       _recovering = false;
@@ -862,6 +898,113 @@ class CameraStationRuntime {
 
   void _emitState() {
     if (!_stateController.isClosed) _stateController.add(null);
+  }
+
+  Future<void> _handleAndroidTaskRemoved() async {
+    if (!Platform.isAndroid) return;
+    developer.log(
+      '[SERVICE] Finalizing the active segment before Android exits',
+      name: 'CameraStationRuntime',
+    );
+    await stop();
+  }
+
+  void _startNetworkMonitor() {
+    _networkTimer?.cancel();
+    _networkTimer = Timer.periodic(const Duration(seconds: 3), (_) {
+      unawaited(_checkNetworkState());
+    });
+    unawaited(_checkNetworkState());
+  }
+
+  Future<String?> _readLanAddress() async {
+    if (Platform.isIOS) {
+      final value = await _platformChannel
+          .invokeMethod<String>('getWifiIpAddress')
+          .timeout(const Duration(seconds: 2));
+      return selectPrivateLanIpv4([?value]);
+    }
+    final interfaces = await NetworkInterface.list(
+      type: InternetAddressType.IPv4,
+      includeLoopback: false,
+    );
+    return selectPrivateLanIpv4(
+      interfaces.expand(
+        (interface) => interface.addresses.map((address) => address.address),
+      ),
+    );
+  }
+
+  Future<void> _checkNetworkState() async {
+    if (_networkCheckRunning || _stopping) return;
+    _networkCheckRunning = true;
+    try {
+      final address = await _readLanAddress();
+      final previous = _lanAddress;
+      final hadRecoveryError = _networkError != null;
+      final firstObservation = !_networkObservationInitialized;
+      _networkObservationInitialized = true;
+      _lanAddress = address;
+      _networkError = null;
+      if (!firstObservation &&
+          address != null &&
+          (address != previous || hadRecoveryError)) {
+        await reconnectNetworkServices();
+      } else if (address != previous) {
+        _emitState();
+      }
+    } catch (error, stackTrace) {
+      _networkError = error.toString();
+      developer.log(
+        '[NETWORK] Cannot inspect LAN state',
+        error: error,
+        stackTrace: stackTrace,
+        name: 'CameraStationRuntime',
+      );
+      _emitState();
+    } finally {
+      _networkCheckRunning = false;
+    }
+  }
+
+  /// Restarts only live/discovery transports. Camera capture and the current
+  /// recording segment are deliberately preserved.
+  Future<void> reconnectNetworkServices() async {
+    if (_networkRecovering) return;
+    final server = _cameraServer;
+    if (server == null || !server.running) {
+      throw StateError('Camera Station network server is not running.');
+    }
+    final currentAddress = _lanAddress ?? await _readLanAddress();
+    _lanAddress = currentAddress;
+    if (currentAddress == null) {
+      _networkError = null;
+      _emitState();
+      return;
+    }
+    _networkRecovering = true;
+    _networkError = null;
+    _emitState();
+    try {
+      await server.reconnectNetworkServices();
+      _lanAddress = await _readLanAddress();
+      developer.log(
+        '[NETWORK] Live services ready at ${_lanAddress ?? 'no LAN address'}',
+        name: 'CameraStationRuntime',
+      );
+    } catch (error, stackTrace) {
+      _networkError = error.toString();
+      developer.log(
+        '[NETWORK] Live service recovery failed',
+        error: error,
+        stackTrace: stackTrace,
+        name: 'CameraStationRuntime',
+      );
+      rethrow;
+    } finally {
+      _networkRecovering = false;
+      _emitState();
+    }
   }
 
   Future<void> _waitForIosCaptureWarmup({CameraResolutionProfile? profile}) {

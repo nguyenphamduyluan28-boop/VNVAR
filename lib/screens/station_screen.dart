@@ -217,7 +217,14 @@ class _StationScreenState extends State<StationScreen>
         return;
       }
 
-      setState(() {});
+      setState(() {
+        final address = _runtime.lanAddress;
+        final port =
+            _runtime.cameraServer?.apiPort ?? CameraServer.defaultApiPort;
+        _viewerAddress = address == null
+            ? 'Chưa kết nối Wi-Fi/LAN'
+            : 'http://$address:$port/viewer';
+      });
       _showRtspWarningIfNeeded();
     });
 
@@ -300,6 +307,42 @@ class _StationScreenState extends State<StationScreen>
       setState(() {
         _viewerAddress = result;
       });
+    }
+  }
+
+  Future<void> _reconnectNetwork() async {
+    if (_runtime.networkRecovering) return;
+    try {
+      await _runtime.reconnectNetworkServices();
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+            appText(
+              context,
+              _runtime.lanAddress == null
+                  ? 'Chưa có IP Wi-Fi/LAN. Camera vẫn đang ghi và sẽ tự kết nối khi có mạng.'
+                  : 'Đã khởi động lại kết nối live. Camera và video đang ghi không bị reset.',
+              _runtime.lanAddress == null
+                  ? 'No Wi-Fi/LAN IP yet. Recording continues and live will reconnect automatically.'
+                  : 'Live connection restarted. Camera and recording were not reset.',
+            ),
+          ),
+        ),
+      );
+    } catch (error) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+            appText(
+              context,
+              'Không thể làm mới kết nối: $error',
+              'Cannot refresh connection: $error',
+            ),
+          ),
+        ),
+      );
     }
   }
 
@@ -919,6 +962,11 @@ class _StationScreenState extends State<StationScreen>
           final narrow = constraints.maxWidth < 380;
           final short = constraints.maxHeight < 560;
           final compact = narrow || short;
+          final landscape = constraints.maxWidth > constraints.maxHeight;
+          // In landscape the vertical control dock occupies its own lane.
+          // Header/status content must not render underneath it, otherwise
+          // controls become obscured on short phones after rotation.
+          final controlDockLane = landscape ? (compact ? 58.0 : 70.0) : 0.0;
 
           // Scrim height scales with the viewport instead of being a
           // fixed 180px — on short screens a fixed height made the
@@ -936,6 +984,9 @@ class _StationScreenState extends State<StationScreen>
                   quarterTurns: _cameraQuarterTurns,
                   child: RTCVideoView(
                     renderer,
+                    key: ValueKey(
+                      'camera-preview-$landscape-$_cameraQuarterTurns',
+                    ),
                     // Match the phone's native camera preview: front camera is
                     // mirrored for intuitive movement, while recorded/RTSP
                     // frames remain unmirrored so text and court direction are
@@ -962,7 +1013,7 @@ class _StationScreenState extends State<StationScreen>
               // ==============================================
               Positioned(
                 left: 0,
-                right: 0,
+                right: controlDockLane,
                 top: 0,
                 child: SafeArea(
                   bottom: false,
@@ -1030,7 +1081,7 @@ class _StationScreenState extends State<StationScreen>
               // ==============================================
               Positioned(
                 left: compact ? 8 : 14,
-                right: compact ? 8 : 14,
+                right: (compact ? 8 : 14) + controlDockLane,
                 bottom: 0,
                 child: SafeArea(
                   top: false,
@@ -1038,6 +1089,18 @@ class _StationScreenState extends State<StationScreen>
                   child: Column(
                     mainAxisSize: MainAxisSize.min,
                     children: [
+                      if (_runtime.lanAddress == null ||
+                          _runtime.networkRecovering ||
+                          _runtime.networkError != null)
+                        _NetworkStatusBanner(
+                          compact: compact,
+                          connectedAddress: _runtime.lanAddress,
+                          recovering: _runtime.networkRecovering,
+                          hasError: _runtime.networkError != null,
+                          onReconnect: _runtime.networkRecovering
+                              ? null
+                              : _reconnectNetwork,
+                        ),
                       if (Platform.isIOS &&
                           (_runtime.lifecycleSuspended ||
                               _runtime.lifecycleResuming ||
@@ -1139,6 +1202,97 @@ class _StationScreenState extends State<StationScreen>
             ],
           );
         },
+      ),
+    );
+  }
+}
+
+class _NetworkStatusBanner extends StatelessWidget {
+  const _NetworkStatusBanner({
+    required this.compact,
+    required this.connectedAddress,
+    required this.recovering,
+    required this.hasError,
+    required this.onReconnect,
+  });
+
+  final bool compact;
+  final String? connectedAddress;
+  final bool recovering;
+  final bool hasError;
+  final VoidCallback? onReconnect;
+
+  @override
+  Widget build(BuildContext context) {
+    final message = recovering
+        ? appText(
+            context,
+            'Đang khởi động lại kết nối live…',
+            'Restarting live connection…',
+          )
+        : connectedAddress == null
+        ? appText(
+            context,
+            'Chưa có Wi-Fi/LAN. Camera vẫn ghi hình và sẽ tự kết nối khi có IP.',
+            'No Wi-Fi/LAN. Recording continues and live will connect automatically.',
+          )
+        : appText(
+            context,
+            hasError
+                ? 'Kết nối live gặp lỗi. Camera vẫn tiếp tục ghi hình.'
+                : 'Kết nối live cần được làm mới.',
+            hasError
+                ? 'Live connection has an error. Recording is still active.'
+                : 'Live connection needs to be refreshed.',
+          );
+    return Container(
+      width: double.infinity,
+      margin: EdgeInsets.only(bottom: compact ? 6 : 8),
+      padding: EdgeInsets.fromLTRB(
+        compact ? 10 : 12,
+        compact ? 6 : 8,
+        6,
+        compact ? 6 : 8,
+      ),
+      decoration: BoxDecoration(
+        color: const Color(0xFF37474F).withValues(alpha: 0.95),
+        borderRadius: BorderRadius.circular(compact ? 10 : 12),
+      ),
+      child: Row(
+        children: [
+          if (recovering)
+            const SizedBox(
+              width: 16,
+              height: 16,
+              child: CircularProgressIndicator(
+                strokeWidth: 2,
+                color: Colors.white,
+              ),
+            )
+          else
+            const Icon(Icons.wifi_off_rounded, color: Colors.white, size: 18),
+          const SizedBox(width: 8),
+          Expanded(
+            child: Text(
+              message,
+              maxLines: compact ? 2 : 1,
+              overflow: TextOverflow.ellipsis,
+              style: TextStyle(
+                color: Colors.white,
+                fontSize: compact ? 11 : 12,
+                fontWeight: FontWeight.w700,
+              ),
+            ),
+          ),
+          TextButton.icon(
+            onPressed: onReconnect,
+            icon: const Icon(Icons.sync_rounded, size: 17),
+            label: Text(
+              appText(context, 'KẾT NỐI LẠI', 'RECONNECT'),
+              style: const TextStyle(fontWeight: FontWeight.w900),
+            ),
+          ),
+        ],
       ),
     );
   }
