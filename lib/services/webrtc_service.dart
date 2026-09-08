@@ -70,8 +70,17 @@ class WebRtcService {
   // PEER CONNECTION
   // ============================================================
 
-  RTCPeerConnection? _peerConnection;
-  Future<void>? _disposeConnectionOperation;
+  static const int maximumActivePeers = 4;
+  static const Duration _disconnectedPeerGrace = Duration(seconds: 10);
+  final Map<String, RTCPeerConnection> _peerConnections =
+      <String, RTCPeerConnection>{};
+  final Map<String, Future<void>> _disposePeerOperations =
+      <String, Future<void>>{};
+  final Map<String, Timer> _peerDisconnectTimers = <String, Timer>{};
+  final Map<String, List<RTCIceCandidate>> _pendingIceCandidates =
+      <String, List<RTCIceCandidate>>{};
+  final Set<String> _remoteDescriptionReady = <String>{};
+  String? _latestPeerId;
 
   // ============================================================
   // LOCAL PREVIEW
@@ -217,7 +226,14 @@ class WebRtcService {
 
   MediaStream? get localStream => _localStream;
 
-  RTCPeerConnection? get peerConnection => _peerConnection;
+  RTCPeerConnection? get peerConnection {
+    final latest = _latestPeerId;
+    if (latest != null) return _peerConnections[latest];
+    return _peerConnections.isEmpty ? null : _peerConnections.values.first;
+  }
+
+  int get activePeerCount => _peerConnections.length;
+  bool hasPeer(String peerId) => _peerConnections.containsKey(peerId);
 
   /// Quan trọng cho RecordingService.
   ///
@@ -893,7 +909,10 @@ class WebRtcService {
   // CREATE PEER CONNECTION
   // ============================================================
 
-  Future<void> _createPeerConnection() async {
+  Future<RTCPeerConnection> _createPeerConnection(
+    String peerId, {
+    required int maximumPeers,
+  }) async {
     // ==========================================================
     // CAMERA PHẢI SẴN SÀNG
     // ==========================================================
@@ -907,7 +926,13 @@ class WebRtcService {
     // RecordingService cũng đang dùng video track này.
     // ==========================================================
 
-    await disposeConnection();
+    await disposePeerConnection(peerId);
+    final effectiveMaximum = maximumPeers.clamp(1, maximumActivePeers);
+    if (_peerConnections.length >= effectiveMaximum) {
+      throw StateError(
+        'WEBRTC_PEER_LIMIT: ${_peerConnections.length}/$effectiveMaximum',
+      );
+    }
 
     // ==========================================================
     // CREATE NEW PC
@@ -915,16 +940,33 @@ class WebRtcService {
 
     final pc = await createPeerConnection(_rtcConfiguration);
 
-    _peerConnection = pc;
+    _peerConnections[peerId] = pc;
+    _latestPeerId = peerId;
 
-    developer.log('Station PeerConnection created', name: 'WebRtcService');
+    developer.log(
+      'Station PeerConnection created: $peerId '
+      '(${_peerConnections.length}/$effectiveMaximum)',
+      name: 'WebRtcService',
+    );
 
     // ==========================================================
     // CONNECTION STATE
     // ==========================================================
 
     pc.onConnectionState = (state) {
-      developer.log('Station connection state: $state', name: 'WebRtcService');
+      developer.log(
+        'Station connection state [$peerId]: $state',
+        name: 'WebRtcService',
+      );
+      if (state == RTCPeerConnectionState.RTCPeerConnectionStateConnected) {
+        _peerDisconnectTimers.remove(peerId)?.cancel();
+      } else if (state == RTCPeerConnectionState.RTCPeerConnectionStateFailed ||
+          state == RTCPeerConnectionState.RTCPeerConnectionStateClosed) {
+        unawaited(disposePeerConnection(peerId, expectedPeer: pc));
+      } else if (state ==
+          RTCPeerConnectionState.RTCPeerConnectionStateDisconnected) {
+        _scheduleDisconnectedPeerCleanup(peerId, pc);
+      }
     };
 
     // ==========================================================
@@ -933,9 +975,19 @@ class WebRtcService {
 
     pc.onIceConnectionState = (state) {
       developer.log(
-        'Station ICE connection state: $state',
+        'Station ICE connection state [$peerId]: $state',
         name: 'WebRtcService',
       );
+      if (state == RTCIceConnectionState.RTCIceConnectionStateConnected ||
+          state == RTCIceConnectionState.RTCIceConnectionStateCompleted) {
+        _peerDisconnectTimers.remove(peerId)?.cancel();
+      } else if (state == RTCIceConnectionState.RTCIceConnectionStateFailed ||
+          state == RTCIceConnectionState.RTCIceConnectionStateClosed) {
+        unawaited(disposePeerConnection(peerId, expectedPeer: pc));
+      } else if (state ==
+          RTCIceConnectionState.RTCIceConnectionStateDisconnected) {
+        _scheduleDisconnectedPeerCleanup(peerId, pc);
+      }
     };
 
     // ==========================================================
@@ -999,8 +1051,8 @@ class WebRtcService {
             RTCDegradationPreference.MAINTAIN_FRAMERATE;
         for (final encoding in parameters.encodings ?? <RTCRtpEncoding>[]) {
           encoding.minBitrate = 300000;
-          encoding.maxBitrate = _resolutionProfile.bitrate;
-          encoding.maxFramerate = _resolutionProfile.fps;
+          encoding.maxBitrate = math.min(_resolutionProfile.bitrate, 2500000);
+          encoding.maxFramerate = math.min(_resolutionProfile.fps, 30);
           encoding.priority = RTCPriorityType.high;
           encoding.networkPriority = RTCPriorityType.high;
         }
@@ -1026,6 +1078,7 @@ class WebRtcService {
         name: 'WebRtcService',
       );
     }
+    return pc;
   }
 
   // ============================================================
@@ -1035,26 +1088,24 @@ class WebRtcService {
   Future<RTCSessionDescription> handleOffer({
     required String sdp,
     required String type,
+    String peerId = 'default',
+    int maximumPeers = maximumActivePeers,
   }) async {
-    developer.log('Handling Tablet offer', name: 'WebRtcService');
+    developer.log('Handling Tablet offer: $peerId', name: 'WebRtcService');
 
     // ==========================================================
     // CREATE PC
     // ==========================================================
 
-    await _createPeerConnection();
-
-    final pc = _peerConnection;
-
-    if (pc == null) {
-      throw Exception('Không tạo được Station PeerConnection.');
-    }
+    final pc = await _createPeerConnection(peerId, maximumPeers: maximumPeers);
 
     // ==========================================================
     // REMOTE OFFER
     // ==========================================================
 
     await pc.setRemoteDescription(RTCSessionDescription(sdp, type));
+    _remoteDescriptionReady.add(peerId);
+    await _flushPendingIceCandidates(peerId, pc);
 
     developer.log('Tablet offer applied', name: 'WebRtcService');
 
@@ -1135,22 +1186,41 @@ class WebRtcService {
     required String candidate,
     String? sdpMid,
     int? sdpMLineIndex,
+    String? peerId,
   }) async {
-    final pc = _peerConnection;
+    final targetPeerId =
+        peerId ??
+        (_peerConnections.length == 1 ? _peerConnections.keys.first : null);
+    if (targetPeerId == null) {
+      throw StateError('peerId is required when multiple WebRTC peers exist.');
+    }
+    final ice = RTCIceCandidate(candidate, sdpMid, sdpMLineIndex);
+    final pc = _peerConnections[targetPeerId];
 
-    if (pc == null) {
+    if (pc == null || !_remoteDescriptionReady.contains(targetPeerId)) {
+      if (!_pendingIceCandidates.containsKey(targetPeerId) &&
+          _pendingIceCandidates.length >= 8) {
+        throw StateError('Too many pending WebRTC peer candidates.');
+      }
+      final pending = _pendingIceCandidates.putIfAbsent(
+        targetPeerId,
+        () => <RTCIceCandidate>[],
+      );
+      if (pending.length >= 64) pending.removeAt(0);
+      pending.add(ice);
       developer.log(
-        'Ignore remote ICE candidate: '
-        'PeerConnection is null',
+        'Queued remote ICE candidate [$targetPeerId]',
         name: 'WebRtcService',
       );
-
       return;
     }
 
-    await pc.addCandidate(RTCIceCandidate(candidate, sdpMid, sdpMLineIndex));
+    await pc.addCandidate(ice);
 
-    developer.log('Station remote ICE candidate added', name: 'WebRtcService');
+    developer.log(
+      'Station remote ICE candidate added [$targetPeerId]',
+      name: 'WebRtcService',
+    );
   }
 
   // ============================================================
@@ -1165,24 +1235,69 @@ class WebRtcService {
   // trong khi RecordingService vẫn ghi video.
   // ============================================================
 
-  Future<void> disposeConnection() {
-    final activeDispose = _disposeConnectionOperation;
+  Future<void> disposePeerConnection(
+    String peerId, {
+    RTCPeerConnection? expectedPeer,
+  }) {
+    final activeDispose = _disposePeerOperations[peerId];
     if (activeDispose != null) return activeDispose;
-
-    final pc = _peerConnection;
-    _peerConnection = null;
-    if (pc == null) return Future<void>.value();
-
-    final operation = _closePeerConnection(pc);
-    _disposeConnectionOperation = operation;
+    final pc = _peerConnections[peerId];
+    if (pc == null || (expectedPeer != null && !identical(pc, expectedPeer))) {
+      return Future<void>.value();
+    }
+    _peerConnections.remove(peerId);
+    _remoteDescriptionReady.remove(peerId);
+    _pendingIceCandidates.remove(peerId);
+    _peerDisconnectTimers.remove(peerId)?.cancel();
+    if (_latestPeerId == peerId) {
+      _latestPeerId = _peerConnections.isEmpty
+          ? null
+          : _peerConnections.keys.last;
+    }
+    final operation = _closePeerConnection(pc, peerId);
+    _disposePeerOperations[peerId] = operation;
     return operation.whenComplete(() {
-      if (identical(_disposeConnectionOperation, operation)) {
-        _disposeConnectionOperation = null;
+      if (identical(_disposePeerOperations[peerId], operation)) {
+        _disposePeerOperations.remove(peerId);
       }
     });
   }
 
-  Future<void> _closePeerConnection(RTCPeerConnection pc) async {
+  Future<void> disposeConnection([String? peerId]) async {
+    if (peerId != null) {
+      await disposePeerConnection(peerId);
+      return;
+    }
+    final peerIds = _peerConnections.keys.toList(growable: false);
+    await Future.wait(peerIds.map(disposePeerConnection));
+    if (_disposePeerOperations.isNotEmpty) {
+      await Future.wait(_disposePeerOperations.values.toList(growable: false));
+    }
+  }
+
+  void _scheduleDisconnectedPeerCleanup(
+    String peerId,
+    RTCPeerConnection expectedPeer,
+  ) {
+    _peerDisconnectTimers.remove(peerId)?.cancel();
+    _peerDisconnectTimers[peerId] = Timer(_disconnectedPeerGrace, () {
+      unawaited(disposePeerConnection(peerId, expectedPeer: expectedPeer));
+    });
+  }
+
+  Future<void> _flushPendingIceCandidates(
+    String peerId,
+    RTCPeerConnection expectedPeer,
+  ) async {
+    if (!identical(_peerConnections[peerId], expectedPeer)) return;
+    final pending = _pendingIceCandidates.remove(peerId) ?? const [];
+    for (final candidate in pending) {
+      if (!identical(_peerConnections[peerId], expectedPeer)) return;
+      await expectedPeer.addCandidate(candidate);
+    }
+  }
+
+  Future<void> _closePeerConnection(RTCPeerConnection pc, String peerId) async {
     try {
       await pc.close();
     } catch (e, stackTrace) {
@@ -1194,7 +1309,10 @@ class WebRtcService {
       );
     }
 
-    developer.log('Station PeerConnection closed', name: 'WebRtcService');
+    developer.log(
+      'Station PeerConnection closed: $peerId',
+      name: 'WebRtcService',
+    );
   }
 
   // ============================================================

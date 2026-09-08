@@ -32,6 +32,27 @@ DateTime checkVarEventTime(String? epochMilliseconds, DateTime receivedAt) {
   return candidate;
 }
 
+String normalizeWebRtcPeerId(String? value, {required String fallbackAddress}) {
+  final raw = (value?.trim().isNotEmpty ?? false)
+      ? value!.trim()
+      : 'legacy_$fallbackAddress';
+  final safe = raw.replaceAll(RegExp(r'[^a-zA-Z0-9._-]'), '_');
+  final normalized = safe.isEmpty ? 'legacy_unknown' : safe;
+  return normalized.length <= 96 ? normalized : normalized.substring(0, 96);
+}
+
+int effectiveWebRtcPeerLimit(String thermalState) {
+  switch (thermalState.toLowerCase()) {
+    case 'critical':
+      return 1;
+    case 'hot':
+    case 'serious':
+      return 2;
+    default:
+      return WebRtcService.maximumActivePeers;
+  }
+}
+
 class CameraServer {
   // ============================================================
   // SERVER
@@ -79,7 +100,7 @@ class CameraServer {
   final RequestRateLimiter _rateLimiter = RequestRateLimiter();
   Future<void> _webRtcOfferTail = Future<void>.value();
   int _pendingWebRtcOffers = 0;
-  static const int maximumPendingWebRtcOffers = 2;
+  static const int maximumPendingWebRtcOffers = 4;
 
   bool get running => _server != null;
 
@@ -221,6 +242,7 @@ class CameraServer {
 <script>
 (async()=>{
   const state=document.getElementById('state');
+  const peerId='viewer_'+(globalThis.crypto?.randomUUID?.()||Date.now()+'_'+Math.random());
   try{
     const pc=new RTCPeerConnection({iceServers:[{urls:'stun:stun.l.google.com:19302'}]});
     pc.addTransceiver('video',{direction:'recvonly'});
@@ -229,10 +251,11 @@ class CameraServer {
     await pc.setLocalDescription(await pc.createOffer());
     if(pc.iceGatheringState!=='complete')await new Promise(resolve=>{const done=()=>{if(pc.iceGatheringState==='complete'){pc.removeEventListener('icegatheringstatechange',done);resolve()}};pc.addEventListener('icegatheringstatechange',done);setTimeout(resolve,8000)});
     const offer=pc.localDescription;
-    const response=await fetch('/webrtc/offer',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({sdp:offer.sdp,type:offer.type})});
+    const response=await fetch('/webrtc/offer',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({sdp:offer.sdp,type:offer.type,peerId})});
     if(!response.ok)throw new Error('HTTP '+response.status);
     const answer=await response.json();
     await pc.setRemoteDescription(answer);
+    addEventListener('pagehide',()=>navigator.sendBeacon('/webrtc/disconnect',new Blob([JSON.stringify({peerId})],{type:'application/json'})),{once:true});
   }catch(error){state.textContent='Lỗi kết nối';document.body.insertAdjacentHTML('beforeend','<div style="position:fixed;left:16px;bottom:16px;color:#ff8a80">'+String(error)+'</div>')}
 })();
 </script></body></html>''');
@@ -505,6 +528,11 @@ class CameraServer {
         return;
       }
 
+      if (path == '/webrtc/disconnect' && method == 'POST') {
+        await _handleWebRtcDisconnect(request);
+        return;
+      }
+
       // ========================================================
       // 404
       // ========================================================
@@ -673,6 +701,10 @@ class CameraServer {
       'thermalState': thermalStateProvider?.call() ?? 'unknown',
       'temperatureC': temperatureProvider?.call(),
       'captureMetrics': captureMetricsProvider?.call() ?? const {},
+      'webrtcPeers': webRtcService.activePeerCount,
+      'webrtcPeerLimit': effectiveWebRtcPeerLimit(
+        thermalStateProvider?.call() ?? 'normal',
+      ),
       'capabilities': {
         'continuousBackgroundCapture': Platform.isAndroid,
         'foregroundCaptureRequired': Platform.isIOS,
@@ -1381,6 +1413,8 @@ class CameraServer {
 
       final type = body['type'] as String?;
 
+      final peerId = _peerIdForRequest(request, body);
+
       if (sdp == null || sdp.isEmpty || type == null || type.isEmpty) {
         await _sendJson(request.response, HttpStatus.badRequest, {
           'error': 'Invalid WebRTC offer',
@@ -1391,16 +1425,42 @@ class CameraServer {
 
       developer.log('Received WebRTC offer', name: 'CameraServer');
 
-      final RTCSessionDescription answer = await webRtcService.handleOffer(
-        sdp: sdp,
-
-        type: type,
+      final peerLimit = effectiveWebRtcPeerLimit(
+        thermalStateProvider?.call() ?? 'normal',
       );
+      if (!webRtcService.hasPeer(peerId) &&
+          webRtcService.activePeerCount >= peerLimit) {
+        request.response.headers.set(HttpHeaders.retryAfterHeader, '2');
+        await _sendJson(request.response, HttpStatus.serviceUnavailable, {
+          'error': 'WebRTC peer capacity reached',
+          'retryable': true,
+          'peerId': peerId,
+          'activePeers': webRtcService.activePeerCount,
+          'maximumPeers': peerLimit,
+        });
+        return;
+      }
+
+      late final RTCSessionDescription answer;
+      try {
+        answer = await webRtcService.handleOffer(
+          sdp: sdp,
+          type: type,
+          peerId: peerId,
+          maximumPeers: peerLimit,
+        );
+      } catch (_) {
+        // A malformed/aborted negotiation must not consume a peer slot.
+        await webRtcService.disposePeerConnection(peerId);
+        rethrow;
+      }
 
       await _sendJson(request.response, HttpStatus.ok, {
         'sdp': answer.sdp,
 
         'type': answer.type,
+
+        'peerId': peerId,
       });
 
       developer.log('WebRTC answer returned', name: 'CameraServer');
@@ -1418,6 +1478,8 @@ class CameraServer {
     final body = await _readJson(request);
 
     final candidate = body['candidate'] as String?;
+
+    final peerId = _peerIdForRequest(request, body);
 
     if (candidate == null || candidate.isEmpty) {
       await _sendJson(request.response, HttpStatus.badRequest, {
@@ -1443,9 +1505,39 @@ class CameraServer {
       sdpMid: body['sdpMid'] as String?,
 
       sdpMLineIndex: index,
+
+      peerId: peerId,
     );
 
-    await _sendJson(request.response, HttpStatus.ok, {'success': true});
+    await _sendJson(request.response, HttpStatus.ok, {
+      'success': true,
+      'peerId': peerId,
+    });
+  }
+
+  Future<void> _handleWebRtcDisconnect(HttpRequest request) async {
+    final body = await _readJson(request);
+    final peerId = _peerIdForRequest(request, body);
+    final existed = webRtcService.hasPeer(peerId);
+    await webRtcService.disposePeerConnection(peerId);
+    await _sendJson(request.response, HttpStatus.ok, {
+      'success': true,
+      'peerId': peerId,
+      'disconnected': existed,
+      'activePeers': webRtcService.activePeerCount,
+    });
+  }
+
+  String _peerIdForRequest(HttpRequest request, Map<String, dynamic> body) {
+    final supplied =
+        body['peerId'] ??
+        body['sessionId'] ??
+        request.headers.value('X-Peer-ID');
+    return normalizeWebRtcPeerId(
+      supplied?.toString(),
+      fallbackAddress:
+          request.connectionInfo?.remoteAddress.address ?? 'unknown',
+    );
   }
 
   // ============================================================
