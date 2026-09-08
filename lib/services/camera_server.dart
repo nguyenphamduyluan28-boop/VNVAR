@@ -908,18 +908,6 @@ class CameraServer {
           request.uri.queryParameters['duration'] ??
           '',
     );
-    if (requestedLookback == null && request.contentLength > 0) {
-      try {
-        final body = await _readJson(request);
-        final raw =
-            body['lookbackSeconds'] ?? body['lookback'] ?? body['duration'];
-        if (raw is num) requestedLookback = raw.toInt();
-        if (raw is String) requestedLookback = int.tryParse(raw);
-      } catch (_) {
-        // No or non-JSON body is safe to ignore.
-      }
-    }
-    final lookbackSeconds = (requestedLookback ?? 15).clamp(5, 60).toInt();
     final activeStartedAt = recordingService.currentSegmentStartedAt;
     final historical =
         activeStartedAt != null && requestedAt.isBefore(activeStartedAt)
@@ -956,6 +944,23 @@ class CameraServer {
         );
       }
     }
+    // The recorder boundary is the time-sensitive part of CheckVAR. Never
+    // wait for a slow HTTP body before stopping it: on a weak LAN that used
+    // to turn a 14:00:31 press into a source file ending at 14:00:45. The
+    // optional lookback only affects the exported clip and can be parsed once
+    // the source boundary is already secured.
+    if (requestedLookback == null && request.contentLength > 0) {
+      try {
+        final body = await _readJson(request);
+        final raw =
+            body['lookbackSeconds'] ?? body['lookback'] ?? body['duration'];
+        if (raw is num) requestedLookback = raw.toInt();
+        if (raw is String) requestedLookback = int.tryParse(raw);
+      } catch (_) {
+        // No or non-JSON body is safe to ignore.
+      }
+    }
+    final lookbackSeconds = (requestedLookback ?? 15).clamp(5, 60).toInt();
     RecordedSegment checkpoint = segment;
     var autoTrimmed = false;
     String? trimError;

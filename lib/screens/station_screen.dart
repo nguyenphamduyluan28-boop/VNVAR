@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:io';
+import 'dart:ui' as ui;
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -490,14 +491,91 @@ class _StationScreenState extends State<StationScreen>
     final confirmed = await showDialog<bool>(
       context: context,
       builder: (dialogContext) {
+        final media = MediaQuery.of(dialogContext);
+        final landscape = media.orientation == Orientation.landscape;
+        final compactHeight = media.size.height < 480;
+        final identityDetails = landscape
+            ? Row(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Expanded(
+                    child: Column(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        _ConfigLine(
+                          title: appText(context, 'Tên', 'Name'),
+                          value: newIdentity.cameraName,
+                        ),
+                        _ConfigLine(
+                          title: 'Camera',
+                          value: newIdentity.cameraId,
+                        ),
+                      ],
+                    ),
+                  ),
+                  const SizedBox(width: 16),
+                  Expanded(
+                    child: Column(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        _ConfigLine(
+                          title: appText(context, 'Sân', 'Court'),
+                          value: _courtLabel(newIdentity.courtId),
+                        ),
+                        _ConfigLine(
+                          title: appText(context, 'Vị trí', 'Position'),
+                          value: newIdentity.cameraPosition,
+                        ),
+                      ],
+                    ),
+                  ),
+                ],
+              )
+            : Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  _ConfigLine(
+                    title: appText(context, 'Tên', 'Name'),
+                    value: newIdentity.cameraName,
+                  ),
+                  _ConfigLine(title: 'Camera', value: newIdentity.cameraId),
+                  _ConfigLine(
+                    title: appText(context, 'Sân', 'Court'),
+                    value: _courtLabel(newIdentity.courtId),
+                  ),
+                  _ConfigLine(
+                    title: appText(context, 'Vị trí', 'Position'),
+                    value: newIdentity.cameraPosition,
+                  ),
+                ],
+              );
         return AlertDialog(
+          scrollable: true,
+          insetPadding: EdgeInsets.symmetric(
+            horizontal: landscape ? 32 : 20,
+            vertical: landscape ? 12 : 24,
+          ),
+          iconPadding: EdgeInsets.fromLTRB(20, compactHeight ? 12 : 20, 20, 4),
+          titlePadding: const EdgeInsets.fromLTRB(20, 4, 20, 8),
+          contentPadding: EdgeInsets.fromLTRB(
+            landscape ? 18 : 20,
+            0,
+            landscape ? 18 : 20,
+            compactHeight ? 8 : 14,
+          ),
+          actionsPadding: EdgeInsets.fromLTRB(
+            16,
+            0,
+            16,
+            compactHeight ? 10 : 16,
+          ),
           shape: RoundedRectangleBorder(
             borderRadius: BorderRadius.circular(20),
           ),
-          icon: const Icon(
+          icon: Icon(
             Icons.settings_rounded,
-            color: Color(0xFF1565C0),
-            size: 42,
+            color: const Color(0xFF1565C0),
+            size: compactHeight ? 30 : 38,
           ),
           title: Text(
             appText(context, 'ÁP DỤNG CẤU HÌNH MỚI?', 'APPLY NEW SETTINGS?'),
@@ -514,31 +592,15 @@ class _StationScreenState extends State<StationScreen>
                 ),
                 textAlign: TextAlign.center,
               ),
-              const SizedBox(height: 16),
+              SizedBox(height: compactHeight ? 8 : 14),
               Container(
                 width: double.infinity,
-                padding: const EdgeInsets.all(14),
+                padding: EdgeInsets.all(compactHeight ? 9 : 12),
                 decoration: BoxDecoration(
                   color: const Color(0xFFF4F6F9),
                   borderRadius: BorderRadius.circular(14),
                 ),
-                child: Column(
-                  children: [
-                    _ConfigLine(
-                      title: appText(context, 'Tên', 'Name'),
-                      value: newIdentity.cameraName,
-                    ),
-                    _ConfigLine(title: 'Camera', value: newIdentity.cameraId),
-                    _ConfigLine(
-                      title: appText(context, 'Sân', 'Court'),
-                      value: _courtLabel(newIdentity.courtId),
-                    ),
-                    _ConfigLine(
-                      title: appText(context, 'Vị trí', 'Position'),
-                      value: newIdentity.cameraPosition,
-                    ),
-                  ],
-                ),
+                child: identityDetails,
               ),
             ],
           ),
@@ -1013,7 +1075,7 @@ class _StationScreenState extends State<StationScreen>
               // ==============================================
               Positioned(
                 left: 0,
-                right: controlDockLane,
+                right: 0,
                 top: 0,
                 child: SafeArea(
                   bottom: false,
@@ -1039,6 +1101,16 @@ class _StationScreenState extends State<StationScreen>
                   ),
                 ),
               ),
+
+              if (_runtime.thermalWarning)
+                Positioned(
+                  top: compact ? 58 : 72,
+                  right: (compact ? 8 : 14) + controlDockLane,
+                  child: SafeArea(
+                    bottom: false,
+                    child: _ThermalToast(compact: compact),
+                  ),
+                ),
 
               // ==============================================
               // RIGHT-SIDE CAMERA CONTROLS
@@ -1082,16 +1154,16 @@ class _StationScreenState extends State<StationScreen>
               // ==============================================
               Positioned(
                 left: compact ? 8 : 14,
-                right: (compact ? 8 : 14) + controlDockLane,
+                right: compact ? 8 : 14,
                 bottom: 0,
                 child: SafeArea(
                   top: false,
                   minimum: EdgeInsets.only(bottom: compact ? 10 : 14),
                   child: Align(
-                    alignment: Alignment.bottomLeft,
+                    alignment: Alignment.bottomCenter,
                     child: ConstrainedBox(
                       constraints: BoxConstraints(
-                        maxWidth: landscape ? 520 : double.infinity,
+                        maxWidth: landscape ? 440 : 520,
                       ),
                       child: Column(
                         mainAxisSize: MainAxisSize.min,
@@ -1150,8 +1222,7 @@ class _StationScreenState extends State<StationScreen>
                                 ),
                               ),
                             ),
-                          if (_runtime.thermalWarning ||
-                              _runtime.storageWarning)
+                          if (_runtime.storageWarning)
                             Container(
                               width: double.infinity,
                               margin: EdgeInsets.only(bottom: compact ? 6 : 8),
@@ -1166,17 +1237,11 @@ class _StationScreenState extends State<StationScreen>
                                 ),
                               ),
                               child: Text(
-                                _runtime.thermalWarning
-                                    ? appText(
-                                        context,
-                                        'Thiết bị đang nóng${_runtime.temperatureC == null ? '' : ' (${_runtime.temperatureC!.toStringAsFixed(1)}°C)'}. Đã giảm xuống ${_runtime.resolutionProfile.shortLabel}/${_runtime.resolutionProfile.fps} FPS để bảo vệ camera.',
-                                        'Device temperature is high${_runtime.temperatureC == null ? '' : ' (${_runtime.temperatureC!.toStringAsFixed(1)}°C)'}. Reduced to ${_runtime.resolutionProfile.shortLabel}/${_runtime.resolutionProfile.fps} FPS to protect the camera.',
-                                      )
-                                    : appText(
-                                        context,
-                                        'Dung lượng lưu trữ thấp. Hệ thống sẽ dọn video cũ theo chính sách lưu trữ.',
-                                        'Storage is low. Old videos will be cleaned according to the retention policy.',
-                                      ),
+                                appText(
+                                  context,
+                                  'Dung lượng lưu trữ thấp. Hệ thống sẽ dọn video cũ theo chính sách lưu trữ.',
+                                  'Storage is low. Old videos will be cleaned according to the retention policy.',
+                                ),
                                 maxLines: compact ? 2 : 1,
                                 overflow: TextOverflow.ellipsis,
                                 textAlign: TextAlign.center,
@@ -1187,24 +1252,25 @@ class _StationScreenState extends State<StationScreen>
                                 ),
                               ),
                             ),
-                          if (_cameraReady &&
-                              (_runtime.webRtcService?.cameraZoomSupported ??
-                                  false))
-                            _CameraZoomSlider(
-                              compact: compact,
-                              value:
-                                  _zoomValue ??
-                                  _runtime.webRtcService!.cameraZoom,
-                              minimum:
-                                  _runtime.webRtcService!.minimumCameraZoom,
-                              maximum:
-                                  _runtime.webRtcService!.maximumCameraZoom,
-                              onChanged: _changeZoom,
-                            ),
-                          _BottomStatusBar(
+                          _BottomControlPanel(
                             compact: compact,
                             cameraReady: _cameraReady,
                             recording: _recording,
+                            zoomSupported:
+                                _cameraReady &&
+                                (_runtime
+                                        .webRtcService
+                                        ?.cameraZoomSupported ??
+                                    false),
+                            zoomValue:
+                                _zoomValue ??
+                                _runtime.webRtcService?.cameraZoom ??
+                                1,
+                            minimumZoom:
+                                _runtime.webRtcService?.minimumCameraZoom ?? 1,
+                            maximumZoom:
+                                _runtime.webRtcService?.maximumCameraZoom ?? 1,
+                            onZoomChanged: _changeZoom,
                           ),
                         ],
                       ),
@@ -1215,6 +1281,142 @@ class _StationScreenState extends State<StationScreen>
             ],
           );
         },
+      ),
+    );
+  }
+}
+
+class _ThermalToast extends StatelessWidget {
+  const _ThermalToast({required this.compact});
+
+  final bool compact;
+
+  @override
+  Widget build(BuildContext context) {
+    return ConstrainedBox(
+      constraints: BoxConstraints(maxWidth: compact ? 310 : 430),
+      child: ClipRRect(
+        borderRadius: BorderRadius.circular(18),
+        child: BackdropFilter(
+          filter: ui.ImageFilter.blur(sigmaX: 12, sigmaY: 12),
+          child: Container(
+            padding: EdgeInsets.symmetric(
+              horizontal: compact ? 10 : 12,
+              vertical: compact ? 7 : 9,
+            ),
+            decoration: BoxDecoration(
+              color: const Color(0xFF2A1C08).withValues(alpha: 0.38),
+              borderRadius: BorderRadius.circular(18),
+              border: Border.all(
+                color: Colors.amber.withValues(alpha: 0.42),
+              ),
+              boxShadow: const [
+                BoxShadow(
+                  color: Color(0x33000000),
+                  blurRadius: 12,
+                  offset: Offset(0, 4),
+                ),
+              ],
+            ),
+            child: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Icon(
+                  Icons.warning_amber_rounded,
+                  color: Colors.amber,
+                  size: compact ? 16 : 18,
+                ),
+                const SizedBox(width: 8),
+                Flexible(
+                  child: Text(
+                    'Thiết bị đang nóng. Đã giảm xuống 720p/15 FPS để bảo vệ camera.',
+                    maxLines: 2,
+                    overflow: TextOverflow.ellipsis,
+                    style: TextStyle(
+                      color: Colors.amber.shade100,
+                      fontSize: compact ? 10 : 11,
+                      fontWeight: FontWeight.w700,
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _BottomControlPanel extends StatelessWidget {
+  const _BottomControlPanel({
+    required this.compact,
+    required this.cameraReady,
+    required this.recording,
+    required this.zoomSupported,
+    required this.zoomValue,
+    required this.minimumZoom,
+    required this.maximumZoom,
+    required this.onZoomChanged,
+  });
+
+  final bool compact;
+  final bool cameraReady;
+  final bool recording;
+  final bool zoomSupported;
+  final double zoomValue;
+  final double minimumZoom;
+  final double maximumZoom;
+  final ValueChanged<double> onZoomChanged;
+
+  @override
+  Widget build(BuildContext context) {
+    return ClipRRect(
+      borderRadius: BorderRadius.circular(compact ? 18 : 20),
+      child: BackdropFilter(
+        filter: ui.ImageFilter.blur(sigmaX: 14, sigmaY: 14),
+        child: Container(
+          padding: EdgeInsets.symmetric(
+            horizontal: compact ? 8 : 10,
+            vertical: compact ? 4 : 6,
+          ),
+          decoration: BoxDecoration(
+            color: const Color(0xFF101216).withValues(alpha: 0.30),
+            borderRadius: BorderRadius.circular(compact ? 18 : 20),
+            border: Border.all(color: Colors.white.withValues(alpha: 0.11)),
+            boxShadow: const [
+              BoxShadow(
+                color: Color(0x40000000),
+                blurRadius: 16,
+                offset: Offset(0, 5),
+              ),
+            ],
+          ),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              if (zoomSupported) ...[
+                _CameraZoomSlider(
+                  compact: compact,
+                  value: zoomValue,
+                  minimum: minimumZoom,
+                  maximum: maximumZoom,
+                  onChanged: onZoomChanged,
+                ),
+                Container(
+                  height: 1,
+                  margin: const EdgeInsets.symmetric(horizontal: 8),
+                  color: Colors.white.withValues(alpha: 0.09),
+                ),
+              ],
+              _BottomStatusBar(
+                compact: compact,
+                cameraReady: cameraReady,
+                recording: recording,
+              ),
+            ],
+          ),
+        ),
       ),
     );
   }
@@ -1329,16 +1531,11 @@ class _CameraZoomSlider extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final safeValue = value.clamp(minimum, maximum).toDouble();
-    return Container(
-      margin: EdgeInsets.only(bottom: compact ? 6 : 8),
-      padding: const EdgeInsets.symmetric(horizontal: 10),
-      decoration: BoxDecoration(
-        color: Colors.black.withValues(alpha: 0.68),
-        borderRadius: BorderRadius.circular(14),
-      ),
+    return Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 4),
       child: Row(
         children: [
-          const Icon(Icons.zoom_out_rounded, color: Colors.white70, size: 20),
+          Icon(Icons.remove_rounded, color: Colors.white70, size: compact ? 18 : 20),
           Expanded(
             child: Slider(
               value: safeValue,
@@ -1348,7 +1545,7 @@ class _CameraZoomSlider extends StatelessWidget {
               onChanged: onChanged,
             ),
           ),
-          const Icon(Icons.zoom_in_rounded, color: Colors.white70, size: 20),
+          Icon(Icons.add_rounded, color: Colors.white70, size: compact ? 18 : 20),
           const SizedBox(width: 6),
           SizedBox(
             width: 42,
@@ -1405,60 +1602,74 @@ class _StationHeader extends StatelessWidget {
     // Detailed identifiers remain available in Settings while the camera
     // preview keeps most of the screen during normal operation.
     if (landscape || compact) {
-      return Container(
-        width: double.infinity,
-        padding: const EdgeInsets.symmetric(horizontal: 9, vertical: 7),
-        decoration: BoxDecoration(
-          color: Colors.black.withValues(alpha: 0.68),
-          borderRadius: BorderRadius.circular(13),
-          border: Border.all(color: Colors.white.withValues(alpha: 0.10)),
-        ),
-        child: Row(
-          children: [
-            const Icon(Icons.videocam_rounded, color: Colors.white70, size: 18),
-            const SizedBox(width: 7),
-            Expanded(
-              child: Text(
-                '${identity.cameraName} · ${identity.cameraId} · $courtLabel',
-                maxLines: 1,
-                overflow: TextOverflow.ellipsis,
-                style: const TextStyle(
-                  color: Colors.white,
-                  fontSize: 12,
-                  fontWeight: FontWeight.w800,
+      return Row(
+        children: [
+          Expanded(
+            child: Align(
+              alignment: Alignment.centerLeft,
+              child: _HeaderGlassCluster(
+                child: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    const Icon(
+                      Icons.videocam_rounded,
+                      color: Colors.white70,
+                      size: 18,
+                    ),
+                    const SizedBox(width: 7),
+                    Flexible(
+                      child: Text(
+                        '${identity.cameraName} · ${identity.cameraId} · $courtLabel',
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: const TextStyle(
+                          color: Colors.white,
+                          fontSize: 12,
+                          fontWeight: FontWeight.w800,
+                        ),
+                      ),
+                    ),
+                  ],
                 ),
               ),
             ),
-            const SizedBox(width: 6),
-            _RecordingChip(recording: recording, compact: true),
-            const SizedBox(width: 5),
-            _ResolutionChip(
-              profile: resolutionProfile,
-              switching: resolutionSwitching,
-              onTap: onResolution,
+          ),
+          const SizedBox(width: 12),
+          _HeaderGlassCluster(
+            child: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                _RecordingChip(recording: recording, compact: true),
+                const SizedBox(width: 5),
+                _ResolutionChip(
+                  profile: resolutionProfile,
+                  switching: resolutionSwitching,
+                  onTap: onResolution,
+                ),
+                const SizedBox(width: 5),
+                _HeaderIconButton(
+                  icon: Icons.video_settings_rounded,
+                  tooltip: appText(context, 'Kho video', 'Video storage'),
+                  size: 32,
+                  onTap: onVideoStorage,
+                ),
+                const SizedBox(width: 4),
+                AppLanguageButton(foregroundColor: Colors.white, size: 32),
+                const SizedBox(width: 4),
+                _HeaderIconButton(
+                  icon: Icons.settings_rounded,
+                  tooltip: appText(
+                    context,
+                    'Cấu hình Camera Station',
+                    'Camera Station settings',
+                  ),
+                  size: 32,
+                  onTap: onSettings,
+                ),
+              ],
             ),
-            const SizedBox(width: 5),
-            _HeaderIconButton(
-              icon: Icons.video_settings_rounded,
-              tooltip: appText(context, 'Kho video', 'Video storage'),
-              size: 32,
-              onTap: onVideoStorage,
-            ),
-            const SizedBox(width: 4),
-            AppLanguageButton(foregroundColor: Colors.white, size: 32),
-            const SizedBox(width: 4),
-            _HeaderIconButton(
-              icon: Icons.settings_rounded,
-              tooltip: appText(
-                context,
-                'Cấu hình Camera Station',
-                'Camera Station settings',
-              ),
-              size: 32,
-              onTap: onSettings,
-            ),
-          ],
-        ),
+          ),
+        ],
       );
     }
 
@@ -1466,7 +1677,7 @@ class _StationHeader extends StatelessWidget {
       width: double.infinity,
       padding: EdgeInsets.all(compact ? 10 : 12),
       decoration: BoxDecoration(
-        color: Colors.black.withValues(alpha: 0.64),
+        color: Colors.black.withValues(alpha: 0.30),
         borderRadius: BorderRadius.circular(compact ? 14 : 18),
         border: Border.all(color: Colors.white.withValues(alpha: 0.10)),
       ),
@@ -1566,6 +1777,38 @@ class _StationHeader extends StatelessWidget {
             ],
           ),
         ],
+      ),
+    );
+  }
+}
+
+class _HeaderGlassCluster extends StatelessWidget {
+  const _HeaderGlassCluster({required this.child});
+
+  final Widget child;
+
+  @override
+  Widget build(BuildContext context) {
+    return ClipRRect(
+      borderRadius: BorderRadius.circular(16),
+      child: BackdropFilter(
+        filter: ui.ImageFilter.blur(sigmaX: 10, sigmaY: 10),
+        child: Container(
+          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+          decoration: BoxDecoration(
+            color: const Color(0xFF101216).withValues(alpha: 0.22),
+            borderRadius: BorderRadius.circular(16),
+            border: Border.all(color: Colors.white.withValues(alpha: 0.09)),
+            boxShadow: const [
+              BoxShadow(
+                color: Color(0x26000000),
+                blurRadius: 10,
+                offset: Offset(0, 3),
+              ),
+            ],
+          ),
+          child: child,
+        ),
       ),
     );
   }
@@ -1784,15 +2027,22 @@ class _CameraControlDock extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final gap = compact ? 8.0 : 12.0;
-    final buttonSize = compact ? 38.0 : 44.0;
+    final gap = compact ? 8.0 : 10.0;
+    final buttonSize = compact ? 36.0 : 40.0;
 
     return Container(
-      padding: EdgeInsets.symmetric(vertical: compact ? 8 : 10, horizontal: 6),
+      padding: EdgeInsets.symmetric(vertical: compact ? 7 : 9, horizontal: 6),
       decoration: BoxDecoration(
-        color: Colors.black.withValues(alpha: 0.55),
-        borderRadius: BorderRadius.circular(28),
-        border: Border.all(color: Colors.white.withValues(alpha: 0.08)),
+        color: const Color(0xFF101216).withValues(alpha: 0.28),
+        borderRadius: BorderRadius.circular(22),
+        border: Border.all(color: Colors.white.withValues(alpha: 0.11)),
+        boxShadow: const [
+          BoxShadow(
+            color: Color(0x33000000),
+            blurRadius: 12,
+            offset: Offset(0, 4),
+          ),
+        ],
       ),
       child: Column(
         mainAxisSize: MainAxisSize.min,
@@ -1933,16 +2183,10 @@ class _BottomStatusBar extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return Container(
-      width: double.infinity,
+    return Padding(
       padding: EdgeInsets.symmetric(
         horizontal: compact ? 8 : 10,
-        vertical: compact ? 9 : 11,
-      ),
-      decoration: BoxDecoration(
-        color: Colors.black.withValues(alpha: 0.72),
-        borderRadius: BorderRadius.circular(compact ? 14 : 16),
-        border: Border.all(color: Colors.white.withValues(alpha: 0.10)),
+        vertical: compact ? 7 : 9,
       ),
       child: Row(
         children: [

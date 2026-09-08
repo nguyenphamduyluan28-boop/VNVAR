@@ -738,13 +738,14 @@ class CameraStationRuntime {
           previousProfile,
           selectedProfile,
         );
-        if (!recreateCapture && recording.recording) {
-          await recording.checkpointCurrentSegment(
-            onRecorderStopped: webRtc.switchCamera,
-          );
-        } else if (!recreateCapture) {
+        if (!recreateCapture) {
+          // flutter_webrtc switches the capturer behind the existing
+          // MediaStreamTrack. Recorder, WebRTC peers and RTSP can therefore
+          // keep consuming that same track without cutting a segment. Waiting
+          // for a checkpoint here made the UI spin until FFmpeg had finished
+          // remuxing, especially after several consecutive lens switches.
           await webRtc.switchCamera();
-          await server.ensureRecording();
+          if (!recording.recording) await server.ensureRecording();
         } else {
           // Helper.switchCamera keeps the constraints of the previous lens.
           // Recreate capture when the target lens needs a lower profile (for
