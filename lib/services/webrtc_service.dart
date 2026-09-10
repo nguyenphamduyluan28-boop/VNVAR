@@ -109,6 +109,9 @@ class WebRtcService {
   int _cameraLifecycleGeneration = 0;
   String? _currentFacingMode;
   final Map<String, String> _preferredCameraDeviceIds = <String, String>{};
+  final Map<String, List<CameraResolutionProfile>>
+  _verifiedResolutionProfiles = <String, List<CameraResolutionProfile>>{};
+  final Map<String, String> _resolutionProfileDeviceIds = <String, String>{};
   bool? _isEmulator;
   double _cameraZoom = 1;
   double _minimumCameraZoom = 1;
@@ -312,38 +315,76 @@ class WebRtcService {
         CameraResolutionProfile.fullHd1080,
       ];
     }
-    try {
-      final result = await _platformChannel.invokeListMethod<Object?>(
-        'getCameraResolutionProfiles',
-        {'facing': facingMode},
-      );
-      final supported = <CameraResolutionProfile>[];
-      for (final item in result ?? const []) {
-        if (item is! Map) continue;
-        final deviceId = item['deviceId'];
-        if (deviceId is String && deviceId.isNotEmpty) {
-          _preferredCameraDeviceIds[facingMode] = deviceId;
+    Object? lastError;
+    for (var attempt = 0; attempt < 3; attempt++) {
+      try {
+        final result = await _platformChannel.invokeListMethod<Object?>(
+          'getCameraResolutionProfiles',
+          {'facing': facingMode},
+        );
+        final supported = <CameraResolutionProfile>[];
+        String? detectedDeviceId;
+        for (final item in result ?? const []) {
+          if (item is! Map) continue;
+          final deviceId = item['deviceId'];
+          if (deviceId is String && deviceId.isNotEmpty) {
+            detectedDeviceId ??= deviceId;
+          }
+          final profile = CameraResolutionProfile.fromId(
+            item['id'] as String?,
+          );
+          final maxFps = item['maxFps'];
+          if (profile != null && maxFps is num && maxFps.toInt() > 0) {
+            final detectedFps = maxFps.toInt();
+            final platformFps =
+                Platform.isAndroid &&
+                    profile.preset == CameraResolutionPreset.ultraHd4k
+                ? math.min(detectedFps, 20)
+                : detectedFps;
+            supported.add(profile.withFps(platformFps));
+          }
         }
-        final profile = CameraResolutionProfile.fromId(item['id'] as String?);
-        final maxFps = item['maxFps'];
-        if (profile != null && maxFps is num) {
-          final detectedFps = maxFps.toInt();
-          final platformFps =
-              Platform.isAndroid &&
-                  profile.preset == CameraResolutionPreset.ultraHd4k
-              ? math.min(detectedFps, 20)
-              : detectedFps;
-          supported.add(profile.withFps(platformFps));
+        if (supported.isNotEmpty && detectedDeviceId != null) {
+          supported.sort(
+            (left, right) => left.preset.index.compareTo(right.preset.index),
+          );
+          _preferredCameraDeviceIds[facingMode] = detectedDeviceId;
+          _resolutionProfileDeviceIds[facingMode] = detectedDeviceId;
+          _verifiedResolutionProfiles[facingMode] = List.unmodifiable(
+            supported,
+          );
+          developer.log(
+            '[CAMERA] Verified ${supported.map((item) => item.shortLabel).join(', ')} '
+            'for $facingMode camera $detectedDeviceId',
+            name: 'WebRtcService',
+          );
+          return List.unmodifiable(supported);
         }
+        lastError = StateError(
+          'Camera $facingMode returned no usable WebRTC profile.',
+        );
+      } catch (error) {
+        lastError = error;
       }
-      if (supported.isNotEmpty) return supported;
-      if (!fallbackWhenUnavailable) return const [];
-    } catch (error) {
+      if (attempt < 2) {
+        await Future<void>.delayed(Duration(milliseconds: 120 * (attempt + 1)));
+      }
+    }
+    final cached = _verifiedResolutionProfiles[facingMode];
+    if (cached != null && cached.isNotEmpty) {
       developer.log(
-        '[CAMERA] Cannot detect resolution profiles: $error',
+        '[CAMERA] Capability scan failed; using verified cache for '
+        '$facingMode camera ${_resolutionProfileDeviceIds[facingMode]}: '
+        '$lastError',
         name: 'WebRtcService',
       );
+      return List.unmodifiable(cached);
     }
+    developer.log(
+      '[CAMERA] Cannot detect resolution profiles after 3 attempts: $lastError',
+      name: 'WebRtcService',
+    );
+    if (!fallbackWhenUnavailable) return const [];
     return const [CameraResolutionProfile.hd720];
   }
 
@@ -874,18 +915,25 @@ class WebRtcService {
     if (!_cameraInitialized || track == null) {
       throw StateError('Camera chưa sẵn sàng.');
     }
+    final previousFacing = currentFacingMode;
+    final targetFacing = previousFacing == 'environment'
+        ? 'user'
+        : 'environment';
     final switched = await Helper.switchCamera(track);
     if (!switched) {
       throw StateError('Thiết bị không có camera khác để chuyển.');
     }
+    // Native switchCamera may resolve before AVCaptureSession/Camera2 has
+    // delivered a frame from the new lens. Give the capture pipeline one
+    // short settling interval so the renderer callback cannot be satisfied
+    // by the final frame of the previous lens during rapid taps.
+    await Future<void>.delayed(const Duration(milliseconds: 120));
     final stream = _localStream;
     if (stream == null) throw StateError('Camera stream không còn tồn tại.');
     final firstFrame = _bindRendererAndWaitForFirstFrame(stream, rebind: true);
     await _configureNaturalCameraMetering(track);
     await firstFrame;
-    _currentFacingMode = currentFacingMode == 'environment'
-        ? 'user'
-        : 'environment';
+    _currentFacingMode = targetFacing;
     await refreshCameraZoom();
     developer.log(
       '[CAMERA] Switched front/back on the current VideoTrack',

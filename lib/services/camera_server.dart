@@ -97,6 +97,7 @@ class CameraServer {
   bool _iosLifecycleSuspended = false;
   final Map<String, Future<Map<String, dynamic>>> _checkVarJobs = {};
   final Map<String, Map<String, dynamic>> _checkVarResults = {};
+  Future<void> _checkVarProcessingTail = Future<void>.value();
   final RequestRateLimiter _rateLimiter = RequestRateLimiter();
   Future<void> _webRtcOfferTail = Future<void>.value();
   int _pendingWebRtcOffers = 0;
@@ -418,12 +419,10 @@ class CameraServer {
         }
         var operation = _checkVarJobs[requestId];
         if (operation == null) {
-          operation = _serializeRecordingRequest(
-            () => _checkVar(
-              request,
-              requestId: requestId,
-              requestedAt: requestedAt,
-            ),
+          operation = _checkVar(
+            request,
+            requestId: requestId,
+            requestedAt: requestedAt,
           );
           _checkVarJobs[requestId] = operation;
         } else if (request.contentLength != 0) {
@@ -635,6 +634,15 @@ class CameraServer {
     final previous = _recordingRequestTail;
     final current = previous.catchError((Object _) {}).then((_) => operation());
     _recordingRequestTail = current.then<void>((_) {}, onError: (_) {});
+    return current;
+  }
+
+  Future<T> _serializeCheckVarProcessing<T>(
+    Future<T> Function() operation,
+  ) {
+    final previous = _checkVarProcessingTail;
+    final current = previous.catchError((Object _) {}).then((_) => operation());
+    _checkVarProcessingTail = current.then<void>((_) {}, onError: (_) {});
     return current;
   }
 
@@ -908,6 +916,42 @@ class CameraServer {
           request.uri.queryParameters['duration'] ??
           '',
     );
+    // Hold the recorder queue only until RecordingService has secured the
+    // boundary and handed capture to the next file. Post-checkpoint trimming
+    // runs on a separate queue below, so it cannot keep the recorder lock.
+    final source = await _serializeRecordingRequest(
+      () => _checkpointCheckVar(requestedAt),
+    );
+    // The recorder boundary is the time-sensitive part of CheckVAR. Never
+    // wait for a slow HTTP body before stopping it: on a weak LAN that used
+    // to turn a 14:00:31 press into a source file ending at 14:00:45. The
+    // optional lookback only affects the exported clip and can be parsed once
+    // the source boundary is already secured.
+    if (requestedLookback == null && request.contentLength != 0) {
+      try {
+        final body = await _readJson(request);
+        final raw =
+            body['lookbackSeconds'] ?? body['lookback'] ?? body['duration'];
+        if (raw is num) requestedLookback = raw.toInt();
+        if (raw is String) requestedLookback = int.tryParse(raw);
+      } catch (_) {
+        // No or non-JSON body is safe to ignore.
+      }
+    }
+    final lookbackSeconds = (requestedLookback ?? 15).clamp(5, 60).toInt();
+    return _serializeCheckVarProcessing(
+      () => _finishCheckVar(
+        requestId: requestId,
+        requestedAt: requestedAt,
+        source: source,
+        lookbackSeconds: lookbackSeconds,
+      ),
+    );
+  }
+
+  Future<({RecordedSegment segment, bool usedPrevious})> _checkpointCheckVar(
+    DateTime requestedAt,
+  ) async {
     final activeStartedAt = recordingService.currentSegmentStartedAt;
     final historical =
         activeStartedAt != null && requestedAt.isBefore(activeStartedAt)
@@ -923,15 +967,14 @@ class CameraServer {
     }
     final segment =
         historical ?? await recordingService.checkpointCurrentSegment();
+    final usedPrevious = historical == null
+        ? recordingService.lastCheckpointUsedPrevious
+        : true;
     developer.log(
-      '[CHECKVAR] Source ready: ${segment.fileName} '
+      '[CHECKVAR] Recorder boundary secured: ${segment.fileName} '
       '(${segment.durationMs}ms)',
       name: 'CameraServer',
     );
-    // Đảm bảo recording tiếp tục ngay sau checkpoint. Nếu _startNewSegment()
-    // bên trong rotation thất bại (ví dụ: lỗi audio tạm thời trên Android),
-    // recording bị dừng nhưng caller không biết. Gọi ensureRecording() ở đây
-    // để phục hồi ngay thay vì chờ health monitor retry sau 10 giây.
     if (!recordingService.recording && !recordingService.rotating) {
       try {
         await ensureRecording();
@@ -944,23 +987,16 @@ class CameraServer {
         );
       }
     }
-    // The recorder boundary is the time-sensitive part of CheckVAR. Never
-    // wait for a slow HTTP body before stopping it: on a weak LAN that used
-    // to turn a 14:00:31 press into a source file ending at 14:00:45. The
-    // optional lookback only affects the exported clip and can be parsed once
-    // the source boundary is already secured.
-    if (requestedLookback == null && request.contentLength > 0) {
-      try {
-        final body = await _readJson(request);
-        final raw =
-            body['lookbackSeconds'] ?? body['lookback'] ?? body['duration'];
-        if (raw is num) requestedLookback = raw.toInt();
-        if (raw is String) requestedLookback = int.tryParse(raw);
-      } catch (_) {
-        // No or non-JSON body is safe to ignore.
-      }
-    }
-    final lookbackSeconds = (requestedLookback ?? 15).clamp(5, 60).toInt();
+    return (segment: segment, usedPrevious: usedPrevious);
+  }
+
+  Future<Map<String, dynamic>> _finishCheckVar({
+    required String requestId,
+    required DateTime requestedAt,
+    required ({RecordedSegment segment, bool usedPrevious}) source,
+    required int lookbackSeconds,
+  }) async {
+    final segment = source.segment;
     RecordedSegment checkpoint = segment;
     var autoTrimmed = false;
     String? trimError;
@@ -1004,7 +1040,7 @@ class CameraServer {
       'requestId': requestId,
       'status': 'READY',
       'requestedAt': requestedAt.toIso8601String(),
-      'usedPreviousSegment': recordingService.lastCheckpointUsedPrevious,
+      'usedPreviousSegment': source.usedPrevious,
       'autoTrimmed': autoTrimmed,
       'lookbackSeconds': lookbackSeconds,
       'trimError': trimError,

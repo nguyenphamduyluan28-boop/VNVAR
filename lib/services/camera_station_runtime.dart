@@ -94,9 +94,12 @@ class CameraStationRuntime {
   bool _stopping = false;
   bool _cameraEnabled = true;
   bool _profileSwitching = false;
+  Future<void>? _lensSwitchOperation;
+  DateTime? _lastLensSwitchCompletedAt;
   bool _iosLifecycleSuspended = false;
   bool _iosResumeQueued = false;
   bool _iosAppInForeground = true;
+  int _iosLifecycleGeneration = 0;
   bool _healthCheckRunning = false;
   bool _networkCheckRunning = false;
   bool _networkObservationInitialized = false;
@@ -136,6 +139,13 @@ class CameraStationRuntime {
   static const Duration _recordingTransitionGrace = Duration(seconds: 20);
   static const Duration _recordingStallTimeout = Duration(seconds: 45);
   static const Duration _bufferedVideoHardStallTimeout = Duration(minutes: 2);
+  static const Duration _iosBackgroundRequestDrainTimeout = Duration(
+    seconds: 6,
+  );
+  static const Duration _iosBackgroundRecorderTimeout = Duration(seconds: 15);
+  static const Duration _iosTransportDisposeTimeout = Duration(seconds: 6);
+  static const Duration _iosForegroundResumeTimeout = Duration(seconds: 30);
+  static const Duration _lensSwitchCooldown = Duration(milliseconds: 750);
   static const MethodChannel _platformChannel = MethodChannel(
     'vnvar/camera_station_service',
   );
@@ -201,6 +211,23 @@ class CameraStationRuntime {
   CameraResolutionProfile get resolutionProfile => _resolutionProfile;
   List<CameraResolutionProfile> get supportedResolutionProfiles =>
       List.unmodifiable(_supportedResolutionProfiles);
+
+  Future<List<CameraResolutionProfile>>
+  refreshSupportedResolutionProfiles() async {
+    final webRtc = _webRtcService;
+    if (webRtc == null || !_cameraEnabled) {
+      return supportedResolutionProfiles;
+    }
+    final detected = await webRtc.getSupportedResolutionProfiles(
+      facingMode: webRtc.currentFacingMode,
+      fallbackWhenUnavailable: false,
+    );
+    if (detected.isNotEmpty) {
+      _supportedResolutionProfiles = detected;
+      _emitState();
+    }
+    return supportedResolutionProfiles;
+  }
 
   Future<void> initialize({
     required String cameraId,
@@ -490,13 +517,22 @@ class CameraStationRuntime {
       return Future<void>.value();
     }
     _iosLifecycleSuspended = true;
+    final lifecycleGeneration = ++_iosLifecycleGeneration;
     _interruptRecovery();
     _emitState();
-    return _serializeLifecycle(_suspendForIosBackgroundInternal);
+    return _serializeLifecycle(
+      () => _suspendForIosBackgroundInternal(lifecycleGeneration),
+    );
   }
 
-  Future<void> _suspendForIosBackgroundInternal() async {
-    if (!Platform.isIOS || !_iosLifecycleSuspended) return;
+  Future<void> _suspendForIosBackgroundInternal(
+    int lifecycleGeneration,
+  ) async {
+    if (!Platform.isIOS ||
+        !_iosLifecycleSuspended ||
+        lifecycleGeneration != _iosLifecycleGeneration) {
+      return;
+    }
     final recording = _recordingService;
     final webRtc = _webRtcService;
     if (recording == null || webRtc == null) return;
@@ -510,8 +546,20 @@ class CameraStationRuntime {
         // Finish an already accepted CheckVAR request before stopping the
         // recorder. Without this barrier, the lifecycle queue and HTTP queue
         // could finalize the same recorder concurrently.
-        await _cameraServer?.prepareForIosBackground();
-        await recording.stop();
+        await _cameraServer
+            ?.prepareForIosBackground()
+            .timeout(_iosBackgroundRequestDrainTimeout);
+        await _stopRecordingAtIosBoundary(recording).timeout(
+          _iosBackgroundRecorderTimeout,
+        );
+      } on TimeoutException catch (error, stackTrace) {
+        developer.log(
+          '[LIFECYCLE] iOS background finalization timed out; releasing the '
+          'lifecycle queue so foreground recovery cannot deadlock',
+          error: error,
+          stackTrace: stackTrace,
+          name: 'CameraStationRuntime',
+        );
       } catch (error, stackTrace) {
         // iOS grants only a short background execution window. A recorder
         // finalization failure must not prevent the capture session from
@@ -526,19 +574,66 @@ class CameraStationRuntime {
       }
     } finally {
       try {
-        try {
-          await webRtc.disposeConnection();
-        } finally {
-          await webRtc.disposeCamera();
+        // A foreground event can arrive while iOS is finishing the bounded
+        // background task. Never let the stale suspend operation dispose a
+        // newly reopened camera.
+        if (lifecycleGeneration == _iosLifecycleGeneration &&
+            !_iosAppInForeground) {
+          try {
+            await webRtc
+                .disposeConnection()
+                .timeout(_iosTransportDisposeTimeout);
+          } finally {
+            await webRtc.disposeCamera().timeout(_iosTransportDisposeTimeout);
+          }
+          await WakelockPlus.disable();
+          await _setIosStationActive(false);
+          _resetRecordingProgressWatchdog();
+          _emitState();
         }
-        await WakelockPlus.disable();
-        await _setIosStationActive(false);
-        _resetRecordingProgressWatchdog();
-        _emitState();
+      } on TimeoutException catch (error, stackTrace) {
+        developer.log(
+          '[LIFECYCLE] Timed out while releasing iOS live transports',
+          error: error,
+          stackTrace: stackTrace,
+          name: 'CameraStationRuntime',
+        );
       } finally {
         await _endIosBackgroundFinalization();
       }
     }
+  }
+
+  Future<void> _stopRecordingAtIosBoundary(RecordingService recording) async {
+    final recorderSecured = Completer<void>();
+    final stopOperation = recording.stop(
+      onRecorderStopped: () async {
+        if (!recorderSecured.isCompleted) recorderSecured.complete();
+      },
+    );
+    // The source MP4/WAV is already safe when onRecorderStopped fires.
+    // Conversion to TS may continue after this method releases the lifecycle
+    // queue and must never consume the limited iOS background window.
+    unawaited(
+      stopOperation.then<void>(
+        (_) {
+          if (!recorderSecured.isCompleted) recorderSecured.complete();
+        },
+        onError: (Object error, StackTrace stackTrace) {
+          if (!recorderSecured.isCompleted) {
+            recorderSecured.completeError(error, stackTrace);
+          } else {
+            developer.log(
+              '[LIFECYCLE] Deferred iOS segment packaging failed',
+              error: error,
+              stackTrace: stackTrace,
+              name: 'CameraStationRuntime',
+            );
+          }
+        },
+      ),
+    );
+    await recorderSecured.future;
   }
 
   Future<void> resumeFromIosBackground() {
@@ -548,20 +643,46 @@ class CameraStationRuntime {
       return Future<void>.value();
     }
     _iosResumeQueued = true;
+    final lifecycleGeneration = ++_iosLifecycleGeneration;
     _emitState();
-    return _serializeLifecycle(_resumeFromIosBackgroundInternal).whenComplete(
-      () {
+    return _serializeLifecycle(
+      () => _resumeFromIosBackgroundInternal(lifecycleGeneration).timeout(
+        _iosForegroundResumeTimeout,
+        onTimeout: () {
+          throw TimeoutException(
+            'iOS camera resume exceeded '
+            '${_iosForegroundResumeTimeout.inSeconds} seconds.',
+          );
+        },
+      ),
+    ).catchError((Object error, StackTrace stackTrace) {
+      developer.log(
+        '[LIFECYCLE] Foreground resume operation failed or timed out',
+        error: error,
+        stackTrace: stackTrace,
+        name: 'CameraStationRuntime',
+      );
+      if (_iosAppInForeground &&
+          lifecycleGeneration == _iosLifecycleGeneration) {
+        _iosLifecycleSuspended = false;
+        _scheduleRecovery('ios_foreground_resume_timeout');
+      }
+    }).whenComplete(() {
+      if (lifecycleGeneration == _iosLifecycleGeneration) {
         _iosResumeQueued = false;
-        _emitState();
-      },
-    );
+      }
+      _emitState();
+    });
   }
 
-  Future<void> _resumeFromIosBackgroundInternal() async {
+  Future<void> _resumeFromIosBackgroundInternal(
+    int lifecycleGeneration,
+  ) async {
     if (!Platform.isIOS ||
         !_iosLifecycleSuspended ||
         !_cameraEnabled ||
-        !_iosAppInForeground) {
+        !_iosAppInForeground ||
+        lifecycleGeneration != _iosLifecycleGeneration) {
       return;
     }
     final webRtc = _webRtcService;
@@ -570,7 +691,8 @@ class CameraStationRuntime {
     if (_thermalCriticalSuspended) {
       await WakelockPlus.enable();
       await _setIosStationActive(true);
-      if (!_iosAppInForeground) {
+      if (!_iosAppInForeground ||
+          lifecycleGeneration != _iosLifecycleGeneration) {
         await WakelockPlus.disable();
         await _setIosStationActive(false);
         return;
@@ -583,25 +705,29 @@ class CameraStationRuntime {
       // Recreating the stream also rechecks microphone permission. A grant
       // made in iOS Settings therefore takes effect on the first new segment.
       await webRtc.initializeCamera();
-      if (!_iosAppInForeground) {
+      if (!_iosAppInForeground ||
+          lifecycleGeneration != _iosLifecycleGeneration) {
         await webRtc.disposeCamera();
         return;
       }
       await webRtc.ensureMicrophoneEnabled();
       await _waitForIosCaptureWarmup();
-      if (!_iosAppInForeground) {
+      if (!_iosAppInForeground ||
+          lifecycleGeneration != _iosLifecycleGeneration) {
         await webRtc.disposeCamera();
         return;
       }
       await server.ensureRecording();
-      if (!_iosAppInForeground) {
+      if (!_iosAppInForeground ||
+          lifecycleGeneration != _iosLifecycleGeneration) {
         await _recordingService?.stop();
         await webRtc.disposeCamera();
         return;
       }
       await WakelockPlus.enable();
       await _setIosStationActive(true);
-      if (!_iosAppInForeground) {
+      if (!_iosAppInForeground ||
+          lifecycleGeneration != _iosLifecycleGeneration) {
         await _recordingService?.stop();
         await webRtc.disposeCamera();
         await WakelockPlus.disable();
@@ -621,7 +747,8 @@ class CameraStationRuntime {
         stackTrace: stackTrace,
         name: 'CameraStationRuntime',
       );
-      if (_iosAppInForeground) {
+      if (_iosAppInForeground &&
+          lifecycleGeneration == _iosLifecycleGeneration) {
         _iosLifecycleSuspended = false;
         _scheduleRecovery('ios_foreground_resume_failed');
       }
@@ -688,8 +815,22 @@ class CameraStationRuntime {
   }
 
   Future<void> switchCamera() {
+    final current = _lensSwitchOperation;
+    if (current != null) return current;
+    final completedAt = _lastLensSwitchCompletedAt;
+    if (completedAt != null &&
+        DateTime.now().difference(completedAt) < _lensSwitchCooldown) {
+      return Future<void>.value();
+    }
     _interruptRecovery();
-    return _serializeLifecycle(_switchCameraInternal);
+    final operation = _serializeLifecycle(_switchCameraInternal);
+    _lensSwitchOperation = operation;
+    return operation.whenComplete(() {
+      if (identical(_lensSwitchOperation, operation)) {
+        _lensSwitchOperation = null;
+        _lastLensSwitchCompletedAt = DateTime.now();
+      }
+    });
   }
 
   Future<void> _switchCameraInternal() async {

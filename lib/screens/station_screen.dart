@@ -706,6 +706,12 @@ class _StationScreenState extends State<StationScreen>
 
   Future<void> _openResolutionPicker() async {
     if (!_cameraReady || _runtime.profileSwitching) return;
+    try {
+      await _runtime.refreshSupportedResolutionProfiles();
+    } catch (error) {
+      debugPrint('[CAMERA] Cannot refresh camera profiles: $error');
+    }
+    if (!mounted || !_cameraReady || _runtime.profileSwitching) return;
     final selected = await showModalBottomSheet<CameraResolutionProfile>(
       context: context,
       backgroundColor: const Color(0xFF11161D),
