@@ -25,10 +25,19 @@
   }
 
   // RTSP clients cannot renegotiate video dimensions in the middle of an
-  // active H.264 session. Keep the encoded canvas at the camera track's native
-  // dimensions even when WebRTC changes frame.rotation after an iPhone turns.
-  const int outputWidth = source.width;
-  const int outputHeight = source.height;
+  // active H.264 session. Keep one stable encoded canvas for the lifetime of
+  // the capture profile even when WebRTC changes frame.rotation.
+  // Recording may keep the original 4K track, but encoding a second 4K H.264
+  // stream for RTSP competes with MediaRecorder for VideoToolbox resources.
+  // That contention is especially visible when CheckVAR rotates the recorder:
+  // the live encoder can stop producing decodable frames. Cap only the RTSP
+  // copy at 1080p; the source track and recorded CheckVAR clip remain 4K.
+  const CGFloat outputScale = MIN(
+      1.0,
+      MIN(1920.0 / (CGFloat)source.width,
+          1080.0 / (CGFloat)source.height));
+  const int outputWidth = MAX(2, ((int)floor(source.width * outputScale)) & ~1);
+  const int outputHeight = MAX(2, ((int)floor(source.height * outputScale)) & ~1);
   int rotatedWidth = source.width;
   int rotatedHeight = source.height;
   if (frame.rotation == RTCVideoRotation_90 ||
