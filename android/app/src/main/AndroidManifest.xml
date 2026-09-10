@@ -13,7 +13,7 @@
     <uses-feature android:name="android.hardware.camera.any" android:required="false" />
 
     <application
-        android:label="camera_station"
+        android:label="SportO Cam"
         android:requestLegacyExternalStorage="true"
         android:usesCleartextTraffic="false"
         android:icon="@mipmap/ic_launcher">

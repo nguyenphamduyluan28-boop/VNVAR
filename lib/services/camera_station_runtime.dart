@@ -102,6 +102,7 @@ class CameraStationRuntime {
   bool _healthCheckRunning = false;
   bool _networkCheckRunning = false;
   bool _networkObservationInitialized = false;
+  int _missingNetworkObservations = 0;
   bool _networkRecovering = false;
   String? _lanAddress;
   String? _networkError;
@@ -440,6 +441,7 @@ class CameraStationRuntime {
     _networkTimer = null;
     _networkCheckRunning = false;
     _networkObservationInitialized = false;
+    _missingNetworkObservations = 0;
     _networkRecovering = false;
     _lanAddress = null;
     _networkError = null;
@@ -1136,6 +1138,20 @@ class CameraStationRuntime {
       final hadRecoveryError = _networkError != null;
       final firstObservation = !_networkObservationInitialized;
       _networkObservationInitialized = true;
+
+      // iOS can briefly return no Wi-Fi address while its window and network
+      // state settle during an orientation transition. Keep the last valid
+      // address for one missed poll. Otherwise the next successful poll looks
+      // like an IP change and unnecessarily recreates live transports,
+      // disconnecting every tablet peer even though Wi-Fi never changed.
+      if (address == null && previous != null) {
+        _missingNetworkObservations++;
+        _networkError = null;
+        if (_missingNetworkObservations < 2) return;
+      } else {
+        _missingNetworkObservations = 0;
+      }
+
       _lanAddress = address;
       _networkError = null;
       if (!firstObservation &&

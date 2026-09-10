@@ -717,7 +717,7 @@ class _StationScreenState extends State<StationScreen>
       backgroundColor: const Color(0xFF11161D),
       showDragHandle: true,
       isScrollControlled: true,
-      constraints: const BoxConstraints(maxWidth: 760),
+      constraints: const BoxConstraints(maxWidth: 560),
       builder: _buildResolutionPicker,
     );
     if (selected == null || !mounted) return;
@@ -745,10 +745,15 @@ class _StationScreenState extends State<StationScreen>
     final profiles = _runtime.supportedResolutionProfiles;
     final landscape = media.orientation == Orientation.landscape;
     final columns = landscape && media.size.width >= 560 ? 2 : 1;
-    final sheetHeight = (media.size.height * (landscape ? 0.88 : 0.68)).clamp(
-      260.0,
-      520.0,
+    final rows = (profiles.length / columns).ceil();
+    final contentHeight = 58.0 + (rows * 88.0) + ((rows - 1) * 10.0) + 16.0;
+    final maximumHeight = (media.size.height * (landscape ? 0.72 : 0.48)).clamp(
+      220.0,
+      400.0,
     );
+    final sheetHeight = contentHeight < maximumHeight
+        ? contentHeight
+        : maximumHeight;
 
     return SafeArea(
       child: SizedBox(
@@ -1080,6 +1085,9 @@ class _StationScreenState extends State<StationScreen>
   Widget _buildStation() {
     final webRtc = _runtime.webRtcService;
     final renderer = webRtc?.localRenderer;
+    // Match the phone's Camera app: mirror only the local front-camera
+    // preview for intuitive movement. Recording, RTSP and tablet video consume
+    // the original track and therefore remain in the real capture direction.
     final mirrorPreview = webRtc?.currentFacingMode == 'user';
 
     return Scaffold(
@@ -1095,6 +1103,7 @@ class _StationScreenState extends State<StationScreen>
           final short = constraints.maxHeight < 560;
           final compact = narrow || short;
           final landscape = constraints.maxWidth > constraints.maxHeight;
+          final controlDockLane = landscape ? (compact ? 58.0 : 70.0) : 0.0;
           // Scrim height scales with the viewport instead of being a
           // fixed 180px — on short screens a fixed height made the
           // top + bottom scrims overlap and blanket the whole preview
@@ -1169,6 +1178,20 @@ class _StationScreenState extends State<StationScreen>
                 ),
               ),
 
+              if (_runtime.thermalWarning)
+                Positioned(
+                  top: landscape ? (compact ? 58 : 72) : (compact ? 128 : 144),
+                  left: landscape ? null : (compact ? 8 : 14),
+                  right: (compact ? 8 : 14) + controlDockLane,
+                  child: SafeArea(
+                    bottom: false,
+                    child: _ThermalToast(
+                      compact: compact,
+                      landscape: landscape,
+                    ),
+                  ),
+                ),
+
               // ==============================================
               // RIGHT-SIDE CAMERA CONTROLS
               // ==============================================
@@ -1225,11 +1248,6 @@ class _StationScreenState extends State<StationScreen>
                       child: Column(
                         mainAxisSize: MainAxisSize.min,
                         children: [
-                          if (_runtime.thermalWarning)
-                            _ThermalToast(
-                              compact: compact,
-                              landscape: landscape,
-                            ),
                           if (_runtime.lanAddress == null ||
                               _runtime.networkRecovering ||
                               _runtime.networkError != null)
@@ -1354,17 +1372,18 @@ class _ThermalToast extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return Padding(
-      padding: EdgeInsets.only(bottom: compact ? 6 : 8),
+    return ConstrainedBox(
+      constraints: BoxConstraints(
+        maxWidth: landscape ? (compact ? 310 : 430) : double.infinity,
+      ),
       child: ClipRRect(
         borderRadius: BorderRadius.circular(18),
         child: BackdropFilter(
           filter: ui.ImageFilter.blur(sigmaX: 12, sigmaY: 12),
           child: Container(
-            width: double.infinity,
             padding: EdgeInsets.symmetric(
-              horizontal: compact ? 10 : 12,
-              vertical: compact ? 7 : 9,
+              horizontal: compact ? 8 : 10,
+              vertical: compact ? 5 : 7,
             ),
             decoration: BoxDecoration(
               color: const Color(0xFF2A1C08).withValues(alpha: 0.38),
@@ -1384,22 +1403,18 @@ class _ThermalToast extends StatelessWidget {
                 Icon(
                   Icons.warning_amber_rounded,
                   color: Colors.amber,
-                  size: compact ? 16 : 18,
+                  size: compact ? 14 : 16,
                 ),
                 const SizedBox(width: 8),
-                Expanded(
+                Flexible(
                   child: Text(
-                    appText(
-                      context,
-                      'Thiết bị đang nóng. Camera đã tự giảm xuống 720p/15 FPS.',
-                      'Device temperature is high. Camera reduced to 720p/15 FPS.',
-                    ),
-                    maxLines: landscape ? 1 : 2,
+                    'Thiết bị đang nóng. Đã giảm xuống 720p/15 FPS để bảo vệ camera, sẽ tự khôi phục khi nhiệt độ bình thường.',
+                    maxLines: 3,
                     overflow: TextOverflow.ellipsis,
                     style: TextStyle(
                       color: Colors.amber.shade100,
-                      fontSize: compact ? 10 : 11,
-                      height: 1.2,
+                      fontSize: compact ? 9 : 10,
+                      height: 1.15,
                       fontWeight: FontWeight.w700,
                     ),
                   ),

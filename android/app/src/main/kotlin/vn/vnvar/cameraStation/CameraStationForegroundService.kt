@@ -141,10 +141,10 @@ class CameraStationForegroundService : Service() {
 
         val channel = NotificationChannel(
             CHANNEL_ID,
-            "VNVAR Camera Station",
+            "SportO Cam",
             NotificationManager.IMPORTANCE_LOW,
         ).apply {
-            description = "Trạng thái quay của Camera Station"
+            description = "Trạng thái quay của SportO Cam"
             setShowBadge(false)
         }
 
@@ -165,7 +165,7 @@ class CameraStationForegroundService : Service() {
 
         return Notification.Builder(this, CHANNEL_ID)
             .setSmallIcon(android.R.drawable.presence_video_online)
-            .setContentTitle("VNVAR Camera Station")
+            .setContentTitle("SportO Cam")
             .setContentText("$cameraId đang hoạt động · $courtId")
             .setContentIntent(openAppPendingIntent)
             .setCategory(Notification.CATEGORY_SERVICE)
