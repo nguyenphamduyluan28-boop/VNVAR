@@ -95,7 +95,6 @@ class CameraStationRuntime {
   bool _cameraEnabled = true;
   bool _profileSwitching = false;
   Future<void>? _lensSwitchOperation;
-  DateTime? _lastLensSwitchCompletedAt;
   bool _iosLifecycleSuspended = false;
   bool _iosResumeQueued = false;
   bool _iosAppInForeground = true;
@@ -145,7 +144,6 @@ class CameraStationRuntime {
   static const Duration _iosBackgroundRecorderTimeout = Duration(seconds: 15);
   static const Duration _iosTransportDisposeTimeout = Duration(seconds: 6);
   static const Duration _iosForegroundResumeTimeout = Duration(seconds: 30);
-  static const Duration _lensSwitchCooldown = Duration(milliseconds: 750);
   static const MethodChannel _platformChannel = MethodChannel(
     'vnvar/camera_station_service',
   );
@@ -815,18 +813,12 @@ class CameraStationRuntime {
   Future<void> switchCamera() {
     final current = _lensSwitchOperation;
     if (current != null) return current;
-    final completedAt = _lastLensSwitchCompletedAt;
-    if (completedAt != null &&
-        DateTime.now().difference(completedAt) < _lensSwitchCooldown) {
-      return Future<void>.value();
-    }
     _interruptRecovery();
     final operation = _serializeLifecycle(_switchCameraInternal);
     _lensSwitchOperation = operation;
     return operation.whenComplete(() {
       if (identical(_lensSwitchOperation, operation)) {
         _lensSwitchOperation = null;
-        _lastLensSwitchCompletedAt = DateTime.now();
       }
     });
   }
@@ -899,8 +891,28 @@ class CameraStationRuntime {
           // keep consuming that same track without cutting a segment. Waiting
           // for a checkpoint here made the UI spin until FFmpeg had finished
           // remuxing, especially after several consecutive lens switches.
-          await webRtc.switchCamera();
-          if (!recording.recording) await server.ensureRecording();
+          try {
+            await webRtc.switchCamera();
+            if (!recording.recording) await server.ensureRecording();
+          } catch (error, stackTrace) {
+            // Some iOS devices report a successful native lens handoff before
+            // the new AVCaptureSession produces its first frame. Reopen the
+            // requested facing explicitly so one tap is sufficient instead
+            // of rolling back and forcing the operator to tap repeatedly.
+            developer.log(
+              '[CAMERA] In-place iOS lens switch failed; reopening target lens',
+              error: error,
+              stackTrace: stackTrace,
+              name: 'CameraStationRuntime',
+            );
+            await recording.stop();
+            await webRtc.disposeConnection();
+            await webRtc.disposeCamera();
+            webRtc.setResolutionProfile(selectedProfile);
+            await webRtc.initializeCamera(facingMode: targetFacing);
+            await _waitForIosCaptureWarmup(profile: selectedProfile);
+            await server.ensureRecording();
+          }
         } else {
           // Helper.switchCamera keeps the constraints of the previous lens.
           // Recreate capture when the target lens needs a lower profile (for

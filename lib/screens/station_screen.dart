@@ -1116,9 +1116,11 @@ class _StationScreenState extends State<StationScreen>
                   quarterTurns: _cameraQuarterTurns,
                   child: RTCVideoView(
                     renderer,
-                    key: ValueKey(
-                      'camera-preview-$landscape-$_cameraQuarterTurns',
-                    ),
+                    // Keep the native rendering surface alive while Flutter
+                    // relays out portrait/landscape. Re-keying this view on
+                    // every rotation destroys the surface and can leave iOS
+                    // showing the last frame until the camera is restarted.
+                    key: const ValueKey('camera-preview'),
                     // Match the phone's native camera preview: front camera is
                     // mirrored for intuitive movement, while recorded/RTSP
                     // frames remain unmirrored so text and court direction are
@@ -1174,11 +1176,18 @@ class _StationScreenState extends State<StationScreen>
 
               if (_runtime.thermalWarning)
                 Positioned(
-                  top: compact ? 58 : 72,
+                  // Portrait has a two-row camera header. Keep the thermal
+                  // notice below it, especially on iPhones with a tall top
+                  // safe area, so camera name/ID/court/quality stay visible.
+                  top: landscape ? (compact ? 58 : 72) : (compact ? 128 : 144),
+                  left: landscape ? null : (compact ? 8 : 14),
                   right: (compact ? 8 : 14) + controlDockLane,
                   child: SafeArea(
                     bottom: false,
-                    child: _ThermalToast(compact: compact),
+                    child: _ThermalToast(
+                      compact: compact,
+                      landscape: landscape,
+                    ),
                   ),
                 ),
 
@@ -1355,22 +1364,25 @@ class _StationScreenState extends State<StationScreen>
 }
 
 class _ThermalToast extends StatelessWidget {
-  const _ThermalToast({required this.compact});
+  const _ThermalToast({required this.compact, required this.landscape});
 
   final bool compact;
+  final bool landscape;
 
   @override
   Widget build(BuildContext context) {
     return ConstrainedBox(
-      constraints: BoxConstraints(maxWidth: compact ? 310 : 430),
+      constraints: BoxConstraints(
+        maxWidth: landscape ? (compact ? 310 : 430) : double.infinity,
+      ),
       child: ClipRRect(
         borderRadius: BorderRadius.circular(18),
         child: BackdropFilter(
           filter: ui.ImageFilter.blur(sigmaX: 12, sigmaY: 12),
           child: Container(
             padding: EdgeInsets.symmetric(
-              horizontal: compact ? 10 : 12,
-              vertical: compact ? 7 : 9,
+              horizontal: compact ? 8 : 10,
+              vertical: compact ? 5 : 7,
             ),
             decoration: BoxDecoration(
               color: const Color(0xFF2A1C08).withValues(alpha: 0.38),
@@ -1390,7 +1402,7 @@ class _ThermalToast extends StatelessWidget {
                 Icon(
                   Icons.warning_amber_rounded,
                   color: Colors.amber,
-                  size: compact ? 16 : 18,
+                  size: compact ? 14 : 16,
                 ),
                 const SizedBox(width: 8),
                 Flexible(
@@ -1400,7 +1412,8 @@ class _ThermalToast extends StatelessWidget {
                     overflow: TextOverflow.ellipsis,
                     style: TextStyle(
                       color: Colors.amber.shade100,
-                      fontSize: compact ? 10 : 11,
+                      fontSize: compact ? 9 : 10,
+                      height: 1.15,
                       fontWeight: FontWeight.w700,
                     ),
                   ),
@@ -1672,10 +1685,10 @@ class _StationHeader extends StatelessWidget {
     final logoSize = compact ? 34.0 : 42.0;
     final actionSize = compact ? 34.0 : 38.0;
 
-    // Phones with limited width use the same one-row header as landscape.
-    // Detailed identifiers remain available in Settings while the camera
-    // preview keeps most of the screen during normal operation.
-    if (landscape || compact) {
+    // Only landscape uses the condensed one-row header. A narrow portrait
+    // phone still needs the second row below, where the quality selector has
+    // enough room and cannot be pushed off-screen by the action buttons.
+    if (landscape) {
       return Row(
         children: [
           Expanded(
