@@ -1,4 +1,5 @@
 #import "VnvarWebRtcTrackBridge.h"
+#import <CoreImage/CoreImage.h>
 #import <flutter_webrtc/FlutterWebRTCPlugin.h>
 #import <flutter_webrtc/FlutterRTCAudioSink.h>
 #import <math.h>
@@ -23,15 +24,20 @@
     return nil;
   }
 
-  int width = source.width;
-  int height = source.height;
+  // RTSP clients cannot renegotiate video dimensions in the middle of an
+  // active H.264 session. Keep the encoded canvas at the camera track's native
+  // dimensions even when WebRTC changes frame.rotation after an iPhone turns.
+  const int outputWidth = source.width;
+  const int outputHeight = source.height;
+  int rotatedWidth = source.width;
+  int rotatedHeight = source.height;
   if (frame.rotation == RTCVideoRotation_90 ||
       frame.rotation == RTCVideoRotation_270) {
-    width = source.height;
-    height = source.width;
+    rotatedWidth = source.height;
+    rotatedHeight = source.width;
   }
-  RTCI420Buffer *rotated = [[RTCI420Buffer alloc] initWithWidth:width
-                                                        height:height];
+  RTCI420Buffer *rotated = [[RTCI420Buffer alloc] initWithWidth:rotatedWidth
+                                                        height:rotatedHeight];
   [RTCYUVHelper I420Rotate:source.dataY
                 srcStrideY:source.strideY
                       srcU:source.dataU
@@ -54,8 +60,8 @@
   CVPixelBufferRef pixelBuffer = nil;
   CVReturn status = CVPixelBufferCreate(
       kCFAllocatorDefault,
-      width,
-      height,
+      rotatedWidth,
+      rotatedHeight,
       kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
       (__bridge CFDictionaryRef)attributes,
       &pixelBuffer);
@@ -81,7 +87,58 @@
                      width:rotated.width
                     height:rotated.height];
   CVPixelBufferUnlockBaseAddress(pixelBuffer, 0);
-  return pixelBuffer;
+
+  if (rotatedWidth == outputWidth && rotatedHeight == outputHeight) {
+    return pixelBuffer;
+  }
+
+  // Portrait and landscape have opposite aspect ratios. Fit the fully rotated
+  // image inside the stable encoder canvas instead of cropping court content.
+  // The resulting letterbox is preferable to changing SPS dimensions, which
+  // freezes the tablet decoder until the phone returns to its initial angle.
+  CVPixelBufferRef stableBuffer = nil;
+  status = CVPixelBufferCreate(
+      kCFAllocatorDefault,
+      outputWidth,
+      outputHeight,
+      kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
+      (__bridge CFDictionaryRef)attributes,
+      &stableBuffer);
+  if (status != kCVReturnSuccess || stableBuffer == nil) {
+    CVPixelBufferRelease(pixelBuffer);
+    return nil;
+  }
+
+  CIImage *image = [CIImage imageWithCVPixelBuffer:pixelBuffer];
+  const CGFloat scale = MIN((CGFloat)outputWidth / rotatedWidth,
+                            (CGFloat)outputHeight / rotatedHeight);
+  CIImage *scaled = [image imageByApplyingTransform:
+      CGAffineTransformMakeScale(scale, scale)];
+  const CGFloat offsetX = ((CGFloat)outputWidth - scaled.extent.size.width) / 2.0;
+  const CGFloat offsetY = ((CGFloat)outputHeight - scaled.extent.size.height) / 2.0;
+  CIImage *positioned = [scaled imageByApplyingTransform:
+      CGAffineTransformMakeTranslation(offsetX - scaled.extent.origin.x,
+                                       offsetY - scaled.extent.origin.y)];
+  const CGRect outputBounds = CGRectMake(0, 0, outputWidth, outputHeight);
+  CIImage *background = [[[CIImage alloc]
+      initWithColor:[CIColor colorWithRed:0 green:0 blue:0 alpha:1]]
+      imageByCroppingToRect:outputBounds];
+  CIImage *composited = [positioned imageByCompositingOverImage:background];
+  static CIContext *context;
+  static CGColorSpaceRef colorSpace;
+  static dispatch_once_t onceToken;
+  dispatch_once(&onceToken, ^{
+    context = [CIContext contextWithOptions:@{
+      kCIContextUseSoftwareRenderer: @NO,
+    }];
+    colorSpace = CGColorSpaceCreateDeviceRGB();
+  });
+  [context render:composited
+   toCVPixelBuffer:stableBuffer
+            bounds:outputBounds
+        colorSpace:colorSpace];
+  CVPixelBufferRelease(pixelBuffer);
+  return stableBuffer;
 }
 
 @end

@@ -1103,7 +1103,6 @@ class _StationScreenState extends State<StationScreen>
           final short = constraints.maxHeight < 560;
           final compact = narrow || short;
           final landscape = constraints.maxWidth > constraints.maxHeight;
-          final controlDockLane = landscape ? (compact ? 58.0 : 70.0) : 0.0;
           // Scrim height scales with the viewport instead of being a
           // fixed 180px — on short screens a fixed height made the
           // top + bottom scrims overlap and blanket the whole preview
@@ -1166,6 +1165,7 @@ class _StationScreenState extends State<StationScreen>
                       identity: widget.identity,
                       courtLabel: _courtLabel(widget.identity.courtId),
                       recording: _recording,
+                      thermalWarning: _runtime.thermalWarning,
                       compact: compact,
                       landscape: landscape,
                       resolutionProfile: _runtime.resolutionProfile,
@@ -1178,11 +1178,11 @@ class _StationScreenState extends State<StationScreen>
                 ),
               ),
 
-              if (_runtime.thermalWarning)
+              if (_runtime.thermalWarning && !landscape)
                 Positioned(
-                  top: landscape ? (compact ? 58 : 72) : (compact ? 128 : 144),
-                  left: landscape ? null : (compact ? 8 : 14),
-                  right: (compact ? 8 : 14) + controlDockLane,
+                  top: compact ? 128 : 144,
+                  left: compact ? 8 : 14,
+                  right: compact ? 8 : 14,
                   child: SafeArea(
                     bottom: false,
                     child: _ThermalToast(
@@ -1408,8 +1408,8 @@ class _ThermalToast extends StatelessWidget {
                 const SizedBox(width: 8),
                 Flexible(
                   child: Text(
-                    'Thiết bị đang nóng. Đã giảm xuống 720p/15 FPS để bảo vệ camera, sẽ tự khôi phục khi nhiệt độ bình thường.',
-                    maxLines: 3,
+                    'Thiết bị đang nóng. Đã giảm xuống 720p/15 FPS để bảo vệ camera.',
+                    maxLines: 2,
                     overflow: TextOverflow.ellipsis,
                     style: TextStyle(
                       color: Colors.amber.shade100,
@@ -1660,6 +1660,7 @@ class _StationHeader extends StatelessWidget {
   final StationIdentity identity;
   final String courtLabel;
   final bool recording;
+  final bool thermalWarning;
   final bool compact;
   final bool landscape;
   final CameraResolutionProfile resolutionProfile;
@@ -1672,6 +1673,7 @@ class _StationHeader extends StatelessWidget {
     required this.identity,
     required this.courtLabel,
     required this.recording,
+    required this.thermalWarning,
     required this.compact,
     required this.landscape,
     required this.resolutionProfile,
@@ -1723,37 +1725,52 @@ class _StationHeader extends StatelessWidget {
             ),
           ),
           const SizedBox(width: 12),
-          _HeaderGlassCluster(
-            child: Row(
+          IntrinsicWidth(
+            child: Column(
               mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.stretch,
               children: [
-                _RecordingChip(recording: recording, compact: true),
-                const SizedBox(width: 5),
-                _ResolutionChip(
-                  profile: resolutionProfile,
-                  switching: resolutionSwitching,
-                  onTap: onResolution,
-                ),
-                const SizedBox(width: 5),
-                _HeaderIconButton(
-                  icon: Icons.video_settings_rounded,
-                  tooltip: appText(context, 'Kho video', 'Video storage'),
-                  size: 32,
-                  onTap: onVideoStorage,
-                ),
-                const SizedBox(width: 4),
-                AppLanguageButton(foregroundColor: Colors.white, size: 32),
-                const SizedBox(width: 4),
-                _HeaderIconButton(
-                  icon: Icons.settings_rounded,
-                  tooltip: appText(
-                    context,
-                    'Cấu hình Camera Station',
-                    'Camera Station settings',
+                _HeaderGlassCluster(
+                  child: Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      _RecordingChip(recording: recording, compact: true),
+                      const SizedBox(width: 5),
+                      _ResolutionChip(
+                        profile: resolutionProfile,
+                        switching: resolutionSwitching,
+                        onTap: onResolution,
+                      ),
+                      const SizedBox(width: 5),
+                      _HeaderIconButton(
+                        icon: Icons.video_settings_rounded,
+                        tooltip: appText(context, 'Kho video', 'Video storage'),
+                        size: 32,
+                        onTap: onVideoStorage,
+                      ),
+                      const SizedBox(width: 4),
+                      AppLanguageButton(
+                        foregroundColor: Colors.white,
+                        size: 32,
+                      ),
+                      const SizedBox(width: 4),
+                      _HeaderIconButton(
+                        icon: Icons.settings_rounded,
+                        tooltip: appText(
+                          context,
+                          'Cấu hình Camera Station',
+                          'Camera Station settings',
+                        ),
+                        size: 32,
+                        onTap: onSettings,
+                      ),
+                    ],
                   ),
-                  size: 32,
-                  onTap: onSettings,
                 ),
+                if (thermalWarning) ...[
+                  const SizedBox(height: 10),
+                  _ThermalToast(compact: compact, landscape: true),
+                ],
               ],
             ),
           ),
