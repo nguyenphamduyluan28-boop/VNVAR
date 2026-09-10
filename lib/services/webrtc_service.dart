@@ -109,8 +109,8 @@ class WebRtcService {
   int _cameraLifecycleGeneration = 0;
   String? _currentFacingMode;
   final Map<String, String> _preferredCameraDeviceIds = <String, String>{};
-  final Map<String, List<CameraResolutionProfile>>
-  _verifiedResolutionProfiles = <String, List<CameraResolutionProfile>>{};
+  final Map<String, List<CameraResolutionProfile>> _verifiedResolutionProfiles =
+      <String, List<CameraResolutionProfile>>{};
   final Map<String, String> _resolutionProfileDeviceIds = <String, String>{};
   bool? _isEmulator;
   double _cameraZoom = 1;
@@ -330,9 +330,7 @@ class WebRtcService {
           if (deviceId is String && deviceId.isNotEmpty) {
             detectedDeviceId ??= deviceId;
           }
-          final profile = CameraResolutionProfile.fromId(
-            item['id'] as String?,
-          );
+          final profile = CameraResolutionProfile.fromId(item['id'] as String?);
           final maxFps = item['maxFps'];
           if (profile != null && maxFps is num && maxFps.toInt() > 0) {
             final detectedFps = maxFps.toInt();
@@ -431,6 +429,24 @@ class WebRtcService {
     };
 
     developer.log('Station renderer initialized', name: 'WebRtcService');
+  }
+
+  /// Reattaches only the local preview after an iOS window-size/orientation
+  /// change. Camera capture, recording, RTSP and remote WebRTC peers keep the
+  /// same MediaStream; this only refreshes the native preview surface.
+  Future<void> rebindLocalPreviewAfterLayoutChange() async {
+    if (!Platform.isIOS || !_rendererInitialized || !_cameraInitialized) return;
+    final stream = _localStream;
+    if (stream == null || stream.getVideoTracks().isEmpty) return;
+    localRenderer.srcObject = null;
+    await Future<void>.delayed(const Duration(milliseconds: 32));
+    if (_cameraInitialized && identical(_localStream, stream)) {
+      localRenderer.srcObject = stream;
+      developer.log(
+        '[CAMERA] Reattached iOS preview after layout change',
+        name: 'WebRtcService',
+      );
+    }
   }
 
   // ============================================================

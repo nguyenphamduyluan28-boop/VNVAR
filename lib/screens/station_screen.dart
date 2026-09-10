@@ -66,6 +66,7 @@ class _StationScreenState extends State<StationScreen>
   String? _lastShownRtspError;
   String _viewerAddress = 'Đang kiểm tra mạng...';
   Timer? _zoomDebounce;
+  Timer? _previewLayoutDebounce;
   double? _zoomValue;
 
   bool get _recording => _runtime.recordingService?.recording ?? false;
@@ -248,6 +249,25 @@ class _StationScreenState extends State<StationScreen>
     if (shouldSuspendIosCapture(state)) {
       unawaited(_suspendIosCapture());
     }
+  }
+
+  @override
+  void didChangeMetrics() {
+    if (!Platform.isIOS || !mounted) return;
+    _previewLayoutDebounce?.cancel();
+    // iOS sends several metric changes while rotating. Wait for the final
+    // portrait/landscape constraints, then reattach only the preview surface.
+    _previewLayoutDebounce = Timer(const Duration(milliseconds: 220), () async {
+      if (!mounted) return;
+      setState(() {});
+      await WidgetsBinding.instance.endOfFrame;
+      if (!mounted) return;
+      try {
+        await _runtime.webRtcService?.rebindLocalPreviewAfterLayoutChange();
+      } catch (error) {
+        debugPrint('[CAMERA] Cannot refresh iOS preview layout: $error');
+      }
+    });
   }
 
   Future<void> _suspendIosCapture() async {
@@ -924,6 +944,7 @@ class _StationScreenState extends State<StationScreen>
     WidgetsBinding.instance.removeObserver(this);
     _runtimeSubscription?.cancel();
     _zoomDebounce?.cancel();
+    _previewLayoutDebounce?.cancel();
     if (_screenDimmed) {
       unawaited(StationDisplayService.setDimmed(false));
     }
@@ -1881,6 +1902,7 @@ class _HeaderGlassCluster extends StatelessWidget {
       child: BackdropFilter(
         filter: ui.ImageFilter.blur(sigmaX: 10, sigmaY: 10),
         child: Container(
+          constraints: const BoxConstraints(minHeight: 44),
           padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
           decoration: BoxDecoration(
             color: const Color(0xFF101216).withValues(alpha: 0.22),
