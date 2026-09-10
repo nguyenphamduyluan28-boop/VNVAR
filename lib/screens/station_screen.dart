@@ -1408,7 +1408,11 @@ class _ThermalToast extends StatelessWidget {
                 const SizedBox(width: 8),
                 Flexible(
                   child: Text(
-                    'Thiết bị đang nóng. Đã giảm xuống 720p/15 FPS để bảo vệ camera.',
+                    appText(
+                      context,
+                      'Thiết bị đang nóng. Đã giảm xuống 720p/15 FPS để bảo vệ camera.',
+                      'Device temperature is high. Reduced to 720p/15 FPS to protect the camera.',
+                    ),
                     maxLines: 2,
                     overflow: TextOverflow.ellipsis,
                     style: TextStyle(
