@@ -525,9 +525,7 @@ class CameraStationRuntime {
     );
   }
 
-  Future<void> _suspendForIosBackgroundInternal(
-    int lifecycleGeneration,
-  ) async {
+  Future<void> _suspendForIosBackgroundInternal(int lifecycleGeneration) async {
     if (!Platform.isIOS ||
         !_iosLifecycleSuspended ||
         lifecycleGeneration != _iosLifecycleGeneration) {
@@ -546,12 +544,12 @@ class CameraStationRuntime {
         // Finish an already accepted CheckVAR request before stopping the
         // recorder. Without this barrier, the lifecycle queue and HTTP queue
         // could finalize the same recorder concurrently.
-        await _cameraServer
-            ?.prepareForIosBackground()
-            .timeout(_iosBackgroundRequestDrainTimeout);
-        await _stopRecordingAtIosBoundary(recording).timeout(
-          _iosBackgroundRecorderTimeout,
+        await _cameraServer?.prepareForIosBackground().timeout(
+          _iosBackgroundRequestDrainTimeout,
         );
+        await _stopRecordingAtIosBoundary(
+          recording,
+        ).timeout(_iosBackgroundRecorderTimeout);
       } on TimeoutException catch (error, stackTrace) {
         developer.log(
           '[LIFECYCLE] iOS background finalization timed out; releasing the '
@@ -580,9 +578,9 @@ class CameraStationRuntime {
         if (lifecycleGeneration == _iosLifecycleGeneration &&
             !_iosAppInForeground) {
           try {
-            await webRtc
-                .disposeConnection()
-                .timeout(_iosTransportDisposeTimeout);
+            await webRtc.disposeConnection().timeout(
+              _iosTransportDisposeTimeout,
+            );
           } finally {
             await webRtc.disposeCamera().timeout(_iosTransportDisposeTimeout);
           }
@@ -646,38 +644,38 @@ class CameraStationRuntime {
     final lifecycleGeneration = ++_iosLifecycleGeneration;
     _emitState();
     return _serializeLifecycle(
-      () => _resumeFromIosBackgroundInternal(lifecycleGeneration).timeout(
-        _iosForegroundResumeTimeout,
-        onTimeout: () {
-          throw TimeoutException(
-            'iOS camera resume exceeded '
-            '${_iosForegroundResumeTimeout.inSeconds} seconds.',
+          () => _resumeFromIosBackgroundInternal(lifecycleGeneration).timeout(
+            _iosForegroundResumeTimeout,
+            onTimeout: () {
+              throw TimeoutException(
+                'iOS camera resume exceeded '
+                '${_iosForegroundResumeTimeout.inSeconds} seconds.',
+              );
+            },
+          ),
+        )
+        .catchError((Object error, StackTrace stackTrace) {
+          developer.log(
+            '[LIFECYCLE] Foreground resume operation failed or timed out',
+            error: error,
+            stackTrace: stackTrace,
+            name: 'CameraStationRuntime',
           );
-        },
-      ),
-    ).catchError((Object error, StackTrace stackTrace) {
-      developer.log(
-        '[LIFECYCLE] Foreground resume operation failed or timed out',
-        error: error,
-        stackTrace: stackTrace,
-        name: 'CameraStationRuntime',
-      );
-      if (_iosAppInForeground &&
-          lifecycleGeneration == _iosLifecycleGeneration) {
-        _iosLifecycleSuspended = false;
-        _scheduleRecovery('ios_foreground_resume_timeout');
-      }
-    }).whenComplete(() {
-      if (lifecycleGeneration == _iosLifecycleGeneration) {
-        _iosResumeQueued = false;
-      }
-      _emitState();
-    });
+          if (_iosAppInForeground &&
+              lifecycleGeneration == _iosLifecycleGeneration) {
+            _iosLifecycleSuspended = false;
+            _scheduleRecovery('ios_foreground_resume_timeout');
+          }
+        })
+        .whenComplete(() {
+          if (lifecycleGeneration == _iosLifecycleGeneration) {
+            _iosResumeQueued = false;
+          }
+          _emitState();
+        });
   }
 
-  Future<void> _resumeFromIosBackgroundInternal(
-    int lifecycleGeneration,
-  ) async {
+  Future<void> _resumeFromIosBackgroundInternal(int lifecycleGeneration) async {
     if (!Platform.isIOS ||
         !_iosLifecycleSuspended ||
         !_cameraEnabled ||
@@ -851,24 +849,40 @@ class CameraStationRuntime {
     final targetFacing = previousFacing == 'environment'
         ? 'user'
         : 'environment';
-    final targetProfiles = await webRtc.getSupportedResolutionProfiles(
+    var targetProfiles = await webRtc.getSupportedResolutionProfiles(
       facingMode: targetFacing,
       fallbackWhenUnavailable: false,
     );
-    if (targetProfiles.isEmpty) {
+    // On iOS AVCaptureDevice discovery can temporarily return an empty list
+    // while the current capture session owns the camera. That is not proof
+    // that the opposite lens does not exist. Let flutter_webrtc perform the
+    // real lens switch and refresh capabilities after the new lens is active.
+    // Android recreates the capture stream, so it still needs a verified
+    // target profile before stopping the current recorder.
+    if (targetProfiles.isEmpty && !Platform.isIOS) {
       throw StateError('Thiết bị không có camera $targetFacing khả dụng.');
     }
 
     final previousProfile = _resolutionProfile;
     final previousProfiles = _supportedResolutionProfiles;
-    var selectedProfile = targetProfiles.firstWhere(
-      (profile) => profile.preset == previousProfile.preset,
-      orElse: () => targetProfiles.last,
-    );
-    selectedProfile = await _applySavedIosAdaptiveFps(
-      selectedProfile,
-      facingMode: targetFacing,
-    );
+    // When iOS capability discovery is temporarily unavailable, use 720p as
+    // a universally conservative capture profile. If the active profile is
+    // already 720p the existing track can switch in place; otherwise the
+    // target lens is reopened explicitly instead of asking it to inherit an
+    // unsupported 2K/4K constraint from the previous lens.
+    var selectedProfile = targetProfiles.isEmpty && Platform.isIOS
+        ? CameraResolutionProfile.hd720
+        : previousProfile;
+    if (targetProfiles.isNotEmpty) {
+      selectedProfile = targetProfiles.firstWhere(
+        (profile) => profile.preset == previousProfile.preset,
+        orElse: () => targetProfiles.last,
+      );
+      selectedProfile = await _applySavedIosAdaptiveFps(
+        selectedProfile,
+        facingMode: targetFacing,
+      );
+    }
 
     _profileSwitching = true;
     _generation++;
@@ -899,7 +913,18 @@ class CameraStationRuntime {
           await _waitForIosCaptureWarmup(profile: selectedProfile);
           await server.ensureRecording();
         }
-        _supportedResolutionProfiles = targetProfiles;
+        if (targetProfiles.isEmpty) {
+          final refreshed = await webRtc.getSupportedResolutionProfiles(
+            facingMode: targetFacing,
+            fallbackWhenUnavailable: false,
+          );
+          targetProfiles = refreshed.isEmpty
+              ? <CameraResolutionProfile>[selectedProfile]
+              : refreshed;
+        }
+        _supportedResolutionProfiles = targetProfiles.isEmpty
+            ? previousProfiles
+            : targetProfiles;
         _resolutionProfile = selectedProfile;
         webRtc.setResolutionProfile(selectedProfile);
         if (selectedProfile != previousProfile) {

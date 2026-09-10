@@ -716,60 +716,9 @@ class _StationScreenState extends State<StationScreen>
       context: context,
       backgroundColor: const Color(0xFF11161D),
       showDragHandle: true,
-      builder: (sheetContext) {
-        return SafeArea(
-          child: Padding(
-            padding: const EdgeInsets.fromLTRB(16, 0, 16, 20),
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Text(
-                  appText(context, 'CHẤT LƯỢNG CAMERA', 'CAMERA QUALITY'),
-                  style: const TextStyle(
-                    color: Colors.white,
-                    fontSize: 17,
-                    fontWeight: FontWeight.w900,
-                  ),
-                ),
-                const SizedBox(height: 8),
-                ..._runtime.supportedResolutionProfiles.map((profile) {
-                  final active =
-                      profile.preset == _runtime.resolutionProfile.preset;
-                  final displayProfile = active
-                      ? _runtime.resolutionProfile
-                      : profile;
-                  return ListTile(
-                    contentPadding: const EdgeInsets.symmetric(horizontal: 4),
-                    leading: Icon(
-                      active
-                          ? Icons.check_circle_rounded
-                          : Icons.radio_button_unchecked_rounded,
-                      color: active ? Colors.greenAccent : Colors.white38,
-                    ),
-                    title: Text(
-                      displayProfile.title,
-                      style: const TextStyle(
-                        color: Colors.white,
-                        fontWeight: FontWeight.w800,
-                      ),
-                    ),
-                    subtitle: Text(
-                      '${displayProfile.width} × ${displayProfile.height}  •  '
-                      '${displayProfile.fps} FPS  •  '
-                      '${(displayProfile.bitrate / 1000000).toStringAsFixed(1)} Mbps',
-                      style: const TextStyle(color: Colors.white60),
-                    ),
-                    onTap: active
-                        ? null
-                        : () => Navigator.pop(sheetContext, profile),
-                  );
-                }),
-              ],
-            ),
-          ),
-        );
-      },
+      isScrollControlled: true,
+      constraints: const BoxConstraints(maxWidth: 760),
+      builder: _buildResolutionPicker,
     );
     if (selected == null || !mounted) return;
     try {
@@ -789,6 +738,121 @@ class _StationScreenState extends State<StationScreen>
         );
       }
     }
+  }
+
+  Widget _buildResolutionPicker(BuildContext sheetContext) {
+    final media = MediaQuery.of(sheetContext);
+    final profiles = _runtime.supportedResolutionProfiles;
+    final landscape = media.orientation == Orientation.landscape;
+    final columns = landscape && media.size.width >= 560 ? 2 : 1;
+    final sheetHeight = (media.size.height * (landscape ? 0.88 : 0.68)).clamp(
+      260.0,
+      520.0,
+    );
+
+    return SafeArea(
+      child: SizedBox(
+        height: sheetHeight,
+        child: Padding(
+          padding: const EdgeInsets.fromLTRB(16, 0, 16, 16),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(
+                appText(context, 'CHẤT LƯỢNG CAMERA', 'CAMERA QUALITY'),
+                style: const TextStyle(
+                  color: Colors.white,
+                  fontSize: 17,
+                  fontWeight: FontWeight.w900,
+                ),
+              ),
+              const SizedBox(height: 10),
+              Expanded(
+                child: GridView.builder(
+                  padding: EdgeInsets.zero,
+                  itemCount: profiles.length,
+                  gridDelegate: SliverGridDelegateWithFixedCrossAxisCount(
+                    crossAxisCount: columns,
+                    crossAxisSpacing: 10,
+                    mainAxisSpacing: 10,
+                    mainAxisExtent: 88,
+                  ),
+                  itemBuilder: (context, index) {
+                    final profile = profiles[index];
+                    final active =
+                        profile.preset == _runtime.resolutionProfile.preset;
+                    final displayProfile = active
+                        ? _runtime.resolutionProfile
+                        : profile;
+                    return Material(
+                      color: active
+                          ? const Color(0xFF183728)
+                          : const Color(0xFF1A2028),
+                      borderRadius: BorderRadius.circular(14),
+                      child: InkWell(
+                        borderRadius: BorderRadius.circular(14),
+                        onTap: active
+                            ? null
+                            : () => Navigator.pop(sheetContext, profile),
+                        child: Padding(
+                          padding: const EdgeInsets.symmetric(
+                            horizontal: 12,
+                            vertical: 10,
+                          ),
+                          child: Row(
+                            children: [
+                              Icon(
+                                active
+                                    ? Icons.check_circle_rounded
+                                    : Icons.radio_button_unchecked_rounded,
+                                color: active
+                                    ? Colors.greenAccent
+                                    : Colors.white38,
+                              ),
+                              const SizedBox(width: 10),
+                              Expanded(
+                                child: Column(
+                                  mainAxisAlignment: MainAxisAlignment.center,
+                                  crossAxisAlignment: CrossAxisAlignment.start,
+                                  children: [
+                                    Text(
+                                      displayProfile.title,
+                                      maxLines: 1,
+                                      overflow: TextOverflow.ellipsis,
+                                      style: const TextStyle(
+                                        color: Colors.white,
+                                        fontWeight: FontWeight.w800,
+                                      ),
+                                    ),
+                                    const SizedBox(height: 4),
+                                    Text(
+                                      '${displayProfile.width} × ${displayProfile.height}  •  '
+                                      '${displayProfile.fps} FPS\n'
+                                      '${(displayProfile.bitrate / 1000000).toStringAsFixed(1)} Mbps',
+                                      maxLines: 2,
+                                      overflow: TextOverflow.ellipsis,
+                                      style: const TextStyle(
+                                        color: Colors.white60,
+                                        fontSize: 12,
+                                        height: 1.2,
+                                      ),
+                                    ),
+                                  ],
+                                ),
+                              ),
+                            ],
+                          ),
+                        ),
+                      ),
+                    );
+                  },
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
   }
 
   void _handleResolutionPressed() {
@@ -1264,9 +1328,7 @@ class _StationScreenState extends State<StationScreen>
                             recording: _recording,
                             zoomSupported:
                                 _cameraReady &&
-                                (_runtime
-                                        .webRtcService
-                                        ?.cameraZoomSupported ??
+                                (_runtime.webRtcService?.cameraZoomSupported ??
                                     false),
                             zoomValue:
                                 _zoomValue ??
@@ -1313,9 +1375,7 @@ class _ThermalToast extends StatelessWidget {
             decoration: BoxDecoration(
               color: const Color(0xFF2A1C08).withValues(alpha: 0.38),
               borderRadius: BorderRadius.circular(18),
-              border: Border.all(
-                color: Colors.amber.withValues(alpha: 0.42),
-              ),
+              border: Border.all(color: Colors.amber.withValues(alpha: 0.42)),
               boxShadow: const [
                 BoxShadow(
                   color: Color(0x33000000),
@@ -1541,7 +1601,11 @@ class _CameraZoomSlider extends StatelessWidget {
       padding: const EdgeInsets.symmetric(horizontal: 4),
       child: Row(
         children: [
-          Icon(Icons.remove_rounded, color: Colors.white70, size: compact ? 18 : 20),
+          Icon(
+            Icons.remove_rounded,
+            color: Colors.white70,
+            size: compact ? 18 : 20,
+          ),
           Expanded(
             child: Slider(
               value: safeValue,
@@ -1551,7 +1615,11 @@ class _CameraZoomSlider extends StatelessWidget {
               onChanged: onChanged,
             ),
           ),
-          Icon(Icons.add_rounded, color: Colors.white70, size: compact ? 18 : 20),
+          Icon(
+            Icons.add_rounded,
+            color: Colors.white70,
+            size: compact ? 18 : 20,
+          ),
           const SizedBox(width: 6),
           SizedBox(
             width: 42,
