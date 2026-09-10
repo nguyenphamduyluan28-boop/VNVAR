@@ -108,10 +108,24 @@ final class VnvarRtspServer {
       guard let self = self else { return }
       let playing = self.sessions.values.filter(\.playing)
       guard !playing.isEmpty else { return }
+      var recoveryNals = nals
+      if isKeyFrame {
+        // A tablet returning from CheckVAR creates a fresh decoder. Supplying
+        // SPS/PPS only in DESCRIBE is not sufficient for every Android player;
+        // send them in-band with each IDR so the live view can recover without
+        // restarting the iPhone camera or the RTSP connection.
+        let nalTypes = Set(nals.compactMap { $0.first.map { $0 & 0x1F } })
+        if !nalTypes.contains(8), let pps = self.pps {
+          recoveryNals.insert(pps, at: 0)
+        }
+        if !nalTypes.contains(7), let sps = self.sps {
+          recoveryNals.insert(sps, at: 0)
+        }
+      }
       var shouldRequestKeyFrame = false
       for session in playing {
         if session.send(
-          nals: nals,
+          nals: recoveryNals,
           timestamp: timestamp,
           isKeyFrame: isKeyFrame
         ) {
