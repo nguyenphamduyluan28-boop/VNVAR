@@ -431,24 +431,6 @@ class WebRtcService {
     developer.log('Station renderer initialized', name: 'WebRtcService');
   }
 
-  /// Reattaches only the local preview after an iOS window-size/orientation
-  /// change. Camera capture, recording, RTSP and remote WebRTC peers keep the
-  /// same MediaStream; this only refreshes the native preview surface.
-  Future<void> rebindLocalPreviewAfterLayoutChange() async {
-    if (!Platform.isIOS || !_rendererInitialized || !_cameraInitialized) return;
-    final stream = _localStream;
-    if (stream == null || stream.getVideoTracks().isEmpty) return;
-    localRenderer.srcObject = null;
-    await Future<void>.delayed(const Duration(milliseconds: 32));
-    if (_cameraInitialized && identical(_localStream, stream)) {
-      localRenderer.srcObject = stream;
-      developer.log(
-        '[CAMERA] Reattached iOS preview after layout change',
-        name: 'WebRtcService',
-      );
-    }
-  }
-
   // ============================================================
   // INITIALIZE CAMERA
   // ============================================================
@@ -935,20 +917,28 @@ class WebRtcService {
     final targetFacing = previousFacing == 'environment'
         ? 'user'
         : 'environment';
-    final switched = await Helper.switchCamera(track);
-    if (!switched) {
+    final switchResult = await Helper.switchCamera(
+      track,
+    ).timeout(const Duration(seconds: 8));
+    // flutter_webrtc's iOS implementation returns `_usingFrontCamera`, not a
+    // success flag: true means the new lens is front-facing and false means
+    // it is back-facing. Therefore false is the expected result when switching
+    // from the selfie camera back to the rear camera. Android uses this value
+    // as an actual success flag.
+    if (!Platform.isIOS && !switchResult) {
       throw StateError('Thiết bị không có camera khác để chuyển.');
     }
-    // Native switchCamera may resolve before AVCaptureSession/Camera2 has
-    // delivered a frame from the new lens. Give the capture pipeline one
-    // short settling interval so the renderer callback cannot be satisfied
-    // by the final frame of the previous lens during rapid taps.
-    await Future<void>.delayed(const Duration(milliseconds: 120));
-    final stream = _localStream;
-    if (stream == null) throw StateError('Camera stream không còn tồn tại.');
-    final firstFrame = _bindRendererAndWaitForFirstFrame(stream, rebind: true);
+    // Keep the renderer attached to the MediaStream while the native capturer
+    // changes lens. Detaching/rebinding the same stream can leave iOS holding
+    // its last texture, and onFirstFrameRendered is not guaranteed to fire a
+    // second time for that stream. The native switch future is the handoff
+    // boundary; a short delay lets the new capture session settle before
+    // applying lens-specific controls.
+    await Future<void>.delayed(const Duration(milliseconds: 250));
+    if (_localStream == null || localVideoTrack != track) {
+      throw StateError('Camera stream không còn tồn tại.');
+    }
     await _configureNaturalCameraMetering(track);
-    await firstFrame;
     _currentFacingMode = targetFacing;
     await refreshCameraZoom();
     developer.log(
@@ -957,22 +947,9 @@ class WebRtcService {
     );
   }
 
-  Future<void> _bindRendererAndWaitForFirstFrame(
-    MediaStream stream, {
-    bool rebind = false,
-  }) async {
+  Future<void> _bindRendererAndWaitForFirstFrame(MediaStream stream) async {
     _receivedFirstFrame = false;
     _firstFrameFailureTimer?.cancel();
-    if (rebind) {
-      localRenderer.srcObject = null;
-      // Let the native renderer detach the old camera texture before binding
-      // the same VideoTrack again, otherwise its one-shot first-frame event can
-      // belong to the lens that has just stopped.
-      await Future<void>.delayed(const Duration(milliseconds: 16));
-      if (_localStream != stream) {
-        throw StateError('Camera stream changed while waiting for rebind.');
-      }
-    }
     final completer = Completer<void>();
     _firstFrameCompleter = completer;
     localRenderer.srcObject = stream;

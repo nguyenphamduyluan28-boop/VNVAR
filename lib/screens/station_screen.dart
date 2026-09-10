@@ -66,7 +66,6 @@ class _StationScreenState extends State<StationScreen>
   String? _lastShownRtspError;
   String _viewerAddress = 'Đang kiểm tra mạng...';
   Timer? _zoomDebounce;
-  Timer? _previewLayoutDebounce;
   double? _zoomValue;
 
   bool get _recording => _runtime.recordingService?.recording ?? false;
@@ -249,25 +248,6 @@ class _StationScreenState extends State<StationScreen>
     if (shouldSuspendIosCapture(state)) {
       unawaited(_suspendIosCapture());
     }
-  }
-
-  @override
-  void didChangeMetrics() {
-    if (!Platform.isIOS || !mounted) return;
-    _previewLayoutDebounce?.cancel();
-    // iOS sends several metric changes while rotating. Wait for the final
-    // portrait/landscape constraints, then reattach only the preview surface.
-    _previewLayoutDebounce = Timer(const Duration(milliseconds: 220), () async {
-      if (!mounted) return;
-      setState(() {});
-      await WidgetsBinding.instance.endOfFrame;
-      if (!mounted) return;
-      try {
-        await _runtime.webRtcService?.rebindLocalPreviewAfterLayoutChange();
-      } catch (error) {
-        debugPrint('[CAMERA] Cannot refresh iOS preview layout: $error');
-      }
-    });
   }
 
   Future<void> _suspendIosCapture() async {
@@ -944,7 +924,6 @@ class _StationScreenState extends State<StationScreen>
     WidgetsBinding.instance.removeObserver(this);
     _runtimeSubscription?.cancel();
     _zoomDebounce?.cancel();
-    _previewLayoutDebounce?.cancel();
     if (_screenDimmed) {
       unawaited(StationDisplayService.setDimmed(false));
     }
@@ -1116,11 +1095,6 @@ class _StationScreenState extends State<StationScreen>
           final short = constraints.maxHeight < 560;
           final compact = narrow || short;
           final landscape = constraints.maxWidth > constraints.maxHeight;
-          // In landscape the vertical control dock occupies its own lane.
-          // Header/status content must not render underneath it, otherwise
-          // controls become obscured on short phones after rotation.
-          final controlDockLane = landscape ? (compact ? 58.0 : 70.0) : 0.0;
-
           // Scrim height scales with the viewport instead of being a
           // fixed 180px — on short screens a fixed height made the
           // top + bottom scrims overlap and blanket the whole preview
@@ -1195,23 +1169,6 @@ class _StationScreenState extends State<StationScreen>
                 ),
               ),
 
-              if (_runtime.thermalWarning)
-                Positioned(
-                  // Portrait has a two-row camera header. Keep the thermal
-                  // notice below it, especially on iPhones with a tall top
-                  // safe area, so camera name/ID/court/quality stay visible.
-                  top: landscape ? (compact ? 58 : 72) : (compact ? 128 : 144),
-                  left: landscape ? null : (compact ? 8 : 14),
-                  right: (compact ? 8 : 14) + controlDockLane,
-                  child: SafeArea(
-                    bottom: false,
-                    child: _ThermalToast(
-                      compact: compact,
-                      landscape: landscape,
-                    ),
-                  ),
-                ),
-
               // ==============================================
               // RIGHT-SIDE CAMERA CONTROLS
               // ==============================================
@@ -1268,6 +1225,11 @@ class _StationScreenState extends State<StationScreen>
                       child: Column(
                         mainAxisSize: MainAxisSize.min,
                         children: [
+                          if (_runtime.thermalWarning)
+                            _ThermalToast(
+                              compact: compact,
+                              landscape: landscape,
+                            ),
                           if (_runtime.lanAddress == null ||
                               _runtime.networkRecovering ||
                               _runtime.networkError != null)
@@ -1392,18 +1354,17 @@ class _ThermalToast extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return ConstrainedBox(
-      constraints: BoxConstraints(
-        maxWidth: landscape ? (compact ? 310 : 430) : double.infinity,
-      ),
+    return Padding(
+      padding: EdgeInsets.only(bottom: compact ? 6 : 8),
       child: ClipRRect(
         borderRadius: BorderRadius.circular(18),
         child: BackdropFilter(
           filter: ui.ImageFilter.blur(sigmaX: 12, sigmaY: 12),
           child: Container(
+            width: double.infinity,
             padding: EdgeInsets.symmetric(
-              horizontal: compact ? 8 : 10,
-              vertical: compact ? 5 : 7,
+              horizontal: compact ? 10 : 12,
+              vertical: compact ? 7 : 9,
             ),
             decoration: BoxDecoration(
               color: const Color(0xFF2A1C08).withValues(alpha: 0.38),
@@ -1423,18 +1384,22 @@ class _ThermalToast extends StatelessWidget {
                 Icon(
                   Icons.warning_amber_rounded,
                   color: Colors.amber,
-                  size: compact ? 14 : 16,
+                  size: compact ? 16 : 18,
                 ),
                 const SizedBox(width: 8),
-                Flexible(
+                Expanded(
                   child: Text(
-                    'Thiết bị đang nóng. Đã giảm xuống 720p/15 FPS để bảo vệ camera.',
-                    maxLines: 2,
+                    appText(
+                      context,
+                      'Thiết bị đang nóng. Camera đã tự giảm xuống 720p/15 FPS.',
+                      'Device temperature is high. Camera reduced to 720p/15 FPS.',
+                    ),
+                    maxLines: landscape ? 1 : 2,
                     overflow: TextOverflow.ellipsis,
                     style: TextStyle(
                       color: Colors.amber.shade100,
-                      fontSize: compact ? 9 : 10,
-                      height: 1.15,
+                      fontSize: compact ? 10 : 11,
+                      height: 1.2,
                       fontWeight: FontWeight.w700,
                     ),
                   ),
