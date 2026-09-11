@@ -690,6 +690,7 @@ class RecordingService {
         type: 'CLIP',
       );
       _exportSegments[clip.fileName] = clip;
+      unawaited(_videoStorage.scanMediaFile(target.path));
       return clip;
     } catch (_) {
       if (output != null && await output.exists()) await output.delete();
@@ -2052,6 +2053,7 @@ class RecordingService {
 
     _segments.add(segment);
     _notifyVideoChanges();
+    unawaited(_videoStorage.scanMediaFile(file.path));
     await enforceStorageLimit();
 
     try {

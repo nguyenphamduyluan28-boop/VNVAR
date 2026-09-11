@@ -35,6 +35,8 @@ migrate_working_dir/
 .gradle-work/
 
 # Symbolication related
+
+# Symbolication related
 app.*.symbols
 
 # Obfuscation related
@@ -44,3 +46,8 @@ app.*.map.json
 /android/app/debug
 /android/app/profile
 /android/app/release
+
+# Release signing keys
+**/android/key.properties
+*.jks
+*.keystore

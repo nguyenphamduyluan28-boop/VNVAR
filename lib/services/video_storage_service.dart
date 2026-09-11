@@ -122,7 +122,7 @@ class VideoStorageService {
     final uniqueSuffix =
         '${DateTime.now().microsecondsSinceEpoch}_${identityHashCode(this)}';
     final probe = File(
-      '${directory.path}${Platform.pathSeparator}.vnvar_write_$uniqueSuffix',
+      '${directory.path}${Platform.pathSeparator}vnvar_write_$uniqueSuffix.tmp',
     );
     try {
       await probe.writeAsString('VNVAR', flush: true);
@@ -148,6 +148,13 @@ class VideoStorageService {
       );
       return null;
     }
+  }
+
+  Future<void> scanMediaFile(String path) async {
+    if (!Platform.isAndroid) return;
+    try {
+      await _androidChannel.invokeMethod('scanMediaFile', {'path': path});
+    } catch (_) {}
   }
 
   Future<int?> availableBytes() async {
