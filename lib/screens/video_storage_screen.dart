@@ -609,13 +609,16 @@ class _SectionLabel extends StatelessWidget {
       children: [
         Icon(icon, size: 15, color: Colors.black45),
         const SizedBox(width: 6),
-        Text(
-          text,
-          style: const TextStyle(
-            fontWeight: FontWeight.w900,
-            fontSize: 12,
-            letterSpacing: 0.4,
-            color: Colors.black54,
+        Expanded(
+          child: Text(
+            text,
+            softWrap: true,
+            style: const TextStyle(
+              fontWeight: FontWeight.w900,
+              fontSize: 12,
+              letterSpacing: 0.4,
+              color: Colors.black54,
+            ),
           ),
         ),
       ],
