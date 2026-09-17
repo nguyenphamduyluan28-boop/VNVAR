@@ -1,4 +1,7 @@
+import 'dart:io';
+
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 
 import 'models/station_identity.dart';
 import 'screens/court_count_screen.dart';
@@ -10,6 +13,17 @@ import 'services/camera_station_foreground_service.dart';
 import 'services/camera_station_runtime.dart';
 import 'services/station_config_service.dart';
 
+void lockPortraitForSetup() {
+  SystemChrome.setPreferredOrientations(const [
+    DeviceOrientation.portraitUp,
+    DeviceOrientation.portraitDown,
+  ]);
+  if (Platform.isAndroid) {
+    const MethodChannel('vn.vnvar.cameraStation/channel')
+        .invokeMethod('setScreenOrientation', {'mode': 'portrait'});
+  }
+}
+
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
 
@@ -20,6 +34,11 @@ Future<void> main() async {
   } catch (error, stackTrace) {
     debugPrint('[BOOT] Không thể đọc cấu hình đã lưu: $error');
     debugPrintStack(stackTrace: stackTrace);
+  }
+
+  // Khởi tạo hướng màn hình dọc (portrait) cho các bước khởi tạo & thiết lập
+  if (savedIdentity == null) {
+    lockPortraitForSetup();
   }
 
   runApp(VnvarCameraStationApp(savedIdentity: savedIdentity));
@@ -57,11 +76,13 @@ class _VnvarCameraStationAppState extends State<VnvarCameraStationApp> {
 
   void _showCourtSetup() {
     if (!mounted) return;
+    lockPortraitForSetup();
     setState(() => _step = _StartupStep.courtSetup);
   }
 
   void _showCameraSetup(int _) {
     if (!mounted) return;
+    lockPortraitForSetup();
     setState(() {
       _step = _StartupStep.cameraSetup;
     });
@@ -87,9 +108,11 @@ class _VnvarCameraStationAppState extends State<VnvarCameraStationApp> {
         await CameraStationRuntime.instance.stop();
         await CameraStationForegroundService.stop();
         if (!mounted) return;
+        lockPortraitForSetup();
         setState(() => _step = _StartupStep.cameraSetup);
         return;
       case _StartupStep.cameraSetup:
+        lockPortraitForSetup();
         setState(() => _step = _StartupStep.courtSetup);
         return;
       case _StartupStep.splash:

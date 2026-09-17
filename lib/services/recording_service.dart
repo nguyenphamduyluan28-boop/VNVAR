@@ -9,6 +9,7 @@ import 'package:flutter_webrtc/flutter_webrtc.dart';
 import 'package:ffmpeg_kit_flutter_new_video/ffmpeg_kit.dart';
 import 'package:ffmpeg_kit_flutter_new_video/ffprobe_kit.dart';
 import 'package:ffmpeg_kit_flutter_new_video/return_code.dart';
+import 'package:ffmpeg_kit_flutter_new_video/session.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
@@ -23,6 +24,23 @@ bool isDecodableVideoProbe({
   required bool hasVideo,
   required double? durationSeconds,
 }) => hasVideo && durationSeconds != null && durationSeconds > 0.05;
+
+/// Tính toán góc xoay hiệu dụng cần áp dụng cho video.
+/// Khi quay camera selfie trước (cả trên iOS lẫn Android khi ghi raw buffer từ WebRTC),
+/// cảm biến quang học có hướng quét ngược 180° so với camera sau, làm video bị lật ngược chân.
+/// Do đó cần bù 180° kết hợp góc xoay từ UI (quarterTurns).
+int calculateEffectiveVideoRotation({
+  required bool isIos,
+  required String facingMode,
+  required int quarterTurns,
+}) {
+  var degrees = 0;
+  if (facingMode.trim().toLowerCase() == 'user') {
+    degrees += 180;
+  }
+  degrees += (quarterTurns % 4) * 90;
+  return (degrees % 360 + 360) % 360;
+}
 
 /// Returns the real recorder boundary used by file names and API metadata.
 ///
@@ -359,6 +377,23 @@ class RecordingService {
 
   MediaStreamTrack? _videoTrack;
   bool _recordAudio = false;
+
+  String _facingMode = 'environment';
+  int _quarterTurns = 0;
+  String _currentSegmentFacingMode = 'environment';
+  int _currentSegmentQuarterTurns = 0;
+
+  String get facingMode => _facingMode;
+  int get quarterTurns => _quarterTurns;
+
+  void setFacingMode(String facing) {
+    _facingMode = facing.trim().toLowerCase();
+    _currentSegmentFacingMode = _facingMode;
+  }
+
+  void setQuarterTurns(int turns) {
+    _quarterTurns = (turns % 4 + 4) % 4;
+  }
 
   Timer? _segmentTimer;
 
@@ -917,69 +952,88 @@ class RecordingService {
   }
 
   Future<void> _removeExpiredDataInternal({DateTime? referenceTime}) async {
-    final root = await _videoRootDirectory();
+    final Directory root;
+    try {
+      root = await _videoRootDirectory();
+    } catch (e) {
+      developer.log(
+        '[RECORDING] Cannot get video root directory: $e',
+        name: 'RecordingService',
+      );
+      return;
+    }
     final now = referenceTime ?? DateTime.now();
     final today = DateTime(now.year, now.month, now.day);
     final cutoff = today.subtract(Duration(days: storageDays - 1));
 
-    await for (final entity in root.list()) {
-      if (entity is! Directory) continue;
+    try {
+      await for (final entity in root.list()) {
+        if (entity is! Directory) continue;
 
-      final directoryName = entity.uri.pathSegments
-          .where((part) => part.isNotEmpty)
-          .last;
-      final match = RegExp(
-        r'^(\d{2})-(\d{2})-(\d{4})$',
-      ).firstMatch(directoryName);
-      if (match == null) continue;
+        final directoryName = entity.uri.pathSegments
+            .where((part) => part.isNotEmpty)
+            .last;
+        final match = RegExp(
+          r'^(\d{2})-(\d{2})-(\d{4})$',
+        ).firstMatch(directoryName);
+        if (match == null) continue;
 
-      final day = int.parse(match.group(1)!);
-      final month = int.parse(match.group(2)!);
-      final year = int.parse(match.group(3)!);
-      final directoryDate = DateTime(year, month, day);
-      final isValidDate =
-          directoryDate.day == day &&
-          directoryDate.month == month &&
-          directoryDate.year == year;
-      if (!isValidDate || !directoryDate.isBefore(cutoff)) continue;
+        final day = int.parse(match.group(1)!);
+        final month = int.parse(match.group(2)!);
+        final year = int.parse(match.group(3)!);
+        final directoryDate = DateTime(year, month, day);
+        final isValidDate =
+            directoryDate.day == day &&
+            directoryDate.month == month &&
+            directoryDate.year == year;
+        if (!isValidDate || !directoryDate.isBefore(cutoff)) continue;
 
-      // Segment bắt đầu trước 0 giờ có thể vừa được hoàn tất sau 0 giờ. Không
-      // xóa cả thư mục ngày cũ khi bên trong vẫn có file mới được ghi gần đây.
-      var containsRecentFile = false;
-      await for (final child in entity.list(recursive: true)) {
-        if (child is! File || !_isVideoFile(child)) continue;
+        // Segment bắt đầu trước 0 giờ có thể vừa được hoàn tất sau 0 giờ. Không
+        // xóa cả thư mục ngày cũ khi bên trong vẫn có file mới được ghi gần đây.
+        var containsRecentFile = false;
         try {
-          final modified = (await child.stat()).modified;
-          if (now.difference(modified) < recentSegmentProtection) {
-            containsRecentFile = true;
-            break;
+          await for (final child in entity.list(recursive: true)) {
+            if (child is! File || !_isVideoFile(child)) continue;
+            try {
+              final stat = await child.stat();
+              if (now.difference(stat.modified) < recentSegmentProtection) {
+                containsRecentFile = true;
+                break;
+              }
+            } catch (_) {}
           }
         } catch (_) {}
-      }
-      if (containsRecentFile) continue;
-      if (_hasActiveReaderUnder(entity.path)) continue;
+        if (containsRecentFile) continue;
 
-      try {
-        final normalizedDirectory = entity.path.replaceAll('\\', '/');
-        await entity.delete(recursive: true);
-        _segments.removeWhere((segment) {
-          final normalizedPath = segment.path.replaceAll('\\', '/');
-          return normalizedPath == normalizedDirectory ||
-              normalizedPath.startsWith('$normalizedDirectory/');
-        });
-        _notifyVideoChanges();
-        developer.log(
-          '[STORAGE] Removed expired day directory: ${entity.path}',
-          name: 'RecordingService',
-        );
-      } catch (error, stackTrace) {
-        developer.log(
-          '[STORAGE] Unable to remove expired directory: ${entity.path}',
-          error: error,
-          stackTrace: stackTrace,
-          name: 'RecordingService',
-        );
+        try {
+          final normalizedDirectory = entity.path.replaceAll('\\', '/');
+          await entity.delete(recursive: true);
+          _segments.removeWhere((segment) {
+            final normalizedPath = segment.path.replaceAll('\\', '/');
+            return normalizedPath == normalizedDirectory ||
+                normalizedPath.startsWith('$normalizedDirectory/');
+          });
+          _notifyVideoChanges();
+          developer.log(
+            '[STORAGE] Removed expired day directory: ${entity.path}',
+            name: 'RecordingService',
+          );
+        } catch (error, stackTrace) {
+          developer.log(
+            '[STORAGE] Unable to remove expired directory: ${entity.path}',
+            error: error,
+            stackTrace: stackTrace,
+            name: 'RecordingService',
+          );
+        }
       }
+    } catch (error, stackTrace) {
+      developer.log(
+        '[STORAGE] Error listing root directory for expired cleanup: $error',
+        error: error,
+        stackTrace: stackTrace,
+        name: 'RecordingService',
+      );
     }
   }
 
@@ -1026,8 +1080,22 @@ class RecordingService {
     File source,
     DateTime startedAt,
     DateTime endedAt,
-    File? nativeAudio,
-  ) async {
+    File? nativeAudio, {
+    String? facingMode,
+    int? quarterTurns,
+  }) async {
+    final effectiveRotation = calculateEffectiveVideoRotation(
+      isIos: Platform.isIOS,
+      facingMode: facingMode ?? _facingMode,
+      quarterTurns: quarterTurns ?? _quarterTurns,
+    );
+    final filterArgs = switch (effectiveRotation) {
+      180 => const ['-vf', 'hflip,vflip'],
+      90 => const ['-vf', 'transpose=1'],
+      270 => const ['-vf', 'transpose=2'],
+      _ => const <String>[],
+    };
+
     // Dùng ngày kết thúc để segment đi qua 0 giờ không bị lưu vào thư mục ngày
     // cũ rồi bị RemoveExpiredData xóa ngay.
     final directory = await _videoDirectory(date: endedAt);
@@ -1041,38 +1109,46 @@ class RecordingService {
         await nativeAudio.length() > 44;
     final audioInput = hasNativeAudio ? ['-i', nativeAudio.path] : <String>[];
     final audioMap = hasNativeAudio ? '1:a:0?' : '0:a:0?';
-    var session = await FFmpegKit.executeWithArguments([
-      '-y',
-      '-fflags',
-      '+genpts+discardcorrupt',
-      '-i',
-      source.path,
-      ...audioInput,
-      '-map',
-      '0:v:0',
-      '-map',
-      audioMap,
-      '-c:v',
-      'copy',
-      '-c:a',
-      'aac',
-      '-b:a',
-      '128k',
-      '-avoid_negative_ts',
-      'make_zero',
-      '-muxdelay',
-      '0',
-      '-muxpreload',
-      '0',
-      '-mpegts_flags',
-      '+resend_headers',
-      '-f',
-      'mpegts',
-      target.path,
-    ]);
-    var code = await session.getReturnCode();
-    if (!ReturnCode.isSuccess(code)) {
-      final hardwareEncoder = _hardwareH264Encoder;
+
+    ReturnCode? code;
+    Session? session;
+    final hardwareEncoder = _hardwareH264Encoder;
+
+    // Stream copy chỉ dùng được khi video không cần xoay hoặc biến đổi khung hình.
+    if (filterArgs.isEmpty) {
+      session = await FFmpegKit.executeWithArguments([
+        '-y',
+        '-fflags',
+        '+genpts+discardcorrupt',
+        '-i',
+        source.path,
+        ...audioInput,
+        '-map',
+        '0:v:0',
+        '-map',
+        audioMap,
+        '-c:v',
+        'copy',
+        '-c:a',
+        'aac',
+        '-b:a',
+        '128k',
+        '-avoid_negative_ts',
+        'make_zero',
+        '-muxdelay',
+        '0',
+        '-muxpreload',
+        '0',
+        '-mpegts_flags',
+        '+resend_headers',
+        '-f',
+        'mpegts',
+        target.path,
+      ]);
+      code = await session.getReturnCode();
+    }
+
+    if (code == null || !ReturnCode.isSuccess(code)) {
       if (hardwareEncoder != null) {
         if (await target.exists()) await target.delete();
         session = await FFmpegKit.executeWithArguments([
@@ -1086,6 +1162,7 @@ class RecordingService {
           '0:v:0',
           '-map',
           audioMap,
+          ...filterArgs,
           '-threads',
           '1',
           '-c:v',
@@ -1111,7 +1188,7 @@ class RecordingService {
         code = await session.getReturnCode();
       }
     }
-    if (!ReturnCode.isSuccess(code)) {
+    if (code == null || !ReturnCode.isSuccess(code)) {
       if (await target.exists()) await target.delete();
       session = await FFmpegKit.executeWithArguments([
         '-y',
@@ -1124,6 +1201,7 @@ class RecordingService {
         '0:v:0',
         '-map',
         audioMap,
+        ...filterArgs,
         '-threads',
         '1',
         '-c:v',
@@ -1148,10 +1226,11 @@ class RecordingService {
       ]);
       code = await session.getReturnCode();
     }
-    if (!ReturnCode.isSuccess(code) ||
+    if (code == null ||
+        !ReturnCode.isSuccess(code) ||
         !await target.exists() ||
         await target.length() <= 0) {
-      final output = await session.getOutput();
+      final output = await session?.getOutput();
       if (await target.exists()) await target.delete();
       // Không được bỏ mất đoạn recorder đã ghi chỉ vì bước đóng gói TS lỗi.
       // Giữ nguyên MP4 trong thư mục video để segment vẫn xuất hiện và tải
@@ -1172,8 +1251,16 @@ class RecordingService {
           '0:v:0',
           '-map',
           '1:a:0',
-          '-c:v',
-          'copy',
+          if (filterArgs.isNotEmpty) ...[
+            ...filterArgs,
+            '-c:v',
+            'mpeg4',
+            '-q:v',
+            '4',
+          ] else ...[
+            '-c:v',
+            'copy',
+          ],
           '-c:a',
           'aac',
           '-b:a',
@@ -1353,9 +1440,14 @@ class RecordingService {
   Future<void> start({
     required MediaStreamTrack videoTrack,
     bool audioAvailable = true,
+    String? facingMode,
+    int? quarterTurns,
   }) async {
     final stopping = _stopOperation;
     if (stopping != null) await stopping;
+
+    if (facingMode != null) setFacingMode(facingMode);
+    if (quarterTurns != null) setQuarterTurns(quarterTurns);
 
     if (_recording) {
       developer.log('Recording already running', name: 'RecordingService');
@@ -1490,6 +1582,9 @@ class RecordingService {
 
     _recorder = recorder;
 
+    _currentSegmentFacingMode = _facingMode;
+    _currentSegmentQuarterTurns = _quarterTurns;
+
     _currentPath = path;
     _currentJournal = File('$path.json');
     try {
@@ -1498,6 +1593,8 @@ class RecordingService {
           'cameraId': cameraId,
           'startedAtMs': recorderStartedAt.millisecondsSinceEpoch,
           'videoPath': path,
+          'facingMode': _currentSegmentFacingMode,
+          'quarterTurns': _currentSegmentQuarterTurns,
           'audioPath': _recordAudio && (Platform.isAndroid || Platform.isIOS)
               ? path.replaceFirst(RegExp(r'\.mp4$'), '.wav')
               : null,
@@ -2015,6 +2112,8 @@ class RecordingService {
       startedAt,
       endedAt,
       audioPath == null ? null : File(audioPath),
+      facingMode: _currentSegmentFacingMode,
+      quarterTurns: _currentSegmentQuarterTurns,
     );
 
     // Lấy kích thước trước cleanup. Một RecordingService khác dùng chung thư
@@ -2275,114 +2374,123 @@ class RecordingService {
     await removeExpiredData();
     final directory = await _videoRootDirectory();
     _segments.clear();
-    await for (final entity in directory.list(recursive: true)) {
-      if (entity is! File) {
-        continue;
-      }
-
-      final lowerPath = entity.path.toLowerCase();
-      if (!lowerPath.endsWith('.ts') && !lowerPath.endsWith('.mp4')) {
-        continue;
-      }
-      try {
-        final stat = await entity.stat();
-        final fileName = entity.uri.pathSegments.last;
-        final normalizedPath = entity.path.replaceAll('\\', '/');
-        final parentPath = entity.parent.path.replaceAll('\\', '/');
-        final upperParentPath = parentPath.toUpperCase();
-        final cameraFolderMatch = RegExp(
-          r'/AUTOMODE/CAM(\d+)$',
-        ).firstMatch(upperParentPath);
-        final indexedCameraId = cameraFolderMatch != null
-            ? 'CAM${cameraFolderMatch.group(1)}'
-            : upperParentPath.endsWith('/AUTOMODE')
-            ? 'CAM1'
-            : null;
-        final newNameMatch = RegExp(
-          r'^(\d{2})-(\d{2})-(\d{2})_(\d{2})-(\d{2})-(\d{2})\.ts$',
-          caseSensitive: false,
-        ).firstMatch(fileName);
-        final dateMatch = RegExp(
-          r'/(\d{2})-(\d{2})-(\d{4})/AUTOMODE/',
-          caseSensitive: false,
-        ).firstMatch(normalizedPath);
-        if (newNameMatch != null &&
-            dateMatch != null &&
-            indexedCameraId != null &&
-            normalizeCameraKey(indexedCameraId) ==
-                normalizeCameraKey(cameraId)) {
-          final year = int.parse(dateMatch.group(3)!);
-          final month = int.parse(dateMatch.group(2)!);
-          final day = int.parse(dateMatch.group(1)!);
-          var startedAt = DateTime(
-            year,
-            month,
-            day,
-            int.parse(newNameMatch.group(1)!),
-            int.parse(newNameMatch.group(2)!),
-            int.parse(newNameMatch.group(3)!),
-          );
-          var endedAt = DateTime(
-            year,
-            month,
-            day,
-            int.parse(newNameMatch.group(4)!),
-            int.parse(newNameMatch.group(5)!),
-            int.parse(newNameMatch.group(6)!),
-          );
-          if (endedAt.isBefore(startedAt)) {
-            // The directory is selected from the segment end date. A range
-            // such as 23:59-00:01 therefore started on the previous day.
-            startedAt = startedAt.subtract(const Duration(days: 1));
-          }
-          final timestamp = startedAt.millisecondsSinceEpoch;
-          _segments.add(
-            RecordedSegment(
-              id: '${indexedCameraId}_$timestamp',
-              cameraId: indexedCameraId,
-              path: entity.path,
-              startedAt: startedAt,
-              endedAt: endedAt,
-            ),
-          );
+    try {
+      await for (final entity in directory.list(recursive: true)) {
+        if (entity is! File) {
           continue;
         }
 
-        // Hỗ trợ các tên file cũ đã lưu trước khi đổi cấu trúc.
-        final timestampText = fileName
-            .replaceAll(RegExp(r'\.(mp4|ts)$', caseSensitive: false), '')
-            .split('_')
-            .last;
-        final timestamp = int.tryParse(timestampText);
-        final isNewName = fileName.startsWith('VNVAR_${cameraId}_');
-        final isClip =
-            fileName.contains('_CLIP_') ||
-            fileName.startsWith('CLIP_${cameraId}_');
-        final isRecording = isNewName || fileName.startsWith('${cameraId}_');
-        if (timestamp == null || (!isRecording && !isClip)) continue;
-        final startedAt = DateTime.fromMillisecondsSinceEpoch(timestamp);
-        _segments.add(
-          RecordedSegment(
-            id: isClip
-                ? 'CLIP_${cameraId}_$timestamp'
-                : '${cameraId}_$timestamp',
-            cameraId: cameraId,
-            path: entity.path,
-            startedAt: startedAt,
-            endedAt: stat.modified.isAfter(startedAt)
-                ? stat.modified
-                : startedAt,
-            type: isClip ? 'CLIP' : 'RECORDING',
-          ),
-        );
-      } catch (error, stackTrace) {
-        developer.log(
-          'Unable to index stored video',
-          error: error,
-          stackTrace: stackTrace,
-          name: 'RecordingService',
-        );
+        final lowerPath = entity.path.toLowerCase();
+        if (!lowerPath.endsWith('.ts') && !lowerPath.endsWith('.mp4')) {
+          continue;
+        }
+        try {
+          final stat = await entity.stat();
+          final fileName = entity.uri.pathSegments.last;
+          final normalizedPath = entity.path.replaceAll('\\', '/');
+          final parentPath = entity.parent.path.replaceAll('\\', '/');
+          final upperParentPath = parentPath.toUpperCase();
+          final cameraFolderMatch = RegExp(
+            r'/AUTOMODE/CAM(\d+)$',
+          ).firstMatch(upperParentPath);
+          final indexedCameraId = cameraFolderMatch != null
+              ? 'CAM${cameraFolderMatch.group(1)}'
+              : upperParentPath.endsWith('/AUTOMODE')
+              ? 'CAM1'
+              : null;
+          final newNameMatch = RegExp(
+            r'^(\d{2})-(\d{2})-(\d{2})_(\d{2})-(\d{2})-(\d{2})\.ts$',
+            caseSensitive: false,
+          ).firstMatch(fileName);
+          final dateMatch = RegExp(
+            r'/(\d{2})-(\d{2})-(\d{4})/AUTOMODE/',
+            caseSensitive: false,
+          ).firstMatch(normalizedPath);
+          if (newNameMatch != null &&
+              dateMatch != null &&
+              indexedCameraId != null &&
+              normalizeCameraKey(indexedCameraId) ==
+                  normalizeCameraKey(cameraId)) {
+            final year = int.parse(dateMatch.group(3)!);
+            final month = int.parse(dateMatch.group(2)!);
+            final day = int.parse(dateMatch.group(1)!);
+            var startedAt = DateTime(
+              year,
+              month,
+              day,
+              int.parse(newNameMatch.group(1)!),
+              int.parse(newNameMatch.group(2)!),
+              int.parse(newNameMatch.group(3)!),
+            );
+            var endedAt = DateTime(
+              year,
+              month,
+              day,
+              int.parse(newNameMatch.group(4)!),
+              int.parse(newNameMatch.group(5)!),
+              int.parse(newNameMatch.group(6)!),
+            );
+            if (endedAt.isBefore(startedAt)) {
+              // The directory is selected from the segment end date. A range
+              // such as 23:59-00:01 therefore started on the previous day.
+              startedAt = startedAt.subtract(const Duration(days: 1));
+            }
+            final timestamp = startedAt.millisecondsSinceEpoch;
+            _segments.add(
+              RecordedSegment(
+                id: '${indexedCameraId}_$timestamp',
+                cameraId: indexedCameraId,
+                path: entity.path,
+                startedAt: startedAt,
+                endedAt: endedAt,
+              ),
+            );
+            continue;
+          }
+
+          // Hỗ trợ các tên file cũ đã lưu trước khi đổi cấu trúc.
+          final timestampText = fileName
+              .replaceAll(RegExp(r'\.(mp4|ts)$', caseSensitive: false), '')
+              .split('_')
+              .last;
+          final timestamp = int.tryParse(timestampText);
+          final isNewName = fileName.startsWith('VNVAR_${cameraId}_');
+          final isClip =
+              fileName.contains('_CLIP_') ||
+              fileName.startsWith('CLIP_${cameraId}_');
+          final isRecording = isNewName || fileName.startsWith('${cameraId}_');
+          if (timestamp == null || (!isRecording && !isClip)) continue;
+          final startedAt = DateTime.fromMillisecondsSinceEpoch(timestamp);
+          _segments.add(
+            RecordedSegment(
+              id: isClip
+                  ? 'CLIP_${cameraId}_$timestamp'
+                  : '${cameraId}_$timestamp',
+              cameraId: cameraId,
+              path: entity.path,
+              startedAt: startedAt,
+              endedAt: stat.modified.isAfter(startedAt)
+                  ? stat.modified
+                  : startedAt,
+              type: isClip ? 'CLIP' : 'RECORDING',
+            ),
+          );
+        } catch (error, stackTrace) {
+          developer.log(
+            'Unable to index stored video',
+            error: error,
+            stackTrace: stackTrace,
+            name: 'RecordingService',
+          );
+        }
       }
+    } catch (error, stackTrace) {
+      developer.log(
+        'Unable to list stored video directory: ${directory.path}',
+        error: error,
+        stackTrace: stackTrace,
+        name: 'RecordingService',
+      );
     }
 
     _segments.sort((a, b) => a.startedAt.compareTo(b.startedAt));

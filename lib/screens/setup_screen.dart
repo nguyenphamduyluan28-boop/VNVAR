@@ -1,6 +1,8 @@
+import 'dart:io';
 import 'dart:math';
 
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import '../models/station_identity.dart';
@@ -59,6 +61,14 @@ class _SetupScreenState extends State<SetupScreen> {
   @override
   void initState() {
     super.initState();
+    SystemChrome.setPreferredOrientations(const [
+      DeviceOrientation.portraitUp,
+      DeviceOrientation.portraitDown,
+    ]);
+    if (Platform.isAndroid) {
+      const MethodChannel('vn.vnvar.cameraStation/channel')
+          .invokeMethod('setScreenOrientation', {'mode': 'portrait'});
+    }
     final identity = widget.initialIdentity;
 
     final savedCameraNumber = int.tryParse(
@@ -260,7 +270,7 @@ class _SetupScreenState extends State<SetupScreen> {
                       children: [
                         Image.asset(
                           'assets/images/vnvar_logo.png',
-                          height: 86,
+                          height: 54,
                           fit: BoxFit.contain,
                         ),
                         const SizedBox(height: 12),

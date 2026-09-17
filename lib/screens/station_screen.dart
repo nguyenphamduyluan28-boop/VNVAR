@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:io';
+import 'dart:math' as math;
 import 'dart:ui' as ui;
 
 import 'package:flutter/material.dart';
@@ -15,6 +16,7 @@ import '../services/camera_station_runtime.dart';
 import '../services/recording_service.dart';
 import '../services/station_config_service.dart';
 import '../services/station_display_service.dart';
+import 'package:wakelock_plus/wakelock_plus.dart';
 import 'setup_screen.dart';
 import 'video_storage_screen.dart';
 
@@ -23,6 +25,45 @@ bool shouldSuspendIosCapture(AppLifecycleState state) {
   return state == AppLifecycleState.hidden ||
       state == AppLifecycleState.paused ||
       state == AppLifecycleState.detached;
+}
+
+@visibleForTesting
+List<DeviceOrientation> orientationsForMode(String mode) {
+  switch (mode) {
+    case 'landscape':
+      return const [
+        DeviceOrientation.landscapeLeft,
+        DeviceOrientation.landscapeRight,
+      ];
+    case 'portrait':
+      return const [
+        DeviceOrientation.portraitUp,
+        DeviceOrientation.portraitDown,
+      ];
+    case 'auto':
+    default:
+      return const [
+        DeviceOrientation.landscapeLeft,
+        DeviceOrientation.landscapeRight,
+        DeviceOrientation.portraitUp,
+        DeviceOrientation.portraitDown,
+      ];
+  }
+}
+
+@visibleForTesting
+List<DeviceOrientation> orientationsForBackgroundLock({
+  required bool isCurrentLayoutLandscape,
+}) {
+  return isCurrentLayoutLandscape
+      ? const [
+          DeviceOrientation.landscapeLeft,
+          DeviceOrientation.landscapeRight,
+        ]
+      : const [
+          DeviceOrientation.portraitUp,
+          DeviceOrientation.portraitDown,
+        ];
 }
 
 // ============================================================
@@ -67,6 +108,14 @@ class _StationScreenState extends State<StationScreen>
   String _viewerAddress = 'Đang kiểm tra mạng...';
   Timer? _zoomDebounce;
   double? _zoomValue;
+  String _screenOrientation = 'landscape';
+  bool _isCurrentLayoutLandscape = true;
+  /// Hướng màn hình khi ứng dụng đang foreground (chưa bị Keyguard can thiệp).
+  /// Giữ nguyên giá trị này khi app chuyển sang background để tránh race
+  /// condition: Keyguard ép portrait → LayoutBuilder rebuild → giá trị bị đổi
+  /// thành portrait trước khi lifecycle callback kịp chạy.
+  bool _lastActiveOrientationLandscape = true;
+  bool _appResumed = true;
 
   bool get _recording => _runtime.recordingService?.recording ?? false;
 
@@ -150,6 +199,96 @@ class _StationScreenState extends State<StationScreen>
     }
   }
 
+  Future<void> _quickSelectZoom(double target) async {
+    final webRtc = _runtime.webRtcService;
+    if (webRtc == null) return;
+    try {
+      if (target < 0.95) {
+        if (webRtc.hasUltraWideCamera) {
+          await _runtime.switchToLensMode('ultra_wide');
+          if (mounted) {
+            final actualRatio = webRtc.ultraWideZoomRatio;
+            setState(() => _zoomValue = actualRatio);
+            ScaffoldMessenger.of(context).showSnackBar(
+              SnackBar(
+                content: Text(
+                  appText(
+                    context,
+                    'Đã chuyển sang Camera góc rộng (${webRtc.ultraWideLabel})',
+                    'Switched to Wide-Angle camera (${webRtc.ultraWideLabel})',
+                  ),
+                ),
+                duration: const Duration(seconds: 1),
+              ),
+            );
+          }
+        } else {
+          try {
+            await webRtc.setCameraZoom(target);
+            if (mounted) setState(() => _zoomValue = webRtc.cameraZoom);
+          } catch (_) {
+            if (mounted) {
+              ScaffoldMessenger.of(context).showSnackBar(
+                SnackBar(
+                  content: Text(
+                    appText(
+                      context,
+                      'Thiết bị này không có camera góc rộng (${target.toStringAsFixed(1)}×)',
+                      'This device does not have a wide-angle camera (${target.toStringAsFixed(1)}×)',
+                    ),
+                  ),
+                  duration: const Duration(seconds: 2),
+                ),
+              );
+            }
+          }
+        }
+      } else if (target == 1.0) {
+        if (webRtc.isCurrentUltraWide || webRtc.currentFacingMode == 'user') {
+          await _runtime.switchToLensMode('wide');
+          if (mounted) {
+            ScaffoldMessenger.of(context).showSnackBar(
+              SnackBar(
+                content: Text(
+                  appText(
+                    context,
+                    'Đã chuyển sang Camera góc chuẩn (1×)',
+                    'Switched to standard camera (1×)',
+                  ),
+                ),
+                duration: const Duration(seconds: 1),
+              ),
+            );
+          }
+        }
+        await webRtc.setCameraZoom(1.0);
+        if (mounted) setState(() => _zoomValue = 1.0);
+      } else if (target == 2.0) {
+        if (webRtc.isCurrentUltraWide || webRtc.currentFacingMode == 'user') {
+          await _runtime.switchToLensMode('wide');
+        }
+        await webRtc.setCameraZoom(2.0);
+        if (mounted) setState(() => _zoomValue = 2.0);
+      }
+    } catch (e) {
+      debugPrint('[CAMERA] Quick select zoom error: $e');
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text(
+              appText(
+                context,
+                'Không thể chuyển đổi camera: $e',
+                'Cannot switch camera: $e',
+              ),
+            ),
+            duration: const Duration(seconds: 2),
+          ),
+        );
+      }
+    }
+  }
+
   void _changeZoom(double value) {
     setState(() => _zoomValue = value);
     _zoomDebounce?.cancel();
@@ -157,6 +296,12 @@ class _StationScreenState extends State<StationScreen>
       final webRtc = _runtime.webRtcService;
       if (webRtc == null) return;
       try {
+        if (value < 0.85 && !webRtc.isCurrentUltraWide && webRtc.hasUltraWideCamera) {
+          await _quickSelectZoom(webRtc.ultraWideZoomRatio);
+          return;
+        } else if (value >= 1.0 && webRtc.isCurrentUltraWide) {
+          await _runtime.switchToLensMode('wide');
+        }
         await webRtc.setCameraZoom(value);
         if (mounted) setState(() => _zoomValue = webRtc.cameraZoom);
       } catch (error) {
@@ -189,10 +334,23 @@ class _StationScreenState extends State<StationScreen>
     setState(() => _lensSwitching = true);
     try {
       await _runtime.switchCamera();
+      if (mounted) {
+        final webRtc = _runtime.webRtcService;
+        final isUw = webRtc?.isCurrentUltraWide ?? false;
+        final isUser = webRtc?.currentFacingMode == 'user';
+        final msg = isUser
+            ? appText(context, 'Đã chuyển sang Camera trước', 'Switched to front camera')
+            : isUw
+                ? appText(context, 'Đã chuyển sang Camera góc siêu rộng (0.5×)', 'Switched to Ultra-Wide (0.5×)')
+                : appText(context, 'Đã chuyển sang Camera sau chuẩn (1×)', 'Switched to Rear standard camera (1×)');
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text(msg),
+            duration: const Duration(seconds: 1),
+          ),
+        );
+      }
     } catch (error) {
-      // Một số điện thoại chỉ cung cấp một camera cho WebRTC. Không hiển thị
-      // cảnh báo trong trường hợp này vì đây là giới hạn thiết bị, không phải
-      // lỗi vận hành của Station.
       debugPrint('[CAMERA] Bỏ qua yêu cầu đổi camera: $error');
     } finally {
       if (mounted) {
@@ -205,13 +363,14 @@ class _StationScreenState extends State<StationScreen>
   }
 
   // ============================================================
-  // INIT
+  // INIT & LIFECYCLE
   // ============================================================
 
   @override
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
+    _cameraQuarterTurns = _runtime.cameraQuarterTurns;
 
     _runtimeSubscription = _runtime.stateChanges.listen((_) {
       if (!mounted) {
@@ -219,6 +378,7 @@ class _StationScreenState extends State<StationScreen>
       }
 
       setState(() {
+        _cameraQuarterTurns = _runtime.cameraQuarterTurns;
         final address = _runtime.lanAddress;
         final port =
             _runtime.cameraServer?.apiPort ?? CameraServer.defaultApiPort;
@@ -229,12 +389,67 @@ class _StationScreenState extends State<StationScreen>
       _showRtspWarningIfNeeded();
     });
 
+    unawaited(_initScreenOrientation());
+    unawaited(WakelockPlus.enable());
+    if (Platform.isAndroid) {
+      _platformChannel.setMethodCallHandler((call) async {
+        if (call.method == 'onDisplayRotationChanged') {
+          final args = call.arguments as Map<dynamic, dynamic>?;
+          final effectiveRot = args?['effectiveRotation'] as int? ?? 0;
+          debugPrint('[ROTATION] Native auto-sync rotation changed: $effectiveRot°');
+          if (mounted) setState(() {});
+        }
+      });
+    }
     _initialize();
     _loadViewerAddress();
   }
 
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.inactive ||
+        state == AppLifecycleState.paused ||
+        state == AppLifecycleState.hidden) {
+      // Đánh dấu app không còn foreground – LayoutBuilder không được cập nhật
+      // _lastActiveOrientationLandscape nữa (tránh Keyguard ép portrait làm
+      // sai giá trị).
+      _appResumed = false;
+
+      // Khóa cứng ở tầng Android native ngay lập tức khi vuốt thanh thông báo hoặc tắt màn hình
+      if (Platform.isAndroid) {
+        unawaited(_platformChannel.invokeMethod('lockOrientationForBackground'));
+      }
+
+      // Nếu người dùng đã chọn landscape/portrait cố định → luôn khóa theo
+      // lựa chọn đó. Nếu auto → khóa theo hướng active cuối cùng.
+      final List<DeviceOrientation> lockOrientations;
+      if (_screenOrientation == 'landscape') {
+        lockOrientations = orientationsForMode('landscape');
+      } else if (_screenOrientation == 'portrait') {
+        lockOrientations = orientationsForMode('portrait');
+      } else {
+        lockOrientations = orientationsForBackgroundLock(
+          isCurrentLayoutLandscape: _lastActiveOrientationLandscape,
+        );
+      }
+      unawaited(SystemChrome.setPreferredOrientations(lockOrientations));
+      debugPrint(
+        '[ORIENTATION] Background lock: mode=$_screenOrientation, '
+        'lastActive=${_lastActiveOrientationLandscape ? "landscape" : "portrait"}',
+      );
+    } else if (state == AppLifecycleState.resumed) {
+      _appResumed = true;
+      if (Platform.isAndroid) {
+        unawaited(
+          _platformChannel.invokeMethod('setScreenOrientation', {
+            'mode': _screenOrientation,
+          }),
+        );
+      }
+      // Khôi phục hướng màn hình theo cấu hình người dùng
+      unawaited(_applyScreenOrientation(_screenOrientation));
+    }
+
     if (!Platform.isIOS) return;
     if (state == AppLifecycleState.resumed) {
       unawaited(_resumeIosCapture());
@@ -248,6 +463,84 @@ class _StationScreenState extends State<StationScreen>
     if (shouldSuspendIosCapture(state)) {
       unawaited(_suspendIosCapture());
     }
+  }
+
+  Future<void> _initScreenOrientation() async {
+    try {
+      final savedOrientation =
+          await StationConfigService().loadScreenOrientation();
+      if (!mounted) return;
+      setState(() => _screenOrientation = savedOrientation);
+      await _applyScreenOrientation(savedOrientation);
+    } catch (error) {
+      debugPrint('[ORIENTATION] Không thể tải hướng màn hình đã lưu: $error');
+    }
+  }
+
+  Future<void> _applyScreenOrientation(String mode) async {
+    try {
+      await SystemChrome.setPreferredOrientations(orientationsForMode(mode));
+      // Đồng bộ hướng màn hình sang tầng Android native để onPause() có thể
+      // khóa orientation trước khi Keyguard can thiệp. MethodChannel async
+      // của Flutter có thể đến chậm, nhưng Android native onPause() chạy
+      // trước lifecycle callback nên sẽ dùng giá trị đã lưu.
+      if (Platform.isAndroid) {
+        unawaited(
+          _platformChannel.invokeMethod('setScreenOrientation', {
+            'mode': mode,
+          }),
+        );
+      }
+    } catch (error) {
+      debugPrint('[ORIENTATION] Không thể thiết lập hướng màn hình: $error');
+    }
+  }
+
+  Future<void> _toggleScreenOrientation() async {
+    String nextMode;
+    if (_screenOrientation == 'landscape') {
+      nextMode = 'portrait';
+    } else if (_screenOrientation == 'portrait') {
+      nextMode = 'auto';
+    } else {
+      nextMode = 'landscape';
+    }
+    await _setScreenOrientation(nextMode);
+  }
+
+  Future<void> _setScreenOrientation(String mode) async {
+    setState(() => _screenOrientation = mode);
+    try {
+      await StationConfigService().saveScreenOrientation(mode);
+      await _applyScreenOrientation(mode);
+    } catch (error) {
+      debugPrint('[ORIENTATION] Không thể lưu hướng màn hình: $error');
+    }
+
+    if (!mounted) return;
+    final msg = mode == 'landscape'
+        ? appText(
+            context,
+            'Đã khóa hướng màn hình ngang',
+            'Locked landscape orientation',
+          )
+        : mode == 'portrait'
+            ? appText(
+                context,
+                'Đã khóa hướng màn hình dọc',
+                'Locked portrait orientation',
+              )
+            : appText(
+                context,
+                'Đã bật tự động xoay màn hình',
+                'Auto-rotate screen enabled',
+              );
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text(msg),
+        duration: const Duration(seconds: 2),
+      ),
+    );
   }
 
   Future<void> _suspendIosCapture() async {
@@ -381,6 +674,8 @@ class _StationScreenState extends State<StationScreen>
         cameraId: widget.identity.cameraId,
         deviceId: widget.identity.deviceId,
       );
+
+      unawaited(_runtime.setCameraQuarterTurns(_cameraQuarterTurns));
 
       _showRtspWarningIfNeeded();
 
@@ -932,6 +1227,20 @@ class _StationScreenState extends State<StationScreen>
     if (_screenDimmed) {
       unawaited(StationDisplayService.setDimmed(false));
     }
+    // Khôi phục hướng xoay dọc (portrait) khi thoát khỏi màn hình Station về màn hình thiết lập
+    unawaited(
+      SystemChrome.setPreferredOrientations(const [
+        DeviceOrientation.portraitUp,
+        DeviceOrientation.portraitDown,
+      ]),
+    );
+    if (Platform.isAndroid) {
+      unawaited(
+        _platformChannel.invokeMethod('setScreenOrientation', {
+          'mode': 'portrait',
+        }),
+      );
+    }
     super.dispose();
   }
 
@@ -966,8 +1275,8 @@ class _StationScreenState extends State<StationScreen>
             children: [
               Image.asset(
                 'assets/images/vnvar_logo.png',
-                width: 150,
-                height: 70,
+                width: 240,
+                height: 54,
                 fit: BoxFit.contain,
               ),
               const SizedBox(height: 28),
@@ -1103,6 +1412,24 @@ class _StationScreenState extends State<StationScreen>
           final short = constraints.maxHeight < 560;
           final compact = narrow || short;
           final landscape = constraints.maxWidth > constraints.maxHeight;
+          if (_isCurrentLayoutLandscape != landscape) {
+            _isCurrentLayoutLandscape = landscape;
+            // Chỉ cập nhật _lastActiveOrientationLandscape khi app đang
+            // foreground. Khi Android Keyguard ép portrait (tắt màn hình),
+            // LayoutBuilder rebuild trước khi lifecycle callback chạy.
+            // Nếu cập nhật ở đây, giá trị sẽ bị đổi thành portrait → khóa
+            // sai hướng.
+            if (_appResumed) {
+              _lastActiveOrientationLandscape = landscape;
+            }
+            if (_screenOrientation == 'auto' && _appResumed) {
+              unawaited(
+                StationConfigService().saveScreenOrientation(
+                  landscape ? 'landscape' : 'portrait',
+                ),
+              );
+            }
+          }
           // Scrim height scales with the viewport instead of being a
           // fixed 180px — on short screens a fixed height made the
           // top + bottom scrims overlap and blanket the whole preview
@@ -1124,10 +1451,6 @@ class _StationScreenState extends State<StationScreen>
                     // every rotation destroys the surface and can leave iOS
                     // showing the last frame until the camera is restarted.
                     key: const ValueKey('camera-preview'),
-                    // Match the phone's native camera preview: front camera is
-                    // mirrored for intuitive movement, while recorded/RTSP
-                    // frames remain unmirrored so text and court direction are
-                    // preserved for CheckVAR.
                     mirror: mirrorPreview,
                     objectFit:
                         RTCVideoViewObjectFit.RTCVideoViewObjectFitContain,
@@ -1209,12 +1532,16 @@ class _StationScreenState extends State<StationScreen>
                       screenDimmed: _screenDimmed,
                       screenDimSwitching: _screenDimSwitching,
                       lensSwitching: _lensSwitching,
+                      screenOrientation: _screenOrientation,
                       onRotate: _cameraReady
                           ? () {
+                              final nextTurns = (_cameraQuarterTurns + 1) % 4;
                               setState(() {
-                                _cameraQuarterTurns =
-                                    (_cameraQuarterTurns + 1) % 4;
+                                _cameraQuarterTurns = nextTurns;
                               });
+                              unawaited(
+                                _runtime.setCameraQuarterTurns(nextTurns),
+                              );
                             }
                           : null,
                       onSwitchLens: _cameraReady && !_lensSwitching
@@ -1224,6 +1551,7 @@ class _StationScreenState extends State<StationScreen>
                       onToggleScreenDim: _screenDimSwitching
                           ? null
                           : _toggleScreenDim,
+                      onToggleOrientation: _toggleScreenOrientation,
                     ),
                   ),
                 ),
@@ -1345,10 +1673,17 @@ class _StationScreenState extends State<StationScreen>
                                 _runtime.webRtcService?.cameraZoom ??
                                 1,
                             minimumZoom:
-                                _runtime.webRtcService?.minimumCameraZoom ?? 1,
+                                _runtime.webRtcService?.minimumCameraZoom ?? 1.0,
                             maximumZoom:
-                                _runtime.webRtcService?.maximumCameraZoom ?? 1,
+                                _runtime.webRtcService?.maximumCameraZoom ?? 10.0,
+                            hasUltraWide:
+                                _runtime.webRtcService?.hasUltraWideCamera ?? false,
+                            ultraWideRatio:
+                                _runtime.webRtcService?.ultraWideZoomRatio ?? 0.5,
+                            ultraWideLabel:
+                                _runtime.webRtcService?.ultraWideLabel ?? '0.5×',
                             onZoomChanged: _changeZoom,
+                            onQuickSelectZoom: _quickSelectZoom,
                           ),
                         ],
                       ),
@@ -1441,7 +1776,11 @@ class _BottomControlPanel extends StatelessWidget {
     required this.zoomValue,
     required this.minimumZoom,
     required this.maximumZoom,
+    required this.hasUltraWide,
+    required this.ultraWideRatio,
+    required this.ultraWideLabel,
     required this.onZoomChanged,
+    required this.onQuickSelectZoom,
   });
 
   final bool compact;
@@ -1451,7 +1790,11 @@ class _BottomControlPanel extends StatelessWidget {
   final double zoomValue;
   final double minimumZoom;
   final double maximumZoom;
+  final bool hasUltraWide;
+  final double ultraWideRatio;
+  final String ultraWideLabel;
   final ValueChanged<double> onZoomChanged;
+  final ValueChanged<double> onQuickSelectZoom;
 
   @override
   Widget build(BuildContext context) {
@@ -1485,7 +1828,11 @@ class _BottomControlPanel extends StatelessWidget {
                   value: zoomValue,
                   minimum: minimumZoom,
                   maximum: maximumZoom,
+                  hasUltraWide: hasUltraWide,
+                  ultraWideRatio: ultraWideRatio,
+                  ultraWideLabel: ultraWideLabel,
                   onChanged: onZoomChanged,
+                  onQuickSelect: onQuickSelectZoom,
                 ),
                 Container(
                   height: 1,
@@ -1603,54 +1950,153 @@ class _CameraZoomSlider extends StatelessWidget {
     required this.value,
     required this.minimum,
     required this.maximum,
+    required this.hasUltraWide,
+    required this.ultraWideRatio,
+    required this.ultraWideLabel,
     required this.onChanged,
+    required this.onQuickSelect,
   });
 
   final bool compact;
   final double value;
   final double minimum;
   final double maximum;
+  final bool hasUltraWide;
+  final double ultraWideRatio;
+  final String ultraWideLabel;
   final ValueChanged<double> onChanged;
+  final ValueChanged<double> onQuickSelect;
 
   @override
   Widget build(BuildContext context) {
-    final safeValue = value.clamp(minimum, maximum).toDouble();
+    final effectiveMin = hasUltraWide
+        ? math.min(ultraWideRatio, minimum)
+        : minimum.clamp(1.0, maximum);
+    final safeValue = value.clamp(effectiveMin, maximum).toDouble();
     return Padding(
-      padding: const EdgeInsets.symmetric(horizontal: 4),
-      child: Row(
+      padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 2),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
         children: [
-          Icon(
-            Icons.remove_rounded,
-            color: Colors.white70,
-            size: compact ? 18 : 20,
-          ),
-          Expanded(
-            child: Slider(
-              value: safeValue,
-              min: minimum,
-              max: maximum,
-              divisions: ((maximum - minimum) * 10).round().clamp(1, 100),
-              onChanged: onChanged,
-            ),
-          ),
-          Icon(
-            Icons.add_rounded,
-            color: Colors.white70,
-            size: compact ? 18 : 20,
-          ),
-          const SizedBox(width: 6),
-          SizedBox(
-            width: 42,
-            child: Text(
-              '${safeValue.toStringAsFixed(1)}×',
-              textAlign: TextAlign.end,
-              style: const TextStyle(
-                color: Colors.white,
-                fontWeight: FontWeight.w800,
+          Row(
+            children: [
+              if (hasUltraWide) ...[
+                _ZoomPresetButton(
+                  label: ultraWideLabel,
+                  selected: (safeValue - ultraWideRatio).abs() < 0.12,
+                  compact: compact,
+                  onTap: () => onQuickSelect(ultraWideRatio),
+                ),
+                const SizedBox(width: 4),
+              ],
+              _ZoomPresetButton(
+                label: '1×',
+                selected: (safeValue - 1.0).abs() < 0.12,
+                compact: compact,
+                onTap: () => onQuickSelect(1.0),
               ),
-            ),
+              const SizedBox(width: 4),
+              _ZoomPresetButton(
+                label: '2×',
+                selected: (safeValue - 2.0).abs() < 0.15,
+                compact: compact,
+                onTap: () => onQuickSelect(2.0),
+              ),
+              const Spacer(),
+              Text(
+                '${safeValue.toStringAsFixed(1)}×',
+                style: TextStyle(
+                  color: Colors.white,
+                  fontSize: compact ? 12 : 13,
+                  fontWeight: FontWeight.w800,
+                  letterSpacing: 0.2,
+                ),
+              ),
+              const SizedBox(width: 4),
+            ],
+          ),
+          Row(
+            children: [
+              Icon(
+                Icons.remove_rounded,
+                color: Colors.white70,
+                size: compact ? 16 : 18,
+              ),
+              Expanded(
+                child: SliderTheme(
+                  data: SliderTheme.of(context).copyWith(
+                    trackHeight: compact ? 2.5 : 3.0,
+                    thumbShape: RoundSliderThumbShape(
+                      enabledThumbRadius: compact ? 6 : 7,
+                    ),
+                    overlayShape: RoundSliderOverlayShape(
+                      overlayRadius: compact ? 12 : 14,
+                    ),
+                  ),
+                  child: Slider(
+                    value: safeValue,
+                    min: effectiveMin,
+                    max: maximum,
+                    divisions: ((maximum - effectiveMin) * 10).round().clamp(1, 100),
+                    onChanged: onChanged,
+                  ),
+                ),
+              ),
+              Icon(
+                Icons.add_rounded,
+                color: Colors.white70,
+                size: compact ? 16 : 18,
+              ),
+            ],
           ),
         ],
+      ),
+    );
+  }
+}
+
+class _ZoomPresetButton extends StatelessWidget {
+  final String label;
+  final bool selected;
+  final bool compact;
+  final VoidCallback onTap;
+
+  const _ZoomPresetButton({
+    required this.label,
+    required this.selected,
+    required this.compact,
+    required this.onTap,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return GestureDetector(
+      onTap: onTap,
+      child: Container(
+        padding: EdgeInsets.symmetric(
+          horizontal: compact ? 8 : 10,
+          vertical: compact ? 2 : 3,
+        ),
+        decoration: BoxDecoration(
+          color: selected
+              ? Colors.amber.withValues(alpha: 0.9)
+              : Colors.white.withValues(alpha: 0.12),
+          borderRadius: BorderRadius.circular(12),
+          border: Border.all(
+            color: selected
+                ? Colors.amberAccent
+                : Colors.white.withValues(alpha: 0.15),
+            width: 1,
+          ),
+        ),
+        child: Text(
+          label,
+          style: TextStyle(
+            color: selected ? Colors.black : Colors.white,
+            fontWeight: selected ? FontWeight.w900 : FontWeight.w600,
+            fontSize: compact ? 11 : 12,
+          ),
+        ),
       ),
     );
   }
@@ -1689,7 +2135,8 @@ class _StationHeader extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final logoSize = compact ? 34.0 : 42.0;
+    final logoWidth = compact ? 76.0 : 94.0;
+    final logoHeight = compact ? 26.0 : 30.0;
     final actionSize = compact ? 34.0 : 38.0;
 
     // Only landscape uses the condensed one-row header. A narrow portrait
@@ -1803,11 +2250,11 @@ class _StationHeader extends StatelessWidget {
             crossAxisAlignment: CrossAxisAlignment.center,
             children: [
               ClipRRect(
-                borderRadius: BorderRadius.circular(9),
+                borderRadius: BorderRadius.circular(8),
                 child: Container(
-                  width: logoSize,
-                  height: logoSize * 0.8,
-                  padding: const EdgeInsets.all(4),
+                  width: logoWidth,
+                  height: logoHeight,
+                  padding: const EdgeInsets.symmetric(horizontal: 5, vertical: 2),
                   color: Colors.white.withValues(alpha: 0.08),
                   child: Image.asset(
                     'assets/images/vnvar_logo.png',
@@ -2116,10 +2563,12 @@ class _CameraControlDock extends StatelessWidget {
   final bool screenDimmed;
   final bool screenDimSwitching;
   final bool lensSwitching;
+  final String screenOrientation;
   final VoidCallback? onRotate;
   final VoidCallback? onSwitchLens;
   final VoidCallback? onToggleCamera;
   final VoidCallback? onToggleScreenDim;
+  final VoidCallback? onToggleOrientation;
 
   const _CameraControlDock({
     required this.compact,
@@ -2129,10 +2578,12 @@ class _CameraControlDock extends StatelessWidget {
     required this.screenDimmed,
     required this.screenDimSwitching,
     required this.lensSwitching,
+    required this.screenOrientation,
     required this.onRotate,
     required this.onSwitchLens,
     required this.onToggleCamera,
     required this.onToggleScreenDim,
+    required this.onToggleOrientation,
   });
 
   @override
@@ -2216,6 +2667,38 @@ class _CameraControlDock extends StatelessWidget {
             background: screenDimmed
                 ? Colors.amber.withValues(alpha: 0.8)
                 : Colors.blueGrey.withValues(alpha: 0.75),
+          ),
+          SizedBox(height: gap),
+          _DockButton(
+            icon: screenOrientation == 'landscape'
+                ? Icons.screen_lock_landscape_rounded
+                : screenOrientation == 'portrait'
+                    ? Icons.screen_lock_portrait_rounded
+                    : Icons.screen_rotation_rounded,
+            tooltip: screenOrientation == 'landscape'
+                ? appText(
+                    context,
+                    'Đang khóa xoay ngang (chạm để đổi)',
+                    'Locked landscape (tap to change)',
+                  )
+                : screenOrientation == 'portrait'
+                    ? appText(
+                        context,
+                        'Đang khóa xoay dọc (chạm để đổi)',
+                        'Locked portrait (tap to change)',
+                      )
+                    : appText(
+                        context,
+                        'Tự động xoay màn hình (chạm để khóa)',
+                        'Auto-rotate screen (tap to lock)',
+                      ),
+            size: buttonSize,
+            onPressed: onToggleOrientation,
+            background: screenOrientation == 'landscape'
+                ? Colors.blueAccent.withValues(alpha: 0.8)
+                : screenOrientation == 'portrait'
+                    ? Colors.amber.withValues(alpha: 0.8)
+                    : null,
           ),
         ],
       ),

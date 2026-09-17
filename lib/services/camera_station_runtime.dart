@@ -108,6 +108,7 @@ class CameraStationRuntime {
   String? _networkError;
   int _iosLowFpsReports = 0;
   DateTime? _lastIosFpsAdjustmentAt;
+  int _cameraQuarterTurns = 0;
   double? _iosActualFps;
   int? _iosRequestedFps;
   DateTime? _iosPerformanceMeasuredAt;
@@ -173,6 +174,16 @@ class CameraStationRuntime {
   bool get profileSwitching => _profileSwitching;
   double? get temperatureC => _temperatureC;
   bool get thermalWarning => _thermalThrottled;
+  int get cameraQuarterTurns => _cameraQuarterTurns;
+
+  Future<void> setCameraQuarterTurns(int quarterTurns) async {
+    final turns = (quarterTurns % 4 + 4) % 4;
+    _cameraQuarterTurns = turns;
+    _recordingService?.setQuarterTurns(turns);
+    await _webRtcService?.setCameraRotation(turns);
+    await StationConfigService().saveCameraQuarterTurns(turns);
+    _emitState();
+  }
   bool get storageWarning => _recordingService?.lowStorageWarning ?? false;
   bool get lifecycleSuspended => _iosLifecycleSuspended;
   bool get lifecycleResuming => _iosResumeQueued;
@@ -345,6 +356,12 @@ class CameraStationRuntime {
         // intentionally falls back to video-only recording.
         await webRtc.ensureMicrophoneEnabled();
       }
+
+      final savedQuarterTurns =
+          await StationConfigService().loadCameraQuarterTurns();
+      _cameraQuarterTurns = savedQuarterTurns;
+      recording.setQuarterTurns(savedQuarterTurns);
+      recording.setFacingMode(webRtc.currentFacingMode);
 
       final apiPort = await StationConfigService().loadApiPort();
       final server = CameraServer(
@@ -700,9 +717,9 @@ class CameraStationRuntime {
       return;
     }
     try {
-      // Recreating the stream also rechecks microphone permission. A grant
-      // made in iOS Settings therefore takes effect on the first new segment.
-      await webRtc.initializeCamera();
+      final currentFacing = webRtc.currentFacingMode;
+      await webRtc.initializeCamera(facingMode: currentFacing);
+      _recordingService?.setFacingMode(currentFacing);
       if (!_iosAppInForeground ||
           lifecycleGeneration != _iosLifecycleGeneration) {
         await webRtc.disposeCamera();
@@ -797,7 +814,9 @@ class CameraStationRuntime {
     }
 
     try {
-      await webRtc.initializeCamera();
+      final currentFacing = webRtc.currentFacingMode;
+      await webRtc.initializeCamera(facingMode: currentFacing);
+      recording.setFacingMode(currentFacing);
       await _waitForIosCaptureWarmup();
       await server.ensureRecording();
       await WakelockPlus.enable();
@@ -825,6 +844,25 @@ class CameraStationRuntime {
     });
   }
 
+  Future<void> switchToLensMode(String mode) {
+    final current = _lensSwitchOperation;
+    if (current != null) return current;
+    _interruptRecovery();
+    final operation = _serializeLifecycle(() async {
+      if (!_cameraEnabled) throw StateError('Camera đang tắt.');
+      final webRtc = _webRtcService;
+      if (webRtc == null) throw StateError('Camera chưa sẵn sàng.');
+      await webRtc.switchToLensMode(mode);
+      _emitState();
+    });
+    _lensSwitchOperation = operation;
+    return operation.whenComplete(() {
+      if (identical(_lensSwitchOperation, operation)) {
+        _lensSwitchOperation = null;
+      }
+    });
+  }
+
   Future<void> _switchCameraInternal() async {
     if (!_cameraEnabled) {
       throw StateError('Camera đang tắt.');
@@ -840,9 +878,32 @@ class CameraStationRuntime {
     }
 
     final previousFacing = webRtc.currentFacingMode;
-    final targetFacing = previousFacing == 'environment'
-        ? 'user'
-        : 'environment';
+    final isUw = webRtc.isCurrentUltraWide;
+    final hasUw = webRtc.hasUltraWideCamera && webRtc.ultraWideCamera != null;
+
+    final String targetFacing;
+    if (hasUw) {
+      if (previousFacing == 'user') {
+        targetFacing = 'environment';
+      } else if (isUw) {
+        targetFacing = 'user';
+      } else {
+        // Main back -> Ultra-wide back
+        targetFacing = 'environment';
+      }
+    } else {
+      targetFacing = previousFacing == 'environment'
+          ? 'user'
+          : 'environment';
+    }
+
+    if (targetFacing == previousFacing) {
+      // In-place switch between rear lenses (Wide <-> UltraWide)
+      await webRtc.switchCamera();
+      _emitState();
+      return;
+    }
+
     var targetProfiles = await webRtc.getSupportedResolutionProfiles(
       facingMode: targetFacing,
       fallbackWhenUnavailable: false,
@@ -895,6 +956,7 @@ class CameraStationRuntime {
           // remuxing, especially after several consecutive lens switches.
           try {
             await webRtc.switchCamera();
+            recording.setFacingMode(webRtc.currentFacingMode);
             if (!recording.recording) await server.ensureRecording();
           } catch (error, stackTrace) {
             // Some iOS devices report a successful native lens handoff before
@@ -912,6 +974,7 @@ class CameraStationRuntime {
             await webRtc.disposeCamera();
             webRtc.setResolutionProfile(selectedProfile);
             await webRtc.initializeCamera(facingMode: targetFacing);
+            recording.setFacingMode(targetFacing);
             await _waitForIosCaptureWarmup(profile: selectedProfile);
             await server.ensureRecording();
           }
@@ -924,6 +987,7 @@ class CameraStationRuntime {
           await webRtc.disposeCamera();
           webRtc.setResolutionProfile(selectedProfile);
           await webRtc.initializeCamera(facingMode: targetFacing);
+          recording.setFacingMode(targetFacing);
           await _waitForIosCaptureWarmup(profile: selectedProfile);
           await server.ensureRecording();
         }
@@ -955,6 +1019,7 @@ class CameraStationRuntime {
       await webRtc.disposeCamera();
       webRtc.setResolutionProfile(selectedProfile);
       await webRtc.initializeCamera(facingMode: targetFacing);
+      recording.setFacingMode(targetFacing);
       await server.ensureRecording();
 
       _supportedResolutionProfiles = targetProfiles;
@@ -980,6 +1045,7 @@ class CameraStationRuntime {
         await webRtc.disposeConnection();
         await webRtc.disposeCamera();
         await webRtc.initializeCamera(facingMode: previousFacing);
+        recording.setFacingMode(previousFacing);
         await _waitForIosCaptureWarmup(profile: previousProfile);
         await server.ensureRecording();
       } catch (rollbackError, stackTrace) {
@@ -1038,6 +1104,7 @@ class CameraStationRuntime {
     }
 
     final previous = _resolutionProfile;
+    final currentFacing = webRtc.currentFacingMode;
     _iosLowFpsReports = 0;
     _profileSwitching = true;
     _generation++;
@@ -1047,7 +1114,8 @@ class CameraStationRuntime {
       await webRtc.disposeConnection();
       await webRtc.disposeCamera();
       webRtc.setResolutionProfile(selected);
-      await webRtc.initializeCamera();
+      await webRtc.initializeCamera(facingMode: currentFacing);
+      recording.setFacingMode(currentFacing);
       await _waitForIosCaptureWarmup(profile: selected);
       await server.ensureRecording();
       _resolutionProfile = selected;
@@ -1056,14 +1124,15 @@ class CameraStationRuntime {
       }
       developer.log(
         '[CAMERA] Resolution changed to ${selected.shortLabel} '
-        '${selected.fps} FPS',
+        '${selected.fps} FPS ($currentFacing)',
         name: 'CameraStationRuntime',
       );
     } catch (_) {
       webRtc.setResolutionProfile(previous);
       try {
         await webRtc.disposeCamera();
-        await webRtc.initializeCamera();
+        await webRtc.initializeCamera(facingMode: currentFacing);
+        recording.setFacingMode(currentFacing);
         await _waitForIosCaptureWarmup(profile: previous);
         await server.ensureRecording();
       } catch (rollbackError, stackTrace) {
@@ -1766,7 +1835,9 @@ class CameraStationRuntime {
     final server = _cameraServer;
     if (webRtc == null || server == null) return;
     try {
-      await webRtc.initializeCamera();
+      final currentFacing = webRtc.currentFacingMode;
+      await webRtc.initializeCamera(facingMode: currentFacing);
+      _recordingService?.setFacingMode(currentFacing);
       await webRtc.ensureMicrophoneEnabled();
       await server.ensureRecording();
       if (Platform.isIOS && _iosAppInForeground) {
@@ -1907,7 +1978,9 @@ class CameraStationRuntime {
       if (_stopping || generation != _generation) return;
 
       try {
-        await webRtc.initializeCamera();
+        final currentFacing = webRtc.currentFacingMode;
+        await webRtc.initializeCamera(facingMode: currentFacing);
+        _recordingService?.setFacingMode(currentFacing);
         await _waitForIosCaptureWarmup();
         await server.ensureRecording();
         if (Platform.isIOS && _iosAppInForeground) {

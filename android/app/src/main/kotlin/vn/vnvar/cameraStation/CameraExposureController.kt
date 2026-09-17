@@ -1,5 +1,6 @@
 package vn.vnvar.cameraStation
 
+import android.content.Context
 import android.hardware.Camera
 import android.hardware.camera2.CameraCaptureSession
 import android.hardware.camera2.CameraCharacteristics
@@ -8,6 +9,7 @@ import android.hardware.camera2.CameraManager
 import android.hardware.camera2.CaptureRequest
 import android.hardware.camera2.TotalCaptureResult
 import android.graphics.Rect
+import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
@@ -19,6 +21,7 @@ import com.cloudwebrtc.webrtc.GetUserMediaImpl
 import org.webrtc.Camera1Capturer
 import org.webrtc.Camera2Capturer
 import org.webrtc.CameraEnumerationAndroid
+import org.webrtc.CameraVideoCapturer
 import kotlin.math.roundToInt
 
 /** Applies a conservative exposure bias to flutter_webrtc's active camera. */
@@ -31,7 +34,7 @@ object CameraExposureController {
     @Volatile
     private var activeTrackId: String? = null
     @Volatile
-    private var activeTargetEv = 1.3
+    private var activeTargetEv = 0.0
     @Volatile private var activeZoom = 1.0
     @Volatile
     private var activeCamera2 = false
@@ -129,9 +132,39 @@ object CameraExposureController {
                     val session = readField(capturer, "currentSession")
                     val device = readField(session, "cameraDevice") as CameraDevice
                     val manager = readField(capturer, "cameraManager") as CameraManager
-                    val max = manager.getCameraCharacteristics(device.id)
-                        .get(CameraCharacteristics.SCALER_AVAILABLE_MAX_DIGITAL_ZOOM)?.toDouble() ?: 1.0
-                    callback(mapOf("supported" to (max > 1.0), "min" to 1.0, "max" to max.coerceAtMost(10.0), "current" to activeZoom.coerceIn(1.0, max)))
+                    val characteristics = manager.getCameraCharacteristics(device.id)
+
+                    // Android 11+ (API 30): CONTROL_ZOOM_RATIO_RANGE cho phép
+                    // zoom < 1.0 trên thiết bị có ống kính ultra-wide.
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                        val zoomRange = characteristics.get(
+                            CameraCharacteristics.CONTROL_ZOOM_RATIO_RANGE
+                        )
+                        if (zoomRange != null) {
+                            val minZoom = zoomRange.lower.toDouble().coerceAtLeast(0.3)
+                            val maxZoom = zoomRange.upper.toDouble().coerceAtMost(10.0)
+                            callback(mapOf(
+                                "supported" to (maxZoom > minZoom),
+                                "min" to minZoom,
+                                "max" to maxZoom,
+                                "current" to activeZoom.coerceIn(minZoom, maxZoom),
+                                "cameraId" to device.id,
+                            ))
+                            return
+                        }
+                    }
+
+                    // Fallback: SCALER_AVAILABLE_MAX_DIGITAL_ZOOM (min cố định 1.0)
+                    val max = characteristics.get(
+                        CameraCharacteristics.SCALER_AVAILABLE_MAX_DIGITAL_ZOOM
+                    )?.toDouble() ?: 1.0
+                    callback(mapOf(
+                        "supported" to (max > 1.0),
+                        "min" to 1.0,
+                        "max" to max.coerceAtMost(10.0),
+                        "current" to activeZoom.coerceIn(1.0, max),
+                        "cameraId" to device.id,
+                    ))
                 }
                 is Camera1Capturer -> {
                     val camera = readField(readField(capturer, "currentSession"), "camera") as Camera
@@ -144,9 +177,171 @@ object CameraExposureController {
         } catch (error: Throwable) { callback(mapOf("supported" to false, "reason" to error.javaClass.simpleName)) }
     }
 
+    private data class ParsedCamera(
+        val id: String,
+        val facing: Int,
+        val facingStr: String,
+        val minFocal: Float,
+        val fov: Float,
+        val minZoom: Double,
+        val maxZoom: Double,
+        var isUltraWide: Boolean,
+    )
+
+    fun getAvailableCameras(context: Context): List<Map<String, Any>> {
+        val manager = context.getSystemService(Context.CAMERA_SERVICE) as? CameraManager
+            ?: return emptyList()
+        val parsedList = mutableListOf<ParsedCamera>()
+        val examinedIds = mutableSetOf<String>()
+        try {
+            val candidateIds = mutableListOf<String>()
+            candidateIds.addAll(manager.cameraIdList)
+
+            // Probe physical IDs from logical cameras (Android 9+)
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                for (id in manager.cameraIdList) {
+                    try {
+                        val chars = manager.getCameraCharacteristics(id)
+                        candidateIds.addAll(chars.physicalCameraIds)
+                    } catch (_: Throwable) {}
+                }
+            }
+
+            // Probe auxiliary IDs (0..9) used by Xiaomi, Samsung, Oppo, Vivo, OnePlus
+            for (i in 0..9) {
+                val idStr = i.toString()
+                if (!candidateIds.contains(idStr)) {
+                    candidateIds.add(idStr)
+                }
+            }
+
+            for (id in candidateIds) {
+                if (!examinedIds.add(id)) continue
+                try {
+                    val chars = manager.getCameraCharacteristics(id)
+                    val facing = chars.get(CameraCharacteristics.LENS_FACING) ?: continue
+                    val facingStr = when (facing) {
+                        CameraCharacteristics.LENS_FACING_FRONT -> "front"
+                        CameraCharacteristics.LENS_FACING_BACK -> "back"
+                        else -> "external"
+                    }
+                    val focalLengths = chars.get(CameraCharacteristics.LENS_INFO_AVAILABLE_FOCAL_LENGTHS)
+                    val minFocal = focalLengths?.minOrNull() ?: 0f
+                    val sensorSize = chars.get(CameraCharacteristics.SENSOR_INFO_PHYSICAL_SIZE)
+                    val fov = if (sensorSize != null && minFocal > 0f) {
+                        (2.0 * Math.toDegrees(Math.atan((sensorSize.width / (2.0 * minFocal)).toDouble()))).toFloat()
+                    } else 0f
+
+                    var minZoom = 1.0
+                    var maxZoom = 1.0
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                        val zoomRange = chars.get(CameraCharacteristics.CONTROL_ZOOM_RATIO_RANGE)
+                        if (zoomRange != null) {
+                            minZoom = zoomRange.lower.toDouble()
+                            maxZoom = zoomRange.upper.toDouble()
+                        }
+                    }
+                    if (maxZoom <= 1.0) {
+                        val maxDigital = chars.get(CameraCharacteristics.SCALER_AVAILABLE_MAX_DIGITAL_ZOOM)?.toDouble() ?: 1.0
+                        maxZoom = maxDigital
+                    }
+
+                    // Ultra-wide criteria:
+                    // 1) Facing back
+                    // 2) AND (minZoom <= 0.85 OR (minFocal in 0.1f..3.5f) OR fov >= 82f)
+                    val isUltraWide = (facing == CameraCharacteristics.LENS_FACING_BACK) &&
+                        (minZoom <= 0.85 || (minFocal in 0.1f..3.5f) || fov >= 82f)
+
+                    parsedList.add(ParsedCamera(id, facing, facingStr, minFocal, fov, minZoom, maxZoom, isUltraWide))
+                } catch (_: Throwable) {}
+            }
+
+            // Post-process: nếu có nhiều camera sau mà chưa camera nào được đánh dấu ultra-wide
+            val backCameras = parsedList.filter { it.facing == CameraCharacteristics.LENS_FACING_BACK }
+            if (backCameras.size >= 2 && backCameras.none { it.isUltraWide }) {
+                val primaryBack = backCameras.firstOrNull { it.id == "0" } ?: backCameras.first()
+                val minFocalBack = backCameras.filter { it.minFocal > 0f }.minByOrNull { it.minFocal }
+                if (minFocalBack != null && minFocalBack.id != primaryBack.id && minFocalBack.minFocal < primaryBack.minFocal) {
+                    minFocalBack.isUltraWide = true
+                } else {
+                    val secondary = backCameras.firstOrNull { it.id != primaryBack.id }
+                    secondary?.isUltraWide = true
+                }
+            }
+        } catch (e: Throwable) {
+            Log.w(TAG, "Error enumerating cameras: $e")
+        }
+        return parsedList.map {
+            mapOf(
+                "id" to it.id,
+                "facing" to it.facingStr,
+                "minFocal" to it.minFocal.toDouble(),
+                "fov" to it.fov.toDouble(),
+                "minZoom" to it.minZoom,
+                "maxZoom" to it.maxZoom,
+                "isUltraWide" to it.isUltraWide,
+            )
+        }
+    }
+
     fun setZoom(trackId: String, zoom: Double, callback: (Map<String, Any>) -> Unit) {
-        activeZoom = zoom.coerceAtLeast(1.0)
+        activeZoom = zoom.coerceAtLeast(0.3)
         apply(trackId, activeTargetEv) { response -> callback(response + ("zoom" to activeZoom)) }
+    }
+
+    fun switchCameraToId(
+        trackId: String,
+        targetCameraId: String,
+        callback: (Boolean, String?) -> Unit,
+    ) {
+        try {
+            val plugin = FlutterWebRTCPlugin.sharedSingleton
+                ?: return callback(false, "plugin_unavailable")
+            val handler = readField(plugin, "methodCallHandler")
+            val getUserMedia = readField(handler, "getUserMediaImpl") as GetUserMediaImpl
+            val info = getUserMedia.getCapturerInfo(trackId)
+                ?: return callback(false, "capturer_unavailable")
+            val capturer = info.capturer as? CameraVideoCapturer
+                ?: return callback(false, "not_camera_capturer")
+
+            val manager = (capturer as? Camera2Capturer)?.let {
+                try {
+                    readField(it, "cameraManager") as? CameraManager
+                } catch (_: Throwable) { null }
+            }
+            val isTargetFront = if (manager != null) {
+                try {
+                    val chars = manager.getCameraCharacteristics(targetCameraId)
+                    chars.get(CameraCharacteristics.LENS_FACING) == CameraCharacteristics.LENS_FACING_FRONT
+                } catch (_: Throwable) { false }
+            } else false
+
+            capturer.switchCamera(object : CameraVideoCapturer.CameraSwitchHandler {
+                override fun onCameraSwitchDone(isFrontFacing: Boolean) {
+                    try {
+                        val isFacingField = getUserMedia.javaClass.getDeclaredField("isFacing").apply { isAccessible = true }
+                        isFacingField.set(getUserMedia, isTargetFront)
+                    } catch (_: Throwable) {}
+                    activeZoom = 1.0
+                    lastCaptureHeartbeatMs = 0L
+                    lifecycleHandler.post {
+                        callback(true, null)
+                    }
+                }
+
+                override fun onCameraSwitchError(errorDescription: String?) {
+                    Log.w(TAG, "switchCameraToId failed for $targetCameraId: $errorDescription")
+                    lifecycleHandler.post {
+                        callback(false, errorDescription)
+                    }
+                }
+            }, targetCameraId)
+        } catch (e: Throwable) {
+            Log.w(TAG, "switchCameraToId exception: $e")
+            lifecycleHandler.post {
+                callback(false, e.message)
+            }
+        }
     }
 
 
@@ -162,6 +357,13 @@ object CameraExposureController {
         callback: (Map<String, Any>) -> Unit,
     ) {
         val session = readField(capturer, "currentSession")
+        if (activeRotationDegrees != 0) {
+            try {
+                val helper = readField(session, "surfaceTextureHelper")
+                val method = helper.javaClass.getMethod("setFrameRotation", Int::class.javaPrimitiveType)
+                method.invoke(helper, activeRotationDegrees)
+            } catch (_: Throwable) {}
+        }
         val captureSession = readField(session, "captureSession") as CameraCaptureSession
         val cameraDevice = readField(session, "cameraDevice") as CameraDevice
         val surface = readField(session, "surface") as Surface
@@ -208,16 +410,25 @@ object CameraExposureController {
                     )
                     set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_VIDEO)
                     set(CaptureRequest.CONTROL_AWB_MODE, CaptureRequest.CONTROL_AWB_MODE_AUTO)
-                    val sensor = characteristics.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE)
-                    val maxZoom = characteristics.get(CameraCharacteristics.SCALER_AVAILABLE_MAX_DIGITAL_ZOOM) ?: 1f
-                    if (sensor != null && maxZoom > 1f) {
-                        val zoom = activeZoom.coerceIn(1.0, maxZoom.toDouble())
-                        val width = (sensor.width() / zoom).roundToInt()
-                        val height = (sensor.height() / zoom).roundToInt()
-                        val left = sensor.centerX() - width / 2
-                        val top = sensor.centerY() - height / 2
-                        set(CaptureRequest.SCALER_CROP_REGION, Rect(left, top, left + width, top + height))
-                        activeZoom = zoom
+                    // Zoom: ưu tiên CONTROL_ZOOM_RATIO (Android 11+) cho phép
+                    // giá trị < 1.0 (ultra-wide). Fallback SCALER_CROP_REGION
+                    // cho Android cũ hơn.
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                        val zoomRange = characteristics.get(
+                            CameraCharacteristics.CONTROL_ZOOM_RATIO_RANGE
+                        )
+                        if (zoomRange != null) {
+                            val zoom = activeZoom.coerceIn(
+                                zoomRange.lower.toDouble(),
+                                zoomRange.upper.toDouble(),
+                            )
+                            set(CaptureRequest.CONTROL_ZOOM_RATIO, zoom.toFloat())
+                            activeZoom = zoom
+                        } else {
+                            applyLegacyCropZoom(this, characteristics)
+                        }
+                    } else {
+                        applyLegacyCropZoom(this, characteristics)
                     }
                     setFirstSupportedMode(
                         this,
@@ -308,6 +519,58 @@ object CameraExposureController {
     ) {
         if (availableModes?.contains(preferredMode) == true) {
             request.set(key, preferredMode)
+        }
+    }
+
+    /** Legacy zoom bằng SCALER_CROP_REGION – chỉ hỗ trợ zoom >= 1.0. */
+    private fun applyLegacyCropZoom(
+        request: CaptureRequest.Builder,
+        characteristics: CameraCharacteristics,
+    ) {
+        val sensor = characteristics.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE)
+        val maxZoom = characteristics.get(
+            CameraCharacteristics.SCALER_AVAILABLE_MAX_DIGITAL_ZOOM
+        ) ?: 1f
+        if (sensor != null && maxZoom > 1f) {
+            val zoom = activeZoom.coerceIn(1.0, maxZoom.toDouble())
+            val width = (sensor.width() / zoom).roundToInt()
+            val height = (sensor.height() / zoom).roundToInt()
+            val left = sensor.centerX() - width / 2
+            val top = sensor.centerY() - height / 2
+            request.set(
+                CaptureRequest.SCALER_CROP_REGION,
+                Rect(left, top, left + width, top + height),
+            )
+            activeZoom = zoom
+        }
+    }
+
+    @Volatile
+    private var activeRotationDegrees = 0
+
+    fun setCaptureRotation(degrees: Int): Boolean {
+        val normalized = ((degrees % 360) + 360) % 360
+        activeRotationDegrees = normalized
+        val trackId = activeTrackId ?: return false
+        return applyCaptureRotation(trackId, normalized)
+    }
+
+    fun applyCaptureRotation(trackId: String, degrees: Int): Boolean {
+        try {
+            val plugin = FlutterWebRTCPlugin.sharedSingleton ?: return false
+            val handler = readField(plugin, "methodCallHandler")
+            val getUserMedia = readField(handler, "getUserMediaImpl") as GetUserMediaImpl
+            val info = getUserMedia.getCapturerInfo(trackId) ?: return false
+            val capturer = info.capturer ?: return false
+            val session = try { readField(capturer, "currentSession") } catch (_: Throwable) { null } ?: return false
+            val helper = try { readField(session, "surfaceTextureHelper") } catch (_: Throwable) { null } ?: return false
+            val method = helper.javaClass.getMethod("setFrameRotation", Int::class.javaPrimitiveType)
+            method.invoke(helper, degrees)
+            Log.i(TAG, "Applied capture frame rotation to WebRTC: $degrees°")
+            return true
+        } catch (e: Throwable) {
+            Log.w(TAG, "Cannot set capture rotation to $degrees°: $e")
+            return false
         }
     }
 

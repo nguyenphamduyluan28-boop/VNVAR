@@ -42,17 +42,22 @@ class VideoStorageService {
           'ensurePublicVideoStorage',
         );
         if (path != null && path.trim().isNotEmpty) {
-          _androidPublicPath = Directory(path).absolute.path;
+          final dir = Directory(path);
+          await _verifyWritableDirectory(dir);
+          _androidPublicPath = dir.absolute.path;
+          developer.log(
+            '[STORAGE] Android video storage path resolved to: $_androidPublicPath',
+            name: 'VideoStorageService',
+          );
         }
-      } on PlatformException catch (error, stackTrace) {
+      } catch (error, stackTrace) {
         developer.log(
-          '[STORAGE] Public internal-storage VNVAR access was not granted; '
+          '[STORAGE] Android video storage path was not writable or listable; '
           'using application Documents.',
           error: error,
           stackTrace: stackTrace,
           name: 'VideoStorageService',
         );
-      } on MissingPluginException {
         _androidPublicPath = null;
       }
     }
@@ -93,8 +98,23 @@ class VideoStorageService {
       rootPath = '${defaultRoot.path}${Platform.pathSeparator}VNVAR';
     }
     final directory = Directory(rootPath);
-    if (!await directory.exists()) await directory.create(recursive: true);
-    return directory;
+    try {
+      if (!await directory.exists()) await directory.create(recursive: true);
+      await directory.list().take(1).drain();
+      return directory;
+    } catch (error, stackTrace) {
+      developer.log(
+        '[STORAGE] Directory $rootPath is not listable/writable; falling back to app documents.',
+        error: error,
+        stackTrace: stackTrace,
+        name: 'VideoStorageService',
+      );
+      final defaultRoot = await getApplicationDocumentsDirectory();
+      final fallbackDir =
+          Directory('${defaultRoot.path}${Platform.pathSeparator}VNVAR');
+      if (!await fallbackDir.exists()) await fallbackDir.create(recursive: true);
+      return fallbackDir;
+    }
   }
 
   Future<void> setStoragePath(String? path) async {
@@ -122,10 +142,12 @@ class VideoStorageService {
     final uniqueSuffix =
         '${DateTime.now().microsecondsSinceEpoch}_${identityHashCode(this)}';
     final probe = File(
-      '${directory.path}${Platform.pathSeparator}vnvar_write_$uniqueSuffix.tmp',
+      '${directory.path}${Platform.pathSeparator}vnvar_write_$uniqueSuffix.mp4',
     );
     try {
       await probe.writeAsString('VNVAR', flush: true);
+      // Verify that directory listing is also allowed by OS (Scoped Storage check)
+      await directory.list().take(1).drain();
     } finally {
       try {
         if (await probe.exists()) await probe.delete();

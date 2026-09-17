@@ -845,6 +845,7 @@ class CameraServer {
     await recordingService.start(
       videoTrack: videoTrack,
       audioAvailable: webRtcService.microphoneAvailable,
+      facingMode: webRtcService.currentFacingMode,
     );
 
     recording = true;

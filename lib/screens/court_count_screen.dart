@@ -1,4 +1,7 @@
+import 'dart:io';
+
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import '../services/app_language_service.dart';
@@ -22,6 +25,14 @@ class _CourtCountScreenState extends State<CourtCountScreen> {
   @override
   void initState() {
     super.initState();
+    SystemChrome.setPreferredOrientations(const [
+      DeviceOrientation.portraitUp,
+      DeviceOrientation.portraitDown,
+    ]);
+    if (Platform.isAndroid) {
+      const MethodChannel('vn.vnvar.cameraStation/channel')
+          .invokeMethod('setScreenOrientation', {'mode': 'portrait'});
+    }
     _loadExisting();
   }
 
@@ -89,7 +100,7 @@ class _CourtCountScreenState extends State<CourtCountScreen> {
                     children: [
                       Image.asset(
                         'assets/images/vnvar_logo.png',
-                        height: 80,
+                        height: 52,
                         fit: BoxFit.contain,
                       ),
                       const SizedBox(height: 20),

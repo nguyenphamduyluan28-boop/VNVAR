@@ -16,9 +16,32 @@ class StationConfigService {
   static const String _resolutionProfileKey = 'camera_resolution_profile';
   static const String _adaptiveFpsPrefix = 'ios_adaptive_fps';
   static const String _apiPortKey = 'camera_api_port';
+  static const String _cameraQuarterTurnsKey = 'camera_quarter_turns';
+
+  static const String _screenOrientationKey = 'station_screen_orientation';
 
   // ConfigService cũ đã lưu Camera ID bằng key này.
   static const String _legacyCameraKey = 'camera_id';
+
+  Future<void> saveScreenOrientation(String orientation) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString(_screenOrientationKey, orientation);
+  }
+
+  Future<String> loadScreenOrientation() async {
+    final prefs = await SharedPreferences.getInstance();
+    return prefs.getString(_screenOrientationKey) ?? 'landscape';
+  }
+
+  Future<void> saveCameraQuarterTurns(int quarterTurns) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setInt(_cameraQuarterTurnsKey, (quarterTurns % 4 + 4) % 4);
+  }
+
+  Future<int> loadCameraQuarterTurns() async {
+    final prefs = await SharedPreferences.getInstance();
+    return ((prefs.getInt(_cameraQuarterTurnsKey) ?? 0) % 4 + 4) % 4;
+  }
 
   Future<void> saveIdentity(StationIdentity identity) async {
     final normalized = _normalizeAndValidate(identity);

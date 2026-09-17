@@ -84,10 +84,45 @@ import UIKit
         self.cameraZoom(call, result, apply: false)
       case "setCameraZoom":
         self.cameraZoom(call, result, apply: true)
+      case "getAvailableCameras":
+        self.getAvailableCameras(call, result)
       default:
         result(FlutterMethodNotImplemented)
       }
     }
+  }
+
+  private func getAvailableCameras(_ call: FlutterMethodCall, _ result: FlutterResult) {
+    var types: [AVCaptureDevice.DeviceType] = [
+      .builtInWideAngleCamera,
+    ]
+    if #available(iOS 13.0, *) {
+      types.append(.builtInUltraWideCamera)
+      types.append(.builtInTripleCamera)
+      types.append(.builtInDualWideCamera)
+    }
+    let discovery = AVCaptureDevice.DiscoverySession(
+      deviceTypes: types,
+      mediaType: .video,
+      position: .unspecified
+    )
+    var cameras: [[String: Any]] = []
+    for device in discovery.devices {
+      let isUltraWide: Bool
+      if #available(iOS 13.0, *) {
+        isUltraWide = device.deviceType == .builtInUltraWideCamera
+      } else {
+        isUltraWide = false
+      }
+      cameras.append([
+        "id": device.uniqueID,
+        "facing": device.position == .front ? "front" : "back",
+        "minZoom": max(0.5, device.minAvailableVideoZoomFactor),
+        "maxZoom": min(10.0, device.maxAvailableVideoZoomFactor),
+        "isUltraWide": isUltraWide,
+      ])
+    }
+    result(cameras)
   }
 
   private func cameraZoom(_ call: FlutterMethodCall, _ result: FlutterResult, apply: Bool) {
@@ -101,7 +136,7 @@ import UIKit
     guard let device = exactDevice ?? AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: position) else {
       result(["supported": false]); return
     }
-    let minimum = max(1, device.minAvailableVideoZoomFactor)
+    let minimum = max(0.5, device.minAvailableVideoZoomFactor)
     let maximum = min(10, device.maxAvailableVideoZoomFactor)
     if apply, let requested = (arguments?["zoom"] as? NSNumber)?.doubleValue {
       do {

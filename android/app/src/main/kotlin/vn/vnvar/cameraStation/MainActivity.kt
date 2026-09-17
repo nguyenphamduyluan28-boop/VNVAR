@@ -2,18 +2,24 @@ package vn.vnvar.cameraStation
 
 import android.Manifest
 import android.content.Intent
+import android.content.pm.ActivityInfo
 import android.content.pm.PackageManager
 import android.graphics.SurfaceTexture
 import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CameraManager
+import android.content.res.Configuration
+import android.media.MediaScannerConnection
+import android.net.Uri
 import android.os.Build
+import android.os.Bundle
 import android.os.Environment
-import android.os.StatFs
 import android.os.PowerManager
+import android.os.StatFs
 import android.provider.DocumentsContract
 import android.provider.Settings
-import android.net.Uri
-import android.media.MediaScannerConnection
+import android.view.OrientationEventListener
+import android.view.Surface
+import android.view.WindowManager
 import androidx.core.content.ContextCompat
 import com.cloudwebrtc.webrtc.FlutterWebRTCPlugin
 import io.flutter.embedding.android.FlutterActivity
@@ -28,6 +34,15 @@ class MainActivity : FlutterActivity() {
     private var activityResumed = false
     private var rtspPublisher: VnvarRtspPublisher? = null
     private var pendingFolderResult: MethodChannel.Result? = null
+    /// Hướng màn hình được Flutter yêu cầu khóa. Giá trị hợp lệ:
+    /// "landscape", "portrait", "auto".
+    /// Dùng trong onPause() để khóa orientation ở tầng native TRƯỚC KHI
+    /// Android Keyguard ép portrait.
+    private var lockedOrientation: String = "portrait"
+    @Volatile
+    private var lastKnownLandscapeRotation: Int = ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE
+    private var manualQuarterTurns = 0
+    private var orientationListener: OrientationEventListener? = null
     private val nativeAudioRecorder: NativeAudioSegmentRecorder
         get() = sharedAudioRecorder ?: synchronized(MainActivity::class.java) {
             sharedAudioRecorder ?: NativeAudioSegmentRecorder(applicationContext).also {
@@ -35,6 +50,43 @@ class MainActivity : FlutterActivity() {
             }
         }
     private lateinit var platformChannel: MethodChannel
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        // Luôn luôn giữ màn hình sáng liên tục (Keep Screen On) không bao giờ tự tắt
+        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+
+        // Đảm bảo Activity tiếp tục chạy ở chế độ Landscape khi màn hình tắt / khóa Keyguard
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O_MR1) {
+            setShowWhenLocked(true)
+            setTurnScreenOn(true)
+        } else {
+            @Suppress("DEPRECATION")
+            window.addFlags(
+                WindowManager.LayoutParams.FLAG_SHOW_WHEN_LOCKED or
+                WindowManager.LayoutParams.FLAG_DISMISS_KEYGUARD or
+                WindowManager.LayoutParams.FLAG_TURN_SCREEN_ON
+            )
+        }
+        initOrientationListener()
+    }
+
+    override fun onUserLeaveHint() {
+        super.onUserLeaveHint()
+        // Khi người dùng bấm Home hoặc vuốt thoát app:
+        // Khóa hướng landscape và chuyển sang chế độ Picture-in-Picture (PiP) 16:9
+        lockOrientationForBackground()
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            try {
+                val params = android.app.PictureInPictureParams.Builder()
+                    .setAspectRatio(android.util.Rational(16, 9))
+                    .build()
+                enterPictureInPictureMode(params)
+            } catch (_: Exception) {
+                // PiP không được hỗ trợ hoặc bị tắt bởi người dùng
+            }
+        }
+    }
 
     override fun shouldDestroyEngineWithHost(): Boolean = false
 
@@ -120,7 +172,7 @@ class MainActivity : FlutterActivity() {
 
                 "setCameraExposureBoost" -> {
                     val trackId = call.argument<String>("trackId")
-                    val targetEv = call.argument<Double>("targetEv") ?: 1.3
+                    val targetEv = call.argument<Double>("targetEv") ?: 0.0
                     if (trackId.isNullOrBlank()) {
                         result.error("INVALID_TRACK", "Thiếu video track để chỉnh exposure.", null)
                     } else {
@@ -135,6 +187,11 @@ class MainActivity : FlutterActivity() {
                     result.success(null)
                 }
 
+                "getAvailableCameras" -> {
+                    val cameras = CameraExposureController.getAvailableCameras(this)
+                    result.success(cameras)
+                }
+
                 "getCameraZoom" -> {
                     val trackId = call.argument<String>("trackId")
                     if (trackId.isNullOrBlank()) result.error("INVALID_TRACK", "Video track is required", null)
@@ -146,6 +203,24 @@ class MainActivity : FlutterActivity() {
                     val zoom = call.argument<Double>("zoom")
                     if (trackId.isNullOrBlank() || zoom == null) result.error("INVALID_ZOOM", "Track and zoom are required", null)
                     else CameraExposureController.setZoom(trackId, zoom) { response -> runOnUiThread { result.success(response) } }
+                }
+
+                "switchCameraToId" -> {
+                    val trackId = call.argument<String>("trackId")
+                    val cameraId = call.argument<String>("cameraId")
+                    if (trackId.isNullOrBlank() || cameraId.isNullOrBlank()) {
+                        result.error("INVALID_ARGS", "trackId and cameraId are required", null)
+                    } else {
+                        CameraExposureController.switchCameraToId(trackId, cameraId) { success, error ->
+                            runOnUiThread {
+                                if (success) {
+                                    result.success(true)
+                                } else {
+                                    result.error("SWITCH_CAMERA_FAILED", error ?: "Failed to switch camera", null)
+                                }
+                            }
+                        }
+                    }
                 }
 
                 "startRtsp" -> {
@@ -244,6 +319,39 @@ class MainActivity : FlutterActivity() {
                     ))
                 }
 
+                "setScreenOrientation" -> {
+                    val mode = call.argument<String>("mode") ?: "landscape"
+                    lockedOrientation = mode
+                    runOnUiThread {
+                        if (activityResumed) {
+                            unlockOrientationForForeground()
+                        } else {
+                            lockOrientationForBackground()
+                        }
+                    }
+                    result.success(null)
+                }
+
+                "lockOrientationForBackground" -> {
+                    lockOrientationForBackground()
+                    result.success(null)
+                }
+
+                "setCameraRotation" -> {
+                    val quarterTurns = call.argument<Int>("quarterTurns") ?: 0
+                    manualQuarterTurns = (quarterTurns % 4 + 4) % 4
+                    val applied = updateEffectiveRotation()
+                    result.success(applied)
+                }
+
+                "getEffectiveRotation" -> {
+                    result.success(computeEffectiveRotation())
+                }
+
+                "getDisplayRotationDegrees" -> {
+                    result.success(getDisplayRotationDegrees())
+                }
+
                 else -> result.notImplemented()
             }
         }
@@ -312,6 +420,14 @@ class MainActivity : FlutterActivity() {
     override fun onPostResume() {
         super.onPostResume()
         activityResumed = true
+        val rot = getDisplayRotation()
+        if (rot == Surface.ROTATION_270) {
+            lastKnownLandscapeRotation = ActivityInfo.SCREEN_ORIENTATION_REVERSE_LANDSCAPE
+        } else if (rot == Surface.ROTATION_90) {
+            lastKnownLandscapeRotation = ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE
+        }
+        unlockOrientationForForeground()
+        updateEffectiveRotation()
         refreshCameraStationForegroundTypes()
         CameraExposureController.reapplyAfterLifecycleChange("foreground")
         completePendingStartIfPossible()
@@ -348,33 +464,40 @@ class MainActivity : FlutterActivity() {
     private fun ensurePublicVideoStorage(result: MethodChannel.Result) {
         try {
             val publicMovies = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_MOVIES)
-            if (!publicMovies.exists()) {
-                publicMovies.mkdirs()
-            }
             val publicVnvar = java.io.File(publicMovies, "VNVAR")
-            if (!publicVnvar.exists()) {
-                publicVnvar.mkdirs()
+
+            // Test if public Movies/VNVAR is actually accessible (can create, write, and list)
+            val isPublicFullyAccessible = try {
+                if (!publicVnvar.exists()) {
+                    publicVnvar.mkdirs()
+                }
+                // Check if directory can be listed without permission denial
+                val canList = publicVnvar.listFiles() != null
+                val testFile = java.io.File(publicVnvar, "probe_${System.currentTimeMillis()}.mp4")
+                val canWrite = testFile.createNewFile() && testFile.delete()
+                android.util.Log.i("MainActivity", "[STORAGE] Public Movies/VNVAR probe: canList=$canList canWrite=$canWrite")
+                canList && canWrite
+            } catch (e: Exception) {
+                android.util.Log.e("MainActivity", "[STORAGE] Public Movies/VNVAR probe failed: ${e.message}", e)
+                false
             }
 
-            if (!publicVnvar.exists() && Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                try {
-                    val values = android.content.ContentValues().apply {
-                        put(android.provider.MediaStore.Video.Media.DISPLAY_NAME, "init_${System.currentTimeMillis()}.mp4")
-                        put(android.provider.MediaStore.Video.Media.RELATIVE_PATH, "Movies/VNVAR/")
-                        put(android.provider.MediaStore.Video.Media.MIME_TYPE, "video/mp4")
-                    }
-                    val uri = contentResolver.insert(android.provider.MediaStore.Video.Media.EXTERNAL_CONTENT_URI, values)
-                    if (uri != null) {
-                        contentResolver.delete(uri, null, null)
-                    }
-                } catch (_: Exception) {}
+            if (isPublicFullyAccessible) {
+                result.success(publicVnvar.absolutePath)
+                return
             }
 
-            if (!publicVnvar.exists()) {
-                publicVnvar.mkdirs()
+            // Fallback to app-specific external files dir (Movies/VNVAR).
+            // On Android, getExternalFilesDir() is located on external storage
+            // (/storage/emulated/0/Android/data/<package>/files/Movies/VNVAR).
+            // It has full storage capacity and requires ZERO permissions, guaranteed
+            // accessible via POSIX File/Directory APIs on all Android versions.
+            val appMovies = getExternalFilesDir(Environment.DIRECTORY_MOVIES) ?: filesDir
+            val appVnvar = java.io.File(appMovies, "VNVAR")
+            if (!appVnvar.exists()) {
+                appVnvar.mkdirs()
             }
-
-            result.success(publicVnvar.absolutePath)
+            result.success(appVnvar.absolutePath)
         } catch (error: Exception) {
             result.error("PUBLIC_STORAGE_CREATE_FAILED", error.message, null)
         }
@@ -444,10 +567,27 @@ class MainActivity : FlutterActivity() {
         }
     }
 
+    override fun onWindowFocusChanged(hasFocus: Boolean) {
+        super.onWindowFocusChanged(hasFocus)
+        if (!hasFocus) {
+            // Vuốt thanh thông báo / màn hình chờ xuống (thanh trạng thái chiếm focus)
+            lockOrientationForBackground()
+        } else if (activityResumed) {
+            unlockOrientationForForeground()
+        }
+    }
+
     override fun onPause() {
         activityResumed = false
+        lockOrientationForBackground()
         super.onPause()
         CameraExposureController.reapplyAfterLifecycleChange("background")
+    }
+
+    override fun onStop() {
+        activityResumed = false
+        lockOrientationForBackground()
+        super.onStop()
     }
 
     private fun hasCameraPermission(): Boolean {
@@ -622,5 +762,193 @@ class MainActivity : FlutterActivity() {
         private const val NOTIFICATION_PERMISSION_REQUEST = 4102
         private const val VIDEO_FOLDER_REQUEST = 45186
         private const val STORAGE_PERMISSION_REQUEST = 45187
+    }
+
+    private fun getDisplayRotation(): Int {
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            display?.rotation ?: Surface.ROTATION_0
+        } else {
+            @Suppress("DEPRECATION")
+            windowManager.defaultDisplay.rotation
+        }
+    }
+
+    /**
+     * Khóa cứng (Hard lock) hướng màn hình ở tầng native để:
+     * 1. Khi vuốt thanh thông báo / trung tâm điều khiển (onWindowFocusChanged false).
+     * 2. Khi màn hình tắt / khóa máy (onPause, onStop).
+     * Android Keyguard hay SystemUI không thể ép về Portrait.
+     * Cảm biến gia tốc khi tắt màn hình không bị rơi về Portrait.
+     */
+    private fun lockOrientationForBackground() {
+        val currentRotation = getDisplayRotation()
+        val targetOrientation = when (lockedOrientation) {
+            "portrait" -> {
+                if (currentRotation == Surface.ROTATION_180) {
+                    ActivityInfo.SCREEN_ORIENTATION_REVERSE_PORTRAIT
+                } else {
+                    ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
+                }
+            }
+            "landscape" -> {
+                // Khóa cứng vào hướng landscape thực tế:
+                // Nếu getDisplayRotation() vẫn trả về 90 hoặc 270 thì cập nhật,
+                // ngược lại (khi màn hình tắt, vuốt về home hoặc notification shade mở)
+                // sử dụng lastKnownLandscapeRotation đã lưu lúc active!
+                if (currentRotation == Surface.ROTATION_270) {
+                    lastKnownLandscapeRotation = ActivityInfo.SCREEN_ORIENTATION_REVERSE_LANDSCAPE
+                    ActivityInfo.SCREEN_ORIENTATION_REVERSE_LANDSCAPE
+                } else if (currentRotation == Surface.ROTATION_90) {
+                    lastKnownLandscapeRotation = ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE
+                    ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE
+                } else {
+                    lastKnownLandscapeRotation
+                }
+            }
+            else -> {
+                // Chế độ auto: nếu đang quay ngang thì khóa cứng ngang, nếu đang dọc thì khóa cứng dọc
+                when (currentRotation) {
+                    Surface.ROTATION_270 -> {
+                        lastKnownLandscapeRotation = ActivityInfo.SCREEN_ORIENTATION_REVERSE_LANDSCAPE
+                        ActivityInfo.SCREEN_ORIENTATION_REVERSE_LANDSCAPE
+                    }
+                    Surface.ROTATION_90 -> {
+                        lastKnownLandscapeRotation = ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE
+                        ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE
+                    }
+                    Surface.ROTATION_180 -> ActivityInfo.SCREEN_ORIENTATION_REVERSE_PORTRAIT
+                    Surface.ROTATION_0 -> {
+                        if (lockedOrientation == "landscape") lastKnownLandscapeRotation
+                        else ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
+                    }
+                    else -> ActivityInfo.SCREEN_ORIENTATION_LOCKED
+                }
+            }
+        }
+        runOnUiThread {
+            super.setRequestedOrientation(targetOrientation)
+        }
+    }
+
+    /**
+     * Mở khóa để cho phép xoay linh hoạt (sensor) khi app quay lại Foreground.
+     */
+    private fun unlockOrientationForForeground() {
+        val targetOrientation = activityInfoOrientationFor(lockedOrientation)
+        runOnUiThread {
+            super.setRequestedOrientation(targetOrientation)
+        }
+    }
+
+    override fun setRequestedOrientation(requestedOrientation: Int) {
+        val effectiveOrientation = if (!activityResumed) {
+            // Khi app ở background, màn hình tắt, hoặc mất focus (vuốt thanh thông báo):
+            // Tuyệt đối không cho phép SENSOR_LANDSCAPE hay SENSOR_PORTRAIT vì cảm biến
+            // tắt sẽ làm Android rơi về Portrait mặc định. Ép sang HARD lock tương ứng!
+            when (requestedOrientation) {
+                ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE,
+                ActivityInfo.SCREEN_ORIENTATION_USER_LANDSCAPE,
+                ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED -> {
+                    val rot = getDisplayRotation()
+                    if (rot == Surface.ROTATION_270) {
+                        lastKnownLandscapeRotation = ActivityInfo.SCREEN_ORIENTATION_REVERSE_LANDSCAPE
+                        ActivityInfo.SCREEN_ORIENTATION_REVERSE_LANDSCAPE
+                    } else if (rot == Surface.ROTATION_90) {
+                        lastKnownLandscapeRotation = ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE
+                        ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE
+                    } else {
+                        lastKnownLandscapeRotation
+                    }
+                }
+                ActivityInfo.SCREEN_ORIENTATION_SENSOR_PORTRAIT,
+                ActivityInfo.SCREEN_ORIENTATION_USER_PORTRAIT -> {
+                    val rot = getDisplayRotation()
+                    if (rot == Surface.ROTATION_180) {
+                        ActivityInfo.SCREEN_ORIENTATION_REVERSE_PORTRAIT
+                    } else {
+                        ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
+                    }
+                }
+                else -> requestedOrientation
+            }
+        } else {
+            requestedOrientation
+        }
+        super.setRequestedOrientation(effectiveOrientation)
+    }
+
+    private fun activityInfoOrientationFor(mode: String): Int = when (mode) {
+        "landscape" -> ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
+        "portrait" -> ActivityInfo.SCREEN_ORIENTATION_SENSOR_PORTRAIT
+        else -> ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
+    }
+
+    private fun getDisplayRotationDegrees(): Int {
+        return when (getDisplayRotation()) {
+            Surface.ROTATION_90 -> 90
+            Surface.ROTATION_180 -> 180
+            Surface.ROTATION_270 -> 270
+            else -> 0
+        }
+    }
+
+    private fun computeEffectiveRotation(): Int {
+        val displayRot = getDisplayRotation()
+        // Khi máy quay ngang Landscape Right (ROTATION_270 - đỉnh máy bên phải, USB bên trái),
+        // mắt camera sau bị úp ngược 180° so với Landscape Left chuẩn (ROTATION_90).
+        // Cần bù 180° tự động để video gửi sang tablet luôn xuôi chiều.
+        val autoCompensation = if (displayRot == Surface.ROTATION_270) 180 else 0
+        val manualRotation = manualQuarterTurns * 90
+        return ((autoCompensation + manualRotation) % 360 + 360) % 360
+    }
+
+    private fun updateEffectiveRotation(): Boolean {
+        val degrees = computeEffectiveRotation()
+        val success = CameraExposureController.setCaptureRotation(degrees)
+        android.util.Log.i("MainActivity", "Updated effective camera rotation: $degrees° (manual=$manualQuarterTurns, display=${getDisplayRotation()})")
+        return success
+    }
+
+    private fun initOrientationListener() {
+        orientationListener = object : OrientationEventListener(this) {
+            private var lastDisplayRotation = -1
+
+            override fun onOrientationChanged(orientation: Int) {
+                if (orientation == ORIENTATION_UNKNOWN) return
+                val currentDisplay = getDisplayRotation()
+                if (currentDisplay != lastDisplayRotation) {
+                    lastDisplayRotation = currentDisplay
+                    runOnUiThread {
+                        updateEffectiveRotation()
+                        if (::platformChannel.isInitialized) {
+                            platformChannel.invokeMethod(
+                                "onDisplayRotationChanged",
+                                mapOf(
+                                    "displayRotation" to currentDisplay,
+                                    "degrees" to getDisplayRotationDegrees(),
+                                    "effectiveRotation" to computeEffectiveRotation(),
+                                ),
+                            )
+                        }
+                    }
+                }
+            }
+        }
+        if (orientationListener?.canDetectOrientation() == true) {
+            orientationListener?.enable()
+        }
+    }
+
+    override fun onConfigurationChanged(newConfig: Configuration) {
+        super.onConfigurationChanged(newConfig)
+        runOnUiThread {
+            updateEffectiveRotation()
+        }
+    }
+
+    override fun onDestroy() {
+        orientationListener?.disable()
+        orientationListener = null
+        super.onDestroy()
     }
 }

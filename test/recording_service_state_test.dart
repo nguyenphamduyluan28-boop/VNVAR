@@ -205,4 +205,64 @@ void main() {
     expect(service.recording, isFalse);
     expect(service.currentSegmentHasAudio, isFalse);
   });
+
+  test('calculateEffectiveVideoRotation rotates 180° for front camera on iOS and Android', () {
+    // Front camera records 180° upside-down on raw buffer -> must compensate 180°
+    expect(
+      calculateEffectiveVideoRotation(
+        isIos: true,
+        facingMode: 'user',
+        quarterTurns: 0,
+      ),
+      180,
+    );
+
+    expect(
+      calculateEffectiveVideoRotation(
+        isIos: false,
+        facingMode: 'user',
+        quarterTurns: 0,
+      ),
+      180,
+    );
+
+    // Front camera with 1 manual quarter turn (90° CW) -> (180 + 90) = 270°
+    expect(
+      calculateEffectiveVideoRotation(
+        isIos: false,
+        facingMode: 'user',
+        quarterTurns: 1,
+      ),
+      270,
+    );
+
+    // Back camera with 0 quarter turns -> 0° (fast stream copy)
+    expect(
+      calculateEffectiveVideoRotation(
+        isIos: false,
+        facingMode: 'environment',
+        quarterTurns: 0,
+      ),
+      0,
+    );
+
+    expect(
+      calculateEffectiveVideoRotation(
+        isIos: true,
+        facingMode: 'environment',
+        quarterTurns: 0,
+      ),
+      0,
+    );
+
+    // Back camera with 2 manual quarter turns -> 180°
+    expect(
+      calculateEffectiveVideoRotation(
+        isIos: false,
+        facingMode: 'environment',
+        quarterTurns: 2,
+      ),
+      180,
+    );
+  });
 }

@@ -49,8 +49,8 @@ class _StationSplashScreenState extends State<StationSplashScreen> {
                   children: [
                     const Image(
                       image: AssetImage('assets/images/vnvar_logo.png'),
-                      width: 260,
-                      height: 150,
+                      width: 290,
+                      height: 70,
                       fit: BoxFit.contain,
                     ),
                     const SizedBox(height: 24),

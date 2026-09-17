@@ -45,6 +45,38 @@ Map<String, dynamic> buildCameraVideoConstraints({
   };
 }
 
+class AvailableCameraDevice {
+  final String id;
+  final String facing;
+  final double minFocal;
+  final double fov;
+  final double minZoom;
+  final double maxZoom;
+  final bool isUltraWide;
+
+  const AvailableCameraDevice({
+    required this.id,
+    required this.facing,
+    required this.minFocal,
+    required this.fov,
+    required this.minZoom,
+    required this.maxZoom,
+    required this.isUltraWide,
+  });
+
+  factory AvailableCameraDevice.fromMap(Map<dynamic, dynamic> map) {
+    return AvailableCameraDevice(
+      id: map['id']?.toString() ?? '',
+      facing: map['facing']?.toString() ?? 'back',
+      minFocal: (map['minFocal'] as num?)?.toDouble() ?? 0,
+      fov: (map['fov'] as num?)?.toDouble() ?? 0,
+      minZoom: (map['minZoom'] as num?)?.toDouble() ?? 1,
+      maxZoom: (map['maxZoom'] as num?)?.toDouble() ?? 1,
+      isUltraWide: map['isUltraWide'] == true,
+    );
+  }
+}
+
 class WebRtcService {
   static const MethodChannel _platformChannel = MethodChannel(
     'vnvar/camera_station_service',
@@ -108,20 +140,121 @@ class WebRtcService {
   bool _receivedFirstFrame = false;
   int _cameraLifecycleGeneration = 0;
   String? _currentFacingMode;
+  bool _switchingCamera = false;
   final Map<String, String> _preferredCameraDeviceIds = <String, String>{};
   final Map<String, List<CameraResolutionProfile>> _verifiedResolutionProfiles =
       <String, List<CameraResolutionProfile>>{};
   final Map<String, String> _resolutionProfileDeviceIds = <String, String>{};
   bool? _isEmulator;
+  List<AvailableCameraDevice> _availableCameras = <AvailableCameraDevice>[];
+  String? _activeCameraId;
   double _cameraZoom = 1;
   double _minimumCameraZoom = 1;
   double _maximumCameraZoom = 1;
   bool _cameraZoomSupported = false;
 
+  List<AvailableCameraDevice> get availableCameras => _availableCameras;
+  String? get activeCameraId => _activeCameraId;
+
+  AvailableCameraDevice? get ultraWideCamera {
+    final uwList = _availableCameras
+        .where((c) => c.isUltraWide && c.facing == 'back')
+        .toList();
+    if (uwList.isEmpty) {
+      for (final c in _availableCameras) {
+        if (c.isUltraWide) return c;
+      }
+      return null;
+    }
+    // Ưu tiên camera có minZoom < 0.95 (như camera 3 hỗ trợ 0.6x liền mạch) hoặc tiêu cự nhỏ nhất
+    uwList.sort((a, b) {
+      if (a.minZoom < 0.95 && b.minZoom >= 0.95) return -1;
+      if (b.minZoom < 0.95 && a.minZoom >= 0.95) return 1;
+      if (a.minFocal > 0 && b.minFocal > 0) {
+        return a.minFocal.compareTo(b.minFocal);
+      }
+      return 0;
+    });
+    return uwList.first;
+  }
+
+  AvailableCameraDevice? get mainBackCamera {
+    for (final c in _availableCameras) {
+      if (c.facing == 'back' && !c.isUltraWide) return c;
+    }
+    return _availableCameras.where((c) => c.facing == 'back').firstOrNull;
+  }
+
+  AvailableCameraDevice? get frontCamera {
+    for (final c in _availableCameras) {
+      if (c.facing == 'front') return c;
+    }
+    return null;
+  }
+
+  bool get hasUltraWideCamera =>
+      ultraWideCamera != null ||
+      (_minimumCameraZoom <= 0.85) ||
+      _availableCameras.where((c) => c.facing == 'back').length > 1;
+
+  double get ultraWideZoomRatio {
+    if (!hasUltraWideCamera) return 1.0;
+    if (_minimumCameraZoom < 0.95 && _minimumCameraZoom >= 0.35) {
+      return ((_minimumCameraZoom * 10).round() / 10).clamp(0.4, 0.9);
+    }
+    final uw = ultraWideCamera;
+    if (uw != null && uw.minZoom < 0.95 && uw.minZoom >= 0.35) {
+      return ((uw.minZoom * 10).round() / 10).clamp(0.4, 0.9);
+    }
+    for (final c in _availableCameras) {
+      if (c.facing == 'back' && c.minZoom < 0.95 && c.minZoom >= 0.35) {
+        return ((c.minZoom * 10).round() / 10).clamp(0.4, 0.9);
+      }
+    }
+    return 0.5;
+  }
+
+  String get ultraWideLabel => '${ultraWideZoomRatio.toStringAsFixed(1)}×';
+
+  bool get isCurrentUltraWide =>
+      (ultraWideCamera != null && _activeCameraId == ultraWideCamera!.id) ||
+      (_cameraZoom < 0.95);
+
   double get cameraZoom => _cameraZoom;
   double get minimumCameraZoom => _minimumCameraZoom;
   double get maximumCameraZoom => _maximumCameraZoom;
   bool get cameraZoomSupported => _cameraZoomSupported;
+
+  Future<void> refreshAvailableCameras() async {
+    if (!Platform.isAndroid && !Platform.isIOS) return;
+    try {
+      final list = await _platformChannel.invokeListMethod<dynamic>('getAvailableCameras');
+      if (list != null) {
+        _availableCameras = list
+            .whereType<Map<dynamic, dynamic>>()
+            .map(AvailableCameraDevice.fromMap)
+            .toList();
+        developer.log(
+          '[CAMERA] Discovered ${_availableCameras.length} camera devices. '
+          'Ultra-wide: ${ultraWideCamera?.id ?? "none"} ($ultraWideLabel)',
+          name: 'WebRtcService',
+        );
+      }
+    } catch (e) {
+      developer.log('[CAMERA] Cannot enumerate cameras: $e', name: 'WebRtcService');
+    }
+  }
+
+  Future<void> setCameraRotation(int quarterTurns) async {
+    if (!Platform.isAndroid) return;
+    try {
+      await _platformChannel.invokeMethod('setCameraRotation', {
+        'quarterTurns': quarterTurns,
+      });
+    } catch (e) {
+      developer.log('[CAMERA] setCameraRotation error: $e', name: 'WebRtcService');
+    }
+  }
 
   Future<void> refreshCameraZoom() async {
     final track = localVideoTrack;
@@ -130,25 +263,44 @@ class WebRtcService {
         .invokeMapMethod<String, dynamic>('getCameraZoom', {
           'trackId': track.id,
           'facing': currentFacingMode,
-          'deviceId': _preferredCameraDeviceIds[currentFacingMode],
+          'deviceId': _activeCameraId ?? _preferredCameraDeviceIds[currentFacingMode],
         });
     _cameraZoomSupported = result?['supported'] == true;
-    _minimumCameraZoom = (result?['min'] as num?)?.toDouble() ?? 1;
-    _maximumCameraZoom = (result?['max'] as num?)?.toDouble() ?? 1;
-    _cameraZoom = (result?['current'] as num?)?.toDouble() ?? 1;
+    final reportedMin = (result?['min'] as num?)?.toDouble() ?? 1;
+    final reportedMax = (result?['max'] as num?)?.toDouble() ?? 1;
+    final reportedCurrent = (result?['current'] as num?)?.toDouble() ?? 1;
+    final reportedCameraId = result?['cameraId']?.toString();
+    if (reportedCameraId != null && reportedCameraId.isNotEmpty) {
+      _activeCameraId = reportedCameraId;
+    }
+
+    final effectiveMinRatio = hasUltraWideCamera ? ultraWideZoomRatio : reportedMin;
+    if (isCurrentUltraWide && ultraWideCamera != null) {
+      _minimumCameraZoom = effectiveMinRatio;
+      _maximumCameraZoom = math.max(reportedMax, 2.0);
+      _cameraZoom = effectiveMinRatio;
+    } else if (hasUltraWideCamera) {
+      _minimumCameraZoom = effectiveMinRatio;
+      _maximumCameraZoom = math.max(reportedMax, 10.0);
+      _cameraZoom = reportedCurrent;
+    } else {
+      _minimumCameraZoom = reportedMin;
+      _maximumCameraZoom = reportedMax;
+      _cameraZoom = reportedCurrent;
+    }
   }
 
   Future<void> setCameraZoom(double value) async {
     final track = localVideoTrack;
     if (track == null || !_cameraZoomSupported) return;
-    final target = value
-        .clamp(_minimumCameraZoom, _maximumCameraZoom)
-        .toDouble();
+    final minZ = hasUltraWideCamera ? ultraWideZoomRatio : _minimumCameraZoom;
+    final maxZ = math.max(_maximumCameraZoom, 10.0);
+    final target = value.clamp(minZ, maxZ).toDouble();
     final result = await _platformChannel
         .invokeMapMethod<String, dynamic>('setCameraZoom', {
           'trackId': track.id,
           'facing': currentFacingMode,
-          'deviceId': _preferredCameraDeviceIds[currentFacingMode],
+          'deviceId': _activeCameraId ?? _preferredCameraDeviceIds[currentFacingMode],
           'zoom': target,
         });
     _cameraZoom =
@@ -478,6 +630,10 @@ class WebRtcService {
 
     _isEmulator ??= await _detectEmulator();
     if (cameraGeneration != _cameraLifecycleGeneration) return;
+    if (_availableCameras.isEmpty) {
+      await refreshAvailableCameras();
+      if (cameraGeneration != _cameraLifecycleGeneration) return;
+    }
     final selectedFacingMode = facingMode ?? currentFacingMode;
     final preferredDeviceId = _preferredCameraDeviceIds[selectedFacingMode];
     developer.log(
@@ -630,6 +786,7 @@ class WebRtcService {
 
     await _startRtsp(videoTrack);
     try {
+      await refreshAvailableCameras();
       await refreshCameraZoom();
     } catch (error) {
       developer.log('[CAMERA] Zoom unavailable: $error', name: 'WebRtcService');
@@ -742,7 +899,7 @@ class WebRtcService {
   }
 
   Future<void> _applyAndroidExposureBoost(MediaStreamTrack track) async {
-    const targetEv = 1.3;
+    const targetEv = 0.0;
     const retryDelay = Duration(milliseconds: 300);
     Map<String, dynamic>? lastResult;
 
@@ -908,43 +1065,174 @@ class WebRtcService {
     });
   }
 
-  Future<void> switchCamera() async {
+  Future<void> switchCameraToId(String? deviceId) async {
     final track = localVideoTrack;
     if (!_cameraInitialized || track == null) {
       throw StateError('Camera chưa sẵn sàng.');
     }
-    final previousFacing = currentFacingMode;
-    final targetFacing = previousFacing == 'environment'
-        ? 'user'
-        : 'environment';
-    final switchResult = await Helper.switchCamera(
-      track,
-    ).timeout(const Duration(seconds: 8));
-    // flutter_webrtc's iOS implementation returns `_usingFrontCamera`, not a
-    // success flag: true means the new lens is front-facing and false means
-    // it is back-facing. Therefore false is the expected result when switching
-    // from the selfie camera back to the rear camera. Android uses this value
-    // as an actual success flag.
-    if (!Platform.isIOS && !switchResult) {
-      throw StateError('Thiết bị không có camera khác để chuyển.');
+    if (_switchingCamera) {
+      throw StateError('Đang đổi camera, vui lòng đợi.');
     }
-    // Keep the renderer attached to the MediaStream while the native capturer
-    // changes lens. Detaching/rebinding the same stream can leave iOS holding
-    // its last texture, and onFirstFrameRendered is not guaranteed to fire a
-    // second time for that stream. The native switch future is the handoff
-    // boundary; a short delay lets the new capture session settle before
-    // applying lens-specific controls.
-    await Future<void>.delayed(const Duration(milliseconds: 250));
-    if (_localStream == null || localVideoTrack != track) {
-      throw StateError('Camera stream không còn tồn tại.');
+    _switchingCamera = true;
+    try {
+      final targetCamera = _availableCameras.where((c) => c.id == deviceId).firstOrNull;
+      final targetFacing = targetCamera?.facing ??
+          (deviceId == null
+              ? (currentFacingMode == 'environment' ? 'user' : 'environment')
+              : 'environment');
+
+      bool switched = false;
+      if (Platform.isAndroid && deviceId != null) {
+        try {
+          final result = await _platformChannel.invokeMethod<bool>(
+            'switchCameraToId',
+            {
+              'trackId': track.id,
+              'cameraId': deviceId,
+            },
+          );
+          switched = result == true;
+        } catch (e) {
+          developer.log(
+            '[CAMERA] Native switchCameraToId failed for $deviceId: $e, falling back to Helper',
+            name: 'WebRtcService',
+          );
+        }
+      }
+
+      if (!switched) {
+        final switchResult = await Helper.switchCamera(
+          track,
+          deviceId,
+        ).timeout(const Duration(seconds: 8));
+
+        if (!Platform.isIOS && !switchResult) {
+          throw StateError('Thiết bị không có camera khác để chuyển.');
+        }
+      }
+
+      await Future<void>.delayed(const Duration(milliseconds: 250));
+      if (_localStream == null || localVideoTrack != track) {
+        throw StateError('Camera stream không còn tồn tại.');
+      }
+      await _configureNaturalCameraMetering(track);
+      if (Platform.isIOS) {
+        _currentFacingMode = targetFacing;
+      } else {
+        _currentFacingMode = targetFacing;
+      }
+      if (deviceId != null) {
+        _activeCameraId = deviceId;
+        _preferredCameraDeviceIds[_currentFacingMode!] = deviceId;
+      }
+      await refreshCameraZoom();
+      developer.log(
+        '[CAMERA] Switched camera to $deviceId ($_currentFacingMode)',
+        name: 'WebRtcService',
+      );
+    } finally {
+      _switchingCamera = false;
     }
-    await _configureNaturalCameraMetering(track);
-    _currentFacingMode = targetFacing;
-    await refreshCameraZoom();
-    developer.log(
-      '[CAMERA] Switched front/back on the current VideoTrack',
-      name: 'WebRtcService',
-    );
+  }
+
+  Future<void> switchCamera() async {
+    if (_availableCameras.isEmpty) {
+      await refreshAvailableCameras();
+    }
+    final ultraWide = ultraWideCamera;
+    final mainBack = mainBackCamera;
+    final front = frontCamera;
+
+    if (ultraWide != null && mainBack != null) {
+      if (currentFacingMode == 'user') {
+        await switchCameraToId(mainBack.id);
+      } else if (isCurrentUltraWide) {
+        if (front != null) {
+          await switchCameraToId(front.id);
+        } else {
+          await switchCameraToId(mainBack.id);
+        }
+      } else {
+        await switchCameraToId(ultraWide.id);
+      }
+    } else {
+      final targetFacing = currentFacingMode == 'environment' ? 'user' : 'environment';
+      final targetDev = _availableCameras.where((c) => c.facing == targetFacing).firstOrNull;
+      await switchCameraToId(targetDev?.id);
+    }
+  }
+
+  Future<void> switchToLensMode(String mode) async {
+    if (_availableCameras.isEmpty) {
+      await refreshAvailableCameras();
+    }
+    if (mode == 'ultra_wide') {
+      final targetRatio = ultraWideZoomRatio;
+      final uw = ultraWideCamera;
+      if (uw != null && uw.id != _activeCameraId) {
+        try {
+          await switchCameraToId(uw.id);
+        } catch (e) {
+          developer.log(
+            '[CAMERA] Primary ultra-wide switch to ${uw.id} failed: $e, trying alternatives',
+            name: 'WebRtcService',
+          );
+          final alts = _availableCameras
+              .where(
+                (c) =>
+                    c.facing == 'back' &&
+                    c.id != _activeCameraId &&
+                    c.id != uw.id &&
+                    c.isUltraWide,
+              )
+              .toList();
+          bool switchedAlt = false;
+          for (final alt in alts) {
+            try {
+              await switchCameraToId(alt.id);
+              switchedAlt = true;
+              break;
+            } catch (_) {}
+          }
+          if (!switchedAlt) {
+            await setCameraZoom(targetRatio);
+          }
+        }
+      } else if (_minimumCameraZoom <= 0.85) {
+        await setCameraZoom(targetRatio);
+      } else {
+        final backCameras =
+            _availableCameras.where((c) => c.facing == 'back').toList();
+        if (backCameras.length > 1) {
+          final aux = backCameras.firstWhere(
+            (c) => c.id != _activeCameraId,
+            orElse: () => backCameras.last,
+          );
+          await switchCameraToId(aux.id);
+        } else {
+          await setCameraZoom(targetRatio);
+        }
+      }
+    } else if (mode == 'wide') {
+      final main = mainBackCamera;
+      if (currentFacingMode == 'user' || isCurrentUltraWide) {
+        if (main != null && _activeCameraId != main.id) {
+          await switchCameraToId(main.id);
+        } else if (currentFacingMode == 'user') {
+          await switchCameraToId(null);
+        }
+      }
+      await setCameraZoom(1.0);
+    } else if (mode == 'front') {
+      final front = frontCamera;
+      if (currentFacingMode != 'user') {
+        if (front != null) {
+          await switchCameraToId(front.id);
+        } else {
+          await switchCameraToId(null);
+        }
+      }
+    }
   }
 
   Future<void> _bindRendererAndWaitForFirstFrame(MediaStream stream) async {

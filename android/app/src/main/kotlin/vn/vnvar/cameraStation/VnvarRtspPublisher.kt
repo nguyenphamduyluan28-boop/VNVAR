@@ -151,12 +151,23 @@ class VnvarRtspPublisher(
                     if (index >= 0) {
                         val input = encoder.getInputBuffer(index) ?: return
                         input.clear()
-                        copyPlane(i420.dataY, i420.strideY, i420.width, i420.height, input)
-                        if (encoderColorFormat == MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420SemiPlanar) {
-                            copyNv12Chroma(i420, input)
+                        val is180 = frame.rotation == 180
+                        if (is180) {
+                            copyPlaneRotated180(i420.dataY, i420.strideY, i420.width, i420.height, input)
+                            if (encoderColorFormat == MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420SemiPlanar) {
+                                copyNv12ChromaRotated180(i420, input)
+                            } else {
+                                copyPlaneRotated180(i420.dataU, i420.strideU, (i420.width + 1) / 2, (i420.height + 1) / 2, input)
+                                copyPlaneRotated180(i420.dataV, i420.strideV, (i420.width + 1) / 2, (i420.height + 1) / 2, input)
+                            }
                         } else {
-                            copyPlane(i420.dataU, i420.strideU, (i420.width + 1) / 2, (i420.height + 1) / 2, input)
-                            copyPlane(i420.dataV, i420.strideV, (i420.width + 1) / 2, (i420.height + 1) / 2, input)
+                            copyPlane(i420.dataY, i420.strideY, i420.width, i420.height, input)
+                            if (encoderColorFormat == MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420SemiPlanar) {
+                                copyNv12Chroma(i420, input)
+                            } else {
+                                copyPlane(i420.dataU, i420.strideU, (i420.width + 1) / 2, (i420.height + 1) / 2, input)
+                                copyPlane(i420.dataV, i420.strideV, (i420.width + 1) / 2, (i420.height + 1) / 2, input)
+                            }
                         }
                         encoder.queueInputBuffer(index, 0, input.position(), frame.timestampNs / 1000, 0)
                         drainEncoder()
@@ -199,6 +210,31 @@ class VnvarRtspPublisher(
             val vOffset = row * i420.strideV
             for (column in 0 until chromaWidth) {
                 // COLOR_FormatYUV420SemiPlanar on Android AVC encoders is NV12: UVUV.
+                target.put(u.get(uOffset + column))
+                target.put(v.get(vOffset + column))
+            }
+        }
+    }
+
+    private fun copyPlaneRotated180(source: ByteBuffer, stride: Int, rowWidth: Int, rows: Int, target: ByteBuffer) {
+        val duplicate = source.duplicate()
+        for (row in rows - 1 downTo 0) {
+            val rowStart = row * stride
+            for (col in rowWidth - 1 downTo 0) {
+                target.put(duplicate.get(rowStart + col))
+            }
+        }
+    }
+
+    private fun copyNv12ChromaRotated180(i420: VideoFrame.I420Buffer, target: ByteBuffer) {
+        val chromaWidth = (i420.width + 1) / 2
+        val chromaHeight = (i420.height + 1) / 2
+        val u = i420.dataU.duplicate()
+        val v = i420.dataV.duplicate()
+        for (row in chromaHeight - 1 downTo 0) {
+            val uOffset = row * i420.strideU
+            val vOffset = row * i420.strideV
+            for (column in chromaWidth - 1 downTo 0) {
                 target.put(u.get(uOffset + column))
                 target.put(v.get(vOffset + column))
             }
