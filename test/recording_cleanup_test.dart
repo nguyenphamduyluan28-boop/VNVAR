@@ -62,7 +62,7 @@ void main() {
   });
 
   test(
-    'protects a newly completed segment in an expired day for 5 minutes',
+    'deletes a past day immediately even if its videos are recent',
     () async {
       final reference = DateTime(2026, 8, 25, 0, 1);
       final file = await createSegment(
@@ -71,12 +71,8 @@ void main() {
       );
 
       await recording.removeExpiredData(referenceTime: reference);
-      expect(await file.exists(), isTrue);
-
-      await recording.removeExpiredData(
-        referenceTime: reference.add(const Duration(minutes: 6)),
-      );
       expect(await file.exists(), isFalse);
+      expect(await file.parent.parent.exists(), isFalse);
     },
   );
 
@@ -120,4 +116,38 @@ void main() {
     expect(recording.segments, isEmpty);
     expect(await file.exists(), isTrue);
   });
+
+  test('cleans empty directories and orphaned companion files for past days', () async {
+    final reference = DateTime(2026, 8, 25, 12);
+    final pastDayDir = Directory(
+      '${sandbox.path}${Platform.pathSeparator}24-08-2026'
+      '${Platform.pathSeparator}AUTOMODE${Platform.pathSeparator}CAM2',
+    );
+    await pastDayDir.create(recursive: true);
+
+    // Tạo file mồ côi (.json, .wav) không có video đi kèm
+    final orphanedJson = File(
+      '${pastDayDir.path}${Platform.pathSeparator}session.json',
+    );
+    await orphanedJson.writeAsString('{"test": true}');
+
+    await recording.cleanupEmptyStorageDirectories(referenceTime: reference);
+
+    expect(await pastDayDir.exists(), isFalse);
+    expect(await Directory('${sandbox.path}${Platform.pathSeparator}24-08-2026').exists(), isFalse);
+  });
+
+  test('preserves empty directory for today', () async {
+    final reference = DateTime(2026, 8, 25, 12);
+    final todayDir = Directory(
+      '${sandbox.path}${Platform.pathSeparator}25-08-2026'
+      '${Platform.pathSeparator}AUTOMODE',
+    );
+    await todayDir.create(recursive: true);
+
+    await recording.cleanupEmptyStorageDirectories(referenceTime: reference);
+
+    expect(await todayDir.exists(), isTrue);
+  });
 }
+

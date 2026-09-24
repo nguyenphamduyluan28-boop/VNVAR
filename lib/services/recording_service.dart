@@ -988,23 +988,6 @@ class RecordingService {
             directoryDate.year == year;
         if (!isValidDate || !directoryDate.isBefore(cutoff)) continue;
 
-        // Segment bắt đầu trước 0 giờ có thể vừa được hoàn tất sau 0 giờ. Không
-        // xóa cả thư mục ngày cũ khi bên trong vẫn có file mới được ghi gần đây.
-        var containsRecentFile = false;
-        try {
-          await for (final child in entity.list(recursive: true)) {
-            if (child is! File || !_isVideoFile(child)) continue;
-            try {
-              final stat = await child.stat();
-              if (now.difference(stat.modified) < recentSegmentProtection) {
-                containsRecentFile = true;
-                break;
-              }
-            } catch (_) {}
-          }
-        } catch (_) {}
-        if (containsRecentFile) continue;
-
         try {
           final normalizedDirectory = entity.path.replaceAll('\\', '/');
           await entity.delete(recursive: true);
@@ -1015,7 +998,7 @@ class RecordingService {
           });
           _notifyVideoChanges();
           developer.log(
-            '[STORAGE] Removed expired day directory: ${entity.path}',
+            '[STORAGE] Removed past day directory: ${entity.path}',
             name: 'RecordingService',
           );
         } catch (error, stackTrace) {
@@ -1035,6 +1018,7 @@ class RecordingService {
         name: 'RecordingService',
       );
     }
+    await cleanupEmptyStorageDirectories(referenceTime: now);
   }
 
   Future<Directory> _videoDirectory({DateTime? date}) async {
@@ -2944,6 +2928,9 @@ class RecordingService {
         await _deleteDirectoryIfEmpty(item.file.parent);
       }
     }
+    if (deletedAny) {
+      await cleanupEmptyStorageDirectories();
+    }
     return deletedAny;
   }
 
@@ -3078,6 +3065,76 @@ class RecordingService {
     for (final child in children.whereType<Directory>()) {
       await _deleteDirectoryTreeIfEmpty(child);
     }
+    await _deleteDirectoryIfEmpty(directory);
+  }
+
+  /// Dọn sạch các thư mục cũ và thư mục rỗng trong thư mục lưu trữ video.
+  ///
+  /// - Thư mục ngày hiện tại (`today`) luôn được bảo vệ để không ảnh hưởng
+  ///   phiên quay video đang hoạt động hoặc sắp bắt đầu.
+  /// - Thư mục `download` tạm thời không bị can thiệp ở đây (đã có luồng riêng).
+  /// - Quét đệ quy từ nhánh con sâu nhất lên (post-order traversal). Nếu thư
+  ///   mục không còn chứa file video nào, dọn các file rác mồ côi (.wav, .json, .tmp)
+  ///   và xóa thư mục nếu rỗng.
+  Future<void> cleanupEmptyStorageDirectories({DateTime? referenceTime}) async {
+    final Directory root;
+    try {
+      root = await _videoRootDirectory();
+      if (!await root.exists()) return;
+    } catch (_) {
+      return;
+    }
+
+    final now = referenceTime ?? DateTime.now();
+    String two(int n) => n.toString().padLeft(2, '0');
+    final todayName = '${two(now.day)}-${two(now.month)}-${now.year}';
+
+    try {
+      final entities = await root.list().toList();
+      for (final entity in entities.whereType<Directory>()) {
+        final dirName = entity.uri.pathSegments
+            .where((part) => part.isNotEmpty)
+            .last;
+
+        if (dirName.toLowerCase() == 'download') continue;
+        if (dirName == todayName) continue;
+
+        await _cleanDirectoryRecursively(entity);
+      }
+    } catch (error, stackTrace) {
+      developer.log(
+        '[STORAGE] Error cleaning empty directories: $error',
+        error: error,
+        stackTrace: stackTrace,
+        name: 'RecordingService',
+      );
+    }
+  }
+
+  Future<void> _cleanDirectoryRecursively(Directory directory) async {
+    if (!await directory.exists()) return;
+
+    final children = await directory.list().toList();
+    for (final child in children.whereType<Directory>()) {
+      await _cleanDirectoryRecursively(child);
+    }
+
+    final remaining = await directory.list().toList();
+    final remainingFiles = remaining.whereType<File>().toList();
+    final hasVideo = remainingFiles.any(_isVideoFile);
+
+    // Nếu thư mục không còn bất kỳ video nào và không có thư mục con,
+    // dọn các file phụ trợ mồ côi (.wav, .json, .tmp, file ẩn hệ điều hành)
+    if (!hasVideo && remaining.whereType<Directory>().isEmpty) {
+      for (final file in remainingFiles) {
+        if (!isFileReadActive(file.path)) {
+          try {
+            await file.delete();
+          } catch (_) {}
+        }
+      }
+    }
+
     await _deleteDirectoryIfEmpty(directory);
   }
 
@@ -3241,6 +3298,7 @@ class RecordingService {
     // Sau mỗi chu kỳ dọn dung lượng, xóa đệ quy toàn bộ thư mục ngày hết hạn,
     // bao gồm các trận đấu và thư mục AUTOMODE.
     await removeExpiredData();
+    await cleanupEmptyStorageDirectories();
     final remainingTotal = await storageSizeBytes();
     final available = await availableStorageBytes();
     final availableText = available == null

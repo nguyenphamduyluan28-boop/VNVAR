@@ -167,6 +167,8 @@ class CameraServer {
 
     // Nạp lại video đã lưu trên điện thoại.
     await recordingService.cleanupOldTempFiles();
+    // Dọn sạch toàn bộ thư mục ngày cũ trước hôm nay ngay khi khởi động.
+    await recordingService.removeExpiredData();
 
     // Legacy tablet discovery uses a short TCP request/response on port 40404.
     try {

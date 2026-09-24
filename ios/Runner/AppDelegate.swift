@@ -16,7 +16,48 @@ import UIKit
     _ application: UIApplication,
     didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]?
   ) -> Bool {
+    setupBrightnessLifecycleObservers()
     return super.application(application, didFinishLaunchingWithOptions: launchOptions)
+  }
+
+  override func applicationWillResignActive(_ application: UIApplication) {
+    restoreBrightnessIfNeeded()
+    super.applicationWillResignActive(application)
+  }
+
+  override func applicationDidEnterBackground(_ application: UIApplication) {
+    restoreBrightnessIfNeeded()
+    super.applicationDidEnterBackground(application)
+  }
+
+  override func applicationWillTerminate(_ application: UIApplication) {
+    restoreBrightnessIfNeeded()
+    super.applicationWillTerminate(application)
+  }
+
+  private func setupBrightnessLifecycleObservers() {
+    let center = NotificationCenter.default
+    center.addObserver(
+      forName: UIApplication.willResignActiveNotification,
+      object: nil,
+      queue: .main
+    ) { [weak self] _ in
+      self?.restoreBrightnessIfNeeded()
+    }
+    center.addObserver(
+      forName: UIApplication.didEnterBackgroundNotification,
+      object: nil,
+      queue: .main
+    ) { [weak self] _ in
+      self?.restoreBrightnessIfNeeded()
+    }
+    center.addObserver(
+      forName: UIApplication.willTerminateNotification,
+      object: nil,
+      queue: .main
+    ) { [weak self] _ in
+      self?.restoreBrightnessIfNeeded()
+    }
   }
 
   func didInitializeImplicitFlutterEngine(_ engineBridge: FlutterImplicitEngineBridge) {
@@ -454,7 +495,17 @@ import UIKit
     }
   }
 
-  private func restoreBrightnessIfNeeded() {
+  func restoreBrightnessIfNeeded() {
+    if Thread.isMainThread {
+      performRestoreBrightness()
+    } else {
+      DispatchQueue.main.sync {
+        self.performRestoreBrightness()
+      }
+    }
+  }
+
+  private func performRestoreBrightness() {
     guard let previousBrightness = brightnessBeforeDimming else { return }
     UIScreen.main.brightness = previousBrightness
     brightnessBeforeDimming = nil
