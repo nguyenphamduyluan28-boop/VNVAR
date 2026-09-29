@@ -190,38 +190,63 @@ class VnvarRtspPublisher(
         onEncoderError(message)
     }
 
+    private var uRowBuffer = ByteArray(0)
+    private var vRowBuffer = ByteArray(0)
+    private var nv12RowBuffer = ByteArray(0)
+    private var rowTransferBuffer = ByteArray(0)
+
     private fun copyPlane(source: ByteBuffer, stride: Int, rowWidth: Int, rows: Int, target: ByteBuffer) {
         val duplicate = source.duplicate()
-        for (row in 0 until rows) {
-            duplicate.position(row * stride)
-            duplicate.limit(row * stride + rowWidth)
+        if (stride == rowWidth) {
+            duplicate.position(0)
+            duplicate.limit(rowWidth * rows)
             target.put(duplicate)
-            duplicate.limit(source.capacity())
+        } else {
+            if (rowTransferBuffer.size < rowWidth) {
+                rowTransferBuffer = ByteArray(rowWidth)
+            }
+            for (row in 0 until rows) {
+                duplicate.position(row * stride)
+                duplicate.get(rowTransferBuffer, 0, rowWidth)
+                target.put(rowTransferBuffer, 0, rowWidth)
+            }
         }
     }
 
     private fun copyNv12Chroma(i420: VideoFrame.I420Buffer, target: ByteBuffer) {
         val chromaWidth = (i420.width + 1) / 2
         val chromaHeight = (i420.height + 1) / 2
+        if (uRowBuffer.size < chromaWidth) {
+            uRowBuffer = ByteArray(chromaWidth)
+            vRowBuffer = ByteArray(chromaWidth)
+            nv12RowBuffer = ByteArray(chromaWidth * 2)
+        }
         val u = i420.dataU.duplicate()
         val v = i420.dataV.duplicate()
         for (row in 0 until chromaHeight) {
-            val uOffset = row * i420.strideU
-            val vOffset = row * i420.strideV
+            u.position(row * i420.strideU)
+            u.get(uRowBuffer, 0, chromaWidth)
+            v.position(row * i420.strideV)
+            v.get(vRowBuffer, 0, chromaWidth)
+            var outIdx = 0
             for (column in 0 until chromaWidth) {
-                // COLOR_FormatYUV420SemiPlanar on Android AVC encoders is NV12: UVUV.
-                target.put(u.get(uOffset + column))
-                target.put(v.get(vOffset + column))
+                nv12RowBuffer[outIdx++] = uRowBuffer[column]
+                nv12RowBuffer[outIdx++] = vRowBuffer[column]
             }
+            target.put(nv12RowBuffer, 0, outIdx)
         }
     }
 
     private fun copyPlaneRotated180(source: ByteBuffer, stride: Int, rowWidth: Int, rows: Int, target: ByteBuffer) {
         val duplicate = source.duplicate()
+        if (rowTransferBuffer.size < rowWidth) {
+            rowTransferBuffer = ByteArray(rowWidth)
+        }
         for (row in rows - 1 downTo 0) {
-            val rowStart = row * stride
+            duplicate.position(row * stride)
+            duplicate.get(rowTransferBuffer, 0, rowWidth)
             for (col in rowWidth - 1 downTo 0) {
-                target.put(duplicate.get(rowStart + col))
+                target.put(rowTransferBuffer[col])
             }
         }
     }
@@ -229,15 +254,24 @@ class VnvarRtspPublisher(
     private fun copyNv12ChromaRotated180(i420: VideoFrame.I420Buffer, target: ByteBuffer) {
         val chromaWidth = (i420.width + 1) / 2
         val chromaHeight = (i420.height + 1) / 2
+        if (uRowBuffer.size < chromaWidth) {
+            uRowBuffer = ByteArray(chromaWidth)
+            vRowBuffer = ByteArray(chromaWidth)
+            nv12RowBuffer = ByteArray(chromaWidth * 2)
+        }
         val u = i420.dataU.duplicate()
         val v = i420.dataV.duplicate()
         for (row in chromaHeight - 1 downTo 0) {
-            val uOffset = row * i420.strideU
-            val vOffset = row * i420.strideV
+            u.position(row * i420.strideU)
+            u.get(uRowBuffer, 0, chromaWidth)
+            v.position(row * i420.strideV)
+            v.get(vRowBuffer, 0, chromaWidth)
+            var outIdx = 0
             for (column in chromaWidth - 1 downTo 0) {
-                target.put(u.get(uOffset + column))
-                target.put(v.get(vOffset + column))
+                nv12RowBuffer[outIdx++] = uRowBuffer[column]
+                nv12RowBuffer[outIdx++] = vRowBuffer[column]
             }
+            target.put(nv12RowBuffer, 0, outIdx)
         }
     }
 
@@ -349,8 +383,14 @@ class VnvarRtspPublisher(
                 val frameNals = mutableListOf<ByteArray>()
                 for (nal in splitNals(bytes)) {
                     when (nal.firstOrNull()?.toInt()?.and(0x1f)) {
-                        7 -> sps = nal
-                        8 -> pps = nal
+                        7 -> {
+                            sps = nal
+                            frameNals += nal
+                        }
+                        8 -> {
+                            pps = nal
+                            frameNals += nal
+                        }
                         else -> frameNals += nal
                     }
                 }
@@ -360,6 +400,17 @@ class VnvarRtspPublisher(
                             frameNals.any { nal ->
                                 nal.firstOrNull()?.toInt()?.and(0x1f) == 5
                             }
+                    if (isKeyFrame) {
+                        val hasSps = frameNals.any { it.firstOrNull()?.toInt()?.and(0x1f) == 7 }
+                        val hasPps = frameNals.any { it.firstOrNull()?.toInt()?.and(0x1f) == 8 }
+                        if (!hasSps && sps != null) {
+                            frameNals.add(0, sps!!)
+                        }
+                        if (!hasPps && pps != null) {
+                            val insertIdx = if (frameNals.isNotEmpty() && frameNals[0].firstOrNull()?.toInt()?.and(0x1f) == 7) 1 else 0
+                            frameNals.add(insertIdx, pps!!)
+                        }
+                    }
                     sendAccessUnit(
                         frameNals,
                         info.presentationTimeUs,
@@ -769,25 +820,30 @@ class VnvarRtspPublisher(
             }
 
             val generation: Long
+            val isLoopback = socket.inetAddress?.isLoopbackAddress == true
+            val maxAllowedPending = if (isLoopback) 4096 else MAX_PENDING_RTP_PACKETS
             synchronized(sendStateLock) {
                 if (closed || !playing) return false
                 if (awaitingKeyFrame && !isKeyFrame) return false
                 if (isKeyFrame && keyFrameQueued) return false
 
                 val queueWouldOverflow = pendingRtpPackets > 0 &&
-                    pendingRtpPackets + packetCount > MAX_PENDING_RTP_PACKETS
+                    pendingRtpPackets + packetCount > maxAllowedPending
                 if (queueWouldOverflow) {
-                    val shouldRequest = !awaitingKeyFrame || isKeyFrame
+                    if (!isKeyFrame) {
+                        // Adaptive drop: drop only this P-frame to relieve socket pressure
+                        // without throwing away existing decoded frames
+                        return true
+                    }
                     Log.w(
                         TAG,
                         "RTSP client $id congested: pending=$pendingRtpPackets, " +
-                            "incoming=$packetCount; waiting for a fresh keyframe",
+                            "incoming=$packetCount, limit=$maxAllowedPending; fast-forwarding to keyframe",
                     )
                     sendGeneration++
                     pendingRtpPackets = 0
-                    awaitingKeyFrame = true
+                    awaitingKeyFrame = false
                     keyFrameQueued = false
-                    return shouldRequest
                 }
 
                 generation = sendGeneration
@@ -927,8 +983,8 @@ class VnvarRtspPublisher(
     companion object {
         private const val TAG = "VNVAR-RTSP"
         private const val RTP_PAYLOAD_BYTES = 1200
-        private const val MAX_PENDING_RTP_PACKETS = 384
-        private const val SOCKET_SEND_BUFFER_BYTES = 256 * 1024
+        private const val MAX_PENDING_RTP_PACKETS = 2048
+        private const val SOCKET_SEND_BUFFER_BYTES = 2 * 1024 * 1024
         private const val CLIENT_WRITE_STALL_NANOS = 2_000_000_000L
         private const val MAX_RTSP_CLIENTS = 4
         private const val MAX_RTSP_HEADER_BYTES = 64 * 1024

@@ -697,6 +697,9 @@ class CameraServer {
       'recording': recordingService.recording,
       'acceptingCheckVar': !_iosLifecycleSuspended,
 
+      'serverTimeMs': DateTime.now().millisecondsSinceEpoch,
+      'timestamp': DateTime.now().millisecondsSinceEpoch,
+
       'webrtc': true,
 
       'cameraReady': webRtcService.cameraInitialized,
@@ -1038,8 +1041,11 @@ class CameraServer {
     final checkpointDownloadUrl = autoTrimmed
         ? '/download/${checkpoint.fileName}'
         : '/video/${checkpoint.fileName}';
+    final now = DateTime.now().millisecondsSinceEpoch;
     final result = <String, dynamic>{
       'success': true,
+      'message': 'Flushed active segment successfully',
+      'timestamp': now,
       'requestId': requestId,
       'status': 'READY',
       'requestedAt': requestedAt.toIso8601String(),
@@ -1077,9 +1083,35 @@ class CameraServer {
   // ============================================================
 
   Future<void> _segments(HttpRequest request) async {
+    final now = DateTime.now();
     final segments = recordingService.segments.map((segment) {
-      return {...segment.toJson(), 'downloadUrl': '/video/${segment.fileName}'};
+      final safeDuration = segment.durationMs <= 0 ? 1 : segment.durationMs;
+      return {
+        ...segment.toJson(),
+        'durationMs': safeDuration,
+        'downloadUrl': '/video/${segment.fileName}',
+      };
     }).toList();
+
+    Map<String, dynamic>? activeSegmentJson;
+    final activeStartedAt = recordingService.currentSegmentStartedAt;
+    final activePath = recordingService.currentPath;
+    if (recordingService.recording &&
+        activeStartedAt != null &&
+        activePath != null) {
+      final activeDurationMs = now.difference(activeStartedAt).inMilliseconds;
+      final fileName = activePath.split(Platform.pathSeparator).last;
+      activeSegmentJson = {
+        'id': fileName,
+        'fileName': fileName,
+        'startTime': activeStartedAt.toIso8601String(),
+        'endTime': now.toIso8601String(),
+        'durationMs': activeDurationMs <= 0 ? 1 : activeDurationMs,
+        'downloadUrl': '/video/$fileName',
+        'type': 'RECORDING',
+        'active': true,
+      };
+    }
 
     await _sendJson(request.response, HttpStatus.ok, {
       'type': 'VNVAR_SEGMENT_LIST_V1',
@@ -1090,7 +1122,11 @@ class CameraServer {
 
       'recording': recordingService.recording,
 
+      'serverTimeMs': now.millisecondsSinceEpoch,
+
       'segments': segments,
+
+      'activeSegment': ?activeSegmentJson,
     });
   }
 

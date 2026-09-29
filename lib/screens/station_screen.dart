@@ -16,9 +16,12 @@ import '../services/camera_station_runtime.dart';
 import '../services/recording_service.dart';
 import '../services/station_config_service.dart';
 import '../services/station_display_service.dart';
+import '../services/whip_publisher_service.dart';
+import '../services/rtsp_publisher_service.dart';
 import 'package:wakelock_plus/wakelock_plus.dart';
 import 'setup_screen.dart';
 import 'video_storage_screen.dart';
+import 'live_stream_screen.dart';
 
 @visibleForTesting
 bool shouldSuspendIosCapture(AppLifecycleState state) {
@@ -96,6 +99,8 @@ class _StationScreenState extends State<StationScreen>
   final CameraStationRuntime _runtime = CameraStationRuntime.instance;
 
   StreamSubscription<void>? _runtimeSubscription;
+  StreamSubscription<WhipPublishState>? _whipSubscription;
+  StreamSubscription<RtspPublishState>? _rtspSubscription;
 
   bool _loading = true;
   String? _error;
@@ -401,6 +406,15 @@ class _StationScreenState extends State<StationScreen>
         }
       });
     }
+    _whipSubscription =
+        _runtime.whipPublisherService.onStateChanged.listen((_) {
+      if (mounted) setState(() {});
+    });
+    _rtspSubscription =
+        _runtime.rtspPublisherService.onStateChanged.listen((_) {
+      if (mounted) setState(() {});
+    });
+
     _initialize();
     _loadViewerAddress();
   }
@@ -757,6 +771,24 @@ class _StationScreenState extends State<StationScreen>
         _error = userFacingError(error);
       });
     }
+  }
+
+  String _formatLiveDuration(Duration d) {
+    final h = d.inHours;
+    final m = d.inMinutes.remainder(60).toString().padLeft(2, '0');
+    final s = d.inSeconds.remainder(60).toString().padLeft(2, '0');
+    return h > 0 ? '$h:$m:$s' : '$m:$s';
+  }
+
+  void _openLiveStreamScreen() {
+    Navigator.of(context).push(
+      MaterialPageRoute(
+        builder: (_) => LiveStreamScreen(
+          runtime: _runtime,
+          configService: StationConfigService(),
+        ),
+      ),
+    );
   }
 
   // ============================================================
@@ -1223,6 +1255,8 @@ class _StationScreenState extends State<StationScreen>
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
     _runtimeSubscription?.cancel();
+    _whipSubscription?.cancel();
+    _rtspSubscription?.cancel();
     _zoomDebounce?.cancel();
     if (_screenDimmed) {
       unawaited(StationDisplayService.setDimmed(false));
@@ -1493,13 +1527,57 @@ class _StationScreenState extends State<StationScreen>
                       landscape: landscape,
                       resolutionProfile: _runtime.resolutionProfile,
                       resolutionSwitching: _runtime.profileSwitching,
+                      whipLive: _runtime.isLiveStreaming,
                       onVideoStorage: _openVideoStorage,
                       onResolution: _handleResolutionPressed,
                       onSettings: _openSettings,
+                      onWhipLive: _openLiveStreamScreen,
                     ),
                   ),
                 ),
               ),
+
+              if (_runtime.isLiveStreaming)
+                Positioned(
+                  top: landscape ? (compact ? 54 : 64) : (compact ? 116 : 134),
+                  left: compact ? 10 : 16,
+                  child: SafeArea(
+                    bottom: false,
+                    child: Container(
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 10,
+                        vertical: 4,
+                      ),
+                      decoration: BoxDecoration(
+                        color: Colors.red.withValues(alpha: 0.85),
+                        borderRadius: BorderRadius.circular(14),
+                        boxShadow: [
+                          BoxShadow(
+                            color: Colors.red.withValues(alpha: 0.4),
+                            blurRadius: 8,
+                            spreadRadius: 1,
+                          ),
+                        ],
+                      ),
+                      child: Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          const Icon(Icons.circle, color: Colors.white, size: 8),
+                          const SizedBox(width: 6),
+                          Text(
+                            'LIVE (${_runtime.rtspPublisherService.isLive ? "RTSP" : "WHIP"}) · ${_formatLiveDuration(_runtime.rtspPublisherService.isLive ? _runtime.rtspPublisherService.liveDuration : _runtime.whipPublisherService.liveDuration)}',
+                            style: const TextStyle(
+                              color: Colors.white,
+                              fontSize: 11.5,
+                              fontWeight: FontWeight.w900,
+                              letterSpacing: 0.3,
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ),
+                ),
 
               if (_runtime.thermalWarning && !landscape)
                 Positioned(
@@ -2115,9 +2193,11 @@ class _StationHeader extends StatelessWidget {
   final bool landscape;
   final CameraResolutionProfile resolutionProfile;
   final bool resolutionSwitching;
+  final bool whipLive;
   final VoidCallback onVideoStorage;
   final VoidCallback? onResolution;
   final VoidCallback onSettings;
+  final VoidCallback onWhipLive;
 
   const _StationHeader({
     required this.identity,
@@ -2128,9 +2208,11 @@ class _StationHeader extends StatelessWidget {
     required this.landscape,
     required this.resolutionProfile,
     required this.resolutionSwitching,
+    required this.whipLive,
     required this.onVideoStorage,
     required this.onResolution,
     required this.onSettings,
+    required this.onWhipLive,
   });
 
   @override
@@ -2200,6 +2282,17 @@ class _StationHeader extends StatelessWidget {
                         onTap: onVideoStorage,
                       ),
                       const SizedBox(width: 4),
+                      _HeaderIconButton(
+                        icon: Icons.podcasts_rounded,
+                        tooltip: whipLive
+                            ? appText(context, 'Đang phát trực tiếp', 'Live streaming')
+                            : appText(context, 'Phát trực tiếp lên máy chủ', 'Live stream to server'),
+                        iconColor: whipLive ? Colors.redAccent : Colors.white,
+                        backgroundColor: whipLive ? Colors.red.withValues(alpha: 0.35) : null,
+                        size: 32,
+                        onTap: onWhipLive,
+                      ),
+                      const SizedBox(width: 4),
                       AppLanguageButton(
                         foregroundColor: Colors.white,
                         size: 32,
@@ -2242,9 +2335,7 @@ class _StationHeader extends StatelessWidget {
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
           // -------------------------------------------------
-          // ROW 1 — camera info (left) + settings cluster
-          // (right), all on one line. Name shrinks via Expanded
-          // so the trailing cluster never gets pushed off.
+          // ROW 1 — Camera Info (left) + Action Buttons (right)
           // -------------------------------------------------
           Row(
             crossAxisAlignment: CrossAxisAlignment.center,
@@ -2262,7 +2353,7 @@ class _StationHeader extends StatelessWidget {
                   ),
                 ),
               ),
-              const SizedBox(width: 10),
+              const SizedBox(width: 8),
               Expanded(
                 child: Text(
                   identity.cameraName,
@@ -2270,27 +2361,36 @@ class _StationHeader extends StatelessWidget {
                   overflow: TextOverflow.ellipsis,
                   style: TextStyle(
                     color: Colors.white,
-                    fontSize: compact ? 14 : 16,
+                    fontSize: compact ? 13 : 15,
                     fontWeight: FontWeight.w900,
                     height: 1.0,
                   ),
                 ),
               ),
-              SizedBox(width: compact ? 6 : 8),
-              _RecordingChip(recording: recording, compact: compact),
-              SizedBox(width: compact ? 6 : 8),
+              const SizedBox(width: 6),
               _HeaderIconButton(
                 icon: Icons.video_settings_rounded,
                 tooltip: appText(context, 'Kho video', 'Video storage'),
                 size: actionSize,
                 onTap: onVideoStorage,
               ),
-              SizedBox(width: compact ? 4 : 6),
+              const SizedBox(width: 4),
+              _HeaderIconButton(
+                icon: Icons.podcasts_rounded,
+                tooltip: whipLive
+                    ? appText(context, 'Đang phát trực tiếp', 'Live streaming')
+                    : appText(context, 'Phát trực tiếp lên máy chủ', 'Live stream to server'),
+                iconColor: whipLive ? Colors.redAccent : Colors.white,
+                backgroundColor: whipLive ? Colors.red.withValues(alpha: 0.35) : null,
+                size: actionSize,
+                onTap: onWhipLive,
+              ),
+              const SizedBox(width: 4),
               AppLanguageButton(
                 foregroundColor: Colors.white,
                 size: actionSize,
               ),
-              SizedBox(width: compact ? 4 : 6),
+              const SizedBox(width: 4),
               _HeaderIconButton(
                 icon: Icons.settings_rounded,
                 tooltip: appText(
@@ -2304,21 +2404,23 @@ class _StationHeader extends StatelessWidget {
             ],
           ),
 
-          SizedBox(height: compact ? 8 : 10),
+          SizedBox(height: compact ? 6 : 8),
           Divider(
             height: 1,
             thickness: 1,
             color: Colors.white.withValues(alpha: 0.08),
           ),
-          SizedBox(height: compact ? 8 : 10),
+          SizedBox(height: compact ? 6 : 8),
 
           // -------------------------------------------------
-          // ROW 3 — identifiers only (camera / court / position)
+          // ROW 2 — Recording status + Resolution + Identifiers (All in Wrap)
           // -------------------------------------------------
           Wrap(
             spacing: 6,
             runSpacing: 6,
+            crossAxisAlignment: WrapCrossAlignment.center,
             children: [
+              _RecordingChip(recording: recording, compact: compact),
               _ResolutionChip(
                 profile: resolutionProfile,
                 switching: resolutionSwitching,
@@ -2478,18 +2580,22 @@ class _HeaderIconButton extends StatelessWidget {
   final String tooltip;
   final double size;
   final VoidCallback onTap;
+  final Color? iconColor;
+  final Color? backgroundColor;
 
   const _HeaderIconButton({
     required this.icon,
     required this.tooltip,
     required this.size,
     required this.onTap,
+    this.iconColor,
+    this.backgroundColor,
   });
 
   @override
   Widget build(BuildContext context) {
     return Material(
-      color: Colors.white.withValues(alpha: 0.12),
+      color: backgroundColor ?? Colors.white.withValues(alpha: 0.12),
       shape: const CircleBorder(),
       child: InkWell(
         customBorder: const CircleBorder(),
@@ -2499,7 +2605,11 @@ class _HeaderIconButton extends StatelessWidget {
           child: SizedBox(
             width: size,
             height: size,
-            child: Icon(icon, color: Colors.white, size: size * 0.53),
+            child: Icon(
+              icon,
+              color: iconColor ?? Colors.white,
+              size: size * 0.53,
+            ),
           ),
         ),
       ),
@@ -2605,8 +2715,10 @@ class _CameraControlDock extends StatelessWidget {
           ),
         ],
       ),
-      child: Column(
-        mainAxisSize: MainAxisSize.min,
+      child: SingleChildScrollView(
+        physics: const ClampingScrollPhysics(),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
         children: [
           _DockButton(
             icon: Icons.rotate_90_degrees_cw_rounded,
@@ -2702,7 +2814,8 @@ class _CameraControlDock extends StatelessWidget {
           ),
         ],
       ),
-    );
+    ),
+  );
   }
 }
 

@@ -274,7 +274,8 @@ class RecordedSegment {
   }
 
   int get durationMs {
-    return duration.inMilliseconds;
+    final ms = duration.inMilliseconds;
+    return ms <= 0 ? 1 : ms;
   }
 
   // ============================================================

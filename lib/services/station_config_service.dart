@@ -19,9 +19,56 @@ class StationConfigService {
   static const String _cameraQuarterTurnsKey = 'camera_quarter_turns';
 
   static const String _screenOrientationKey = 'station_screen_orientation';
+  static const String _whipEndpointKey = 'whip_endpoint_url';
+  static const String _whipAuthTokenKey = 'whip_auth_token';
+  static const String _rtspPushUrlKey = 'rtsp_push_url';
+  static const String _streamProtocolKey = 'live_stream_protocol';
 
   // ConfigService cũ đã lưu Camera ID bằng key này.
   static const String _legacyCameraKey = 'camera_id';
+
+  Future<void> saveRtspPushConfig({required String targetUrl}) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString(_rtspPushUrlKey, targetUrl.trim());
+  }
+
+  Future<String?> loadRtspPushUrl() async {
+    final prefs = await SharedPreferences.getInstance();
+    return _readTrimmed(prefs, _rtspPushUrlKey);
+  }
+
+  Future<void> saveStreamProtocol(String protocol) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString(_streamProtocolKey, protocol.trim().toLowerCase());
+  }
+
+  Future<String> loadStreamProtocol() async {
+    final prefs = await SharedPreferences.getInstance();
+    return prefs.getString(_streamProtocolKey) ?? 'rtsp';
+  }
+
+  Future<void> saveWhipConfig({
+    required String endpointUrl,
+    String? token,
+  }) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString(_whipEndpointKey, endpointUrl.trim());
+    if (token != null && token.trim().isNotEmpty) {
+      await prefs.setString(_whipAuthTokenKey, token.trim());
+    } else {
+      await prefs.remove(_whipAuthTokenKey);
+    }
+  }
+
+  Future<String?> loadWhipEndpointUrl() async {
+    final prefs = await SharedPreferences.getInstance();
+    return _readTrimmed(prefs, _whipEndpointKey);
+  }
+
+  Future<String?> loadWhipAuthToken() async {
+    final prefs = await SharedPreferences.getInstance();
+    return _readTrimmed(prefs, _whipAuthTokenKey);
+  }
 
   Future<void> saveScreenOrientation(String orientation) async {
     final prefs = await SharedPreferences.getInstance();

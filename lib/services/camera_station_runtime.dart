@@ -11,6 +11,8 @@ import 'camera_server.dart';
 import 'recording_service.dart';
 import 'station_config_service.dart';
 import 'webrtc_service.dart';
+import 'whip_publisher_service.dart';
+import 'rtsp_publisher_service.dart';
 
 bool shouldRecreateIosCameraForLensSwitch(
   CameraResolutionProfile previous,
@@ -150,10 +152,17 @@ class CameraStationRuntime {
     'vnvar/camera_station_service',
   );
 
+  final WhipPublisherService _whipPublisherService = WhipPublisherService();
+  final RtspPublisherService _rtspPublisherService = RtspPublisherService();
+
   Stream<void> get stateChanges => _stateController.stream;
   WebRtcService? get webRtcService => _webRtcService;
   RecordingService? get recordingService => _recordingService;
   CameraServer? get cameraServer => _cameraServer;
+  WhipPublisherService get whipPublisherService => _whipPublisherService;
+  RtspPublisherService get rtspPublisherService => _rtspPublisherService;
+  bool get isLiveStreaming =>
+      _whipPublisherService.isLive || _rtspPublisherService.isLive;
   bool get ready => _cameraServer?.running ?? false;
   bool get cameraEnabled => _cameraEnabled;
   bool get microphoneAvailable =>
@@ -939,6 +948,7 @@ class CameraStationRuntime {
       );
     }
 
+    final wasRtspPublishing = _rtspPublisherService.isLive;
     _profileSwitching = true;
     _generation++;
     _emitState();
@@ -1008,6 +1018,9 @@ class CameraStationRuntime {
         if (selectedProfile != previousProfile) {
           await StationConfigService().saveResolutionProfile(selectedProfile);
         }
+        if (wasRtspPublishing) {
+          unawaited(_rtspPublisherService.restartIfPublishing());
+        }
         developer.log(
           '[CAMERA] Switched iOS lens with a compatible capture profile',
           name: 'CameraStationRuntime',
@@ -1026,6 +1039,9 @@ class CameraStationRuntime {
       _resolutionProfile = selectedProfile;
       if (selectedProfile != previousProfile) {
         await StationConfigService().saveResolutionProfile(selectedProfile);
+      }
+      if (wasRtspPublishing) {
+        unawaited(_rtspPublisherService.restartIfPublishing());
       }
       developer.log(
         '[CAMERA] Switched to $targetFacing at '
@@ -1105,6 +1121,7 @@ class CameraStationRuntime {
 
     final previous = _resolutionProfile;
     final currentFacing = webRtc.currentFacingMode;
+    final wasRtspPublishing = _rtspPublisherService.isLive;
     _iosLowFpsReports = 0;
     _profileSwitching = true;
     _generation++;
@@ -1122,6 +1139,9 @@ class CameraStationRuntime {
       if (persistSelection) {
         await StationConfigService().saveResolutionProfile(selected);
       }
+      if (wasRtspPublishing) {
+        unawaited(_rtspPublisherService.restartIfPublishing());
+      }
       developer.log(
         '[CAMERA] Resolution changed to ${selected.shortLabel} '
         '${selected.fps} FPS ($currentFacing)',
@@ -1135,6 +1155,9 @@ class CameraStationRuntime {
         recording.setFacingMode(currentFacing);
         await _waitForIosCaptureWarmup(profile: previous);
         await server.ensureRecording();
+        if (wasRtspPublishing) {
+          unawaited(_rtspPublisherService.restartIfPublishing());
+        }
       } catch (rollbackError, stackTrace) {
         developer.log(
           '[CAMERA] Resolution rollback failed',
