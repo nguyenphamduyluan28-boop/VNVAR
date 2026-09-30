@@ -342,13 +342,10 @@ class _StationScreenState extends State<StationScreen>
       await _runtime.switchCamera();
       if (mounted) {
         final webRtc = _runtime.webRtcService;
-        final isUw = webRtc?.isCurrentUltraWide ?? false;
         final isUser = webRtc?.currentFacingMode == 'user';
         final msg = isUser
             ? appText(context, 'Đã chuyển sang Camera trước', 'Switched to front camera')
-            : isUw
-                ? appText(context, 'Đã chuyển sang Camera góc siêu rộng (0.5×)', 'Switched to Ultra-Wide (0.5×)')
-                : appText(context, 'Đã chuyển sang Camera sau chuẩn (1×)', 'Switched to Rear standard camera (1×)');
+            : appText(context, 'Đã chuyển sang Camera sau', 'Switched to rear camera');
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(
             content: Text(msg),

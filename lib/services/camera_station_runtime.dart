@@ -908,43 +908,8 @@ class CameraStationRuntime {
     final wasRtspPublishing = _rtspPublisherService.isLive;
     final wasWhipPublishing = _whipPublisherService.isLive;
     final previousFacing = webRtc.currentFacingMode;
-    final isUw = webRtc.isCurrentUltraWide;
-    final hasUw = webRtc.hasUltraWideCamera && webRtc.ultraWideCamera != null;
-
-    final String targetFacing;
-    if (hasUw) {
-      if (previousFacing == 'user') {
-        targetFacing = 'environment';
-      } else if (isUw) {
-        targetFacing = 'user';
-      } else {
-        // Main back -> Ultra-wide back
-        targetFacing = 'environment';
-      }
-    } else {
-      targetFacing = previousFacing == 'environment'
-          ? 'user'
-          : 'environment';
-    }
-
-    if (targetFacing == previousFacing) {
-      // In-place switch between rear lenses (Wide <-> UltraWide)
-      if (wasRtspPublishing) {
-        await _rtspPublisherService.prepareForReconfiguration();
-      }
-      if (wasWhipPublishing) {
-        await _whipPublisherService.prepareForReconfiguration();
-      }
-      await webRtc.switchCamera();
-      if (wasRtspPublishing) {
-        unawaited(_rtspPublisherService.restartIfPublishing());
-      }
-      if (wasWhipPublishing) {
-        unawaited(_whipPublisherService.restartIfPublishing());
-      }
-      _emitState();
-      return;
-    }
+    final targetFacing =
+        previousFacing == 'environment' ? 'user' : 'environment';
 
     var targetProfiles = await webRtc.getSupportedResolutionProfiles(
       facingMode: targetFacing,
