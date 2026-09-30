@@ -151,14 +151,28 @@
   return stableBuffer;
 }
 
-+ (AVCaptureDevice * _Nullable)activeVideoDeviceForTrackId:(NSString *)trackId {
++ (AVCaptureSession * _Nullable)captureSessionForTrackId:(NSString *)trackId outSource:(id _Nullable * _Nullable)outSource {
   if (trackId.length == 0) return nil;
   RTCVideoTrack *videoTrack = [self videoTrackForId:trackId];
-  if (videoTrack == nil || ![videoTrack.source isKindOfClass:[RTCAVFoundationVideoSource class]]) {
-    return nil;
+  if (videoTrack == nil) return nil;
+  id source = videoTrack.source;
+  if (source == nil) return nil;
+  @try {
+    if ([source respondsToSelector:NSSelectorFromString(@"captureSession")]) {
+      id session = [source valueForKey:@"captureSession"];
+      if ([session isKindOfClass:[AVCaptureSession class]]) {
+        if (outSource) *outSource = source;
+        return (AVCaptureSession *)session;
+      }
+    }
+  } @catch (NSException *e) {
+    NSLog(@"[CAMERA] captureSession lookup exception: %@", e);
   }
-  RTCAVFoundationVideoSource *source = (RTCAVFoundationVideoSource *)videoTrack.source;
-  AVCaptureSession *session = source.captureSession;
+  return nil;
+}
+
++ (AVCaptureDevice * _Nullable)activeVideoDeviceForTrackId:(NSString *)trackId {
+  AVCaptureSession *session = [self captureSessionForTrackId:trackId outSource:nil];
   if (session == nil) return nil;
   for (AVCaptureInput *input in session.inputs) {
     if ([input isKindOfClass:[AVCaptureDeviceInput class]]) {
@@ -173,15 +187,8 @@
   if (trackId.length == 0 || deviceId.length == 0) {
     return NO;
   }
-  RTCVideoTrack *videoTrack = [self videoTrackForId:trackId];
-  if (videoTrack == nil) {
-    return NO;
-  }
-  if (![videoTrack.source isKindOfClass:[RTCAVFoundationVideoSource class]]) {
-    return NO;
-  }
-  RTCAVFoundationVideoSource *source = (RTCAVFoundationVideoSource *)videoTrack.source;
-  AVCaptureSession *session = source.captureSession;
+  id source = nil;
+  AVCaptureSession *session = [self captureSessionForTrackId:trackId outSource:&source];
   if (session == nil) {
     return NO;
   }
@@ -216,7 +223,11 @@
   }
   if ([session canAddInput:newInput]) {
     [session addInput:newInput];
-    source.useBackCamera = (targetDevice.position == AVCaptureDevicePositionBack);
+    @try {
+      if (source != nil && [source respondsToSelector:NSSelectorFromString(@"setUseBackCamera:")]) {
+        [source setValue:@(targetDevice.position == AVCaptureDevicePositionBack) forKey:@"useBackCamera"];
+      }
+    } @catch (_) {}
     [session commitConfiguration];
     return YES;
   } else {
