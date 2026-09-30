@@ -127,10 +127,27 @@ import UIKit
         self.cameraZoom(call, result, apply: true)
       case "getAvailableCameras":
         self.getAvailableCameras(call, result)
+      case "switchCameraToId":
+        self.switchCameraToId(call, result)
       default:
         result(FlutterMethodNotImplemented)
       }
     }
+  }
+
+  private func switchCameraToId(_ call: FlutterMethodCall, _ result: FlutterResult) {
+    guard let arguments = call.arguments as? [String: Any],
+          let trackId = arguments["trackId"] as? String,
+          let cameraId = arguments["cameraId"] as? String else {
+      result(false)
+      return
+    }
+    var error: NSError?
+    let success = VnvarWebRtcTrackBridge.switchCamera(forTrackId: trackId, toDeviceId: cameraId, error: &error)
+    if !success, let err = error {
+      NSLog("[CAMERA] switchCameraToId iOS failed: %@", err.localizedDescription)
+    }
+    result(success)
   }
 
   private func getAvailableCameras(_ call: FlutterMethodCall, _ result: FlutterResult) {
@@ -166,15 +183,30 @@ import UIKit
     result(cameras)
   }
 
+  private func activeVideoDevice(trackId: String?, requestedId: String?, facing: String) -> AVCaptureDevice? {
+    if let requestedId = requestedId, !requestedId.isEmpty,
+       let device = AVCaptureDevice(uniqueID: requestedId) {
+      return device
+    }
+    if let trackId = trackId, !trackId.isEmpty {
+      if let track = VnvarWebRtcTrackBridge.videoTrack(forId: trackId),
+         let source = track.source as? RTCAVFoundationVideoSource {
+        if let session = source.captureSession,
+           let input = session.inputs.first as? AVCaptureDeviceInput {
+          return input.device
+        }
+      }
+    }
+    let position: AVCaptureDevice.Position = facing == "user" ? .front : .back
+    return AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: position)
+  }
+
   private func cameraZoom(_ call: FlutterMethodCall, _ result: FlutterResult, apply: Bool) {
     let arguments = call.arguments as? [String: Any]
     let facing = arguments?["facing"] as? String ?? "environment"
-    let position: AVCaptureDevice.Position = facing == "user" ? .front : .back
     let requestedId = arguments?["deviceId"] as? String
-    let exactDevice = requestedId.flatMap { id in
-      AVCaptureDevice.devices(for: .video).first { $0.uniqueID == id }
-    }
-    guard let device = exactDevice ?? AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: position) else {
+    let trackId = arguments?["trackId"] as? String
+    guard let device = self.activeVideoDevice(trackId: trackId, requestedId: requestedId, facing: facing) else {
       result(["supported": false]); return
     }
     let minimum = max(0.5, device.minAvailableVideoZoomFactor)

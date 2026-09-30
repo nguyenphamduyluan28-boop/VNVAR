@@ -1080,7 +1080,7 @@ class WebRtcService {
               : 'environment');
 
       bool switched = false;
-      if (Platform.isAndroid && deviceId != null) {
+      if ((Platform.isAndroid || Platform.isIOS) && deviceId != null) {
         try {
           final result = await _platformChannel.invokeMethod<bool>(
             'switchCameraToId',

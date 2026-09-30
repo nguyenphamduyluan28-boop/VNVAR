@@ -9,6 +9,9 @@ NS_ASSUME_NONNULL_BEGIN
 + (RTCVideoTrack * _Nullable)videoTrackForId:(NSString *)trackId;
 + (CVPixelBufferRef _Nullable)copyPixelBufferForFrame:(RTCVideoFrame *)frame
     CF_RETURNS_RETAINED;
++ (BOOL)switchCameraForTrackId:(NSString *)trackId
+                    toDeviceId:(NSString *)deviceId
+                         error:(NSError * _Nullable * _Nullable)outError;
 
 @end
 

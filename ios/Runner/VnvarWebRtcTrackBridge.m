@@ -1,4 +1,5 @@
 #import "VnvarWebRtcTrackBridge.h"
+#import <AVFoundation/AVFoundation.h>
 #import <CoreImage/CoreImage.h>
 #import <flutter_webrtc/FlutterWebRTCPlugin.h>
 #import <flutter_webrtc/FlutterRTCAudioSink.h>
@@ -148,6 +149,95 @@
         colorSpace:colorSpace];
   CVPixelBufferRelease(pixelBuffer);
   return stableBuffer;
+}
+
++ (BOOL)switchCameraForTrackId:(NSString *)trackId
+                    toDeviceId:(NSString *)deviceId
+                         error:(NSError * _Nullable * _Nullable)outError {
+  if (trackId.length == 0 || deviceId.length == 0) {
+    if (outError) {
+      *outError = [NSError errorWithDomain:@"VnvarCamera"
+                                      code:1
+                                  userInfo:@{NSLocalizedDescriptionKey: @"trackId or deviceId is empty"}];
+    }
+    return NO;
+  }
+  RTCVideoTrack *videoTrack = [self videoTrackForId:trackId];
+  if (videoTrack == nil) {
+    if (outError) {
+      *outError = [NSError errorWithDomain:@"VnvarCamera"
+                                      code:2
+                                  userInfo:@{NSLocalizedDescriptionKey: @"videoTrack not found"}];
+    }
+    return NO;
+  }
+  if (![videoTrack.source isKindOfClass:[RTCAVFoundationVideoSource class]]) {
+    if (outError) {
+      *outError = [NSError errorWithDomain:@"VnvarCamera"
+                                      code:3
+                                  userInfo:@{NSLocalizedDescriptionKey: @"source is not RTCAVFoundationVideoSource"}];
+    }
+    return NO;
+  }
+  RTCAVFoundationVideoSource *source = (RTCAVFoundationVideoSource *)videoTrack.source;
+  AVCaptureSession *session = source.captureSession;
+  if (session == nil) {
+    if (outError) {
+      *outError = [NSError errorWithDomain:@"VnvarCamera"
+                                      code:4
+                                  userInfo:@{NSLocalizedDescriptionKey: @"captureSession is nil"}];
+    }
+    return NO;
+  }
+
+  AVCaptureDevice *targetDevice = [AVCaptureDevice deviceWithUniqueID:deviceId];
+  if (targetDevice == nil) {
+    if (outError) {
+      *outError = [NSError errorWithDomain:@"VnvarCamera"
+                                      code:5
+                                  userInfo:@{NSLocalizedDescriptionKey: [NSString stringWithFormat:@"targetDevice %@ not found", deviceId]}];
+    }
+    return NO;
+  }
+
+  AVCaptureDeviceInput *currentInput = nil;
+  for (AVCaptureInput *input in session.inputs) {
+    if ([input isKindOfClass:[AVCaptureDeviceInput class]]) {
+      currentInput = (AVCaptureDeviceInput *)input;
+      break;
+    }
+  }
+
+  if (currentInput != nil && [currentInput.device.uniqueID isEqualToString:deviceId]) {
+    return YES;
+  }
+
+  AVCaptureDeviceInput *newInput = [AVCaptureDeviceInput deviceInputWithDevice:targetDevice error:outError];
+  if (newInput == nil) {
+    return NO;
+  }
+
+  [session beginConfiguration];
+  if (currentInput != nil) {
+    [session removeInput:currentInput];
+  }
+  if ([session canAddInput:newInput]) {
+    [session addInput:newInput];
+    source.useBackCamera = (targetDevice.position == AVCaptureDevicePositionBack);
+    [session commitConfiguration];
+    return YES;
+  } else {
+    if (currentInput != nil && [session canAddInput:currentInput]) {
+      [session addInput:currentInput];
+    }
+    [session commitConfiguration];
+    if (outError) {
+      *outError = [NSError errorWithDomain:@"VnvarCamera"
+                                      code:6
+                                  userInfo:@{NSLocalizedDescriptionKey: @"Cannot add newInput to captureSession"}];
+    }
+    return NO;
+  }
 }
 
 @end
