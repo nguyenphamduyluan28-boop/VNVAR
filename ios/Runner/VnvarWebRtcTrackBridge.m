@@ -151,52 +151,43 @@
   return stableBuffer;
 }
 
-+ (BOOL)switchCameraForTrackId:(NSString *)trackId
-                    toDeviceId:(NSString *)deviceId
-                         error:(NSError * _Nullable * _Nullable)outError {
-  if (trackId.length == 0 || deviceId.length == 0) {
-    if (outError) {
-      *outError = [NSError errorWithDomain:@"VnvarCamera"
-                                      code:1
-                                  userInfo:@{NSLocalizedDescriptionKey: @"trackId or deviceId is empty"}];
++ (AVCaptureDevice * _Nullable)activeVideoDeviceForTrackId:(NSString *)trackId {
+  if (trackId.length == 0) return nil;
+  RTCVideoTrack *videoTrack = [self videoTrackForId:trackId];
+  if (videoTrack == nil || ![videoTrack.source isKindOfClass:[RTCAVFoundationVideoSource class]]) {
+    return nil;
+  }
+  RTCAVFoundationVideoSource *source = (RTCAVFoundationVideoSource *)videoTrack.source;
+  AVCaptureSession *session = source.captureSession;
+  if (session == nil) return nil;
+  for (AVCaptureInput *input in session.inputs) {
+    if ([input isKindOfClass:[AVCaptureDeviceInput class]]) {
+      return ((AVCaptureDeviceInput *)input).device;
     }
+  }
+  return nil;
+}
+
++ (BOOL)switchCameraForTrackId:(NSString *)trackId
+                    toDeviceId:(NSString *)deviceId {
+  if (trackId.length == 0 || deviceId.length == 0) {
     return NO;
   }
   RTCVideoTrack *videoTrack = [self videoTrackForId:trackId];
   if (videoTrack == nil) {
-    if (outError) {
-      *outError = [NSError errorWithDomain:@"VnvarCamera"
-                                      code:2
-                                  userInfo:@{NSLocalizedDescriptionKey: @"videoTrack not found"}];
-    }
     return NO;
   }
   if (![videoTrack.source isKindOfClass:[RTCAVFoundationVideoSource class]]) {
-    if (outError) {
-      *outError = [NSError errorWithDomain:@"VnvarCamera"
-                                      code:3
-                                  userInfo:@{NSLocalizedDescriptionKey: @"source is not RTCAVFoundationVideoSource"}];
-    }
     return NO;
   }
   RTCAVFoundationVideoSource *source = (RTCAVFoundationVideoSource *)videoTrack.source;
   AVCaptureSession *session = source.captureSession;
   if (session == nil) {
-    if (outError) {
-      *outError = [NSError errorWithDomain:@"VnvarCamera"
-                                      code:4
-                                  userInfo:@{NSLocalizedDescriptionKey: @"captureSession is nil"}];
-    }
     return NO;
   }
 
   AVCaptureDevice *targetDevice = [AVCaptureDevice deviceWithUniqueID:deviceId];
   if (targetDevice == nil) {
-    if (outError) {
-      *outError = [NSError errorWithDomain:@"VnvarCamera"
-                                      code:5
-                                  userInfo:@{NSLocalizedDescriptionKey: [NSString stringWithFormat:@"targetDevice %@ not found", deviceId]}];
-    }
     return NO;
   }
 
@@ -212,8 +203,10 @@
     return YES;
   }
 
-  AVCaptureDeviceInput *newInput = [AVCaptureDeviceInput deviceInputWithDevice:targetDevice error:outError];
+  NSError *inputError = nil;
+  AVCaptureDeviceInput *newInput = [AVCaptureDeviceInput deviceInputWithDevice:targetDevice error:&inputError];
   if (newInput == nil) {
+    NSLog(@"[CAMERA] deviceInputWithDevice error: %@", inputError);
     return NO;
   }
 
@@ -231,11 +224,6 @@
       [session addInput:currentInput];
     }
     [session commitConfiguration];
-    if (outError) {
-      *outError = [NSError errorWithDomain:@"VnvarCamera"
-                                      code:6
-                                  userInfo:@{NSLocalizedDescriptionKey: @"Cannot add newInput to captureSession"}];
-    }
     return NO;
   }
 }

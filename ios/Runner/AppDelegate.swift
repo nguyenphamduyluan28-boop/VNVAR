@@ -142,11 +142,7 @@ import UIKit
       result(false)
       return
     }
-    var error: NSError?
-    let success = VnvarWebRtcTrackBridge.switchCamera(forTrackId: trackId, toDeviceId: cameraId, error: &error)
-    if !success, let err = error {
-      NSLog("[CAMERA] switchCameraToId iOS failed: %@", err.localizedDescription)
-    }
+    let success = VnvarWebRtcTrackBridge.switchCamera(forTrackId: trackId, toDeviceId: cameraId)
     result(success)
   }
 
@@ -188,14 +184,9 @@ import UIKit
        let device = AVCaptureDevice(uniqueID: requestedId) {
       return device
     }
-    if let trackId = trackId, !trackId.isEmpty {
-      if let track = VnvarWebRtcTrackBridge.videoTrack(forId: trackId),
-         let source = track.source as? RTCAVFoundationVideoSource {
-        if let session = source.captureSession,
-           let input = session.inputs.first as? AVCaptureDeviceInput {
-          return input.device
-        }
-      }
+    if let trackId = trackId, !trackId.isEmpty,
+       let device = VnvarWebRtcTrackBridge.activeVideoDevice(forTrackId: trackId) {
+      return device
     }
     let position: AVCaptureDevice.Position = facing == "user" ? .front : .back
     return AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: position)

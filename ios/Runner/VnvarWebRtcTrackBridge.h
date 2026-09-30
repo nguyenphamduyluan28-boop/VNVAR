@@ -1,5 +1,6 @@
 #import <Foundation/Foundation.h>
 #import <CoreMedia/CoreMedia.h>
+#import <AVFoundation/AVFoundation.h>
 #import <WebRTC/WebRTC.h>
 
 NS_ASSUME_NONNULL_BEGIN
@@ -9,9 +10,9 @@ NS_ASSUME_NONNULL_BEGIN
 + (RTCVideoTrack * _Nullable)videoTrackForId:(NSString *)trackId;
 + (CVPixelBufferRef _Nullable)copyPixelBufferForFrame:(RTCVideoFrame *)frame
     CF_RETURNS_RETAINED;
++ (AVCaptureDevice * _Nullable)activeVideoDeviceForTrackId:(NSString *)trackId;
 + (BOOL)switchCameraForTrackId:(NSString *)trackId
-                    toDeviceId:(NSString *)deviceId
-                         error:(NSError * _Nullable * _Nullable)outError;
+                    toDeviceId:(NSString *)deviceId;
 
 @end
 
