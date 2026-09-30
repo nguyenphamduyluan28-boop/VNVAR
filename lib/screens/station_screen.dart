@@ -121,6 +121,7 @@ class _StationScreenState extends State<StationScreen>
   /// thành portrait trước khi lifecycle callback kịp chạy.
   bool _lastActiveOrientationLandscape = true;
   bool _appResumed = true;
+  bool _isInPipMode = false;
 
   bool get _recording => _runtime.recordingService?.recording ?? false;
 
@@ -403,8 +404,17 @@ class _StationScreenState extends State<StationScreen>
           final effectiveRot = args?['effectiveRotation'] as int? ?? 0;
           debugPrint('[ROTATION] Native auto-sync rotation changed: $effectiveRot°');
           if (mounted) setState(() {});
+        } else if (call.method == 'onPictureInPictureModeChanged') {
+          final args = call.arguments as Map<dynamic, dynamic>?;
+          final inPip = args?['inPip'] as bool? ?? false;
+          if (mounted && _isInPipMode != inPip) {
+            setState(() {
+              _isInPipMode = inPip;
+            });
+          }
         }
       });
+      unawaited(_checkInitialPipMode());
     }
     _whipSubscription =
         _runtime.whipPublisherService.onStateChanged.listen((_) {
@@ -454,6 +464,7 @@ class _StationScreenState extends State<StationScreen>
     } else if (state == AppLifecycleState.resumed) {
       _appResumed = true;
       if (Platform.isAndroid) {
+        unawaited(_checkInitialPipMode());
         unawaited(
           _platformChannel.invokeMethod('setScreenOrientation', {
             'mode': _screenOrientation,
@@ -508,6 +519,19 @@ class _StationScreenState extends State<StationScreen>
     } catch (error) {
       debugPrint('[ORIENTATION] Không thể thiết lập hướng màn hình: $error');
     }
+  }
+
+  Future<void> _checkInitialPipMode() async {
+    if (!Platform.isAndroid) return;
+    try {
+      final inPip =
+          await _platformChannel.invokeMethod<bool>('isInPictureInPictureMode');
+      if (mounted && inPip != null && inPip != _isInPipMode) {
+        setState(() {
+          _isInPipMode = inPip;
+        });
+      }
+    } catch (_) {}
   }
 
   Future<void> _toggleScreenOrientation() async {
@@ -1068,122 +1092,238 @@ class _StationScreenState extends State<StationScreen>
   }
 
   Widget _buildResolutionPicker(BuildContext sheetContext) {
-    final media = MediaQuery.of(sheetContext);
-    final profiles = _runtime.supportedResolutionProfiles;
-    final landscape = media.orientation == Orientation.landscape;
-    final columns = landscape && media.size.width >= 560 ? 2 : 1;
-    final rows = (profiles.length / columns).ceil();
-    final contentHeight = 58.0 + (rows * 88.0) + ((rows - 1) * 10.0) + 16.0;
-    final maximumHeight = (media.size.height * (landscape ? 0.72 : 0.48)).clamp(
-      220.0,
-      400.0,
-    );
-    final sheetHeight = contentHeight < maximumHeight
-        ? contentHeight
-        : maximumHeight;
+    return StatefulBuilder(
+      builder: (context, setSheetState) {
+        final media = MediaQuery.of(sheetContext);
+        final profiles = _runtime.supportedResolutionProfiles;
+        final landscape = media.orientation == Orientation.landscape;
+        final columns = landscape && media.size.width >= 560 ? 2 : 1;
+        final rows = (profiles.length / columns).ceil();
+        final contentHeight = 58.0 + (rows * 88.0) + ((rows - 1) * 10.0) + 16.0;
+        final maximumHeight = (media.size.height * (landscape ? 0.72 : 0.48)).clamp(
+          220.0,
+          400.0,
+        );
+        final sheetHeight = contentHeight < maximumHeight
+            ? contentHeight
+            : maximumHeight;
+        final isLocked = _runtime.resolutionLocked;
 
-    return SafeArea(
-      child: SizedBox(
-        height: sheetHeight,
-        child: Padding(
-          padding: const EdgeInsets.fromLTRB(16, 0, 16, 16),
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              Text(
-                appText(context, 'CHẤT LƯỢNG CAMERA', 'CAMERA QUALITY'),
-                style: const TextStyle(
-                  color: Colors.white,
-                  fontSize: 17,
-                  fontWeight: FontWeight.w900,
-                ),
-              ),
-              const SizedBox(height: 10),
-              Expanded(
-                child: GridView.builder(
-                  padding: EdgeInsets.zero,
-                  itemCount: profiles.length,
-                  gridDelegate: SliverGridDelegateWithFixedCrossAxisCount(
-                    crossAxisCount: columns,
-                    crossAxisSpacing: 10,
-                    mainAxisSpacing: 10,
-                    mainAxisExtent: 88,
-                  ),
-                  itemBuilder: (context, index) {
-                    final profile = profiles[index];
-                    final active =
-                        profile.preset == _runtime.resolutionProfile.preset;
-                    final displayProfile = active
-                        ? _runtime.resolutionProfile
-                        : profile;
-                    return Material(
-                      color: active
-                          ? const Color(0xFF183728)
-                          : const Color(0xFF1A2028),
-                      borderRadius: BorderRadius.circular(14),
-                      child: InkWell(
-                        borderRadius: BorderRadius.circular(14),
-                        onTap: active
-                            ? null
-                            : () => Navigator.pop(sheetContext, profile),
-                        child: Padding(
-                          padding: const EdgeInsets.symmetric(
-                            horizontal: 12,
-                            vertical: 10,
-                          ),
-                          child: Row(
-                            children: [
-                              Icon(
-                                active
-                                    ? Icons.check_circle_rounded
-                                    : Icons.radio_button_unchecked_rounded,
-                                color: active
-                                    ? Colors.greenAccent
-                                    : Colors.white38,
-                              ),
-                              const SizedBox(width: 10),
-                              Expanded(
-                                child: Column(
-                                  mainAxisAlignment: MainAxisAlignment.center,
-                                  crossAxisAlignment: CrossAxisAlignment.start,
-                                  children: [
-                                    Text(
-                                      displayProfile.title,
-                                      maxLines: 1,
-                                      overflow: TextOverflow.ellipsis,
-                                      style: const TextStyle(
-                                        color: Colors.white,
-                                        fontWeight: FontWeight.w800,
-                                      ),
-                                    ),
-                                    const SizedBox(height: 4),
-                                    Text(
-                                      '${displayProfile.width} × ${displayProfile.height}  •  '
-                                      '${displayProfile.fps} FPS\n'
-                                      '${(displayProfile.bitrate / 1000000).toStringAsFixed(1)} Mbps',
-                                      maxLines: 2,
-                                      overflow: TextOverflow.ellipsis,
-                                      style: const TextStyle(
-                                        color: Colors.white60,
-                                        fontSize: 12,
-                                        height: 1.2,
-                                      ),
-                                    ),
-                                  ],
-                                ),
-                              ),
-                            ],
+        return SafeArea(
+          child: SizedBox(
+            height: sheetHeight,
+            child: Padding(
+              padding: const EdgeInsets.fromLTRB(16, 0, 16, 16),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Row(
+                    children: [
+                      Expanded(
+                        child: Text(
+                          appText(context, 'CHẤT LƯỢNG CAMERA', 'CAMERA QUALITY'),
+                          style: const TextStyle(
+                            color: Colors.white,
+                            fontSize: 16,
+                            fontWeight: FontWeight.w900,
                           ),
                         ),
                       ),
-                    );
-                  },
-                ),
+                      Material(
+                        color: Colors.transparent,
+                        child: InkWell(
+                          borderRadius: BorderRadius.circular(20),
+                          onTap: () async {
+                            final nextLock = !_runtime.resolutionLocked;
+                            final lockMsg = nextLock
+                                ? appText(
+                                    sheetContext,
+                                    'Đã khóa chế độ phân giải. Không thể đổi độ phân giải khi đang phát.',
+                                    'Resolution mode locked. Quality cannot be changed accidentally.',
+                                  )
+                                : appText(
+                                    sheetContext,
+                                    'Đã mở khóa chế độ phân giải.',
+                                    'Resolution mode unlocked.',
+                                  );
+                            await _runtime.setResolutionLocked(nextLock);
+                            if (!sheetContext.mounted) return;
+                            setSheetState(() {});
+                            if (mounted) setState(() {});
+                            ScaffoldMessenger.of(sheetContext)
+                              ..hideCurrentSnackBar()
+                              ..showSnackBar(
+                                SnackBar(
+                                  duration: const Duration(seconds: 2),
+                                  content: Text(lockMsg),
+                                ),
+                              );
+                          },
+                          child: Container(
+                            padding: const EdgeInsets.symmetric(
+                              horizontal: 10,
+                              vertical: 5,
+                            ),
+                            decoration: BoxDecoration(
+                              color: isLocked
+                                  ? const Color(0xFFE65100).withValues(alpha: 0.25)
+                                  : Colors.white.withValues(alpha: 0.08),
+                              borderRadius: BorderRadius.circular(20),
+                              border: Border.all(
+                                color: isLocked
+                                    ? const Color(0xFFFF9800)
+                                    : Colors.white24,
+                                width: 1.2,
+                              ),
+                            ),
+                            child: Row(
+                              mainAxisSize: MainAxisSize.min,
+                              children: [
+                                Icon(
+                                  isLocked
+                                      ? Icons.lock_rounded
+                                      : Icons.lock_open_rounded,
+                                  size: 14,
+                                  color: isLocked
+                                      ? const Color(0xFFFFB74D)
+                                      : Colors.white70,
+                                ),
+                                const SizedBox(width: 5),
+                                Text(
+                                  isLocked
+                                      ? appText(context, 'Đã khóa', 'Locked')
+                                      : appText(context, 'Khóa chế độ', 'Lock mode'),
+                                  style: TextStyle(
+                                    color: isLocked
+                                        ? const Color(0xFFFFB74D)
+                                        : Colors.white70,
+                                    fontSize: 12,
+                                    fontWeight: FontWeight.w700,
+                                  ),
+                                ),
+                              ],
+                            ),
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 10),
+                  Expanded(
+                    child: GridView.builder(
+                      padding: EdgeInsets.zero,
+                      itemCount: profiles.length,
+                      gridDelegate: SliverGridDelegateWithFixedCrossAxisCount(
+                        crossAxisCount: columns,
+                        crossAxisSpacing: 10,
+                        mainAxisSpacing: 10,
+                        mainAxisExtent: 88,
+                      ),
+                      itemBuilder: (context, index) {
+                        final profile = profiles[index];
+                        final active =
+                            profile.preset == _runtime.resolutionProfile.preset;
+                        final displayProfile = active
+                            ? _runtime.resolutionProfile
+                            : profile;
+                        return Material(
+                          color: active
+                              ? const Color(0xFF183728)
+                              : isLocked
+                                  ? const Color(0xFF15181E)
+                                  : const Color(0xFF1A2028),
+                          borderRadius: BorderRadius.circular(14),
+                          child: InkWell(
+                            borderRadius: BorderRadius.circular(14),
+                            onTap: active
+                                ? null
+                                : () {
+                                    if (isLocked) {
+                                      ScaffoldMessenger.of(context)
+                                        ..hideCurrentSnackBar()
+                                        ..showSnackBar(
+                                          SnackBar(
+                                            content: Text(
+                                              appText(
+                                                context,
+                                                'Chế độ phân giải đang khóa. Vui lòng bấm nút mở khóa ở góc trên để đổi.',
+                                                'Resolution mode is locked. Please unlock using the top button to change.',
+                                              ),
+                                            ),
+                                          ),
+                                        );
+                                      return;
+                                    }
+                                    Navigator.pop(sheetContext, profile);
+                                  },
+                            child: Padding(
+                              padding: const EdgeInsets.symmetric(
+                                horizontal: 12,
+                                vertical: 10,
+                              ),
+                              child: Row(
+                                children: [
+                                  Icon(
+                                    active
+                                        ? Icons.check_circle_rounded
+                                        : isLocked
+                                            ? Icons.lock_outline_rounded
+                                            : Icons.radio_button_unchecked_rounded,
+                                    color: active
+                                        ? Colors.greenAccent
+                                        : isLocked
+                                            ? Colors.white24
+                                            : Colors.white38,
+                                  ),
+                                  const SizedBox(width: 10),
+                                  Expanded(
+                                    child: Column(
+                                      mainAxisAlignment: MainAxisAlignment.center,
+                                      crossAxisAlignment: CrossAxisAlignment.start,
+                                      children: [
+                                        Text(
+                                          displayProfile.title,
+                                          maxLines: 1,
+                                          overflow: TextOverflow.ellipsis,
+                                          style: TextStyle(
+                                            color: isLocked && !active
+                                                ? Colors.white54
+                                                : Colors.white,
+                                            fontWeight: FontWeight.w800,
+                                          ),
+                                        ),
+                                        const SizedBox(height: 4),
+                                        Text(
+                                          '${displayProfile.width} × ${displayProfile.height}  •  '
+                                          '${displayProfile.fps} FPS\n'
+                                          '${(displayProfile.bitrate / 1000000).toStringAsFixed(1)} Mbps',
+                                          maxLines: 2,
+                                          overflow: TextOverflow.ellipsis,
+                                          style: TextStyle(
+                                            color: isLocked && !active
+                                                ? Colors.white30
+                                                : Colors.white60,
+                                            fontSize: 12,
+                                            height: 1.2,
+                                          ),
+                                        ),
+                                      ],
+                                    ),
+                                  ),
+                                ],
+                              ),
+                            ),
+                          ),
+                        );
+                      },
+                    ),
+                  ),
+                ],
               ),
-            ],
+            ),
           ),
-        ),
-      ),
+        );
+      },
     );
   }
 
@@ -1446,6 +1586,7 @@ class _StationScreenState extends State<StationScreen>
           final short = constraints.maxHeight < 560;
           final compact = narrow || short;
           final landscape = constraints.maxWidth > constraints.maxHeight;
+          final isPip = _isInPipMode || (constraints.maxHeight < 240);
           if (_isCurrentLayoutLandscape != landscape) {
             _isCurrentLayoutLandscape = landscape;
             // Chỉ cập nhật _lastActiveOrientationLandscape khi app đang
@@ -1505,7 +1646,8 @@ class _StationScreenState extends State<StationScreen>
               // ==============================================
               // TOP BAR (identity + primary actions)
               // ==============================================
-              Positioned(
+              if (!isPip)
+                Positioned(
                 left: 0,
                 right: 0,
                 top: 0,
@@ -1527,6 +1669,7 @@ class _StationScreenState extends State<StationScreen>
                       landscape: landscape,
                       resolutionProfile: _runtime.resolutionProfile,
                       resolutionSwitching: _runtime.profileSwitching,
+                      resolutionLocked: _runtime.resolutionLocked,
                       whipLive: _runtime.isLiveStreaming,
                       onVideoStorage: _openVideoStorage,
                       onResolution: _handleResolutionPressed,
@@ -1537,7 +1680,7 @@ class _StationScreenState extends State<StationScreen>
                 ),
               ),
 
-              if (_runtime.isLiveStreaming)
+              if (!isPip && _runtime.isLiveStreaming)
                 Positioned(
                   top: landscape ? (compact ? 54 : 64) : (compact ? 116 : 134),
                   left: compact ? 10 : 16,
@@ -1579,7 +1722,7 @@ class _StationScreenState extends State<StationScreen>
                   ),
                 ),
 
-              if (_runtime.thermalWarning && !landscape)
+              if (!isPip && _runtime.thermalWarning && !landscape)
                 Positioned(
                   top: compact ? 128 : 144,
                   left: compact ? 8 : 14,
@@ -1596,7 +1739,8 @@ class _StationScreenState extends State<StationScreen>
               // ==============================================
               // RIGHT-SIDE CAMERA CONTROLS
               // ==============================================
-              Positioned(
+              if (!isPip)
+                Positioned(
                 right: compact ? 8 : 14,
                 top: 0,
                 bottom: 0,
@@ -1638,7 +1782,8 @@ class _StationScreenState extends State<StationScreen>
               // ==============================================
               // BOTTOM STATUS
               // ==============================================
-              Positioned(
+              if (!isPip)
+                Positioned(
                 left: compact ? 8 : 14,
                 right: compact ? 8 : 14,
                 bottom: 0,
@@ -1769,6 +1914,107 @@ class _StationScreenState extends State<StationScreen>
                   ),
                 ),
               ),
+
+              // ==============================================
+              // PIP MODE MINIMAL STATUS OVERLAY
+              // ==============================================
+              if (isPip)
+                Positioned(
+                  top: 6,
+                  left: 8,
+                  right: 8,
+                  child: Row(
+                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                    children: [
+                      Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          if (_recording)
+                            Container(
+                              padding: const EdgeInsets.symmetric(
+                                horizontal: 5,
+                                vertical: 2,
+                              ),
+                              margin: const EdgeInsets.only(right: 4),
+                              decoration: BoxDecoration(
+                                color: Colors.red.withValues(alpha: 0.85),
+                                borderRadius: BorderRadius.circular(6),
+                              ),
+                              child: const Row(
+                                mainAxisSize: MainAxisSize.min,
+                                children: [
+                                  Icon(Icons.circle, color: Colors.white, size: 6),
+                                  SizedBox(width: 3),
+                                  Text(
+                                    'REC',
+                                    style: TextStyle(
+                                      color: Colors.white,
+                                      fontSize: 9,
+                                      fontWeight: FontWeight.w900,
+                                      letterSpacing: 0.5,
+                                    ),
+                                  ),
+                                ],
+                              ),
+                            ),
+                          if (_runtime.isLiveStreaming)
+                            Container(
+                              padding: const EdgeInsets.symmetric(
+                                horizontal: 5,
+                                vertical: 2,
+                              ),
+                              decoration: BoxDecoration(
+                                color: Colors.blue.withValues(alpha: 0.85),
+                                borderRadius: BorderRadius.circular(6),
+                              ),
+                              child: const Text(
+                                'LIVE',
+                                style: TextStyle(
+                                  color: Colors.white,
+                                  fontSize: 9,
+                                  fontWeight: FontWeight.w900,
+                                  letterSpacing: 0.5,
+                                ),
+                              ),
+                            ),
+                        ],
+                      ),
+                      if (_runtime.thermalWarning)
+                        Container(
+                          padding: const EdgeInsets.symmetric(
+                            horizontal: 5,
+                            vertical: 2,
+                          ),
+                          decoration: BoxDecoration(
+                            color: const Color(0xFF2A1C08).withValues(alpha: 0.85),
+                            borderRadius: BorderRadius.circular(6),
+                            border: Border.all(
+                              color: Colors.amber.withValues(alpha: 0.7),
+                            ),
+                          ),
+                          child: const Row(
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              Icon(
+                                Icons.warning_amber_rounded,
+                                color: Colors.amber,
+                                size: 10,
+                              ),
+                              SizedBox(width: 3),
+                              Text(
+                                '720p',
+                                style: TextStyle(
+                                  color: Colors.amber,
+                                  fontSize: 9,
+                                  fontWeight: FontWeight.w800,
+                                ),
+                              ),
+                            ],
+                          ),
+                        ),
+                    ],
+                  ),
+                ),
             ],
           );
         },
@@ -1819,7 +2065,7 @@ class _ThermalToast extends StatelessWidget {
                   size: compact ? 14 : 16,
                 ),
                 const SizedBox(width: 8),
-                Flexible(
+                Expanded(
                   child: Text(
                     appText(
                       context,
@@ -2193,6 +2439,7 @@ class _StationHeader extends StatelessWidget {
   final bool landscape;
   final CameraResolutionProfile resolutionProfile;
   final bool resolutionSwitching;
+  final bool resolutionLocked;
   final bool whipLive;
   final VoidCallback onVideoStorage;
   final VoidCallback? onResolution;
@@ -2208,6 +2455,7 @@ class _StationHeader extends StatelessWidget {
     required this.landscape,
     required this.resolutionProfile,
     required this.resolutionSwitching,
+    required this.resolutionLocked,
     required this.whipLive,
     required this.onVideoStorage,
     required this.onResolution,
@@ -2272,6 +2520,7 @@ class _StationHeader extends StatelessWidget {
                       _ResolutionChip(
                         profile: resolutionProfile,
                         switching: resolutionSwitching,
+                        locked: resolutionLocked,
                         onTap: onResolution,
                       ),
                       const SizedBox(width: 5),
@@ -2424,6 +2673,7 @@ class _StationHeader extends StatelessWidget {
               _ResolutionChip(
                 profile: resolutionProfile,
                 switching: resolutionSwitching,
+                locked: resolutionLocked,
                 onTap: onResolution,
               ),
               _HeaderTag(icon: Icons.videocam_rounded, text: identity.cameraId),
@@ -2476,23 +2726,36 @@ class _HeaderGlassCluster extends StatelessWidget {
 class _ResolutionChip extends StatelessWidget {
   final CameraResolutionProfile profile;
   final bool switching;
+  final bool locked;
   final VoidCallback? onTap;
 
   const _ResolutionChip({
     required this.profile,
     required this.switching,
+    this.locked = false,
     required this.onTap,
   });
 
   @override
   Widget build(BuildContext context) {
     return Material(
-      color: const Color(0xFF1565C0).withValues(alpha: 0.8),
+      color: locked
+          ? const Color(0xFFE65100).withValues(alpha: 0.85)
+          : const Color(0xFF1565C0).withValues(alpha: 0.8),
       borderRadius: BorderRadius.circular(20),
       child: InkWell(
         borderRadius: BorderRadius.circular(20),
         onTap: switching ? null : onTap,
-        child: Padding(
+        child: Container(
+          decoration: BoxDecoration(
+            borderRadius: BorderRadius.circular(20),
+            border: locked
+                ? Border.all(
+                    color: const Color(0xFFFFB74D).withValues(alpha: 0.7),
+                    width: 1,
+                  )
+                : null,
+          ),
           padding: const EdgeInsets.symmetric(horizontal: 9, vertical: 5),
           child: Row(
             mainAxisSize: MainAxisSize.min,
@@ -2505,6 +2768,12 @@ class _ResolutionChip extends StatelessWidget {
                     strokeWidth: 2,
                     color: Colors.white,
                   ),
+                )
+              else if (locked)
+                const Icon(
+                  Icons.lock_rounded,
+                  size: 12,
+                  color: Color(0xFFFFE082),
                 )
               else
                 const Icon(Icons.high_quality_rounded, size: 13),

@@ -991,7 +991,19 @@ class RecordingService {
 
         try {
           final normalizedDirectory = entity.path.replaceAll('\\', '/');
-          await entity.delete(recursive: true);
+
+          // 1. Thử xóa qua tầng Native Android trước (để giải quyết Scoped Storage)
+          bool nativeDeleted = false;
+          if (Platform.isAndroid) {
+            nativeDeleted =
+                await _videoStorage.deleteDirectoryRecursively(entity.path);
+          }
+
+          // 2. Nếu native chưa xóa được hoặc không phải Android, duyệt xóa sạch từng file con từ dưới lên trong Dart
+          if (!nativeDeleted && await entity.exists()) {
+            await _deepDeleteDirectory(entity);
+          }
+
           _segments.removeWhere((segment) {
             final normalizedPath = segment.path.replaceAll('\\', '/');
             return normalizedPath == normalizedDirectory ||
@@ -1020,6 +1032,29 @@ class RecordingService {
       );
     }
     await cleanupEmptyStorageDirectories(referenceTime: now);
+  }
+
+  Future<void> _deepDeleteDirectory(Directory dir) async {
+    if (!await dir.exists()) return;
+    try {
+      final children = await dir.list(recursive: false).toList();
+      for (final child in children) {
+        if (child is Directory) {
+          await _deepDeleteDirectory(child);
+        } else if (child is File) {
+          try {
+            await child.delete();
+          } catch (_) {}
+        }
+      }
+      try {
+        await dir.delete();
+      } catch (_) {
+        if (Platform.isAndroid) {
+          await _videoStorage.deleteDirectoryRecursively(dir.path);
+        }
+      }
+    } catch (_) {}
   }
 
   Future<Directory> _videoDirectory({DateTime? date}) async {
@@ -2137,7 +2172,6 @@ class RecordingService {
 
     _segments.add(segment);
     _notifyVideoChanges();
-    unawaited(_videoStorage.scanMediaFile(file.path));
     await enforceStorageLimit();
 
     try {

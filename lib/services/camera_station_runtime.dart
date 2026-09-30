@@ -124,6 +124,7 @@ class CameraStationRuntime {
   final Map<String, int> _healthFailureCounts = <String, int>{};
   CameraResolutionProfile _resolutionProfile =
       CameraResolutionProfile.fullHd1080;
+  bool _resolutionLocked = false;
   List<CameraResolutionProfile> _supportedResolutionProfiles = const [
     CameraResolutionProfile.hd720,
   ];
@@ -187,10 +188,19 @@ class CameraStationRuntime {
 
   Future<void> setCameraQuarterTurns(int quarterTurns) async {
     final turns = (quarterTurns % 4 + 4) % 4;
+    final previousTurns = _cameraQuarterTurns;
     _cameraQuarterTurns = turns;
     _recordingService?.setQuarterTurns(turns);
     await _webRtcService?.setCameraRotation(turns);
     await StationConfigService().saveCameraQuarterTurns(turns);
+    if (turns != previousTurns) {
+      if (_rtspPublisherService.isLive) {
+        unawaited(_rtspPublisherService.restartIfPublishing());
+      }
+      if (_whipPublisherService.isLive) {
+        unawaited(_whipPublisherService.restartIfPublishing());
+      }
+    }
     _emitState();
   }
   bool get storageWarning => _recordingService?.lowStorageWarning ?? false;
@@ -228,8 +238,16 @@ class CameraStationRuntime {
   };
 
   CameraResolutionProfile get resolutionProfile => _resolutionProfile;
+  bool get resolutionLocked => _resolutionLocked;
   List<CameraResolutionProfile> get supportedResolutionProfiles =>
       List.unmodifiable(_supportedResolutionProfiles);
+
+  Future<void> setResolutionLocked(bool locked) async {
+    if (_resolutionLocked == locked) return;
+    _resolutionLocked = locked;
+    await StationConfigService().saveResolutionLocked(locked);
+    _emitState();
+  }
 
   Future<List<CameraResolutionProfile>>
   refreshSupportedResolutionProfiles() async {
@@ -332,6 +350,7 @@ class CameraStationRuntime {
       _supportedResolutionProfiles = await webRtc
           .getSupportedResolutionProfiles();
       final savedProfile = await StationConfigService().loadResolutionProfile();
+      _resolutionLocked = await StationConfigService().loadResolutionLocked();
       _resolutionProfile = _supportedResolutionProfiles.firstWhere(
         (profile) => profile.preset == savedProfile?.preset,
         orElse: () => _supportedResolutionProfiles.firstWhere(
@@ -886,6 +905,8 @@ class CameraStationRuntime {
       throw StateError('Camera Station chưa khởi tạo xong.');
     }
 
+    final wasRtspPublishing = _rtspPublisherService.isLive;
+    final wasWhipPublishing = _whipPublisherService.isLive;
     final previousFacing = webRtc.currentFacingMode;
     final isUw = webRtc.isCurrentUltraWide;
     final hasUw = webRtc.hasUltraWideCamera && webRtc.ultraWideCamera != null;
@@ -908,7 +929,19 @@ class CameraStationRuntime {
 
     if (targetFacing == previousFacing) {
       // In-place switch between rear lenses (Wide <-> UltraWide)
+      if (wasRtspPublishing) {
+        await _rtspPublisherService.prepareForReconfiguration();
+      }
+      if (wasWhipPublishing) {
+        await _whipPublisherService.prepareForReconfiguration();
+      }
       await webRtc.switchCamera();
+      if (wasRtspPublishing) {
+        unawaited(_rtspPublisherService.restartIfPublishing());
+      }
+      if (wasWhipPublishing) {
+        unawaited(_whipPublisherService.restartIfPublishing());
+      }
       _emitState();
       return;
     }
@@ -948,7 +981,12 @@ class CameraStationRuntime {
       );
     }
 
-    final wasRtspPublishing = _rtspPublisherService.isLive;
+    if (wasRtspPublishing) {
+      await _rtspPublisherService.prepareForReconfiguration();
+    }
+    if (wasWhipPublishing) {
+      await _whipPublisherService.prepareForReconfiguration();
+    }
     _profileSwitching = true;
     _generation++;
     _emitState();
@@ -1021,6 +1059,9 @@ class CameraStationRuntime {
         if (wasRtspPublishing) {
           unawaited(_rtspPublisherService.restartIfPublishing());
         }
+        if (wasWhipPublishing) {
+          unawaited(_whipPublisherService.restartIfPublishing());
+        }
         developer.log(
           '[CAMERA] Switched iOS lens with a compatible capture profile',
           name: 'CameraStationRuntime',
@@ -1042,6 +1083,9 @@ class CameraStationRuntime {
       }
       if (wasRtspPublishing) {
         unawaited(_rtspPublisherService.restartIfPublishing());
+      }
+      if (wasWhipPublishing) {
+        unawaited(_whipPublisherService.restartIfPublishing());
       }
       developer.log(
         '[CAMERA] Switched to $targetFacing at '
@@ -1079,7 +1123,15 @@ class CameraStationRuntime {
     }
   }
 
-  Future<void> setResolutionProfile(CameraResolutionProfile profile) {
+  Future<void> setResolutionProfile(
+    CameraResolutionProfile profile, {
+    bool ignoreLock = false,
+  }) {
+    if (_resolutionLocked && !ignoreLock) {
+      return Future<void>.error(
+        StateError('Chế độ phân giải đang bị khóa.'),
+      );
+    }
     if (_thermalThrottled &&
         (profile.preset != CameraResolutionPreset.hd720 || profile.fps > 15)) {
       return Future<void>.error(
@@ -1122,6 +1174,13 @@ class CameraStationRuntime {
     final previous = _resolutionProfile;
     final currentFacing = webRtc.currentFacingMode;
     final wasRtspPublishing = _rtspPublisherService.isLive;
+    final wasWhipPublishing = _whipPublisherService.isLive;
+    if (wasRtspPublishing) {
+      await _rtspPublisherService.prepareForReconfiguration();
+    }
+    if (wasWhipPublishing) {
+      await _whipPublisherService.prepareForReconfiguration();
+    }
     _iosLowFpsReports = 0;
     _profileSwitching = true;
     _generation++;
@@ -1142,6 +1201,9 @@ class CameraStationRuntime {
       if (wasRtspPublishing) {
         unawaited(_rtspPublisherService.restartIfPublishing());
       }
+      if (wasWhipPublishing) {
+        unawaited(_whipPublisherService.restartIfPublishing());
+      }
       developer.log(
         '[CAMERA] Resolution changed to ${selected.shortLabel} '
         '${selected.fps} FPS ($currentFacing)',
@@ -1157,6 +1219,9 @@ class CameraStationRuntime {
         await server.ensureRecording();
         if (wasRtspPublishing) {
           unawaited(_rtspPublisherService.restartIfPublishing());
+        }
+        if (wasWhipPublishing) {
+          unawaited(_whipPublisherService.restartIfPublishing());
         }
       } catch (rollbackError, stackTrace) {
         developer.log(

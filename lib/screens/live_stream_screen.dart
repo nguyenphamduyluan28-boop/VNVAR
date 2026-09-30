@@ -245,16 +245,20 @@ class _LiveStreamScreenState extends State<LiveStreamScreen> {
 
     String streamName =
         _rtspStreamNameController.text.trim().replaceAll('.sdp', '');
-    if (streamName.isEmpty) {
+    if (streamName.isEmpty || streamName.contains('http') || streamName.contains('rtsp') || streamName.contains('/')) {
       final currentUrl = _rtspUrlController.text.trim();
-      final nameMatch = RegExp(r'/live/([^/?&\s]+)').firstMatch(currentUrl);
-      if (nameMatch != null) {
-        streamName = nameMatch.group(1)?.replaceAll('.sdp', '') ?? '';
-        _rtspStreamNameController.text = streamName;
+      final lastSlashMatch = RegExp(r'/live/([^/?&\s]+)').allMatches(currentUrl);
+      if (lastSlashMatch.isNotEmpty) {
+        final last = lastSlashMatch.last.group(1)?.replaceAll('.sdp', '') ?? '';
+        streamName = last.replaceAll(RegExp(r'[^a-zA-Z0-9_\-]'), '');
       }
+      if (streamName.isEmpty || streamName.contains('http') || streamName.contains('rtsp')) {
+        streamName = 'cam1';
+      }
+      _rtspStreamNameController.text = streamName;
     }
     final String cleanStreamName =
-        streamName.isEmpty ? 'camera_demo' : streamName;
+        streamName.isEmpty ? 'cam1' : streamName;
 
     String newUrl = '';
     if (presetType == 'rtmp') {
@@ -878,45 +882,57 @@ class _LiveStreamScreenState extends State<LiveStreamScreen> {
                 Row(
                   mainAxisAlignment: MainAxisAlignment.spaceBetween,
                   children: [
-                    Text(
-                      appText(
-                        context,
-                        'Đường dẫn đẩy (RTMP / RTSP có kèm key) *',
-                        'Publish URL (RTMP / RTSP with Key) *',
-                      ),
-                      style: const TextStyle(
-                        color: Colors.white,
-                        fontSize: 13,
-                        fontWeight: FontWeight.w500,
+                    Expanded(
+                      child: Text(
+                        appText(
+                          context,
+                          'Đường dẫn đẩy (RTMP / RTSP) *',
+                          'Publish URL (RTMP / RTSP) *',
+                        ),
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: const TextStyle(
+                          color: Colors.white,
+                          fontSize: 13,
+                          fontWeight: FontWeight.w500,
+                        ),
                       ),
                     ),
+                    const SizedBox(width: 8),
                     if (!isLive)
                       InkWell(
                         onTap: _pasteFromClipboard,
                         borderRadius: BorderRadius.circular(6),
-                        child: Padding(
+                        child: Container(
                           padding: const EdgeInsets.symmetric(
                             horizontal: 8,
-                            vertical: 2,
+                            vertical: 3,
+                          ),
+                          decoration: BoxDecoration(
+                            color: Colors.amberAccent.withValues(alpha: 0.12),
+                            borderRadius: BorderRadius.circular(6),
+                            border: Border.all(
+                              color: Colors.amberAccent.withValues(alpha: 0.35),
+                            ),
                           ),
                           child: Row(
                             mainAxisSize: MainAxisSize.min,
                             children: [
                               const Icon(
                                 Icons.content_paste_rounded,
-                                size: 14,
+                                size: 13,
                                 color: Colors.amberAccent,
                               ),
                               const SizedBox(width: 4),
                               Text(
                                 appText(
                                   context,
-                                  'Dán Key/Link',
-                                  'Paste Key/Link',
+                                  'Dán Link',
+                                  'Paste Link',
                                 ),
                                 style: const TextStyle(
                                   color: Colors.amberAccent,
-                                  fontSize: 12,
+                                  fontSize: 11.5,
                                   fontWeight: FontWeight.bold,
                                 ),
                               ),
@@ -955,16 +971,40 @@ class _LiveStreamScreenState extends State<LiveStreamScreen> {
                       color: Colors.white54,
                       size: 18,
                     ),
-                    suffixIcon: _rtspUrlController.text.isNotEmpty && !isLive
-                        ? IconButton(
-                            icon: const Icon(
-                              Icons.clear_rounded,
-                              size: 16,
-                              color: Colors.white54,
-                            ),
-                            onPressed: () {
-                              setState(() => _rtspUrlController.clear());
-                            },
+                    suffixIcon: !isLive
+                        ? Row(
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              IconButton(
+                                tooltip: appText(
+                                  context,
+                                  'Dán từ bộ nhớ tạm',
+                                  'Paste from clipboard',
+                                ),
+                                icon: const Icon(
+                                  Icons.content_paste_rounded,
+                                  size: 16,
+                                  color: Colors.amberAccent,
+                                ),
+                                onPressed: _pasteFromClipboard,
+                              ),
+                              if (_rtspUrlController.text.isNotEmpty)
+                                IconButton(
+                                  tooltip: appText(
+                                    context,
+                                    'Xóa đường dẫn',
+                                    'Clear URL',
+                                  ),
+                                  icon: const Icon(
+                                    Icons.clear_rounded,
+                                    size: 16,
+                                    color: Colors.white54,
+                                  ),
+                                  onPressed: () {
+                                    setState(() => _rtspUrlController.clear());
+                                  },
+                                ),
+                            ],
                           )
                         : null,
                     contentPadding: const EdgeInsets.symmetric(
@@ -1430,6 +1470,50 @@ class _LiveStreamScreenState extends State<LiveStreamScreen> {
                     color: Colors.white54,
                     size: 18,
                   ),
+                  suffixIcon: !isLive
+                      ? Row(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            IconButton(
+                              tooltip: appText(
+                                context,
+                                'Dán từ bộ nhớ tạm',
+                                'Paste from clipboard',
+                              ),
+                              icon: const Icon(
+                                Icons.content_paste_rounded,
+                                size: 16,
+                                color: Colors.amberAccent,
+                              ),
+                              onPressed: () async {
+                                final data = await Clipboard.getData(
+                                  Clipboard.kTextPlain,
+                                );
+                                final text = data?.text?.trim() ?? '';
+                                if (text.isNotEmpty && mounted) {
+                                  setState(() => _whipUrlController.text = text);
+                                }
+                              },
+                            ),
+                            if (_whipUrlController.text.isNotEmpty)
+                              IconButton(
+                                tooltip: appText(
+                                  context,
+                                  'Xóa đường dẫn',
+                                  'Clear URL',
+                                ),
+                                icon: const Icon(
+                                  Icons.clear_rounded,
+                                  size: 16,
+                                  color: Colors.white54,
+                                ),
+                                onPressed: () {
+                                  setState(() => _whipUrlController.clear());
+                                },
+                              ),
+                          ],
+                        )
+                      : null,
                   contentPadding: const EdgeInsets.symmetric(
                     horizontal: 12,
                     vertical: 12,

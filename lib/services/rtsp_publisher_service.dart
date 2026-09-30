@@ -121,9 +121,11 @@ class RtspPublisherService {
       '-thread_queue_size',
       '2048',
       '-fflags',
-      'nobuffer',
+      '+genpts+nobuffer+discardcorrupt',
       '-flags',
       'low_delay',
+      '-correct_ts_overflow',
+      '1',
       '-rtsp_transport',
       'tcp',
       '-buffer_size',
@@ -143,11 +145,15 @@ class RtspPublisherService {
       '-c:a',
       'aac',
       '-b:a',
-      '64k',
+      '96k',
       '-ar',
-      '44100',
+      '48000',
+      '-af',
+      'aresample=async=1000:min_hard_comp=0.100000:first_pts=0',
       '-max_muxing_queue_size',
-      '2048',
+      '4096',
+      '-avoid_negative_ts',
+      'make_zero',
       '-flush_packets',
       '1',
       if (isRtmp) ...[
@@ -187,7 +193,9 @@ class RtspPublisherService {
           );
 
           if (_intentionalStop || isCancel) {
-            _setState(RtspPublishState.idle);
+            if (_state != RtspPublishState.connecting) {
+              _setState(RtspPublishState.idle);
+            }
             return;
           }
 
@@ -303,6 +311,19 @@ class RtspPublisherService {
     _setState(RtspPublishState.idle);
   }
 
+  /// Gracefully stops active stream before camera hardware resets to avoid broken frames
+  Future<void> prepareForReconfiguration() async {
+    if (!isLive && _state != RtspPublishState.connecting) return;
+    developer.log(
+      '[RTSP_PUSH] Preparing for camera reconfiguration (pausing stream)...',
+      name: 'RtspPublisherService',
+    );
+    _reconnectTimer?.cancel();
+    _reconnectTimer = null;
+    _setState(RtspPublishState.connecting);
+    await _cancelActiveSession();
+  }
+
   /// Restarts the publishing pipeline seamlessly when camera resolution or lens changes
   Future<void> restartIfPublishing() async {
     final url = _targetUrl;
@@ -318,8 +339,8 @@ class RtspPublisherService {
     _retryAttempt = 0;
     await _cancelActiveSession();
     _setState(RtspPublishState.connecting);
-    // Wait for the local RTSP server to stabilize with the new resolution and keyframe
-    await Future<void>.delayed(const Duration(milliseconds: 600));
+    // Wait for the local RTSP server to stabilize with the new resolution and allow remote server to close old connection
+    await Future<void>.delayed(const Duration(milliseconds: 1000));
     await _executePublish();
   }
 

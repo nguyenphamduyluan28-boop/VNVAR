@@ -35,21 +35,16 @@ class VnvarRtspPublisher(
 ) : VideoSink {
     fun sendAudioPcm(pcm: ByteArray) {
         if (!running.get() || !audioAvailable || pcm.isEmpty()) return
-        if (!audioPending.compareAndSet(false, true)) return
+        val targets = sessions.values.filter { it.playing && it.audioConfigured }
+        if (targets.isEmpty()) return
         try {
             audioExecutor.execute {
-                try {
-                    val timestamp = (System.nanoTime() * 48_000L / 1_000_000_000L) and 0xffffffffL
-                    sessions.values.filter { it.playing && it.audioConfigured }.forEach {
-                        it.sendAudio(pcm, timestamp)
-                    }
-                } finally {
-                    audioPending.set(false)
+                if (!running.get()) return@execute
+                sessions.values.filter { it.playing && it.audioConfigured }.forEach {
+                    it.sendAudio(pcm)
                 }
             }
-        } catch (_: Exception) {
-            audioPending.set(false)
-        }
+        } catch (_: Exception) {}
     }
     private val running = AtomicBoolean(false)
     private val sessions = ConcurrentHashMap<String, Session>()
@@ -71,10 +66,12 @@ class VnvarRtspPublisher(
     private val audioExecutor = Executors.newSingleThreadExecutor { task ->
         Thread(task, "VNVAR-RTSP-Audio").apply { isDaemon = true }
     }
-    private val audioPending = AtomicBoolean(false)
     private val framePending = AtomicBoolean(false)
     private val encoderReady = AtomicBoolean(false)
     private val encoderErrorReported = AtomicBoolean(false)
+    private var streamStartNanos = -1L
+    private var lastInputPtsUs = -1L
+    private var lastOutputRtpTimestamp = -1L
 
     fun start() {
         if (!running.compareAndSet(false, true)) return
@@ -169,7 +166,18 @@ class VnvarRtspPublisher(
                                 copyPlane(i420.dataV, i420.strideV, (i420.width + 1) / 2, (i420.height + 1) / 2, input)
                             }
                         }
-                        encoder.queueInputBuffer(index, 0, input.position(), frame.timestampNs / 1000, 0)
+                        val nowNanos = android.os.SystemClock.elapsedRealtimeNanos()
+                        if (streamStartNanos < 0L) {
+                            streamStartNanos = nowNanos
+                        }
+                        val elapsedUs = (nowNanos - streamStartNanos) / 1000L
+                        val inputPtsUs = if (lastInputPtsUs != -1L && elapsedUs <= lastInputPtsUs) {
+                            lastInputPtsUs + (1_000_000L / fps)
+                        } else {
+                            elapsedUs
+                        }
+                        lastInputPtsUs = inputPtsUs
+                        encoder.queueInputBuffer(index, 0, input.position(), inputPtsUs, 0)
                         drainEncoder()
                     }
                 } finally {
@@ -282,6 +290,9 @@ class VnvarRtspPublisher(
         height = newHeight and 1.inv()
         sps = null
         pps = null
+        streamStartNanos = -1L
+        lastInputPtsUs = -1L
+        lastOutputRtpTimestamp = -1L
         val codecInfo = MediaCodecList(MediaCodecList.REGULAR_CODECS).codecInfos
             .filter { codec ->
                 codec.isEncoder && codec.supportedTypes.any { type ->
@@ -477,7 +488,11 @@ class VnvarRtspPublisher(
         presentationTimeUs: Long,
         isKeyFrame: Boolean,
     ) {
-        val timestamp = presentationTimeUs * 90 / 1000
+        var timestamp = presentationTimeUs * 90 / 1000
+        if (lastOutputRtpTimestamp != -1L && timestamp <= lastOutputRtpTimestamp) {
+            timestamp = lastOutputRtpTimestamp + (90000L / fps).coerceAtLeast(1L)
+        }
+        lastOutputRtpTimestamp = timestamp
         var shouldRequestKeyFrame = false
         sessions.values.filter { it.playing }.forEach {
             if (it.enqueueAccessUnit(nals, timestamp, isKeyFrame)) {
@@ -665,6 +680,7 @@ class VnvarRtspPublisher(
         private var audioRtpChannel = 2
         private var sequence = 0
         private var audioSequence = 0
+        private var audioRtpTimestamp: Long = -1L
         private val output: OutputStream = socket.getOutputStream()
         private val outputLock = Any()
         private val sendStateLock = Any()
@@ -726,6 +742,14 @@ class VnvarRtspPublisher(
         }
 
         fun describe(cseq: String) {
+            val deadline = System.currentTimeMillis() + 2500L
+            while ((sps == null || pps == null) && System.currentTimeMillis() < deadline && running.get()) {
+                try {
+                    Thread.sleep(50)
+                } catch (_: InterruptedException) {
+                    break
+                }
+            }
             val localSps = sps
             val localPps = pps
             if (localSps == null || localPps == null) {
@@ -785,6 +809,8 @@ class VnvarRtspPublisher(
                 awaitingKeyFrame = true
                 keyFrameQueued = false
                 playing = true
+                audioRtpTimestamp = -1L
+                audioSequence = 0
             }
         }
 
@@ -795,6 +821,7 @@ class VnvarRtspPublisher(
                 pendingRtpPackets = 0
                 awaitingKeyFrame = true
                 keyFrameQueued = false
+                audioRtpTimestamp = -1L
             }
         }
 
@@ -941,7 +968,7 @@ class VnvarRtspPublisher(
             } catch (_: Exception) { close() }
         }
 
-        fun sendAudio(pcm: ByteArray, timestamp: Long) {
+        fun sendAudio(pcm: ByteArray) {
             val networkPcm = ByteArray(pcm.size)
             var index = 0
             while (index + 1 < pcm.size) {
@@ -956,13 +983,22 @@ class VnvarRtspPublisher(
                 val packet = ByteArray(12 + size)
                 packet[0] = 0x80.toByte(); packet[1] = 97
                 packet[2] = (audioSequence shr 8).toByte(); packet[3] = audioSequence.toByte(); audioSequence = (audioSequence + 1) and 0xffff
-                val ts = (timestamp + offset / 2).toInt(); packet[4] = (ts shr 24).toByte(); packet[5] = (ts shr 16).toByte(); packet[6] = (ts shr 8).toByte(); packet[7] = ts.toByte()
+                if (audioRtpTimestamp < 0L) {
+                    val nowNanos = android.os.SystemClock.elapsedRealtimeNanos()
+                    val baseNanos = if (streamStartNanos > 0L) streamStartNanos else nowNanos
+                    val elapsedNanos = (nowNanos - baseNanos).coerceAtLeast(0L)
+                    audioRtpTimestamp = (elapsedNanos * 48_000L / 1_000_000_000L) and 0xffffffffL
+                }
+                val ts = audioRtpTimestamp.toInt()
+                packet[4] = (ts shr 24).toByte(); packet[5] = (ts shr 16).toByte(); packet[6] = (ts shr 8).toByte(); packet[7] = ts.toByte()
                 packet[8] = 0x56; packet[9] = 0x4e; packet[10] = 0x41; packet[11] = 0x55
                 System.arraycopy(networkPcm, offset, packet, 12, size)
                 val framed = ByteArray(packet.size + 4)
                 framed[0] = '$'.code.toByte(); framed[1] = audioRtpChannel.toByte(); framed[2] = (packet.size shr 8).toByte(); framed[3] = packet.size.toByte()
                 System.arraycopy(packet, 0, framed, 4, packet.size)
                 try { synchronized(outputLock) { output.write(framed) } } catch (_: Exception) { close(); return }
+                val samples = size / 2
+                audioRtpTimestamp = (audioRtpTimestamp + samples) and 0xffffffffL
                 offset += size
             }
         }

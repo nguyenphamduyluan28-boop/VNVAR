@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:developer' as developer;
 import 'dart:io';
 
@@ -100,6 +101,17 @@ class VideoStorageService {
     final directory = Directory(rootPath);
     try {
       if (!await directory.exists()) await directory.create(recursive: true);
+      // Đảm bảo luôn có file .nomedia trong thư mục gốc VNVAR để thư viện ảnh Android (Gallery)
+      // không quét và không hiển thị hàng loạt clip camera vào Bộ sưu tập cá nhân
+      final nomediaFile = File('${directory.path}${Platform.pathSeparator}.nomedia');
+      if (!await nomediaFile.exists()) {
+        try {
+          await nomediaFile.create();
+        } catch (_) {}
+      }
+      if (Platform.isAndroid) {
+        unawaited(ensureNoMedia(directory.path));
+      }
       await directory.list().take(1).drain();
       return directory;
     } catch (error, stackTrace) {
@@ -177,6 +189,26 @@ class VideoStorageService {
     try {
       await _androidChannel.invokeMethod('scanMediaFile', {'path': path});
     } catch (_) {}
+  }
+
+  Future<void> ensureNoMedia(String directoryPath) async {
+    if (!Platform.isAndroid) return;
+    try {
+      await _androidChannel.invokeMethod('ensureNoMedia', {'path': directoryPath});
+    } catch (_) {}
+  }
+
+  Future<bool> deleteDirectoryRecursively(String directoryPath) async {
+    if (!Platform.isAndroid) return false;
+    try {
+      final success = await _androidChannel.invokeMethod<bool>(
+        'deleteDirectoryRecursively',
+        {'path': directoryPath},
+      );
+      return success ?? false;
+    } catch (_) {
+      return false;
+    }
   }
 
   Future<int?> availableBytes() async {

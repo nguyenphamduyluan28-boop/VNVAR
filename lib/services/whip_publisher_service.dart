@@ -358,6 +358,35 @@ class WhipPublisherService {
     developer.log('[WHIP] Publish stopped', name: 'WhipPublisherService');
   }
 
+  Future<void> prepareForReconfiguration() async {
+    if (!isLive && _state != WhipPublishState.connecting) return;
+    developer.log(
+      '[WHIP] Preparing for camera reconfiguration (pausing WHIP)...',
+      name: 'WhipPublisherService',
+    );
+    _reconnectTimer?.cancel();
+    _reconnectTimer = null;
+    _setState(WhipPublishState.connecting);
+    await _cleanupConnection();
+  }
+
+  Future<void> restartIfPublishing() async {
+    final url = _endpointUrl;
+    if (url == null || url.isEmpty) return;
+    developer.log(
+      '[WHIP] Restarting WHIP session due to camera reconfiguration...',
+      name: 'WhipPublisherService',
+    );
+    _intentionalStop = false;
+    _reconnectTimer?.cancel();
+    _reconnectTimer = null;
+    _retryAttempt = 0;
+    await _cleanupConnection();
+    _setState(WhipPublishState.connecting);
+    await Future<void>.delayed(const Duration(milliseconds: 1000));
+    await _executePublish();
+  }
+
   Future<void> _cleanupConnection() async {
     if (_peerConnection != null) {
       try {

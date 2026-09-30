@@ -88,8 +88,24 @@ class MainActivity : FlutterActivity() {
         }
     }
 
-    override fun shouldDestroyEngineWithHost(): Boolean = false
+    override fun onPictureInPictureModeChanged(
+        isInPictureInPictureMode: Boolean,
+        newConfig: Configuration
+    ) {
+        super.onPictureInPictureModeChanged(isInPictureInPictureMode, newConfig)
+        runOnUiThread {
+            try {
+                if (::platformChannel.isInitialized) {
+                    platformChannel.invokeMethod(
+                        "onPictureInPictureModeChanged",
+                        mapOf("inPip" to isInPictureInPictureMode)
+                    )
+                }
+            } catch (_: Exception) {}
+        }
+    }
 
+    override fun shouldDestroyEngineWithHost(): Boolean = false
     override fun provideFlutterEngine(context: android.content.Context): FlutterEngine? =
         FlutterEngineCache.getInstance().get(ENGINE_CACHE_KEY)
 
@@ -112,6 +128,15 @@ class MainActivity : FlutterActivity() {
                 "stop" -> {
                     stopService(Intent(this, CameraStationForegroundService::class.java))
                     result.success(null)
+                }
+
+                "isInPictureInPictureMode" -> {
+                    val inPip = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+                        isInPictureInPictureMode
+                    } else {
+                        false
+                    }
+                    result.success(inPip)
                 }
 
                 "startNativeAudioSegment" -> {
@@ -259,13 +284,20 @@ class MainActivity : FlutterActivity() {
                                     }
                                 },
                             ).also { it.start() }
-                            nativeAudioRecorder.onPcm = { pcm -> rtspPublisher?.sendAudioPcm(pcm) }
+                            val audioPermissionGranted = ContextCompat.checkSelfPermission(
+                                this,
+                                Manifest.permission.RECORD_AUDIO,
+                            ) == PackageManager.PERMISSION_GRANTED
+                            if (audioPermissionGranted) {
+                                nativeAudioRecorder.onPcm = { pcm -> rtspPublisher?.sendAudioPcm(pcm) }
+                                nativeAudioRecorder.startStreaming()
+                            }
                             result.success(mapOf(
                                 "running" to true,
                                 "started" to true,
                                 "port" to port,
                                 "path" to "/camera",
-                                "audio" to (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED),
+                                "audio" to audioPermissionGranted,
                             ))
                         } catch (error: Exception) {
                             rtspPublisher = null
@@ -275,6 +307,7 @@ class MainActivity : FlutterActivity() {
                 }
 
                 "stopRtsp" -> {
+                    try { nativeAudioRecorder.stopStreaming() } catch (_: Exception) {}
                     nativeAudioRecorder.onPcm = null
                     rtspPublisher?.stop()
                     rtspPublisher = null
@@ -292,6 +325,47 @@ class MainActivity : FlutterActivity() {
                     val path = call.argument<String>("path")
                     if (!path.isNullOrBlank()) {
                         MediaScannerConnection.scanFile(this, arrayOf(path), null, null)
+                    }
+                    result.success(true)
+                }
+
+                "deleteDirectoryRecursively" -> {
+                    val path = call.argument<String>("path")
+                    if (path.isNullOrBlank()) {
+                        result.error("INVALID_PATH", "Thiếu đường dẫn thư mục cần xóa.", null)
+                    } else {
+                        try {
+                            val dir = java.io.File(path)
+                            var success = false
+                            if (dir.exists()) {
+                                success = dir.deleteRecursively()
+                            } else {
+                                success = true
+                            }
+                            try {
+                                purgeMediaStoreForVnvar(path)
+                            } catch (_: Exception) {}
+                            result.success(success)
+                        } catch (error: Exception) {
+                            result.error("DELETE_FAILED", error.message, path)
+                        }
+                    }
+                }
+
+                "ensureNoMedia" -> {
+                    val path = call.argument<String>("path")
+                    if (!path.isNullOrBlank()) {
+                        try {
+                            val dir = java.io.File(path)
+                            if (dir.exists() && dir.isDirectory) {
+                                val nomedia = java.io.File(dir, ".nomedia")
+                                if (!nomedia.exists()) {
+                                    nomedia.createNewFile()
+                                }
+                                MediaScannerConnection.scanFile(this, arrayOf(nomedia.absolutePath), null, null)
+                                purgeMediaStoreForVnvar(path)
+                            }
+                        } catch (_: Exception) {}
                     }
                     result.success(true)
                 }
@@ -461,6 +535,15 @@ class MainActivity : FlutterActivity() {
         launchFolderPicker()
     }
 
+    private fun purgeMediaStoreForVnvar(folderPath: String) {
+        try {
+            val uri = android.provider.MediaStore.Video.Media.EXTERNAL_CONTENT_URI
+            val selection = "${android.provider.MediaStore.Video.Media.DATA} LIKE ?"
+            val selectionArgs = arrayOf("$folderPath/%")
+            contentResolver.delete(uri, selection, selectionArgs)
+        } catch (_: Exception) {}
+    }
+
     private fun ensurePublicVideoStorage(result: MethodChannel.Result) {
         try {
             val publicMovies = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_MOVIES)
@@ -471,6 +554,16 @@ class MainActivity : FlutterActivity() {
                 if (!publicVnvar.exists()) {
                     publicVnvar.mkdirs()
                 }
+                // Cố gắng tạo file .nomedia nếu hệ điều hành cho phép, không để lỗi tạo file ẩn làm hỏng probe
+                try {
+                    val nomedia = java.io.File(publicVnvar, ".nomedia")
+                    if (!nomedia.exists()) {
+                        nomedia.createNewFile()
+                    }
+                    MediaScannerConnection.scanFile(this, arrayOf(nomedia.absolutePath), null, null)
+                    purgeMediaStoreForVnvar(publicVnvar.absolutePath)
+                } catch (_: Exception) {}
+
                 // Check if directory can be listed without permission denial
                 val canList = publicVnvar.listFiles() != null
                 val testFile = java.io.File(publicVnvar, "probe_${System.currentTimeMillis()}.mp4")
@@ -497,6 +590,12 @@ class MainActivity : FlutterActivity() {
             if (!appVnvar.exists()) {
                 appVnvar.mkdirs()
             }
+            try {
+                val nomedia = java.io.File(appVnvar, ".nomedia")
+                if (!nomedia.exists()) {
+                    nomedia.createNewFile()
+                }
+            } catch (_: Exception) {}
             result.success(appVnvar.absolutePath)
         } catch (error: Exception) {
             result.error("PUBLIC_STORAGE_CREATE_FAILED", error.message, null)
@@ -949,6 +1048,9 @@ class MainActivity : FlutterActivity() {
     override fun onDestroy() {
         orientationListener?.disable()
         orientationListener = null
+        try { nativeAudioRecorder.stopStreaming() } catch (_: Exception) {}
+        try { rtspPublisher?.stop() } catch (_: Exception) {}
+        rtspPublisher = null
         super.onDestroy()
     }
 }

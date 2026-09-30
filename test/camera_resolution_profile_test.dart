@@ -50,6 +50,17 @@ void main() {
     expect(restored?.preset, CameraResolutionPreset.qhd2k);
   });
 
+  test('persists and restores resolution locked state', () async {
+    final config = StationConfigService();
+    expect(await config.loadResolutionLocked(), isFalse);
+
+    await config.saveResolutionLocked(true);
+    expect(await config.loadResolutionLocked(), isTrue);
+
+    await config.saveResolutionLocked(false);
+    expect(await config.loadResolutionLocked(), isFalse);
+  });
+
   test('persists adaptive iOS FPS per device and camera facing', () async {
     final config = StationConfigService();
     await config.saveAdaptiveIosFps(

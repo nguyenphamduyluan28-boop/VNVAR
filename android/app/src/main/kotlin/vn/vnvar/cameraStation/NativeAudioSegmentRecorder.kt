@@ -15,17 +15,22 @@ import java.util.concurrent.atomic.AtomicLong
 /** Records microphone PCM independently from flutter_webrtc's video muxer. */
 class NativeAudioSegmentRecorder(private val context: Context) {
     @Volatile var onPcm: ((ByteArray) -> Unit)? = null
-    private val running = AtomicBoolean(false)
+    private val recordingFileActive = AtomicBoolean(false)
+    private val streamingActive = AtomicBoolean(false)
+    private val isAudioRecordRunning = AtomicBoolean(false)
+
     private var audioRecord: AudioRecord? = null
     private var worker: Thread? = null
+    private val fileLock = Any()
     private var output: RandomAccessFile? = null
     private var outputFile: File? = null
     private val dataBytes = AtomicLong(0L)
     private val lastProgressElapsedMs = AtomicLong(0L)
 
-    @Synchronized
-    fun start(path: String): Map<String, Any> {
-        stop()
+    private fun ensureAudioRecordStartedLocked() {
+        if (isAudioRecordRunning.get() && audioRecord != null && worker != null) {
+            return
+        }
         check(
             ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) ==
                 PackageManager.PERMISSION_GRANTED,
@@ -36,71 +41,150 @@ class NativeAudioSegmentRecorder(private val context: Context) {
         val encoding = AudioFormat.ENCODING_PCM_16BIT
         val minimum = AudioRecord.getMinBufferSize(sampleRate, channelConfig, encoding)
         check(minimum > 0) { "AudioRecord buffer is unavailable: $minimum" }
-        val bufferSize = maxOf(minimum * 2, 16_384)
-        val recorder = AudioRecord(
-            MediaRecorder.AudioSource.VOICE_RECOGNITION,
-            sampleRate,
-            channelConfig,
-            encoding,
-            bufferSize,
+        val internalBufferSize = maxOf(minimum * 4, 16_384)
+
+        // Try CAMCORDER first for wide dynamic range and natural acoustics without
+        // aggressive speech gating/clipping, then fallback to MIC and DEFAULT.
+        val audioSources = intArrayOf(
+            MediaRecorder.AudioSource.CAMCORDER,
+            MediaRecorder.AudioSource.MIC,
+            MediaRecorder.AudioSource.DEFAULT,
         )
-        check(recorder.state == AudioRecord.STATE_INITIALIZED) {
-            recorder.release()
-            "AudioRecord failed to initialize"
+        var recorder: AudioRecord? = null
+        for (source in audioSources) {
+            try {
+                val candidate = AudioRecord(
+                    source,
+                    sampleRate,
+                    channelConfig,
+                    encoding,
+                    internalBufferSize,
+                )
+                if (candidate.state == AudioRecord.STATE_INITIALIZED) {
+                    recorder = candidate
+                    break
+                } else {
+                    candidate.release()
+                }
+            } catch (_: Exception) {}
+        }
+        val activeRecorder = recorder
+            ?: throw IllegalStateException("AudioRecord failed to initialize on available audio sources")
+
+        try {
+            activeRecorder.startRecording()
+            check(activeRecorder.recordingState == AudioRecord.RECORDSTATE_RECORDING) {
+                "Microphone is already occupied or unavailable"
+            }
+        } catch (error: Exception) {
+            try { activeRecorder.release() } catch (_: Exception) {}
+            throw error
         }
 
+        audioRecord = activeRecorder
+        isAudioRecordRunning.set(true)
+
+        // 960 bytes = 480 samples = 10ms of 16-bit mono 48kHz audio.
+        // Reading in 10ms chunks ensures ultra-low latency, zero micro-bursts,
+        // and fits cleanly within single RTP packets (<1000 bytes) without IP fragmentation.
+        val chunkBytes = 960
+        worker = Thread({
+            val buffer = ByteArray(chunkBytes)
+            while (isAudioRecordRunning.get()) {
+                val count = activeRecorder.read(buffer, 0, buffer.size)
+                when {
+                    count > 0 -> {
+                        val pcmChunk = buffer.copyOf(count)
+                        try {
+                            synchronized(fileLock) {
+                                if (recordingFileActive.get()) {
+                                    output?.write(pcmChunk)
+                                    dataBytes.addAndGet(count.toLong())
+                                }
+                            }
+                            onPcm?.invoke(pcmChunk)
+                            lastProgressElapsedMs.set(android.os.SystemClock.elapsedRealtime())
+                        } catch (_: Exception) {}
+                    }
+                    count == AudioRecord.ERROR_INVALID_OPERATION ||
+                        count == AudioRecord.ERROR_BAD_VALUE -> {
+                        isAudioRecordRunning.set(false)
+                    }
+                }
+            }
+        }, "VNVAR-NativeAudio").also { it.start() }
+    }
+
+    private fun stopAudioRecordInternalLocked() {
+        val recorder = audioRecord
+        val thread = worker
+        isAudioRecordRunning.set(false)
+        try { recorder?.stop() } catch (_: Exception) {}
+        if (thread != null && thread !== Thread.currentThread()) {
+            try { thread.join(1_000) } catch (_: InterruptedException) {
+                Thread.currentThread().interrupt()
+            }
+        }
+        try { recorder?.release() } catch (_: Exception) {}
+        audioRecord = null
+        worker = null
+    }
+
+    @Synchronized
+    fun start(path: String): Map<String, Any> {
+        val sampleRate = 48_000
         val file = File(path)
         file.parentFile?.mkdirs()
         val writer = RandomAccessFile(file, "rw")
         writer.setLength(0)
         writeWavHeader(writer, sampleRate, 1, 16, 0)
 
-        dataBytes.set(0L)
-        lastProgressElapsedMs.set(android.os.SystemClock.elapsedRealtime())
-        outputFile = file
-        output = writer
-        audioRecord = recorder
-        try {
-            recorder.startRecording()
-            check(recorder.recordingState == AudioRecord.RECORDSTATE_RECORDING) {
-                "Microphone is already occupied or unavailable"
-            }
-        } catch (error: Exception) {
-            running.set(false)
-            try { recorder.release() } catch (_: Exception) {}
-            try { writer.close() } catch (_: Exception) {}
-            audioRecord = null
-            output = null
-            outputFile = null
+        synchronized(fileLock) {
+            try { output?.close() } catch (_: Exception) {}
             dataBytes.set(0L)
+            lastProgressElapsedMs.set(android.os.SystemClock.elapsedRealtime())
+            outputFile = file
+            output = writer
+            recordingFileActive.set(true)
+        }
+
+        try {
+            ensureAudioRecordStartedLocked()
+        } catch (error: Exception) {
+            synchronized(fileLock) {
+                recordingFileActive.set(false)
+                try { writer.close() } catch (_: Exception) {}
+                output = null
+                outputFile = null
+            }
             throw error
         }
-        running.set(true)
-
-        worker = Thread({
-            val buffer = ByteArray(bufferSize)
-            while (running.get()) {
-                val count = recorder.read(buffer, 0, buffer.size)
-                when {
-                    count > 0 -> try {
-                        output?.write(buffer, 0, count)
-                        onPcm?.invoke(buffer.copyOf(count))
-                        dataBytes.addAndGet(count.toLong())
-                        lastProgressElapsedMs.set(android.os.SystemClock.elapsedRealtime())
-                    } catch (_: Exception) {
-                        running.set(false)
-                    }
-                    count == AudioRecord.ERROR_INVALID_OPERATION ||
-                        count == AudioRecord.ERROR_BAD_VALUE -> running.set(false)
-                }
-            }
-        }, "VNVAR-NativeAudio").also { it.start() }
 
         return mapOf("path" to path, "sampleRate" to sampleRate, "channels" to 1)
     }
 
+    @Synchronized
+    fun startStreaming(): Boolean {
+        streamingActive.set(true)
+        return try {
+            ensureAudioRecordStartedLocked()
+            true
+        } catch (_: Exception) {
+            streamingActive.set(false)
+            false
+        }
+    }
+
+    @Synchronized
+    fun stopStreaming() {
+        streamingActive.set(false)
+        if (!recordingFileActive.get()) {
+            stopAudioRecordInternalLocked()
+        }
+    }
+
     fun status(): Map<String, Any?> = mapOf(
-        "active" to running.get(),
+        "active" to (recordingFileActive.get() || isAudioRecordRunning.get()),
         "path" to outputFile?.absolutePath,
         "bytes" to dataBytes.get(),
         "lastProgressElapsedMs" to lastProgressElapsedMs.get(),
@@ -108,31 +192,25 @@ class NativeAudioSegmentRecorder(private val context: Context) {
 
     @Synchronized
     fun stop(): Map<String, Any?> {
-        val recorder = audioRecord
-        val thread = worker
-        running.set(false)
-        try { recorder?.stop() } catch (_: Exception) {}
-        if (thread != null && thread !== Thread.currentThread()) {
-            try { thread.join(2_000) } catch (_: InterruptedException) {
-                Thread.currentThread().interrupt()
-            }
-        }
         val bytes = dataBytes.get()
         val file = outputFile
-        try {
-            output?.let {
-                writeWavHeader(it, 48_000, 1, 16, bytes)
-                it.fd.sync()
-                it.close()
-            }
-        } finally {
-            try { recorder?.release() } catch (_: Exception) {}
-            audioRecord = null
-            worker = null
+        synchronized(fileLock) {
+            recordingFileActive.set(false)
+            try {
+                output?.let {
+                    writeWavHeader(it, 48_000, 1, 16, bytes)
+                    it.fd.sync()
+                    it.close()
+                }
+            } catch (_: Exception) {}
             output = null
             outputFile = null
             dataBytes.set(0L)
             lastProgressElapsedMs.set(0L)
+        }
+
+        if (!streamingActive.get()) {
+            stopAudioRecordInternalLocked()
         }
         return mapOf("path" to file?.absolutePath, "bytes" to bytes)
     }
