@@ -227,7 +227,7 @@
       if (source != nil && [source respondsToSelector:NSSelectorFromString(@"setUseBackCamera:")]) {
         [source setValue:@(targetDevice.position == AVCaptureDevicePositionBack) forKey:@"useBackCamera"];
       }
-    } @catch (_) {}
+    } @catch (NSException *e) {}
     [session commitConfiguration];
     return YES;
   } else {
