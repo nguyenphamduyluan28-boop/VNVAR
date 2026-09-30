@@ -211,7 +211,13 @@ import UIKit
         result(FlutterError(code: "ZOOM_FAILED", message: error.localizedDescription, details: nil)); return
       }
     }
-    result(["supported": maximum > minimum, "min": minimum, "max": maximum, "current": device.videoZoomFactor])
+    result([
+      "supported": maximum > minimum,
+      "min": minimum,
+      "max": maximum,
+      "current": device.videoZoomFactor,
+      "cameraId": device.uniqueID,
+    ])
   }
 
   private func startRtsp(_ call: FlutterMethodCall, _ result: @escaping FlutterResult) {

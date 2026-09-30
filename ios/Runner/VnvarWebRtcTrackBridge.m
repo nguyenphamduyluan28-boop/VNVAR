@@ -151,32 +151,21 @@
   return stableBuffer;
 }
 
-+ (AVCaptureSession * _Nullable)captureSessionForTrackId:(NSString *)trackId outSource:(id _Nullable * _Nullable)outSource {
-  if (trackId.length == 0) return nil;
-  RTCVideoTrack *videoTrack = [self videoTrackForId:trackId];
-  if (videoTrack == nil) return nil;
-  id source = videoTrack.source;
-  if (source == nil) return nil;
-  @try {
-    if ([source respondsToSelector:NSSelectorFromString(@"captureSession")]) {
-      id session = [source valueForKey:@"captureSession"];
-      if ([session isKindOfClass:[AVCaptureSession class]]) {
-        if (outSource) *outSource = source;
-        return (AVCaptureSession *)session;
-      }
-    }
-  } @catch (NSException *e) {
-    NSLog(@"[CAMERA] captureSession lookup exception: %@", e);
++ (RTCCameraVideoCapturer * _Nullable)activeVideoCapturer {
+  FlutterWebRTCPlugin *plugin = [FlutterWebRTCPlugin sharedSingleton];
+  if (plugin != nil && plugin.videoCapturer != nil) {
+    return plugin.videoCapturer;
   }
   return nil;
 }
 
 + (AVCaptureDevice * _Nullable)activeVideoDeviceForTrackId:(NSString *)trackId {
-  AVCaptureSession *session = [self captureSessionForTrackId:trackId outSource:nil];
-  if (session == nil) return nil;
-  for (AVCaptureInput *input in session.inputs) {
-    if ([input isKindOfClass:[AVCaptureDeviceInput class]]) {
-      return ((AVCaptureDeviceInput *)input).device;
+  RTCCameraVideoCapturer *capturer = [self activeVideoCapturer];
+  if (capturer != nil && capturer.captureSession != nil) {
+    for (AVCaptureInput *input in capturer.captureSession.inputs) {
+      if ([input isKindOfClass:[AVCaptureDeviceInput class]]) {
+        return ((AVCaptureDeviceInput *)input).device;
+      }
     }
   }
   return nil;
@@ -184,59 +173,78 @@
 
 + (BOOL)switchCameraForTrackId:(NSString *)trackId
                     toDeviceId:(NSString *)deviceId {
-  if (trackId.length == 0 || deviceId.length == 0) {
+  if (deviceId.length == 0) {
     return NO;
   }
-  id source = nil;
-  AVCaptureSession *session = [self captureSessionForTrackId:trackId outSource:&source];
-  if (session == nil) {
+  FlutterWebRTCPlugin *plugin = [FlutterWebRTCPlugin sharedSingleton];
+  if (plugin == nil || plugin.videoCapturer == nil) {
+    NSLog(@"[CAMERA] FlutterWebRTCPlugin or videoCapturer is nil");
     return NO;
   }
+  RTCCameraVideoCapturer *capturer = plugin.videoCapturer;
 
   AVCaptureDevice *targetDevice = [AVCaptureDevice deviceWithUniqueID:deviceId];
   if (targetDevice == nil) {
+    NSLog(@"[CAMERA] targetDevice with uniqueID %@ not found", deviceId);
     return NO;
   }
 
-  AVCaptureDeviceInput *currentInput = nil;
-  for (AVCaptureInput *input in session.inputs) {
-    if ([input isKindOfClass:[AVCaptureDeviceInput class]]) {
-      currentInput = (AVCaptureDeviceInput *)input;
-      break;
-    }
-  }
-
-  if (currentInput != nil && [currentInput.device.uniqueID isEqualToString:deviceId]) {
-    return YES;
-  }
-
-  NSError *inputError = nil;
-  AVCaptureDeviceInput *newInput = [AVCaptureDeviceInput deviceInputWithDevice:targetDevice error:&inputError];
-  if (newInput == nil) {
-    NSLog(@"[CAMERA] deviceInputWithDevice error: %@", inputError);
-    return NO;
-  }
-
-  [session beginConfiguration];
-  if (currentInput != nil) {
-    [session removeInput:currentInput];
-  }
-  if ([session canAddInput:newInput]) {
-    [session addInput:newInput];
-    @try {
-      if (source != nil && [source respondsToSelector:NSSelectorFromString(@"setUseBackCamera:")]) {
-        [source setValue:@(targetDevice.position == AVCaptureDevicePositionBack) forKey:@"useBackCamera"];
+  // Check if already capturing on target device
+  if (capturer.captureSession != nil) {
+    for (AVCaptureInput *input in capturer.captureSession.inputs) {
+      if ([input isKindOfClass:[AVCaptureDeviceInput class]]) {
+        if ([((AVCaptureDeviceInput *)input).device.uniqueID isEqualToString:deviceId]) {
+          return YES;
+        }
       }
-    } @catch (NSException *e) {}
-    [session commitConfiguration];
-    return YES;
-  } else {
-    if (currentInput != nil && [session canAddInput:currentInput]) {
-      [session addInput:currentInput];
     }
-    [session commitConfiguration];
-    return NO;
   }
+
+  NSInteger targetWidth = plugin._lastTargetWidth > 0 ? plugin._lastTargetWidth : 1920;
+  NSInteger targetHeight = plugin._lastTargetHeight > 0 ? plugin._lastTargetHeight : 1080;
+  NSInteger targetFps = plugin._lastTargetFps > 0 ? plugin._lastTargetFps : 30;
+
+  NSArray<AVCaptureDeviceFormat *> *formats = [RTCCameraVideoCapturer supportedFormatsForDevice:targetDevice];
+  AVCaptureDeviceFormat *selectedFormat = nil;
+  long currentDiff = INT_MAX;
+  for (AVCaptureDeviceFormat *format in formats) {
+    CMVideoDimensions dimension = CMVideoFormatDescriptionGetDimensions(format.formatDescription);
+    long diff = labs(targetWidth - dimension.width) + labs(targetHeight - dimension.height);
+    if (diff < currentDiff) {
+      selectedFormat = format;
+      currentDiff = diff;
+    }
+  }
+  if (selectedFormat == nil && formats.count > 0) {
+    selectedFormat = formats.firstObject;
+  }
+
+  Float64 maxSupportedFps = 0;
+  for (AVFrameRateRange *range in selectedFormat.videoSupportedFrameRateRanges) {
+    if (range.maxFrameRate > maxSupportedFps) {
+      maxSupportedFps = range.maxFrameRate;
+    }
+  }
+  NSInteger fps = MIN(targetFps, (NSInteger)maxSupportedFps);
+  if (fps <= 0) fps = 30;
+
+#if TARGET_OS_IPHONE
+  [capturer stopCapture];
+#endif
+
+  [capturer startCaptureWithDevice:targetDevice
+                            format:selectedFormat
+                               fps:fps
+                 completionHandler:^(NSError * _Nullable error) {
+    if (error != nil) {
+      NSLog(@"[CAMERA] startCaptureWithDevice failed: %@", error);
+    } else {
+      NSLog(@"[CAMERA] Successfully switched iOS camera to device %@", targetDevice.localizedName);
+    }
+  }];
+
+  plugin._usingFrontCamera = (targetDevice.position == AVCaptureDevicePositionFront);
+  return YES;
 }
 
 @end
