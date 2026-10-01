@@ -7,15 +7,20 @@ NS_ASSUME_NONNULL_BEGIN
 
 @interface VnvarWebRtcTrackBridge : NSObject
 
-+ (RTCVideoTrack * _Nullable)videoTrackForId:(NSString *)trackId;
++ (RTCVideoTrack * _Nullable)videoTrackForId:(NSString *)trackId
+    NS_SWIFT_NAME(videoTrack(forId:));
 + (CVPixelBufferRef _Nullable)copyPixelBufferForFrame:(RTCVideoFrame *)frame
-    CF_RETURNS_RETAINED;
-+ (AVCaptureDevice * _Nullable)activeVideoDeviceForTrackId:(NSString *)trackId;
+    CF_RETURNS_RETAINED
+    NS_SWIFT_NAME(copyPixelBuffer(for:));
++ (AVCaptureDevice * _Nullable)activeVideoDeviceForTrackId:(NSString *)trackId
+    NS_SWIFT_NAME(activeVideoDevice(forTrackId:));
 + (void)switchCameraForTrackId:(NSString *)trackId
                     toDeviceId:(NSString *)deviceId
-                    completion:(void (^)(BOOL success, NSString * _Nullable error))completion;
+                    completion:(void (^)(BOOL success, NSString * _Nullable error))completion
+    NS_SWIFT_NAME(switchCamera(forTrackId:toDeviceId:completion:));
 + (BOOL)setCameraLockForTrackId:(NSString *)trackId
-                         locked:(BOOL)locked;
+                         locked:(BOOL)locked
+    NS_SWIFT_NAME(setCameraLock(forTrackId:locked:));
 
 @end
 
