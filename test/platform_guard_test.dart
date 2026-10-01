@@ -36,5 +36,17 @@ void main() {
   test('RTSP capability matches the host platform', () {
     final service = WebRtcService();
     expect(service.rtspSupported, Platform.isAndroid || Platform.isIOS);
+    expect(service.isCameraLocked, isFalse);
+  });
+
+  test('setCameraLock returns false without active track', () async {
+    final service = WebRtcService();
+    final result = await service.setCameraLock(locked: true);
+    expect(result, isFalse);
+  });
+
+  test('remeterAndLock is safe without active track', () async {
+    final service = WebRtcService();
+    await expectLater(service.remeterAndLock(), completes);
   });
 }

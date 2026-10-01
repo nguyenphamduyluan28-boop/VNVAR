@@ -122,12 +122,32 @@ class _StationScreenState extends State<StationScreen>
   bool _lastActiveOrientationLandscape = true;
   bool _appResumed = true;
   bool _isInPipMode = false;
+  Offset? _focusIndicatorPosition;
+  int _focusIndicatorKey = 0;
 
   bool get _recording => _runtime.recordingService?.recording ?? false;
 
   bool get _cameraReady =>
       _runtime.cameraEnabled &&
       (_runtime.webRtcService?.cameraInitialized ?? false);
+
+  void _handlePreviewTap(TapDownDetails details, BoxConstraints constraints) {
+    if (!_cameraReady || _isInPipMode) return;
+    final pos = details.localPosition;
+    setState(() {
+      _focusIndicatorPosition = pos;
+      _focusIndicatorKey++;
+    });
+
+    final nx = (pos.dx / constraints.maxWidth).clamp(0.0, 1.0);
+    final ny = (pos.dy / constraints.maxHeight).clamp(0.0, 1.0);
+
+    unawaited(
+      _runtime.webRtcService?.remeterAndLock(
+        point: math.Point<double>(nx, ny),
+      ),
+    );
+  }
 
   Future<void> _toggleCamera() async {
     if (_cameraSwitching) return;
@@ -208,12 +228,28 @@ class _StationScreenState extends State<StationScreen>
   Future<void> _quickSelectZoom(double target) async {
     final webRtc = _runtime.webRtcService;
     if (webRtc == null) return;
+
+    final willSwitchHardware = (target < 0.95 &&
+            !webRtc.isCurrentUltraWide &&
+            webRtc.ultraWideCamera != null &&
+            webRtc.activeCameraId != webRtc.ultraWideCamera!.id &&
+            webRtc.minimumCameraZoom > target + 0.05) ||
+        (target >= 0.95 &&
+            webRtc.isCurrentUltraWide &&
+            webRtc.mainBackCamera != null &&
+            webRtc.activeCameraId != webRtc.mainBackCamera!.id) ||
+        (webRtc.currentFacingMode == 'user');
+
+    if (willSwitchHardware) {
+      setState(() => _lensSwitching = true);
+    }
     try {
       if (target < 0.95) {
         if (webRtc.hasUltraWideCamera) {
           await _runtime.switchToLensMode('ultra_wide');
+          final actualRatio = webRtc.ultraWideZoomRatio;
+          await webRtc.setCameraZoom(actualRatio);
           if (mounted) {
-            final actualRatio = webRtc.ultraWideZoomRatio;
             setState(() => _zoomValue = actualRatio);
             ScaffoldMessenger.of(context).showSnackBar(
               SnackBar(
@@ -224,32 +260,15 @@ class _StationScreenState extends State<StationScreen>
                     'Switched to Wide-Angle camera (${webRtc.ultraWideLabel})',
                   ),
                 ),
-                duration: const Duration(seconds: 1),
+                duration: const Duration(milliseconds: 800),
               ),
             );
           }
         } else {
-          try {
-            await webRtc.setCameraZoom(target);
-            if (mounted) setState(() => _zoomValue = webRtc.cameraZoom);
-          } catch (_) {
-            if (mounted) {
-              ScaffoldMessenger.of(context).showSnackBar(
-                SnackBar(
-                  content: Text(
-                    appText(
-                      context,
-                      'Thiết bị này không có camera góc rộng (${target.toStringAsFixed(1)}×)',
-                      'This device does not have a wide-angle camera (${target.toStringAsFixed(1)}×)',
-                    ),
-                  ),
-                  duration: const Duration(seconds: 2),
-                ),
-              );
-            }
-          }
+          await webRtc.setCameraZoom(target);
+          if (mounted) setState(() => _zoomValue = webRtc.cameraZoom);
         }
-      } else if (target == 1.0) {
+      } else if (target >= 0.95 && target < 1.5) {
         if (webRtc.isCurrentUltraWide || webRtc.currentFacingMode == 'user') {
           await _runtime.switchToLensMode('wide');
           if (mounted) {
@@ -262,35 +281,25 @@ class _StationScreenState extends State<StationScreen>
                     'Switched to standard camera (1×)',
                   ),
                 ),
-                duration: const Duration(seconds: 1),
+                duration: const Duration(milliseconds: 800),
               ),
             );
           }
         }
         await webRtc.setCameraZoom(1.0);
         if (mounted) setState(() => _zoomValue = 1.0);
-      } else if (target == 2.0) {
+      } else if (target >= 1.5) {
         if (webRtc.isCurrentUltraWide || webRtc.currentFacingMode == 'user') {
           await _runtime.switchToLensMode('wide');
         }
-        await webRtc.setCameraZoom(2.0);
-        if (mounted) setState(() => _zoomValue = 2.0);
+        await webRtc.setCameraZoom(target);
+        if (mounted) setState(() => _zoomValue = target);
       }
     } catch (e) {
       debugPrint('[CAMERA] Quick select zoom error: $e');
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(
-            content: Text(
-              appText(
-                context,
-                'Không thể chuyển đổi camera: $e',
-                'Cannot switch camera: $e',
-              ),
-            ),
-            duration: const Duration(seconds: 2),
-          ),
-        );
+    } finally {
+      if (willSwitchHardware && mounted) {
+        setState(() => _lensSwitching = false);
       }
     }
   }
@@ -298,18 +307,37 @@ class _StationScreenState extends State<StationScreen>
   void _changeZoom(double value) {
     setState(() => _zoomValue = value);
     _zoomDebounce?.cancel();
-    _zoomDebounce = Timer(const Duration(milliseconds: 50), () async {
+    _zoomDebounce = Timer(const Duration(milliseconds: 60), () async {
       final webRtc = _runtime.webRtcService;
       if (webRtc == null) return;
       try {
-        if (value < 0.85 && !webRtc.isCurrentUltraWide && webRtc.hasUltraWideCamera) {
-          await _quickSelectZoom(webRtc.ultraWideZoomRatio);
-          return;
-        } else if (value >= 1.0 && webRtc.isCurrentUltraWide) {
-          await _runtime.switchToLensMode('wide');
+        final willSwitchHardwareToUW = value < 0.85 &&
+            !webRtc.isCurrentUltraWide &&
+            webRtc.ultraWideCamera != null &&
+            webRtc.activeCameraId != webRtc.ultraWideCamera!.id &&
+            webRtc.minimumCameraZoom > value + 0.05;
+        final willSwitchHardwareToWide = value >= 0.95 &&
+            webRtc.isCurrentUltraWide &&
+            webRtc.mainBackCamera != null &&
+            webRtc.activeCameraId != webRtc.mainBackCamera!.id;
+
+        if (willSwitchHardwareToUW) {
+          setState(() => _lensSwitching = true);
+          try {
+            await _runtime.switchToLensMode('ultra_wide');
+          } finally {
+            if (mounted) setState(() => _lensSwitching = false);
+          }
+        } else if (willSwitchHardwareToWide) {
+          setState(() => _lensSwitching = true);
+          try {
+            await _runtime.switchToLensMode('wide');
+          } finally {
+            if (mounted) setState(() => _lensSwitching = false);
+          }
         }
         await webRtc.setCameraZoom(value);
-        if (mounted) setState(() => _zoomValue = webRtc.cameraZoom);
+        if (mounted) setState(() => _zoomValue = value);
       } catch (error) {
         debugPrint('[CAMERA] Cannot set zoom: $error');
       }
@@ -1614,18 +1642,22 @@ class _StationScreenState extends State<StationScreen>
               // CAMERA PREVIEW
               // ==============================================
               if (renderer != null && _cameraReady)
-                RotatedBox(
-                  quarterTurns: _cameraQuarterTurns,
-                  child: RTCVideoView(
-                    renderer,
-                    // Keep the native rendering surface alive while Flutter
-                    // relays out portrait/landscape. Re-keying this view on
-                    // every rotation destroys the surface and can leave iOS
-                    // showing the last frame until the camera is restarted.
-                    key: const ValueKey('camera-preview'),
-                    mirror: mirrorPreview,
-                    objectFit:
-                        RTCVideoViewObjectFit.RTCVideoViewObjectFitContain,
+                GestureDetector(
+                  behavior: HitTestBehavior.opaque,
+                  onTapDown: (details) => _handlePreviewTap(details, constraints),
+                  child: RotatedBox(
+                    quarterTurns: _cameraQuarterTurns,
+                    child: RTCVideoView(
+                      renderer,
+                      // Keep the native rendering surface alive while Flutter
+                      // relays out portrait/landscape. Re-keying this view on
+                      // every rotation destroys the surface and can leave iOS
+                      // showing the last frame until the camera is restarted.
+                      key: const ValueKey('camera-preview'),
+                      mirror: mirrorPreview,
+                      objectFit:
+                          RTCVideoViewObjectFit.RTCVideoViewObjectFitContain,
+                    ),
                   ),
                 )
               else
@@ -1639,6 +1671,29 @@ class _StationScreenState extends State<StationScreen>
                     ),
                   ),
                 ),
+
+              // Smooth transition shutter mask during camera/lens switch
+              Positioned.fill(
+                child: IgnorePointer(
+                  child: AnimatedOpacity(
+                    duration: const Duration(milliseconds: 180),
+                    opacity: (_lensSwitching || _cameraSwitching) ? 0.82 : 0.0,
+                    child: Container(
+                      color: Colors.black,
+                      child: const Center(
+                        child: SizedBox(
+                          width: 24,
+                          height: 24,
+                          child: CircularProgressIndicator(
+                            strokeWidth: 2,
+                            color: Colors.white70,
+                          ),
+                        ),
+                      ),
+                    ),
+                  ),
+                ),
+              ),
 
               // ==============================================
               // TOP BAR (identity + primary actions + live status + toast)
@@ -1745,17 +1800,6 @@ class _StationScreenState extends State<StationScreen>
                       screenDimSwitching: _screenDimSwitching,
                       lensSwitching: _lensSwitching,
                       screenOrientation: _screenOrientation,
-                      onRotate: _cameraReady
-                          ? () {
-                              final nextTurns = (_cameraQuarterTurns + 1) % 4;
-                              setState(() {
-                                _cameraQuarterTurns = nextTurns;
-                              });
-                              unawaited(
-                                _runtime.setCameraQuarterTurns(nextTurns),
-                              );
-                            }
-                          : null,
                       onSwitchLens: _cameraReady && !_lensSwitching
                           ? _switchCameraLens
                           : null,
@@ -2005,9 +2049,131 @@ class _StationScreenState extends State<StationScreen>
                     ],
                   ),
                 ),
+
+              // ==============================================
+              // TAP-TO-FOCUS & REMETER INDICATOR
+              // ==============================================
+              if (_focusIndicatorPosition != null)
+                _FocusIndicator(
+                  key: ValueKey('focus-$_focusIndicatorKey'),
+                  position: _focusIndicatorPosition!,
+                  onDismissed: () {
+                    if (mounted) {
+                      setState(() => _focusIndicatorPosition = null);
+                    }
+                  },
+                ),
             ],
           );
         },
+      ),
+    );
+  }
+}
+
+class _FocusIndicator extends StatefulWidget {
+  final Offset position;
+  final VoidCallback onDismissed;
+
+  const _FocusIndicator({
+    super.key,
+    required this.position,
+    required this.onDismissed,
+  });
+
+  @override
+  State<_FocusIndicator> createState() => _FocusIndicatorState();
+}
+
+class _FocusIndicatorState extends State<_FocusIndicator>
+    with SingleTickerProviderStateMixin {
+  late final AnimationController _controller;
+  late final Animation<double> _scaleAnimation;
+  late final Animation<double> _opacityAnimation;
+
+  @override
+  void initState() {
+    super.initState();
+    _controller = AnimationController(
+      vsync: this,
+      duration: const Duration(milliseconds: 1000),
+    );
+    _scaleAnimation = Tween<double>(begin: 1.35, end: 1.0).animate(
+      CurvedAnimation(
+        parent: _controller,
+        curve: const Interval(0.0, 0.25, curve: Curves.easeOutCubic),
+      ),
+    );
+    _opacityAnimation = Tween<double>(begin: 1.0, end: 0.0).animate(
+      CurvedAnimation(
+        parent: _controller,
+        curve: const Interval(0.65, 1.0, curve: Curves.easeIn),
+      ),
+    );
+    _controller.forward().then((_) {
+      if (mounted) widget.onDismissed();
+    });
+  }
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    const size = 64.0;
+    return Positioned(
+      left: widget.position.dx - size / 2,
+      top: widget.position.dy - size / 2,
+      child: IgnorePointer(
+        child: AnimatedBuilder(
+          animation: _controller,
+          builder: (context, child) {
+            return Opacity(
+              opacity: _opacityAnimation.value,
+              child: Transform.scale(
+                scale: _scaleAnimation.value,
+                child: child,
+              ),
+            );
+          },
+          child: Container(
+            width: size,
+            height: size,
+            decoration: BoxDecoration(
+              border: Border.all(
+                color: const Color(0xFFFFD54F),
+                width: 1.5,
+              ),
+              borderRadius: BorderRadius.circular(size / 2),
+              boxShadow: const [
+                BoxShadow(
+                  color: Colors.black38,
+                  blurRadius: 6,
+                  spreadRadius: 1,
+                ),
+              ],
+            ),
+            child: Center(
+              child: Container(
+                width: 4,
+                height: 4,
+                decoration: const BoxDecoration(
+                  color: Color(0xFFFFD54F),
+                  shape: BoxShape.circle,
+                  boxShadow: [
+                    BoxShadow(
+                      color: Colors.black45,
+                      blurRadius: 2,
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          ),
+        ),
       ),
     );
   }
@@ -2933,7 +3099,6 @@ class _CameraControlDock extends StatelessWidget {
   final bool screenDimSwitching;
   final bool lensSwitching;
   final String screenOrientation;
-  final VoidCallback? onRotate;
   final VoidCallback? onSwitchLens;
   final VoidCallback? onToggleCamera;
   final VoidCallback? onToggleScreenDim;
@@ -2948,7 +3113,6 @@ class _CameraControlDock extends StatelessWidget {
     required this.screenDimSwitching,
     required this.lensSwitching,
     required this.screenOrientation,
-    required this.onRotate,
     required this.onSwitchLens,
     required this.onToggleCamera,
     required this.onToggleScreenDim,
@@ -2979,17 +3143,6 @@ class _CameraControlDock extends StatelessWidget {
         child: Column(
           mainAxisSize: MainAxisSize.min,
         children: [
-          _DockButton(
-            icon: Icons.rotate_90_degrees_cw_rounded,
-            tooltip: appText(
-              context,
-              'Xoay hình camera 90°',
-              'Rotate camera 90°',
-            ),
-            size: buttonSize,
-            onPressed: onRotate,
-          ),
-          SizedBox(height: gap),
           _DockButton(
             icon: Icons.cameraswitch_rounded,
             tooltip: appText(

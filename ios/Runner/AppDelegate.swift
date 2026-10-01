@@ -129,21 +129,38 @@ import UIKit
         self.getAvailableCameras(call, result)
       case "switchCameraToId":
         self.switchCameraToId(call, result)
+      case "setCameraLock":
+        self.setCameraLock(call, result)
       default:
         result(FlutterMethodNotImplemented)
       }
     }
   }
 
-  private func switchCameraToId(_ call: FlutterMethodCall, _ result: FlutterResult) {
+  private func setCameraLock(_ call: FlutterMethodCall, _ result: FlutterResult) {
+    let arguments = call.arguments as? [String: Any]
+    let trackId = arguments?["trackId"] as? String ?? ""
+    let locked = arguments?["locked"] as? Bool ?? true
+    let success = VnvarWebRtcTrackBridge.setCameraLock(forTrackId: trackId, locked: locked)
+    result(success)
+  }
+
+  private func switchCameraToId(_ call: FlutterMethodCall, _ result: @escaping FlutterResult) {
     guard let arguments = call.arguments as? [String: Any],
           let trackId = arguments["trackId"] as? String,
           let cameraId = arguments["cameraId"] as? String else {
       result(false)
       return
     }
-    let success = VnvarWebRtcTrackBridge.switchCamera(forTrackId: trackId, toDeviceId: cameraId)
-    result(success)
+    VnvarWebRtcTrackBridge.switchCamera(forTrackId: trackId, toDeviceId: cameraId) { success, error in
+      DispatchQueue.main.async {
+        if success {
+          result(true)
+        } else {
+          result(FlutterError(code: "SWITCH_CAMERA_FAILED", message: error ?? "Switch camera failed", details: nil))
+        }
+      }
+    }
   }
 
   private func getAvailableCameras(_ call: FlutterMethodCall, _ result: FlutterResult) {
@@ -152,8 +169,7 @@ import UIKit
     ]
     if #available(iOS 13.0, *) {
       types.append(.builtInUltraWideCamera)
-      types.append(.builtInTripleCamera)
-      types.append(.builtInDualWideCamera)
+      types.append(.builtInTelephotoCamera)
     }
     let discovery = AVCaptureDevice.DiscoverySession(
       deviceTypes: types,
@@ -168,11 +184,15 @@ import UIKit
       } else {
         isUltraWide = false
       }
+      let minZoom: Double = isUltraWide ? 0.5 : Double(device.minAvailableVideoZoomFactor)
+      let maxZoom: Double = isUltraWide
+        ? (Double(device.maxAvailableVideoZoomFactor) * 0.5)
+        : min(10.0, Double(device.maxAvailableVideoZoomFactor))
       cameras.append([
         "id": device.uniqueID,
         "facing": device.position == .front ? "front" : "back",
-        "minZoom": max(0.5, device.minAvailableVideoZoomFactor),
-        "maxZoom": min(10.0, device.maxAvailableVideoZoomFactor),
+        "minZoom": minZoom,
+        "maxZoom": maxZoom,
         "isUltraWide": isUltraWide,
       ])
     }
@@ -200,22 +220,42 @@ import UIKit
     guard let device = self.activeVideoDevice(trackId: trackId, requestedId: requestedId, facing: facing) else {
       result(["supported": false]); return
     }
-    let minimum = max(0.5, device.minAvailableVideoZoomFactor)
-    let maximum = min(10, device.maxAvailableVideoZoomFactor)
+    let isUltraWide: Bool
+    if #available(iOS 13.0, *) {
+      isUltraWide = (device.deviceType == .builtInUltraWideCamera)
+    } else {
+      isUltraWide = false
+    }
+
+    let minFactor = device.minAvailableVideoZoomFactor
+    let maxFactor = device.maxAvailableVideoZoomFactor
+    let baseRatio: CGFloat = isUltraWide ? 0.5 : 1.0
+
     if apply, let requested = (arguments?["zoom"] as? NSNumber)?.doubleValue {
       do {
         try device.lockForConfiguration()
-        device.videoZoomFactor = min(maximum, max(minimum, requested))
+        let targetFactor: CGFloat
+        if isUltraWide {
+          targetFactor = min(maxFactor, max(minFactor, CGFloat(requested) / baseRatio))
+        } else {
+          targetFactor = min(maxFactor, max(minFactor, CGFloat(requested)))
+        }
+        device.videoZoomFactor = targetFactor
         device.unlockForConfiguration()
       } catch {
         result(FlutterError(code: "ZOOM_FAILED", message: error.localizedDescription, details: nil)); return
       }
     }
+
+    let currentZoom = isUltraWide
+      ? (Double(device.videoZoomFactor) * Double(baseRatio))
+      : Double(device.videoZoomFactor)
+
     result([
-      "supported": maximum > minimum,
-      "min": minimum,
-      "max": maximum,
-      "current": device.videoZoomFactor,
+      "supported": maxFactor > minFactor,
+      "min": isUltraWide ? 0.5 : Double(minFactor),
+      "max": isUltraWide ? (Double(maxFactor) * Double(baseRatio)) : Double(maxFactor),
+      "current": currentZoom,
       "cameraId": device.uniqueID,
     ])
   }

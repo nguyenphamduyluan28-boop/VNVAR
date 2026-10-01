@@ -148,6 +148,9 @@ class WebRtcService {
   bool? _isEmulator;
   List<AvailableCameraDevice> _availableCameras = <AvailableCameraDevice>[];
   String? _activeCameraId;
+  Timer? _cameraAutoLockTimer;
+  bool _isCameraLocked = false;
+  bool get isCameraLocked => _isCameraLocked;
   double _cameraZoom = 1;
   double _minimumCameraZoom = 1;
   double _maximumCameraZoom = 1;
@@ -158,7 +161,7 @@ class WebRtcService {
 
   AvailableCameraDevice? get ultraWideCamera {
     final uwList = _availableCameras
-        .where((c) => c.isUltraWide && c.facing == 'back')
+        .where((c) => c.isUltraWide && c.facing == 'back' && c.id != '0')
         .toList();
     if (uwList.isEmpty) {
       return null;
@@ -176,6 +179,11 @@ class WebRtcService {
   }
 
   AvailableCameraDevice? get mainBackCamera {
+    final id0 = _availableCameras
+        .where((c) => c.facing == 'back' && c.id == '0')
+        .firstOrNull;
+    if (id0 != null) return id0;
+
     for (final c in _availableCameras) {
       if (c.facing == 'back' && !c.isUltraWide) return c;
     }
@@ -192,7 +200,7 @@ class WebRtcService {
   bool get hasUltraWideCamera =>
       ultraWideCamera != null ||
       (_minimumCameraZoom <= 0.85) ||
-      _availableCameras.where((c) => c.facing == 'back').length > 1;
+      _availableCameras.any((c) => c.facing == 'back' && c.minZoom <= 0.85);
 
   double get ultraWideZoomRatio {
     if (!hasUltraWideCamera) return 1.0;
@@ -272,20 +280,12 @@ class WebRtcService {
       _activeCameraId = reportedCameraId;
     }
 
-    final effectiveMinRatio = hasUltraWideCamera ? ultraWideZoomRatio : reportedMin;
-    if (isCurrentUltraWide && ultraWideCamera != null) {
-      _minimumCameraZoom = effectiveMinRatio;
-      _maximumCameraZoom = math.max(reportedMax, 2.0);
-      _cameraZoom = effectiveMinRatio;
-    } else if (hasUltraWideCamera) {
-      _minimumCameraZoom = effectiveMinRatio;
-      _maximumCameraZoom = math.max(reportedMax, 10.0);
-      _cameraZoom = reportedCurrent;
-    } else {
-      _minimumCameraZoom = reportedMin;
-      _maximumCameraZoom = reportedMax;
-      _cameraZoom = reportedCurrent;
-    }
+    final effectiveMinRatio = hasUltraWideCamera
+        ? math.min(ultraWideZoomRatio, reportedMin)
+        : reportedMin;
+    _minimumCameraZoom = effectiveMinRatio;
+    _maximumCameraZoom = math.max(reportedMax, 10.0);
+    _cameraZoom = reportedCurrent;
   }
 
   Future<void> setCameraZoom(double value) async {
@@ -848,6 +848,9 @@ class WebRtcService {
   Future<void> _configureNaturalCameraMetering(MediaStreamTrack track) async {
     if (!Platform.isAndroid && !Platform.isIOS) return;
 
+    // Reset lock to continuous auto before allowing natural adaptation
+    unawaited(setCameraLock(locked: false, trackId: track.id));
+
     // flutter_webrtc 1.6.0 implements Android's setExposurePoint by replacing
     // the active Camera2 repeating request with a new, minimally configured
     // TEMPLATE_RECORD request. That drops the capturer's FPS/AE configuration
@@ -856,6 +859,7 @@ class WebRtcService {
     // gives its automatic exposure the best input available through WebRTC.
     if (Platform.isAndroid) {
       await _applyAndroidExposureBoost(track);
+      _scheduleAutoLock(track);
       return;
     }
 
@@ -875,6 +879,12 @@ class WebRtcService {
           name: 'WebRtcService',
         );
       }
+      try {
+        await Helper.setFocusMode(
+          track,
+          CameraFocusMode.auto,
+        ).timeout(const Duration(seconds: 2));
+      } catch (_) {}
     }
 
     try {
@@ -894,6 +904,84 @@ class WebRtcService {
         name: 'WebRtcService',
       );
     }
+
+    _scheduleAutoLock(track);
+  }
+
+  void _scheduleAutoLock(MediaStreamTrack track) {
+    _cameraAutoLockTimer?.cancel();
+    _cameraAutoLockTimer = Timer(const Duration(seconds: 4), () async {
+      if (_localStream == null || localVideoTrack?.id != track.id) return;
+      developer.log(
+        '[CAMERA] Auto-locking AE/AF/AWB after 4 seconds of natural metering',
+        name: 'WebRtcService',
+      );
+      await setCameraLock(locked: true, trackId: track.id);
+    });
+  }
+
+  Future<bool> setCameraLock({required bool locked, String? trackId}) async {
+    final targetTrackId = trackId ?? localVideoTrack?.id;
+    if (targetTrackId == null) return false;
+    if (!Platform.isAndroid && !Platform.isIOS) return false;
+
+    try {
+      final result = await _platformChannel.invokeMethod<bool>('setCameraLock', {
+        'trackId': targetTrackId,
+        'locked': locked,
+      });
+      _isCameraLocked = locked;
+      developer.log(
+        '[CAMERA] Camera AE/AF/AWB lock set to $locked (result: $result)',
+        name: 'WebRtcService',
+      );
+      return result ?? false;
+    } catch (error) {
+      developer.log(
+        '[CAMERA] Failed to set camera lock: $error',
+        name: 'WebRtcService',
+      );
+      return false;
+    }
+  }
+
+  Future<void> remeterAndLock({math.Point<double>? point}) async {
+    final track = localVideoTrack;
+    if (track == null) return;
+    if (!Platform.isAndroid && !Platform.isIOS) return;
+
+    final targetPoint = point ?? const math.Point<double>(0.5, 0.5);
+    developer.log(
+      '[CAMERA] Tap-to-remeter triggered at (${targetPoint.x.toStringAsFixed(2)}, ${targetPoint.y.toStringAsFixed(2)})',
+      name: 'WebRtcService',
+    );
+
+    // 1. Reset lock to continuous auto before allowing natural adaptation
+    await setCameraLock(locked: false, trackId: track.id);
+
+    // 2. Set metering / focus point
+    try {
+      await Helper.setExposurePoint(track, targetPoint)
+          .timeout(const Duration(seconds: 2));
+    } catch (_) {}
+
+    if (Platform.isIOS) {
+      try {
+        await Helper.setExposureMode(track, CameraExposureMode.auto)
+            .timeout(const Duration(seconds: 2));
+      } catch (_) {}
+      try {
+        await Helper.setFocusMode(track, CameraFocusMode.auto)
+            .timeout(const Duration(seconds: 2));
+      } catch (_) {}
+      try {
+        await Helper.setFocusPoint(track, targetPoint)
+            .timeout(const Duration(seconds: 2));
+      } catch (_) {}
+    }
+
+    // 3. Restart auto-lock countdown (4 seconds)
+    _scheduleAutoLock(track);
   }
 
   Future<void> _applyAndroidExposureBoost(MediaStreamTrack track) async {
@@ -1121,17 +1209,17 @@ class WebRtcService {
         }
       }
 
-      await Future<void>.delayed(const Duration(milliseconds: 250));
+      await Future<void>.delayed(const Duration(milliseconds: 100));
       if (_localStream == null || localVideoTrack != track) {
         throw StateError('Camera stream không còn tồn tại.');
       }
-      await _configureNaturalCameraMetering(track);
       _currentFacingMode = targetFacing;
       if (deviceId != null) {
         _activeCameraId = deviceId;
         _preferredCameraDeviceIds[_currentFacingMode!] = deviceId;
       }
       await refreshCameraZoom();
+      await _configureNaturalCameraMetering(track);
       developer.log(
         '[CAMERA] Switched camera to $deviceId ($_currentFacingMode)',
         name: 'WebRtcService',
@@ -1185,15 +1273,22 @@ class WebRtcService {
         }
       }
 
-      // Đã ở camera sau: thử đổi sang camera ID góc siêu rộng (nếu hỗ trợ chuyển phần cứng)
-      if (uw != null && uw.id != _activeCameraId && currentFacingMode == 'environment') {
+      // Kiểm tra xem camera hiện tại có hỗ trợ targetRatio trực tiếp không
+      // (ví dụ: Camera 0 trên Android là logical multi-camera hỗ trợ zoom mượt từ 0.6x tới 10x không cần đổi ID)
+      final canCurrentZoomDirectly = _minimumCameraZoom <= (targetRatio + 0.05);
+
+      // Đã ở camera sau: thử đổi sang camera ID góc siêu rộng nếu camera hiện tại không zoom trực tiếp được
+      if (!canCurrentZoomDirectly && uw != null && uw.id != _activeCameraId && currentFacingMode == 'environment') {
+        bool switchSuccess = false;
         try {
           await switchCameraToId(uw.id);
+          switchSuccess = true;
         } catch (e) {
           developer.log(
-            '[CAMERA] Primary ultra-wide switch to ${uw.id} failed: $e, trying alternatives or zoom',
+            '[CAMERA] Primary ultra-wide switch to ${uw.id} failed: $e, removing from available cameras',
             name: 'WebRtcService',
           );
+          _availableCameras.removeWhere((c) => c.id == uw.id);
           final alts = _availableCameras
               .where(
                 (c) =>
@@ -1203,17 +1298,27 @@ class WebRtcService {
                     c.isUltraWide,
               )
               .toList();
-          bool switchedAlt = false;
           for (final alt in alts) {
             try {
               await switchCameraToId(alt.id);
-              switchedAlt = true;
+              switchSuccess = true;
               break;
+            } catch (_) {
+              _availableCameras.removeWhere((c) => c.id == alt.id);
+            }
+          }
+        }
+        if (switchSuccess) {
+          await setCameraZoom(targetRatio);
+        } else {
+          // Nếu tất cả camera phụ đều bị từ chối mở (như trên Xiaomi), an toàn giữ nguyên camera chính ở 1.0x
+          final main = mainBackCamera;
+          if (main != null && _activeCameraId != main.id) {
+            try {
+              await switchCameraToId(main.id);
             } catch (_) {}
           }
-          if (!switchedAlt) {
-            await setCameraZoom(targetRatio);
-          }
+          await setCameraZoom(1.0);
         }
       } else {
         await setCameraZoom(targetRatio);
@@ -1719,6 +1824,9 @@ class WebRtcService {
     }
     _firstFrameCompleter = null;
     _receivedFirstFrame = false;
+    _cameraAutoLockTimer?.cancel();
+    _cameraAutoLockTimer = null;
+    _isCameraLocked = false;
     localRenderer.srcObject = null;
 
     final stream = _localStream;

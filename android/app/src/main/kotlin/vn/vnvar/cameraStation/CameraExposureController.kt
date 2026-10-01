@@ -9,6 +9,7 @@ import android.hardware.camera2.CameraManager
 import android.hardware.camera2.CaptureRequest
 import android.hardware.camera2.TotalCaptureResult
 import android.graphics.Rect
+import android.graphics.SurfaceTexture
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
@@ -36,6 +37,8 @@ object CameraExposureController {
     @Volatile
     private var activeTargetEv = 0.0
     @Volatile private var activeZoom = 1.0
+    @Volatile
+    private var activeCameraLock = false
     @Volatile
     private var activeCamera2 = false
     @Volatile
@@ -116,9 +119,21 @@ object CameraExposureController {
         if (trackId != null && activeTrackId != trackId) return
         activeTrackId = null
         activeCamera2 = false
+        activeCameraLock = false
         lastCaptureHeartbeatMs = 0L
         requestGeneration++
         lifecycleHandler.removeCallbacks(captureWatchdog)
+    }
+
+    fun setLock(trackId: String, locked: Boolean, callback: (Map<String, Any>) -> Unit) {
+        activeCameraLock = locked
+        apply(trackId, activeTargetEv) { res ->
+            callback(mapOf(
+                "applied" to (res["applied"] == true),
+                "locked" to locked,
+                "trackId" to trackId,
+            ))
+        }
     }
 
     fun zoomCapabilities(trackId: String, callback: (Map<String, Any>) -> Unit) {
@@ -194,26 +209,17 @@ object CameraExposureController {
         val parsedList = mutableListOf<ParsedCamera>()
         val examinedIds = mutableSetOf<String>()
         try {
-            val candidateIds = mutableListOf<String>()
-            candidateIds.addAll(manager.cameraIdList)
-
-            // Probe physical IDs from logical cameras (Android 9+)
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
-                for (id in manager.cameraIdList) {
-                    try {
-                        val chars = manager.getCameraCharacteristics(id)
-                        candidateIds.addAll(chars.physicalCameraIds)
-                    } catch (_: Throwable) {}
-                }
-            }
-
-            // Probe auxiliary IDs (0..9) used by Xiaomi, Samsung, Oppo, Vivo, OnePlus
-            for (i in 0..9) {
-                val idStr = i.toString()
-                if (!candidateIds.contains(idStr)) {
-                    candidateIds.add(idStr)
-                }
-            }
+            // Chỉ sử dụng các camera được hệ điều hành công khai trong manager.cameraIdList.
+            // LƯU Ý KỸ THUẬT QUAN TRỌNG:
+            // 1. Tuyệt đối KHÔNG thêm chars.physicalCameraIds vì đây là các cảm biến phụ nội bộ
+            //    (hidden physical cameras) của Logical Multi-Camera (Pixel, Galaxy S, Xiaomi).
+            //    Theo Android CDD, việc gọi openCamera() vào physicalCameraId sẽ ném ra
+            //    IllegalArgumentException: Camera id is a hidden physical camera and cannot be opened directly.
+            // 2. Tuyệt đối KHÔNG quét mù 0..9 vì trên Xiaomi/Redmi và các máy khác, gọi openCamera()
+            //    vào ID không nằm trong cameraIdList sẽ bị vendor HAL ném CAMERA_DISABLED hoặc crash.
+            // 3. Với các dòng máy có ống kính góc rộng riêng biệt mở được (như Samsung Galaxy A/M series),
+            //    hãng ĐÃ công khai ID camera góc rộng trong manager.cameraIdList (thường là ID 2).
+            val candidateIds = manager.cameraIdList.toList()
 
             for (id in candidateIds) {
                 if (!examinedIds.add(id)) continue
@@ -225,6 +231,17 @@ object CameraExposureController {
                         CameraCharacteristics.LENS_FACING_BACK -> "back"
                         else -> "external"
                     }
+
+                    // Kiểm tra khả năng xuất video qua SurfaceTexture
+                    val map = chars.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP) ?: continue
+                    val surfaceSizes = map.getOutputSizes(SurfaceTexture::class.java)
+                    if (surfaceSizes.isNullOrEmpty()) continue
+
+                    // Với camera phụ (id != "0"): loại bỏ các camera không hỗ trợ quay video HD (>= 1280px)
+                    // thường là cảm biến đo chiều sâu (depth sensor) hoặc cảm biến đo khoảng cách
+                    val maxSurfaceWidth = surfaceSizes.maxOfOrNull { it.width } ?: 0
+                    if (id != "0" && maxSurfaceWidth < 1280) continue
+
                     val focalLengths = chars.get(CameraCharacteristics.LENS_INFO_AVAILABLE_FOCAL_LENGTHS)
                     val minFocal = focalLengths?.minOrNull() ?: 0f
                     val sensorSize = chars.get(CameraCharacteristics.SENSOR_INFO_PHYSICAL_SIZE)
@@ -248,8 +265,9 @@ object CameraExposureController {
 
                     // Ultra-wide criteria:
                     // 1) Facing back
-                    // 2) AND (minZoom <= 0.85 OR (minFocal in 0.1f..3.5f) OR fov >= 82f)
-                    val isUltraWide = (facing == CameraCharacteristics.LENS_FACING_BACK) &&
+                    // 2) Auxiliary camera (id != "0") - ID "0" is always the primary main camera
+                    // 3) AND (minZoom <= 0.85 OR (minFocal in 0.1f..3.5f) OR fov >= 82f)
+                    val isUltraWide = (id != "0") && (facing == CameraCharacteristics.LENS_FACING_BACK) &&
                         (minZoom <= 0.85 || (minFocal in 0.1f..3.5f) || fov >= 82f)
 
                     parsedList.add(ParsedCamera(id, facing, facingStr, minFocal, fov, minZoom, maxZoom, isUltraWide))
@@ -257,15 +275,14 @@ object CameraExposureController {
             }
 
             // Post-process: nếu có nhiều camera sau mà chưa camera nào được đánh dấu ultra-wide
+            // Chỉ đánh dấu camera phụ là ultra-wide NẾU tiêu cự của nó ngắn hơn rõ rệt (< 85%) so với camera chính.
+            // Tuyệt đối không dùng fallback mù sang camera phụ vì có thể đó là ống kính Telephoto (zoom xa).
             val backCameras = parsedList.filter { it.facing == CameraCharacteristics.LENS_FACING_BACK }
             if (backCameras.size >= 2 && backCameras.none { it.isUltraWide }) {
                 val primaryBack = backCameras.firstOrNull { it.id == "0" } ?: backCameras.first()
-                val minFocalBack = backCameras.filter { it.minFocal > 0f }.minByOrNull { it.minFocal }
-                if (minFocalBack != null && minFocalBack.id != primaryBack.id && minFocalBack.minFocal < primaryBack.minFocal) {
+                val minFocalBack = backCameras.filter { it.minFocal > 0f && it.id != primaryBack.id }.minByOrNull { it.minFocal }
+                if (minFocalBack != null && primaryBack.minFocal > 0f && minFocalBack.minFocal < primaryBack.minFocal * 0.85f) {
                     minFocalBack.isUltraWide = true
-                } else {
-                    val secondary = backCameras.firstOrNull { it.id != primaryBack.id }
-                    secondary?.isUltraWide = true
                 }
             }
         } catch (e: Throwable) {
@@ -304,6 +321,14 @@ object CameraExposureController {
             val capturer = info.capturer as? CameraVideoCapturer
                 ?: return callback(false, "not_camera_capturer")
 
+            val previousCameraId = (capturer as? Camera2Capturer)?.let {
+                try {
+                    val session = readField(it, "currentSession")
+                    val dev = readField(session, "cameraDevice") as? CameraDevice
+                    dev?.id
+                } catch (_: Throwable) { null }
+            } ?: "0"
+
             val manager = (capturer as? Camera2Capturer)?.let {
                 try {
                     readField(it, "cameraManager") as? CameraManager
@@ -323,16 +348,30 @@ object CameraExposureController {
                         isFacingField.set(getUserMedia, isTargetFront)
                     } catch (_: Throwable) {}
                     activeZoom = 1.0
+                    activeCameraLock = false
                     lastCaptureHeartbeatMs = 0L
-                    lifecycleHandler.post {
-                        callback(true, null)
+                    apply(trackId, activeTargetEv) {
+                        lifecycleHandler.post {
+                            callback(true, null)
+                        }
                     }
                 }
 
                 override fun onCameraSwitchError(errorDescription: String?) {
-                    Log.w(TAG, "switchCameraToId failed for $targetCameraId: $errorDescription")
-                    lifecycleHandler.post {
-                        callback(false, errorDescription)
+                    Log.w(TAG, "switchCameraToId failed for $targetCameraId: $errorDescription. Auto-reverting to $previousCameraId")
+                    try {
+                        capturer.switchCamera(object : CameraVideoCapturer.CameraSwitchHandler {
+                            override fun onCameraSwitchDone(isFrontFacing: Boolean) {
+                                lifecycleHandler.post { callback(false, errorDescription) }
+                            }
+                            override fun onCameraSwitchError(err: String?) {
+                                lifecycleHandler.post { callback(false, errorDescription) }
+                            }
+                        }, previousCameraId)
+                    } catch (_: Throwable) {
+                        lifecycleHandler.post {
+                            callback(false, errorDescription)
+                        }
                     }
                 }
             }, targetCameraId)
@@ -408,7 +447,30 @@ object CameraExposureController {
                             captureFormat.framerate.max / fpsUnitFactor,
                         ),
                     )
-                    set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_VIDEO)
+                    val aeLockAvailable = characteristics.get(CameraCharacteristics.CONTROL_AE_LOCK_AVAILABLE) == true
+                    if (aeLockAvailable) {
+                        set(CaptureRequest.CONTROL_AE_LOCK, activeCameraLock)
+                    }
+                    val awbLockAvailable = characteristics.get(CameraCharacteristics.CONTROL_AWB_LOCK_AVAILABLE) == true
+                    if (awbLockAvailable) {
+                        set(CaptureRequest.CONTROL_AWB_LOCK, activeCameraLock)
+                    }
+                    val afModes = characteristics.get(CameraCharacteristics.CONTROL_AF_AVAILABLE_MODES)
+                    if (activeCameraLock) {
+                        if (afModes?.contains(CaptureRequest.CONTROL_AF_MODE_AUTO) == true) {
+                            set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_AUTO)
+                        } else if (afModes?.contains(CaptureRequest.CONTROL_AF_MODE_OFF) == true) {
+                            set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_OFF)
+                        } else {
+                            set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_VIDEO)
+                        }
+                    } else {
+                        if (afModes?.contains(CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_VIDEO) == true) {
+                            set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_VIDEO)
+                        } else {
+                            set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_AUTO)
+                        }
+                    }
                     set(CaptureRequest.CONTROL_AWB_MODE, CaptureRequest.CONTROL_AWB_MODE_AUTO)
                     // Zoom: ưu tiên CONTROL_ZOOM_RATIO (Android 11+) cho phép
                     // giá trị < 1.0 (ultra-wide). Fallback SCALER_CROP_REGION
@@ -486,6 +548,24 @@ object CameraExposureController {
             )
         } else 0
         if (step > 0.0) parameters.exposureCompensation = compensation
+        if (parameters.isAutoExposureLockSupported) {
+            parameters.autoExposureLock = activeCameraLock
+        }
+        if (parameters.isAutoWhiteBalanceLockSupported) {
+            parameters.autoWhiteBalanceLock = activeCameraLock
+        }
+        val supportedFocus = parameters.supportedFocusModes ?: emptyList()
+        if (activeCameraLock) {
+            if (supportedFocus.contains(Camera.Parameters.FOCUS_MODE_FIXED)) {
+                parameters.focusMode = Camera.Parameters.FOCUS_MODE_FIXED
+            } else if (supportedFocus.contains(Camera.Parameters.FOCUS_MODE_AUTO)) {
+                parameters.focusMode = Camera.Parameters.FOCUS_MODE_AUTO
+            }
+        } else {
+            if (supportedFocus.contains(Camera.Parameters.FOCUS_MODE_CONTINUOUS_VIDEO)) {
+                parameters.focusMode = Camera.Parameters.FOCUS_MODE_CONTINUOUS_VIDEO
+            }
+        }
         if (parameters.isZoomSupported) {
             val target = (activeZoom * 100).roundToInt()
             val index = parameters.zoomRatios.indices.minByOrNull { kotlin.math.abs(parameters.zoomRatios[it] - target) } ?: 0

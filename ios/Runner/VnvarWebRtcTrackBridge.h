@@ -11,8 +11,11 @@ NS_ASSUME_NONNULL_BEGIN
 + (CVPixelBufferRef _Nullable)copyPixelBufferForFrame:(RTCVideoFrame *)frame
     CF_RETURNS_RETAINED;
 + (AVCaptureDevice * _Nullable)activeVideoDeviceForTrackId:(NSString *)trackId;
-+ (BOOL)switchCameraForTrackId:(NSString *)trackId
-                    toDeviceId:(NSString *)deviceId;
++ (void)switchCameraForTrackId:(NSString *)trackId
+                    toDeviceId:(NSString *)deviceId
+                    completion:(void (^)(BOOL success, NSString * _Nullable error))completion;
++ (BOOL)setCameraLockForTrackId:(NSString *)trackId
+                         locked:(BOOL)locked;
 
 @end
 

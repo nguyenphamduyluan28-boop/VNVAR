@@ -248,6 +248,18 @@ class MainActivity : FlutterActivity() {
                     }
                 }
 
+                "setCameraLock" -> {
+                    val trackId = call.argument<String>("trackId")
+                    val locked = call.argument<Boolean>("locked") ?: true
+                    if (trackId.isNullOrBlank()) {
+                        result.error("INVALID_TRACK", "trackId is required", null)
+                    } else {
+                        CameraExposureController.setLock(trackId, locked) { response ->
+                            runOnUiThread { result.success(response["applied"] == true) }
+                        }
+                    }
+                }
+
                 "startRtsp" -> {
                     val trackId = call.argument<String>("trackId")
                     val port = call.argument<Int>("port") ?: 8554

@@ -171,22 +171,26 @@
   return nil;
 }
 
-+ (BOOL)switchCameraForTrackId:(NSString *)trackId
-                    toDeviceId:(NSString *)deviceId {
++ (void)switchCameraForTrackId:(NSString *)trackId
+                    toDeviceId:(NSString *)deviceId
+                    completion:(void (^)(BOOL success, NSString * _Nullable error))completion {
   if (deviceId.length == 0) {
-    return NO;
+    if (completion) completion(NO, @"Empty deviceId");
+    return;
   }
   FlutterWebRTCPlugin *plugin = [FlutterWebRTCPlugin sharedSingleton];
   if (plugin == nil || plugin.videoCapturer == nil) {
     NSLog(@"[CAMERA] FlutterWebRTCPlugin or videoCapturer is nil");
-    return NO;
+    if (completion) completion(NO, @"Plugin or videoCapturer is nil");
+    return;
   }
   RTCCameraVideoCapturer *capturer = plugin.videoCapturer;
 
   AVCaptureDevice *targetDevice = [AVCaptureDevice deviceWithUniqueID:deviceId];
   if (targetDevice == nil) {
     NSLog(@"[CAMERA] targetDevice with uniqueID %@ not found", deviceId);
-    return NO;
+    if (completion) completion(NO, @"Device not found");
+    return;
   }
 
   // Check if already capturing on target device
@@ -194,7 +198,8 @@
     for (AVCaptureInput *input in capturer.captureSession.inputs) {
       if ([input isKindOfClass:[AVCaptureDeviceInput class]]) {
         if ([((AVCaptureDeviceInput *)input).device.uniqueID isEqualToString:deviceId]) {
-          return YES;
+          if (completion) completion(YES, nil);
+          return;
         }
       }
     }
@@ -238,12 +243,58 @@
                  completionHandler:^(NSError * _Nullable error) {
     if (error != nil) {
       NSLog(@"[CAMERA] startCaptureWithDevice failed: %@", error);
+      if (completion) completion(NO, error.localizedDescription);
     } else {
       NSLog(@"[CAMERA] Successfully switched iOS camera to device %@", targetDevice.localizedName);
+      plugin._usingFrontCamera = (targetDevice.position == AVCaptureDevicePositionFront);
+      if (completion) completion(YES, nil);
     }
   }];
+}
 
-  plugin._usingFrontCamera = (targetDevice.position == AVCaptureDevicePositionFront);
++ (BOOL)setCameraLockForTrackId:(NSString *)trackId locked:(BOOL)locked {
+  AVCaptureDevice *device = [self activeVideoDeviceForTrackId:trackId];
+  if (device == nil) {
+    NSLog(@"[CAMERA_LOCK] No active AVCaptureDevice found for trackId %@", trackId);
+    return NO;
+  }
+
+  NSError *error = nil;
+  if (![device lockForConfiguration:&error]) {
+    NSLog(@"[CAMERA_LOCK] lockForConfiguration failed: %@", error);
+    return NO;
+  }
+
+  @try {
+    if (locked) {
+      if ([device isExposureModeSupported:AVCaptureExposureModeLocked]) {
+        device.exposureMode = AVCaptureExposureModeLocked;
+      }
+      if ([device isFocusModeSupported:AVCaptureFocusModeLocked]) {
+        device.focusMode = AVCaptureFocusModeLocked;
+      }
+      if ([device isWhiteBalanceModeSupported:AVCaptureWhiteBalanceModeLocked]) {
+        device.whiteBalanceMode = AVCaptureWhiteBalanceModeLocked;
+      }
+      NSLog(@"[CAMERA_LOCK] Successfully locked AE/AF/AWB on %@", device.localizedName);
+    } else {
+      if ([device isExposureModeSupported:AVCaptureExposureModeContinuousAutoExposure]) {
+        device.exposureMode = AVCaptureExposureModeContinuousAutoExposure;
+      }
+      if ([device isFocusModeSupported:AVCaptureFocusModeContinuousAutoFocus]) {
+        device.focusMode = AVCaptureFocusModeContinuousAutoFocus;
+      }
+      if ([device isWhiteBalanceModeSupported:AVCaptureWhiteBalanceModeContinuousAutoWhiteBalance]) {
+        device.whiteBalanceMode = AVCaptureWhiteBalanceModeContinuousAutoWhiteBalance;
+      }
+      NSLog(@"[CAMERA_LOCK] Successfully set AE/AF/AWB to Continuous Auto on %@", device.localizedName);
+    }
+  } @catch (NSException *exception) {
+    NSLog(@"[CAMERA_LOCK] Exception during configuration: %@", exception);
+    [device unlockForConfiguration];
+    return NO;
+  }
+  [device unlockForConfiguration];
   return YES;
 }
 
