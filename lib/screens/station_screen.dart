@@ -232,8 +232,7 @@ class _StationScreenState extends State<StationScreen>
     final willSwitchHardware = (target < 0.95 &&
             !webRtc.isCurrentUltraWide &&
             webRtc.ultraWideCamera != null &&
-            webRtc.activeCameraId != webRtc.ultraWideCamera!.id &&
-            webRtc.minimumCameraZoom > target + 0.05) ||
+            webRtc.activeCameraId != webRtc.ultraWideCamera!.id) ||
         (target >= 0.95 &&
             webRtc.isCurrentUltraWide &&
             webRtc.mainBackCamera != null &&
@@ -311,11 +310,10 @@ class _StationScreenState extends State<StationScreen>
       final webRtc = _runtime.webRtcService;
       if (webRtc == null) return;
       try {
-        final willSwitchHardwareToUW = value < 0.85 &&
+        final willSwitchHardwareToUW = value < 0.95 &&
             !webRtc.isCurrentUltraWide &&
             webRtc.ultraWideCamera != null &&
-            webRtc.activeCameraId != webRtc.ultraWideCamera!.id &&
-            webRtc.minimumCameraZoom > value + 0.05;
+            webRtc.activeCameraId != webRtc.ultraWideCamera!.id;
         final willSwitchHardwareToWide = value >= 0.95 &&
             webRtc.isCurrentUltraWide &&
             webRtc.mainBackCamera != null &&
