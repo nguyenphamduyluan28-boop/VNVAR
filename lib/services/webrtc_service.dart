@@ -295,7 +295,14 @@ class WebRtcService {
         : reportedMin;
     _minimumCameraZoom = effectiveMinRatio;
     _maximumCameraZoom = math.max(reportedMax, 10.0);
-    _cameraZoom = reportedCurrent;
+    final isPhysUltraWide = isCurrentUltraWide &&
+        ultraWideCamera != null &&
+        _activeCameraId == ultraWideCamera!.id;
+    if (isPhysUltraWide) {
+      _cameraZoom = (reportedCurrent * ultraWideZoomRatio).clamp(ultraWideZoomRatio, 10.0);
+    } else {
+      _cameraZoom = reportedCurrent;
+    }
   }
 
   Future<void> setCameraZoom(double value) async {
@@ -304,17 +311,28 @@ class WebRtcService {
     final minZ = hasUltraWideCamera ? ultraWideZoomRatio : _minimumCameraZoom;
     final maxZ = math.max(_maximumCameraZoom, 10.0);
     final target = value.clamp(minZ, maxZ).toDouble();
+
+    final isPhysUltraWide = isCurrentUltraWide &&
+        ultraWideCamera != null &&
+        _activeCameraId == ultraWideCamera!.id;
+    final nativeTarget = isPhysUltraWide
+        ? (target / ultraWideZoomRatio).clamp(1.0, 10.0).toDouble()
+        : target;
+
     final result = await _platformChannel
         .invokeMapMethod<String, dynamic>('setCameraZoom', {
           'trackId': track.id,
           'facing': currentFacingMode,
           'deviceId': _activeCameraId ?? _preferredCameraDeviceIds[currentFacingMode],
-          'zoom': target,
+          'zoom': nativeTarget,
         });
-    _cameraZoom =
-        (result?['current'] as num?)?.toDouble() ??
-        (result?['zoom'] as num?)?.toDouble() ??
-        target;
+    final reported = (result?['current'] as num?)?.toDouble() ??
+        (result?['zoom'] as num?)?.toDouble();
+    if (isPhysUltraWide && reported != null) {
+      _cameraZoom = (reported * ultraWideZoomRatio).clamp(ultraWideZoomRatio, 10.0);
+    } else {
+      _cameraZoom = reported ?? target;
+    }
   }
 
   bool _rtspRunning = false;

@@ -209,17 +209,26 @@ object CameraExposureController {
         val parsedList = mutableListOf<ParsedCamera>()
         val examinedIds = mutableSetOf<String>()
         try {
-            // Chỉ sử dụng các camera được hệ điều hành công khai trong manager.cameraIdList.
-            // LƯU Ý KỸ THUẬT QUAN TRỌNG:
-            // 1. Tuyệt đối KHÔNG thêm chars.physicalCameraIds vì đây là các cảm biến phụ nội bộ
-            //    (hidden physical cameras) của Logical Multi-Camera (Pixel, Galaxy S, Xiaomi).
-            //    Theo Android CDD, việc gọi openCamera() vào physicalCameraId sẽ ném ra
-            //    IllegalArgumentException: Camera id is a hidden physical camera and cannot be opened directly.
-            // 2. Tuyệt đối KHÔNG quét mù 0..9 vì trên Xiaomi/Redmi và các máy khác, gọi openCamera()
-            //    vào ID không nằm trong cameraIdList sẽ bị vendor HAL ném CAMERA_DISABLED hoặc crash.
-            // 3. Với các dòng máy có ống kính góc rộng riêng biệt mở được (như Samsung Galaxy A/M series),
-            //    hãng ĐÃ công khai ID camera góc rộng trong manager.cameraIdList (thường là ID 2).
-            val candidateIds = manager.cameraIdList.toList()
+            val candidateIds = mutableListOf<String>()
+            candidateIds.addAll(manager.cameraIdList)
+
+            // Probe physical IDs from logical cameras (Android 9+)
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                for (id in manager.cameraIdList) {
+                    try {
+                        val chars = manager.getCameraCharacteristics(id)
+                        candidateIds.addAll(chars.physicalCameraIds)
+                    } catch (_: Throwable) {}
+                }
+            }
+
+            // Probe auxiliary IDs (0..9) used by Xiaomi, Samsung, Oppo, Vivo, OnePlus
+            for (i in 0..9) {
+                val idStr = i.toString()
+                if (!candidateIds.contains(idStr)) {
+                    candidateIds.add(idStr)
+                }
+            }
 
             for (id in candidateIds) {
                 if (!examinedIds.add(id)) continue
@@ -236,11 +245,6 @@ object CameraExposureController {
                     val map = chars.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP) ?: continue
                     val surfaceSizes = map.getOutputSizes(SurfaceTexture::class.java)
                     if (surfaceSizes.isNullOrEmpty()) continue
-
-                    // Với camera phụ (id != "0"): loại bỏ các camera không hỗ trợ quay video HD (>= 1280px)
-                    // thường là cảm biến đo chiều sâu (depth sensor) hoặc cảm biến đo khoảng cách
-                    val maxSurfaceWidth = surfaceSizes.maxOfOrNull { it.width } ?: 0
-                    if (id != "0" && maxSurfaceWidth < 1280) continue
 
                     val focalLengths = chars.get(CameraCharacteristics.LENS_INFO_AVAILABLE_FOCAL_LENGTHS)
                     val minFocal = focalLengths?.minOrNull() ?: 0f
@@ -353,10 +357,8 @@ object CameraExposureController {
                     activeZoom = 1.0
                     activeCameraLock = false
                     lastCaptureHeartbeatMs = 0L
-                    apply(trackId, activeTargetEv) {
-                        lifecycleHandler.post {
-                            callback(true, null)
-                        }
+                    lifecycleHandler.post {
+                        callback(true, null)
                     }
                 }
 
