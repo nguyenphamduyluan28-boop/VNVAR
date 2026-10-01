@@ -155,6 +155,8 @@ class CameraStationRuntime {
 
   final WhipPublisherService _whipPublisherService = WhipPublisherService();
   final RtspPublisherService _rtspPublisherService = RtspPublisherService();
+  bool _wasRtspBeforeCameraDisable = false;
+  bool _wasWhipBeforeCameraDisable = false;
 
   Stream<void> get stateChanges => _stateController.stream;
   WebRtcService? get webRtcService => _webRtcService;
@@ -520,6 +522,8 @@ class CameraStationRuntime {
     _courtId = null;
     _deviceId = null;
     _cameraEnabled = false;
+    _wasRtspBeforeCameraDisable = false;
+    _wasWhipBeforeCameraDisable = false;
     _iosLifecycleSuspended = false;
     _iosResumeQueued = false;
     _iosAppInForeground = true;
@@ -779,6 +783,12 @@ class CameraStationRuntime {
       }
       _iosLifecycleSuspended = false;
       server.resumeAfterIosBackground();
+      if (_rtspPublisherService.isLive) {
+        unawaited(_rtspPublisherService.restartIfPublishing());
+      }
+      if (_whipPublisherService.isLive) {
+        unawaited(_whipPublisherService.restartIfPublishing());
+      }
       developer.log(
         '[LIFECYCLE] iOS foreground capture resumed',
         name: 'CameraStationRuntime',
@@ -815,6 +825,22 @@ class CameraStationRuntime {
     _emitState();
 
     if (!enabled) {
+      final wasRtspPublishing = _rtspPublisherService.isLive ||
+          _rtspPublisherService.state == RtspPublishState.connecting ||
+          _rtspPublisherService.state == RtspPublishState.reconnecting;
+      final wasWhipPublishing = _whipPublisherService.isLive ||
+          _whipPublisherService.state == WhipPublishState.connecting ||
+          _whipPublisherService.state == WhipPublishState.reconnecting;
+      _wasRtspBeforeCameraDisable = wasRtspPublishing;
+      _wasWhipBeforeCameraDisable = wasWhipPublishing;
+
+      if (wasRtspPublishing) {
+        await _rtspPublisherService.prepareForReconfiguration();
+      }
+      if (wasWhipPublishing) {
+        await _whipPublisherService.prepareForReconfiguration();
+      }
+
       // Camera cleanup must still run when stopping the recorder/connection
       // fails; otherwise the capture track can remain active in background.
       try {
@@ -849,6 +875,16 @@ class CameraStationRuntime {
       await server.ensureRecording();
       await WakelockPlus.enable();
       await _setIosStationActive(true);
+
+      if (_wasRtspBeforeCameraDisable) {
+        _wasRtspBeforeCameraDisable = false;
+        unawaited(_rtspPublisherService.restartIfPublishing());
+      }
+      if (_wasWhipBeforeCameraDisable) {
+        _wasWhipBeforeCameraDisable = false;
+        unawaited(_whipPublisherService.restartIfPublishing());
+      }
+
       developer.log('[CAMERA] Enabled by user', name: 'CameraStationRuntime');
     } catch (_) {
       _cameraEnabled = false;
