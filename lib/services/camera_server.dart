@@ -1217,7 +1217,8 @@ class CameraServer {
   // ============================================================
 
   RecordedSegment? _findVideo(String fileName) {
-    return recordingService.findByFileName(fileName);
+    return recordingService.findByFileName(fileName) ??
+        recordingService.findExportByFileName(fileName);
   }
 
   // ============================================================
