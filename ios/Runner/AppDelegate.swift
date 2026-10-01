@@ -170,6 +170,8 @@ import UIKit
     if #available(iOS 13.0, *) {
       types.append(.builtInUltraWideCamera)
       types.append(.builtInTelephotoCamera)
+      types.append(.builtInTripleCamera)
+      types.append(.builtInDualWideCamera)
     }
     let discovery = AVCaptureDevice.DiscoverySession(
       deviceTypes: types,
@@ -180,7 +182,9 @@ import UIKit
     for device in discovery.devices {
       let isUltraWide: Bool
       if #available(iOS 13.0, *) {
-        isUltraWide = device.deviceType == .builtInUltraWideCamera
+        isUltraWide = (device.deviceType == .builtInUltraWideCamera ||
+                       device.deviceType == .builtInTripleCamera ||
+                       device.deviceType == .builtInDualWideCamera)
       } else {
         isUltraWide = false
       }

@@ -64,10 +64,17 @@ class AvailableCameraDevice {
     required this.isUltraWide,
   });
 
+  bool get isBack => facing == 'environment' || facing == 'back';
+  bool get isFront => facing == 'user' || facing == 'front';
+
   factory AvailableCameraDevice.fromMap(Map<dynamic, dynamic> map) {
+    final rawFacing = map['facing']?.toString().toLowerCase() ?? 'back';
+    final normalized = (rawFacing == 'front' || rawFacing == 'user')
+        ? 'user'
+        : 'environment';
     return AvailableCameraDevice(
       id: map['id']?.toString() ?? '',
-      facing: map['facing']?.toString() ?? 'back',
+      facing: normalized,
       minFocal: (map['minFocal'] as num?)?.toDouble() ?? 0,
       fov: (map['fov'] as num?)?.toDouble() ?? 0,
       minZoom: (map['minZoom'] as num?)?.toDouble() ?? 1,
@@ -161,38 +168,40 @@ class WebRtcService {
 
   AvailableCameraDevice? get ultraWideCamera {
     final uwList = _availableCameras
-        .where((c) => c.isUltraWide && c.facing == 'back' && c.id != '0')
+        .where((c) => c.isUltraWide && c.isBack && c.id != '0')
         .toList();
-    if (uwList.isEmpty) {
-      return null;
+    if (uwList.isNotEmpty) {
+      uwList.sort((a, b) {
+        if (a.minZoom < 0.95 && b.minZoom >= 0.95) return -1;
+        if (b.minZoom < 0.95 && a.minZoom >= 0.95) return 1;
+        if (a.minFocal > 0 && b.minFocal > 0) {
+          return a.minFocal.compareTo(b.minFocal);
+        }
+        return 0;
+      });
+      return uwList.first;
     }
-    // Ưu tiên camera có minZoom < 0.95 (như camera 3 hỗ trợ 0.6x liền mạch) hoặc tiêu cự nhỏ nhất
-    uwList.sort((a, b) {
-      if (a.minZoom < 0.95 && b.minZoom >= 0.95) return -1;
-      if (b.minZoom < 0.95 && a.minZoom >= 0.95) return 1;
-      if (a.minFocal > 0 && b.minFocal > 0) {
-        return a.minFocal.compareTo(b.minFocal);
-      }
-      return 0;
-    });
-    return uwList.first;
+    // Fallback: nếu thiết bị có nhiều camera sau, camera phụ đầu tiên thường là góc siêu rộng
+    return _availableCameras
+        .where((c) => c.isBack && c.id != '0')
+        .firstOrNull;
   }
 
   AvailableCameraDevice? get mainBackCamera {
     final id0 = _availableCameras
-        .where((c) => c.facing == 'back' && c.id == '0')
+        .where((c) => c.isBack && c.id == '0')
         .firstOrNull;
     if (id0 != null) return id0;
 
     for (final c in _availableCameras) {
-      if (c.facing == 'back' && !c.isUltraWide) return c;
+      if (c.isBack && !c.isUltraWide) return c;
     }
-    return _availableCameras.where((c) => c.facing == 'back').firstOrNull;
+    return _availableCameras.where((c) => c.isBack).firstOrNull;
   }
 
   AvailableCameraDevice? get frontCamera {
     for (final c in _availableCameras) {
-      if (c.facing == 'front') return c;
+      if (c.isFront) return c;
     }
     return null;
   }
@@ -200,7 +209,8 @@ class WebRtcService {
   bool get hasUltraWideCamera =>
       ultraWideCamera != null ||
       (_minimumCameraZoom <= 0.85) ||
-      _availableCameras.any((c) => c.facing == 'back' && c.minZoom <= 0.85);
+      _availableCameras.where((c) => c.isBack).length > 1 ||
+      _availableCameras.any((c) => c.isBack && (c.isUltraWide || c.minZoom <= 0.85));
 
   double get ultraWideZoomRatio {
     if (!hasUltraWideCamera) return 1.0;
@@ -212,7 +222,7 @@ class WebRtcService {
       return ((uw.minZoom * 10).round() / 10).clamp(0.4, 0.9);
     }
     for (final c in _availableCameras) {
-      if (c.facing == 'back' && c.minZoom < 0.95 && c.minZoom >= 0.35) {
+      if (c.isBack && c.minZoom < 0.95 && c.minZoom >= 0.35) {
         return ((c.minZoom * 10).round() / 10).clamp(0.4, 0.9);
       }
     }
@@ -1162,8 +1172,9 @@ class WebRtcService {
     _switchingCamera = true;
     try {
       final targetCamera = _availableCameras.where((c) => c.id == deviceId).firstOrNull;
-      final targetFacing = targetCamera?.facing ??
-          (deviceId == null
+      final targetFacing = targetCamera != null
+          ? targetCamera.facing
+          : (deviceId == null
               ? (currentFacingMode == 'environment' ? 'user' : 'environment')
               : 'environment');
 
@@ -1187,10 +1198,6 @@ class WebRtcService {
       }
 
       if (!switched) {
-        // Chỉ cho phép Helper.switchCamera hoạt động khi THẬT SỰ muốn đổi chiều giữa Trước (user) và Sau (environment).
-        // Helper.switchCamera trong flutter_webrtc chỉ là camera-flipper (Front <-> Back).
-        // Nếu targetFacing == currentFacingMode (ví dụ: đang đổi giữa 2 ống kính cùng mặt sau),
-        // gọi Helper.switchCamera sẽ làm lật camera sang Camera Trước!
         if (targetFacing != currentFacingMode) {
           final switchResult = await Helper.switchCamera(
             track,
@@ -1202,10 +1209,9 @@ class WebRtcService {
           }
         } else {
           developer.log(
-            '[CAMERA] Cannot switch rear lens to $deviceId via Helper.switchCamera (would flip to front). Fallback to zoom.',
+            '[CAMERA] Same facing $targetFacing, skipping Helper.switchCamera',
             name: 'WebRtcService',
           );
-          throw UnsupportedError('Không thể chuyển ống kính vật lý trên cùng mặt camera qua Helper.');
         }
       }
 
@@ -1238,13 +1244,21 @@ class WebRtcService {
 
     if (currentFacingMode == 'user') {
       if (mainBack != null) {
-        await switchCameraToId(mainBack.id);
+        try {
+          await switchCameraToId(mainBack.id);
+        } catch (_) {
+          await switchCameraToId(null);
+        }
       } else {
         await switchCameraToId(null);
       }
     } else {
       if (front != null) {
-        await switchCameraToId(front.id);
+        try {
+          await switchCameraToId(front.id);
+        } catch (_) {
+          await switchCameraToId(null);
+        }
       } else {
         await switchCameraToId(null);
       }
@@ -1274,55 +1288,19 @@ class WebRtcService {
       }
 
       // Kiểm tra xem camera hiện tại có hỗ trợ targetRatio trực tiếp không
-      // (ví dụ: Camera 0 trên Android là logical multi-camera hỗ trợ zoom mượt từ 0.6x tới 10x không cần đổi ID)
       final canCurrentZoomDirectly = _minimumCameraZoom <= (targetRatio + 0.05);
 
-      // Đã ở camera sau: thử đổi sang camera ID góc siêu rộng nếu camera hiện tại không zoom trực tiếp được
       if (!canCurrentZoomDirectly && uw != null && uw.id != _activeCameraId && currentFacingMode == 'environment') {
-        bool switchSuccess = false;
         try {
           await switchCameraToId(uw.id);
-          switchSuccess = true;
         } catch (e) {
           developer.log(
-            '[CAMERA] Primary ultra-wide switch to ${uw.id} failed: $e, removing from available cameras',
+            '[CAMERA] Primary ultra-wide switch to ${uw.id} failed: $e, applying zoom fallback',
             name: 'WebRtcService',
           );
-          _availableCameras.removeWhere((c) => c.id == uw.id);
-          final alts = _availableCameras
-              .where(
-                (c) =>
-                    c.facing == 'back' &&
-                    c.id != _activeCameraId &&
-                    c.id != uw.id &&
-                    c.isUltraWide,
-              )
-              .toList();
-          for (final alt in alts) {
-            try {
-              await switchCameraToId(alt.id);
-              switchSuccess = true;
-              break;
-            } catch (_) {
-              _availableCameras.removeWhere((c) => c.id == alt.id);
-            }
-          }
         }
-        if (switchSuccess) {
-          await setCameraZoom(targetRatio);
-        } else {
-          // Nếu tất cả camera phụ đều bị từ chối mở (như trên Xiaomi), an toàn giữ nguyên camera chính ở 1.0x
-          final main = mainBackCamera;
-          if (main != null && _activeCameraId != main.id) {
-            try {
-              await switchCameraToId(main.id);
-            } catch (_) {}
-          }
-          await setCameraZoom(1.0);
-        }
-      } else {
-        await setCameraZoom(targetRatio);
       }
+      await setCameraZoom(targetRatio);
     } else if (mode == 'wide') {
       final main = mainBackCamera;
       if (currentFacingMode == 'user') {
@@ -1335,21 +1313,21 @@ class WebRtcService {
         } else {
           await switchCameraToId(null);
         }
-      } else if (isCurrentUltraWide) {
-        if (main != null && _activeCameraId != main.id) {
-          try {
-            await switchCameraToId(main.id);
-          } catch (_) {
-            // Không đổi được ID phần cứng thì reset zoom về 1.0
-          }
-        }
+      } else if (main != null && _activeCameraId != main.id) {
+        try {
+          await switchCameraToId(main.id);
+        } catch (_) {}
       }
       await setCameraZoom(1.0);
     } else if (mode == 'front') {
       final front = frontCamera;
       if (currentFacingMode != 'user') {
         if (front != null) {
-          await switchCameraToId(front.id);
+          try {
+            await switchCameraToId(front.id);
+          } catch (_) {
+            await switchCameraToId(null);
+          }
         } else {
           await switchCameraToId(null);
         }

@@ -283,6 +283,9 @@ object CameraExposureController {
                 val minFocalBack = backCameras.filter { it.minFocal > 0f && it.id != primaryBack.id }.minByOrNull { it.minFocal }
                 if (minFocalBack != null && primaryBack.minFocal > 0f && minFocalBack.minFocal < primaryBack.minFocal * 0.85f) {
                     minFocalBack.isUltraWide = true
+                } else {
+                    val secondary = backCameras.firstOrNull { it.id != primaryBack.id }
+                    secondary?.isUltraWide = true
                 }
             }
         } catch (e: Throwable) {
