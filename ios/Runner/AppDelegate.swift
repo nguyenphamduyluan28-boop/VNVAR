@@ -192,8 +192,8 @@ import UIKit
       }
       let minZoom: Double = isUltraWide ? 0.5 : Double(device.minAvailableVideoZoomFactor)
       let maxZoom: Double = isUltraWide
-        ? (Double(device.maxAvailableVideoZoomFactor) * 0.5)
-        : min(10.0, Double(device.maxAvailableVideoZoomFactor))
+        ? min(5.0, Double(device.maxAvailableVideoZoomFactor) * 0.5)
+        : min(5.0, Double(device.maxAvailableVideoZoomFactor))
       cameras.append([
         "id": device.uniqueID,
         "facing": device.position == .front ? "front" : "back",
@@ -242,9 +242,9 @@ import UIKit
         try device.lockForConfiguration()
         let targetFactor: CGFloat
         if isUltraWide {
-          targetFactor = min(maxFactor, max(minFactor, CGFloat(requested) / baseRatio))
+          targetFactor = min(min(maxFactor, 5.0 / baseRatio), max(minFactor, CGFloat(requested) / baseRatio))
         } else {
-          targetFactor = min(maxFactor, max(minFactor, CGFloat(requested)))
+          targetFactor = min(min(maxFactor, 5.0), max(minFactor, CGFloat(requested)))
         }
         device.videoZoomFactor = targetFactor
         device.unlockForConfiguration()
@@ -260,7 +260,9 @@ import UIKit
     result([
       "supported": maxFactor > minFactor,
       "min": isUltraWide ? 0.5 : Double(minFactor),
-      "max": isUltraWide ? (Double(maxFactor) * Double(baseRatio)) : Double(maxFactor),
+      "max": isUltraWide
+        ? min(5.0, Double(maxFactor) * Double(baseRatio))
+        : min(5.0, Double(maxFactor)),
       "current": currentZoom,
       "cameraId": device.uniqueID,
     ])

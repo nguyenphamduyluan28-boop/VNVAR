@@ -157,7 +157,7 @@ object CameraExposureController {
                         )
                         if (zoomRange != null) {
                             val minZoom = zoomRange.lower.toDouble().coerceAtLeast(0.3)
-                            val maxZoom = zoomRange.upper.toDouble().coerceAtMost(10.0)
+                            val maxZoom = zoomRange.upper.toDouble().coerceIn(1.0, 5.0)
                             callback(mapOf(
                                 "supported" to (maxZoom > minZoom),
                                 "min" to minZoom,
@@ -176,8 +176,8 @@ object CameraExposureController {
                     callback(mapOf(
                         "supported" to (max > 1.0),
                         "min" to 1.0,
-                        "max" to max.coerceAtMost(10.0),
-                        "current" to activeZoom.coerceIn(1.0, max),
+                        "max" to max.coerceIn(1.0, 5.0),
+                        "current" to activeZoom.coerceIn(1.0, max.coerceIn(1.0, 5.0)),
                         "cameraId" to device.id,
                     ))
                 }
@@ -259,12 +259,12 @@ object CameraExposureController {
                         val zoomRange = chars.get(CameraCharacteristics.CONTROL_ZOOM_RATIO_RANGE)
                         if (zoomRange != null) {
                             minZoom = zoomRange.lower.toDouble()
-                            maxZoom = zoomRange.upper.toDouble()
+                            maxZoom = zoomRange.upper.toDouble().coerceIn(1.0, 5.0)
                         }
                     }
                     if (maxZoom <= 1.0) {
                         val maxDigital = chars.get(CameraCharacteristics.SCALER_AVAILABLE_MAX_DIGITAL_ZOOM)?.toDouble() ?: 1.0
-                        maxZoom = maxDigital
+                        maxZoom = maxDigital.coerceIn(1.0, 5.0)
                     }
 
                     // Ultra-wide criteria:
@@ -308,7 +308,7 @@ object CameraExposureController {
     }
 
     fun setZoom(trackId: String, zoom: Double, callback: (Map<String, Any>) -> Unit) {
-        activeZoom = zoom.coerceAtLeast(0.3)
+        activeZoom = zoom.coerceIn(0.3, 5.0)
         apply(trackId, activeTargetEv) { response -> callback(response + ("zoom" to activeZoom)) }
     }
 

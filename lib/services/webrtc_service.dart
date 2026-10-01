@@ -295,7 +295,8 @@ class WebRtcService {
         ? math.min(ultraWideZoomRatio, reportedMin)
         : reportedMin;
     _minimumCameraZoom = effectiveMinRatio;
-    _maximumCameraZoom = math.max(reportedMax, 10.0);
+    // Giới hạn zoom tối đa ở mức 5.0x theo yêu cầu
+    _maximumCameraZoom = math.min(math.max(reportedMax, 1.0), 5.0);
     // Trên Android, native trả zoom value trực tiếp từ CONTROL_ZOOM_RATIO (bắt
     // đầu 1.0 cho physical ultra-wide camera) nên Dart cần scale.
     // Trên iOS, native cameraZoom đã tự convert factor ↔ 0.5-based ratio,
@@ -305,9 +306,9 @@ class WebRtcService {
         ultraWideCamera != null &&
         _activeCameraId == ultraWideCamera!.id;
     if (isPhysUltraWide) {
-      _cameraZoom = (reportedCurrent * ultraWideZoomRatio).clamp(ultraWideZoomRatio, 10.0);
+      _cameraZoom = (reportedCurrent * ultraWideZoomRatio).clamp(ultraWideZoomRatio, 5.0);
     } else {
-      _cameraZoom = reportedCurrent;
+      _cameraZoom = reportedCurrent.clamp(effectiveMinRatio, 5.0);
     }
   }
 
@@ -315,7 +316,7 @@ class WebRtcService {
     final track = localVideoTrack;
     if (track == null || !_cameraZoomSupported) return;
     final minZ = hasUltraWideCamera ? ultraWideZoomRatio : _minimumCameraZoom;
-    final maxZ = math.max(_maximumCameraZoom, 10.0);
+    final maxZ = math.min(_maximumCameraZoom, 5.0);
     final target = value.clamp(minZ, maxZ).toDouble();
 
     // Xem comment tương tự ở refreshCameraZoom: chỉ scale trên Android.
@@ -324,7 +325,7 @@ class WebRtcService {
         ultraWideCamera != null &&
         _activeCameraId == ultraWideCamera!.id;
     final nativeTarget = isPhysUltraWide
-        ? (target / ultraWideZoomRatio).clamp(1.0, 10.0).toDouble()
+        ? (target / ultraWideZoomRatio).clamp(1.0, 5.0 / ultraWideZoomRatio).toDouble()
         : target;
 
     final result = await _platformChannel
@@ -337,9 +338,9 @@ class WebRtcService {
     final reported = (result?['current'] as num?)?.toDouble() ??
         (result?['zoom'] as num?)?.toDouble();
     if (isPhysUltraWide && reported != null) {
-      _cameraZoom = (reported * ultraWideZoomRatio).clamp(ultraWideZoomRatio, 10.0);
+      _cameraZoom = (reported * ultraWideZoomRatio).clamp(ultraWideZoomRatio, 5.0);
     } else {
-      _cameraZoom = reported ?? target;
+      _cameraZoom = (reported ?? target).clamp(minZ, 5.0);
     }
   }
 

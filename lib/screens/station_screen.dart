@@ -1932,7 +1932,7 @@ class _StationScreenState extends State<StationScreen>
                             minimumZoom:
                                 _runtime.webRtcService?.minimumCameraZoom ?? 1.0,
                             maximumZoom:
-                                _runtime.webRtcService?.maximumCameraZoom ?? 10.0,
+                                math.min(_runtime.webRtcService?.maximumCameraZoom ?? 5.0, 5.0),
                             hasUltraWide:
                                 _runtime.webRtcService?.hasUltraWideCamera ?? false,
                             ultraWideRatio:
@@ -2451,8 +2451,56 @@ class _CameraZoomSlider extends StatelessWidget {
   Widget build(BuildContext context) {
     final effectiveMin = hasUltraWide
         ? math.min(ultraWideRatio, minimum)
-        : minimum.clamp(1.0, maximum);
-    final safeValue = value.clamp(effectiveMin, maximum).toDouble();
+        : minimum.clamp(1.0, 5.0);
+    final effectiveMax = math.min(maximum, 5.0).clamp(effectiveMin + 0.1, 5.0);
+    final safeValue = value.clamp(effectiveMin, effectiveMax).toDouble();
+
+    void stepZoom(double delta) {
+      final raw = safeValue + delta;
+      final stepped = (raw * 10).round() / 10.0;
+      final clamped = stepped.clamp(effectiveMin, effectiveMax).toDouble();
+      onChanged(clamped);
+    }
+
+    final canDecrease = safeValue > (effectiveMin + 0.04);
+    final canIncrease = safeValue < (effectiveMax - 0.04);
+
+    Widget buildStepButton({
+      required IconData icon,
+      required VoidCallback? onTap,
+    }) {
+      final enabled = onTap != null;
+      return Material(
+        color: Colors.transparent,
+        child: InkWell(
+          onTap: onTap,
+          borderRadius: BorderRadius.circular(18),
+          child: Container(
+            width: compact ? 34 : 38,
+            height: compact ? 34 : 38,
+            alignment: Alignment.center,
+            decoration: BoxDecoration(
+              color: enabled
+                  ? Colors.white.withValues(alpha: 0.12)
+                  : Colors.white.withValues(alpha: 0.04),
+              shape: BoxShape.circle,
+              border: Border.all(
+                color: enabled
+                    ? Colors.white.withValues(alpha: 0.22)
+                    : Colors.white.withValues(alpha: 0.06),
+                width: 1,
+              ),
+            ),
+            child: Icon(
+              icon,
+              color: enabled ? Colors.white : Colors.white24,
+              size: compact ? 18 : 20,
+            ),
+          ),
+        ),
+      );
+    }
+
     return Padding(
       padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 2),
       child: Column(
@@ -2463,7 +2511,7 @@ class _CameraZoomSlider extends StatelessWidget {
               if (hasUltraWide) ...[
                 _ZoomPresetButton(
                   label: ultraWideLabel,
-                  selected: (safeValue - ultraWideRatio).abs() < 0.12,
+                  selected: (safeValue - ultraWideRatio).abs() < 0.08,
                   compact: compact,
                   onTap: () => onQuickSelect(ultraWideRatio),
                 ),
@@ -2471,16 +2519,23 @@ class _CameraZoomSlider extends StatelessWidget {
               ],
               _ZoomPresetButton(
                 label: '1×',
-                selected: (safeValue - 1.0).abs() < 0.12,
+                selected: (safeValue - 1.0).abs() < 0.08,
                 compact: compact,
                 onTap: () => onQuickSelect(1.0),
               ),
               const SizedBox(width: 4),
               _ZoomPresetButton(
                 label: '2×',
-                selected: (safeValue - 2.0).abs() < 0.15,
+                selected: (safeValue - 2.0).abs() < 0.08,
                 compact: compact,
                 onTap: () => onQuickSelect(2.0),
+              ),
+              const SizedBox(width: 4),
+              _ZoomPresetButton(
+                label: '5×',
+                selected: (safeValue - 5.0).abs() < 0.08,
+                compact: compact,
+                onTap: () => onQuickSelect(5.0),
               ),
               const Spacer(),
               Text(
@@ -2495,37 +2550,45 @@ class _CameraZoomSlider extends StatelessWidget {
               const SizedBox(width: 4),
             ],
           ),
+          const SizedBox(height: 2),
           Row(
             children: [
-              Icon(
-                Icons.remove_rounded,
-                color: Colors.white70,
-                size: compact ? 16 : 18,
+              buildStepButton(
+                icon: Icons.remove_rounded,
+                onTap: canDecrease ? () => stepZoom(-0.1) : null,
               ),
+              const SizedBox(width: 2),
               Expanded(
                 child: SliderTheme(
                   data: SliderTheme.of(context).copyWith(
-                    trackHeight: compact ? 2.5 : 3.0,
+                    trackHeight: compact ? 4.5 : 6.0,
                     thumbShape: RoundSliderThumbShape(
-                      enabledThumbRadius: compact ? 6 : 7,
+                      enabledThumbRadius: compact ? 8.5 : 10.5,
+                      elevation: 2.0,
+                      pressedElevation: 4.0,
                     ),
                     overlayShape: RoundSliderOverlayShape(
-                      overlayRadius: compact ? 12 : 14,
+                      overlayRadius: compact ? 16 : 20,
                     ),
+                    activeTrackColor: const Color(0xFF22C55E),
+                    inactiveTrackColor: Colors.white.withValues(alpha: 0.20),
+                    thumbColor: Colors.white,
                   ),
                   child: Slider(
                     value: safeValue,
                     min: effectiveMin,
-                    max: maximum,
-                    divisions: ((maximum - effectiveMin) * 10).round().clamp(1, 100),
+                    max: effectiveMax,
+                    divisions: ((effectiveMax - effectiveMin) * 10)
+                        .round()
+                        .clamp(1, 100),
                     onChanged: onChanged,
                   ),
                 ),
               ),
-              Icon(
-                Icons.add_rounded,
-                color: Colors.white70,
-                size: compact ? 16 : 18,
+              const SizedBox(width: 2),
+              buildStepButton(
+                icon: Icons.add_rounded,
+                onTap: canIncrease ? () => stepZoom(0.1) : null,
               ),
             ],
           ),
