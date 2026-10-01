@@ -182,9 +182,11 @@ import UIKit
     for device in discovery.devices {
       let isUltraWide: Bool
       if #available(iOS 13.0, *) {
-        isUltraWide = (device.deviceType == .builtInUltraWideCamera ||
-                       device.deviceType == .builtInTripleCamera ||
-                       device.deviceType == .builtInDualWideCamera)
+        // Chỉ đánh dấu physical ultra-wide camera. builtInTripleCamera và
+        // builtInDualWideCamera là logical cameras tự quản lý lens switching
+        // qua videoZoomFactor — không nên đánh dấu isUltraWide vì cameraZoom
+        // function chỉ scale cho .builtInUltraWideCamera.
+        isUltraWide = (device.deviceType == .builtInUltraWideCamera)
       } else {
         isUltraWide = false
       }

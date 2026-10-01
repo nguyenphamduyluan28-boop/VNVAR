@@ -287,10 +287,9 @@ object CameraExposureController {
                 val minFocalBack = backCameras.filter { it.minFocal > 0f && it.id != primaryBack.id }.minByOrNull { it.minFocal }
                 if (minFocalBack != null && primaryBack.minFocal > 0f && minFocalBack.minFocal < primaryBack.minFocal * 0.85f) {
                     minFocalBack.isUltraWide = true
-                } else {
-                    val secondary = backCameras.firstOrNull { it.id != primaryBack.id }
-                    secondary?.isUltraWide = true
                 }
+                // Nếu không thể xác định ultra-wide dựa trên tiêu cự,
+                // KHÔNG đánh dấu mù vì camera phụ có thể là Telephoto.
             }
         } catch (e: Throwable) {
             Log.w(TAG, "Error enumerating cameras: $e")

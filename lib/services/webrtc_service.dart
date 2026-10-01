@@ -181,9 +181,11 @@ class WebRtcService {
       });
       return uwList.first;
     }
-    // Fallback: nếu thiết bị có nhiều camera sau, camera phụ đầu tiên thường là góc siêu rộng
+    // Không dùng fallback mù: camera phụ chưa được đánh dấu isUltraWide
+    // có thể là telephoto. Chỉ trả về camera có minZoom < 0.95 (chắc chắn hỗ
+    // trợ ultra-wide zoom range) hoặc null.
     return _availableCameras
-        .where((c) => c.isBack && c.id != '0')
+        .where((c) => c.isBack && c.id != '0' && c.minZoom < 0.95)
         .firstOrNull;
   }
 
@@ -209,7 +211,6 @@ class WebRtcService {
   bool get hasUltraWideCamera =>
       ultraWideCamera != null ||
       (_minimumCameraZoom <= 0.85) ||
-      _availableCameras.where((c) => c.isBack).length > 1 ||
       _availableCameras.any((c) => c.isBack && (c.isUltraWide || c.minZoom <= 0.85));
 
   double get ultraWideZoomRatio {
@@ -295,7 +296,12 @@ class WebRtcService {
         : reportedMin;
     _minimumCameraZoom = effectiveMinRatio;
     _maximumCameraZoom = math.max(reportedMax, 10.0);
-    final isPhysUltraWide = isCurrentUltraWide &&
+    // Trên Android, native trả zoom value trực tiếp từ CONTROL_ZOOM_RATIO (bắt
+    // đầu 1.0 cho physical ultra-wide camera) nên Dart cần scale.
+    // Trên iOS, native cameraZoom đã tự convert factor ↔ 0.5-based ratio,
+    // nên KHÔNG scale thêm ở Dart để tránh double-scaling.
+    final isPhysUltraWide = Platform.isAndroid &&
+        isCurrentUltraWide &&
         ultraWideCamera != null &&
         _activeCameraId == ultraWideCamera!.id;
     if (isPhysUltraWide) {
@@ -312,7 +318,9 @@ class WebRtcService {
     final maxZ = math.max(_maximumCameraZoom, 10.0);
     final target = value.clamp(minZ, maxZ).toDouble();
 
-    final isPhysUltraWide = isCurrentUltraWide &&
+    // Xem comment tương tự ở refreshCameraZoom: chỉ scale trên Android.
+    final isPhysUltraWide = Platform.isAndroid &&
+        isCurrentUltraWide &&
         ultraWideCamera != null &&
         _activeCameraId == ultraWideCamera!.id;
     final nativeTarget = isPhysUltraWide
@@ -1216,7 +1224,10 @@ class WebRtcService {
       }
 
       if (!switched) {
-        if (targetFacing != currentFacingMode) {
+        // Luôn gọi Helper.switchCamera khi native switch thất bại,
+        // kể cả khi cùng facing mode (ví dụ: main back → ultra-wide back).
+        // Helper.switchCamera với deviceId cụ thể sẽ chuyển đúng camera.
+        if (deviceId != null || targetFacing != currentFacingMode) {
           final switchResult = await Helper.switchCamera(
             track,
             deviceId,
@@ -1227,7 +1238,7 @@ class WebRtcService {
           }
         } else {
           developer.log(
-            '[CAMERA] Same facing $targetFacing, skipping Helper.switchCamera',
+            '[CAMERA] Same facing $targetFacing with null deviceId, skipping Helper.switchCamera',
             name: 'WebRtcService',
           );
         }
@@ -1305,10 +1316,10 @@ class WebRtcService {
         }
       }
 
-      // Kiểm tra xem camera hiện tại có hỗ trợ targetRatio trực tiếp không
-      final canCurrentZoomDirectly = _minimumCameraZoom <= (targetRatio + 0.05);
-
-      if (!canCurrentZoomDirectly && uw != null && uw.id != _activeCameraId && currentFacingMode == 'environment') {
+      // Luôn thử switch sang camera ultra-wide nếu nó khác camera hiện tại.
+      // Không dùng _minimumCameraZoom vì giá trị này thuộc camera cũ, chưa
+      // phải camera ultra-wide → sẽ bị stale và cho kết quả sai.
+      if (uw != null && uw.id != _activeCameraId && currentFacingMode == 'environment') {
         try {
           await switchCameraToId(uw.id);
         } catch (e) {
@@ -1318,6 +1329,9 @@ class WebRtcService {
           );
         }
       }
+      // Sau khi switch, thử set zoom. Nếu camera ultra-wide hỗ trợ
+      // CONTROL_ZOOM_RATIO_RANGE < 1.0, zoom sẽ được áp dụng.
+      // Nếu không, ít nhất camera đã được đổi sang ultra-wide sensor.
       await setCameraZoom(targetRatio);
     } else if (mode == 'wide') {
       final main = mainBackCamera;
