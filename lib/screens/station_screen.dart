@@ -1641,94 +1641,87 @@ class _StationScreenState extends State<StationScreen>
                 ),
 
               // ==============================================
-              // TOP BAR (identity + primary actions)
+              // TOP BAR (identity + primary actions + live status + toast)
               // ==============================================
               if (!isPip)
                 Positioned(
-                left: 0,
-                right: 0,
-                top: 0,
-                child: SafeArea(
-                  bottom: false,
-                  child: Padding(
-                    padding: EdgeInsets.fromLTRB(
-                      compact ? 10 : 14,
-                      compact ? 8 : 12,
-                      compact ? 10 : 14,
-                      0,
-                    ),
-                    child: _StationHeader(
-                      identity: widget.identity,
-                      courtLabel: _courtLabel(widget.identity.courtId),
-                      recording: _recording,
-                      thermalWarning: _runtime.thermalWarning,
-                      compact: compact,
-                      landscape: landscape,
-                      resolutionProfile: _runtime.resolutionProfile,
-                      resolutionSwitching: _runtime.profileSwitching,
-                      resolutionLocked: _runtime.resolutionLocked,
-                      whipLive: _runtime.isLiveStreaming,
-                      onVideoStorage: _openVideoStorage,
-                      onResolution: _handleResolutionPressed,
-                      onSettings: _openSettings,
-                      onWhipLive: _openLiveStreamScreen,
-                    ),
-                  ),
-                ),
-              ),
-
-              if (!isPip && _runtime.isLiveStreaming)
-                Positioned(
-                  top: landscape ? (compact ? 54 : 64) : (compact ? 116 : 134),
-                  left: compact ? 10 : 16,
+                  left: 0,
+                  right: 0,
+                  top: 0,
                   child: SafeArea(
                     bottom: false,
-                    child: Container(
-                      padding: const EdgeInsets.symmetric(
-                        horizontal: 10,
-                        vertical: 4,
+                    child: Padding(
+                      padding: EdgeInsets.fromLTRB(
+                        compact ? 10 : 14,
+                        compact ? 8 : 12,
+                        compact ? 10 : 14,
+                        0,
                       ),
-                      decoration: BoxDecoration(
-                        color: Colors.red.withValues(alpha: 0.85),
-                        borderRadius: BorderRadius.circular(14),
-                        boxShadow: [
-                          BoxShadow(
-                            color: Colors.red.withValues(alpha: 0.4),
-                            blurRadius: 8,
-                            spreadRadius: 1,
-                          ),
-                        ],
-                      ),
-                      child: Row(
+                      child: Column(
                         mainAxisSize: MainAxisSize.min,
+                        crossAxisAlignment: CrossAxisAlignment.start,
                         children: [
-                          const Icon(Icons.circle, color: Colors.white, size: 8),
-                          const SizedBox(width: 6),
-                          Text(
-                            'LIVE (${_runtime.rtspPublisherService.isLive ? "RTSP" : "WHIP"}) · ${_formatLiveDuration(_runtime.rtspPublisherService.isLive ? _runtime.rtspPublisherService.liveDuration : _runtime.whipPublisherService.liveDuration)}',
-                            style: const TextStyle(
-                              color: Colors.white,
-                              fontSize: 11.5,
-                              fontWeight: FontWeight.w900,
-                              letterSpacing: 0.3,
-                            ),
+                          _StationHeader(
+                            identity: widget.identity,
+                            courtLabel: _courtLabel(widget.identity.courtId),
+                            recording: _recording,
+                            thermalWarning: _runtime.thermalWarning,
+                            compact: compact,
+                            landscape: landscape,
+                            resolutionProfile: _runtime.resolutionProfile,
+                            resolutionSwitching: _runtime.profileSwitching,
+                            resolutionLocked: _runtime.resolutionLocked,
+                            whipLive: _runtime.isLiveStreaming,
+                            onVideoStorage: _openVideoStorage,
+                            onResolution: _handleResolutionPressed,
+                            onSettings: _openSettings,
+                            onWhipLive: _openLiveStreamScreen,
                           ),
+                          if (_runtime.isLiveStreaming) ...[
+                            SizedBox(height: compact ? 6 : 8),
+                            Container(
+                              padding: const EdgeInsets.symmetric(
+                                horizontal: 10,
+                                vertical: 4,
+                              ),
+                              decoration: BoxDecoration(
+                                color: Colors.red.withValues(alpha: 0.85),
+                                borderRadius: BorderRadius.circular(14),
+                                boxShadow: [
+                                  BoxShadow(
+                                    color: Colors.red.withValues(alpha: 0.4),
+                                    blurRadius: 8,
+                                    spreadRadius: 1,
+                                  ),
+                                ],
+                              ),
+                              child: Row(
+                                mainAxisSize: MainAxisSize.min,
+                                children: [
+                                  const Icon(Icons.circle, color: Colors.white, size: 8),
+                                  const SizedBox(width: 6),
+                                  Text(
+                                    'LIVE (${_runtime.rtspPublisherService.isLive ? "RTSP" : "WHIP"}) · ${_formatLiveDuration(_runtime.rtspPublisherService.isLive ? _runtime.rtspPublisherService.liveDuration : _runtime.whipPublisherService.liveDuration)}',
+                                    style: const TextStyle(
+                                      color: Colors.white,
+                                      fontSize: 11.5,
+                                      fontWeight: FontWeight.w900,
+                                      letterSpacing: 0.3,
+                                    ),
+                                  ),
+                                ],
+                              ),
+                            ),
+                          ],
+                          if (_runtime.thermalWarning && !landscape) ...[
+                            SizedBox(height: compact ? 6 : 8),
+                            _ThermalToast(
+                              compact: compact,
+                              landscape: landscape,
+                            ),
+                          ],
                         ],
                       ),
-                    ),
-                  ),
-                ),
-
-              if (!isPip && _runtime.thermalWarning && !landscape)
-                Positioned(
-                  top: compact ? 128 : 144,
-                  left: compact ? 8 : 14,
-                  right: compact ? 8 : 14,
-                  child: SafeArea(
-                    bottom: false,
-                    child: _ThermalToast(
-                      compact: compact,
-                      landscape: landscape,
                     ),
                   ),
                 ),
