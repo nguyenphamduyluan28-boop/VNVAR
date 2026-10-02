@@ -149,6 +149,54 @@ class _StationScreenState extends State<StationScreen>
     );
   }
 
+  void _showStationToast(
+    String message, {
+    bool isError = false,
+    bool isSuccess = false,
+    Duration duration = const Duration(seconds: 2),
+    IconData? icon,
+  }) {
+    if (!mounted) return;
+    final Color bg = isError
+        ? const Color(0xFFC62828)
+        : isSuccess
+            ? const Color(0xFF2E7D32)
+            : const Color(0xFF1565C0);
+    final IconData defaultIcon = isError
+        ? Icons.error_outline_rounded
+        : isSuccess
+            ? Icons.check_circle_outline_rounded
+            : Icons.info_outline_rounded;
+
+    ScaffoldMessenger.of(context)
+      ..hideCurrentSnackBar()
+      ..showSnackBar(
+        SnackBar(
+          behavior: SnackBarBehavior.floating,
+          margin: const EdgeInsets.symmetric(horizontal: 20, vertical: 14),
+          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+          backgroundColor: bg,
+          duration: duration,
+          content: Row(
+            children: [
+              Icon(icon ?? defaultIcon, color: Colors.white, size: 20),
+              const SizedBox(width: 10),
+              Expanded(
+                child: Text(
+                  message,
+                  style: const TextStyle(
+                    color: Colors.white,
+                    fontSize: 13,
+                    fontWeight: FontWeight.w600,
+                  ),
+                ),
+              ),
+            ],
+          ),
+        ),
+      );
+  }
+
   Future<void> _toggleCamera() async {
     if (_cameraSwitching) return;
     setState(() => _cameraSwitching = true);
@@ -181,16 +229,13 @@ class _StationScreenState extends State<StationScreen>
         } catch (_) {}
       }
       if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(
-            content: Text(
-              appText(
-                context,
-                'Không thể đổi trạng thái camera: $error',
-                'Cannot change camera state: $error',
-              ),
-            ),
+        _showStationToast(
+          appText(
+            context,
+            'Không thể chuyển đổi trạng thái camera lúc này. Vui lòng thử lại sau.',
+            'Cannot switch camera state right now. Please try again shortly.',
           ),
+          isError: true,
         );
       }
     } finally {
@@ -208,16 +253,13 @@ class _StationScreenState extends State<StationScreen>
       if (mounted) setState(() => _screenDimmed = dimmed);
     } catch (error) {
       if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(
-            content: Text(
-              appText(
-                context,
-                'Không thể thay đổi độ sáng màn hình: $error',
-                'Cannot change screen brightness: $error',
-              ),
-            ),
+        _showStationToast(
+          appText(
+            context,
+            'Không thể điều chỉnh độ sáng màn hình. Vui lòng kiểm tra quyền hệ thống.',
+            'Cannot adjust screen brightness. Please check system permissions.',
           ),
+          isError: true,
         );
       }
     } finally {
@@ -250,18 +292,6 @@ class _StationScreenState extends State<StationScreen>
           await webRtc.setCameraZoom(actualRatio);
           if (mounted) {
             setState(() => _zoomValue = actualRatio);
-            ScaffoldMessenger.of(context).showSnackBar(
-              SnackBar(
-                content: Text(
-                  appText(
-                    context,
-                    'Đã chuyển sang Camera góc rộng (${webRtc.ultraWideLabel})',
-                    'Switched to Wide-Angle camera (${webRtc.ultraWideLabel})',
-                  ),
-                ),
-                duration: const Duration(milliseconds: 800),
-              ),
-            );
           }
         } else {
           await webRtc.setCameraZoom(target);
@@ -270,20 +300,6 @@ class _StationScreenState extends State<StationScreen>
       } else if (target >= 0.95 && target < 1.5) {
         if (webRtc.isCurrentUltraWide || webRtc.currentFacingMode == 'user') {
           await _runtime.switchToLensMode('wide');
-          if (mounted) {
-            ScaffoldMessenger.of(context).showSnackBar(
-              SnackBar(
-                content: Text(
-                  appText(
-                    context,
-                    'Đã chuyển sang Camera góc chuẩn (1×)',
-                    'Switched to standard camera (1×)',
-                  ),
-                ),
-                duration: const Duration(milliseconds: 800),
-              ),
-            );
-          }
         }
         await webRtc.setCameraZoom(1.0);
         if (mounted) setState(() => _zoomValue = 1.0);
@@ -348,16 +364,13 @@ class _StationScreenState extends State<StationScreen>
     final error = webRtc.rtspError;
     if (!mounted || error == null || error == _lastShownRtspError) return;
     _lastShownRtspError = error;
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(
-        content: Text(
-          appText(
-            context,
-            'Camera vẫn hoạt động nhưng RTSP không thể khởi động: $error',
-            'The camera is running, but RTSP could not start: $error',
-          ),
-        ),
+    _showStationToast(
+      appText(
+        context,
+        'Camera vẫn ghi hình bình thường. Đường truyền live đang thử kết nối lại.',
+        'Camera is recording normally. Live stream is attempting to reconnect.',
       ),
+      icon: Icons.info_outline_rounded,
     );
   }
 
@@ -372,11 +385,10 @@ class _StationScreenState extends State<StationScreen>
         final msg = isUser
             ? appText(context, 'Đã chuyển sang Camera trước', 'Switched to front camera')
             : appText(context, 'Đã chuyển sang Camera sau', 'Switched to rear camera');
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(
-            content: Text(msg),
-            duration: const Duration(seconds: 1),
-          ),
+        _showStationToast(
+          msg,
+          icon: isUser ? Icons.person_rounded : Icons.camera_rear_rounded,
+          duration: const Duration(seconds: 1),
         );
       }
     } catch (error) {
@@ -596,11 +608,14 @@ class _StationScreenState extends State<StationScreen>
                 'Đã bật tự động xoay màn hình',
                 'Auto-rotate screen enabled',
               );
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(
-        content: Text(msg),
-        duration: const Duration(seconds: 2),
-      ),
+    _showStationToast(
+      msg,
+      icon: mode == 'landscape'
+          ? Icons.screen_lock_landscape_rounded
+          : mode == 'portrait'
+              ? Icons.screen_lock_portrait_rounded
+              : Icons.screen_rotation_rounded,
+      duration: const Duration(seconds: 2),
     );
   }
 
@@ -670,33 +685,27 @@ class _StationScreenState extends State<StationScreen>
     try {
       await _runtime.reconnectNetworkServices();
       if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(
-          content: Text(
-            appText(
-              context,
-              _runtime.lanAddress == null
-                  ? 'Chưa có IP Wi-Fi/LAN. Camera vẫn đang ghi và sẽ tự kết nối khi có mạng.'
-                  : 'Đã khởi động lại kết nối live. Camera và video đang ghi không bị reset.',
-              _runtime.lanAddress == null
-                  ? 'No Wi-Fi/LAN IP yet. Recording continues and live will reconnect automatically.'
-                  : 'Live connection restarted. Camera and recording were not reset.',
-            ),
-          ),
+      _showStationToast(
+        appText(
+          context,
+          _runtime.lanAddress == null
+              ? 'Chưa nhận diện IP mạng. Quá trình ghi hình vẫn an toàn và sẽ tự kết nối khi có Wi-Fi.'
+              : 'Đã làm mới kết nối mạng thành công. Quá trình ghi hình vẫn an toàn.',
+          _runtime.lanAddress == null
+              ? 'No network IP yet. Recording continues and will reconnect automatically.'
+              : 'Network connection refreshed successfully. Recording is safe.',
         ),
+        isSuccess: _runtime.lanAddress != null,
       );
     } catch (error) {
       if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(
-          content: Text(
-            appText(
-              context,
-              'Không thể làm mới kết nối: $error',
-              'Cannot refresh connection: $error',
-            ),
-          ),
+      _showStationToast(
+        appText(
+          context,
+          'Không thể làm mới kết nối mạng. Vui lòng kiểm tra lại sóng Wi-Fi hoặc dây mạng.',
+          'Cannot refresh network. Please check Wi-Fi or LAN connection.',
         ),
+        isError: true,
       );
     }
   }
@@ -1104,16 +1113,13 @@ class _StationScreenState extends State<StationScreen>
       await _runtime.setResolutionProfile(selected);
     } catch (error) {
       if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(
-            content: Text(
-              appText(
-                context,
-                'Không thể đổi chất lượng camera: $error',
-                'Cannot change camera quality: $error',
-              ),
-            ),
+        _showStationToast(
+          appText(
+            context,
+            'Không thể đổi chất lượng camera lúc này. Vui lòng thử lại sau vài giây.',
+            'Cannot change camera quality right now. Please try again shortly.',
           ),
+          isError: true,
         );
       }
     }
@@ -1177,15 +1183,15 @@ class _StationScreenState extends State<StationScreen>
                             await _runtime.setResolutionLocked(nextLock);
                             if (!sheetContext.mounted) return;
                             setSheetState(() {});
-                            if (mounted) setState(() {});
-                            ScaffoldMessenger.of(sheetContext)
-                              ..hideCurrentSnackBar()
-                              ..showSnackBar(
-                                SnackBar(
-                                  duration: const Duration(seconds: 2),
-                                  content: Text(lockMsg),
-                                ),
+                            if (mounted) {
+                              setState(() {});
+                              _showStationToast(
+                                lockMsg,
+                                icon: nextLock
+                                    ? Icons.lock_rounded
+                                    : Icons.lock_open_rounded,
                               );
+                            }
                           },
                           child: Container(
                             padding: const EdgeInsets.symmetric(
@@ -1256,7 +1262,7 @@ class _StationScreenState extends State<StationScreen>
                             : profile;
                         return Material(
                           color: active
-                              ? const Color(0xFF183728)
+                              ? const Color(0xFF1565C0)
                               : isLocked
                                   ? const Color(0xFF15181E)
                                   : const Color(0xFF1A2028),
@@ -1267,42 +1273,57 @@ class _StationScreenState extends State<StationScreen>
                                 ? null
                                 : () {
                                     if (isLocked) {
-                                      ScaffoldMessenger.of(context)
-                                        ..hideCurrentSnackBar()
-                                        ..showSnackBar(
-                                          SnackBar(
-                                            content: Text(
-                                              appText(
-                                                context,
-                                                'Chế độ phân giải đang khóa. Vui lòng bấm nút mở khóa ở góc trên để đổi.',
-                                                'Resolution mode is locked. Please unlock using the top button to change.',
-                                              ),
-                                            ),
-                                          ),
-                                        );
+                                      _showStationToast(
+                                        appText(
+                                          context,
+                                          'Chế độ phân giải đang khóa. Vui lòng bấm nút mở khóa ở góc trên để đổi.',
+                                          'Resolution mode is locked. Please unlock using the top button to change.',
+                                        ),
+                                        icon: Icons.lock_rounded,
+                                      );
                                       return;
                                     }
                                     Navigator.pop(sheetContext, profile);
                                   },
-                            child: Padding(
-                              padding: const EdgeInsets.symmetric(
-                                horizontal: 12,
-                                vertical: 10,
+                            child: Container(
+                              decoration: BoxDecoration(
+                                borderRadius: BorderRadius.circular(14),
+                                border: Border.all(
+                                  color: active
+                                      ? const Color(0xFF64B5F6)
+                                      : Colors.white.withValues(alpha: 0.08),
+                                  width: active ? 1.5 : 1.0,
+                                ),
+                                boxShadow: active
+                                    ? [
+                                        BoxShadow(
+                                          color: const Color(0xFF1565C0)
+                                              .withValues(alpha: 0.35),
+                                          blurRadius: 8,
+                                          offset: const Offset(0, 2),
+                                        ),
+                                      ]
+                                    : null,
                               ),
-                              child: Row(
-                                children: [
-                                  Icon(
-                                    active
-                                        ? Icons.check_circle_rounded
-                                        : isLocked
-                                            ? Icons.lock_outline_rounded
-                                            : Icons.radio_button_unchecked_rounded,
-                                    color: active
-                                        ? Colors.greenAccent
-                                        : isLocked
-                                            ? Colors.white24
-                                            : Colors.white38,
-                                  ),
+                              child: Padding(
+                                padding: const EdgeInsets.symmetric(
+                                  horizontal: 12,
+                                  vertical: 10,
+                                ),
+                                child: Row(
+                                  children: [
+                                    Icon(
+                                      active
+                                          ? Icons.check_circle_rounded
+                                          : isLocked
+                                              ? Icons.lock_outline_rounded
+                                              : Icons.radio_button_unchecked_rounded,
+                                      color: active
+                                          ? Colors.white
+                                          : isLocked
+                                              ? Colors.white24
+                                              : Colors.white38,
+                                    ),
                                   const SizedBox(width: 10),
                                   Expanded(
                                     child: Column(
@@ -1342,8 +1363,9 @@ class _StationScreenState extends State<StationScreen>
                               ),
                             ),
                           ),
-                        );
-                      },
+                        ),
+                      );
+                    },
                     ),
                   ),
                 ],
@@ -1357,23 +1379,19 @@ class _StationScreenState extends State<StationScreen>
 
   void _handleResolutionPressed() {
     if (_runtime.thermalWarning) {
-      ScaffoldMessenger.of(context)
-        ..hideCurrentSnackBar()
-        ..showSnackBar(
-          SnackBar(
-            content: Text(
-              appText(
-                context,
-                'Thiết bị đang nóng. Chất lượng tạm khóa ở '
-                    '${_runtime.resolutionProfile.shortLabel}/'
-                    '${_runtime.resolutionProfile.fps} FPS và sẽ tự khôi phục khi nhiệt độ ổn định.',
-                'Device temperature is high. Quality is temporarily locked at '
-                    '${_runtime.resolutionProfile.shortLabel}/'
-                    '${_runtime.resolutionProfile.fps} FPS and will recover when temperature is stable.',
-              ),
-            ),
-          ),
-        );
+      _showStationToast(
+        appText(
+          context,
+          'Thiết bị đang nóng. Chất lượng tạm khóa ở '
+              '${_runtime.resolutionProfile.shortLabel}/'
+              '${_runtime.resolutionProfile.fps} FPS để bảo vệ máy, sẽ tự khôi phục khi nhiệt độ ổn định.',
+          'Device temperature is high. Quality is temporarily locked at '
+              '${_runtime.resolutionProfile.shortLabel}/'
+              '${_runtime.resolutionProfile.fps} FPS and will recover when temperature is stable.',
+        ),
+        icon: Icons.thermostat_rounded,
+        duration: const Duration(seconds: 3),
+      );
       return;
     }
     _openResolutionPicker();
@@ -2625,20 +2643,29 @@ class _ZoomPresetButton extends StatelessWidget {
         ),
         decoration: BoxDecoration(
           color: selected
-              ? Colors.amber.withValues(alpha: 0.9)
+              ? const Color(0xFF1565C0)
               : Colors.white.withValues(alpha: 0.12),
           borderRadius: BorderRadius.circular(12),
           border: Border.all(
             color: selected
-                ? Colors.amberAccent
+                ? const Color(0xFF64B5F6)
                 : Colors.white.withValues(alpha: 0.15),
-            width: 1,
+            width: selected ? 1.5 : 1,
           ),
+          boxShadow: selected
+              ? [
+                  BoxShadow(
+                    color: const Color(0xFF1565C0).withValues(alpha: 0.4),
+                    blurRadius: 6,
+                    offset: const Offset(0, 2),
+                  ),
+                ]
+              : null,
         ),
         child: Text(
           label,
           style: TextStyle(
-            color: selected ? Colors.black : Colors.white,
+            color: Colors.white,
             fontWeight: selected ? FontWeight.w900 : FontWeight.w600,
             fontSize: compact ? 11 : 12,
           ),
@@ -3255,7 +3282,7 @@ class _CameraControlDock extends StatelessWidget {
             onPressed: onToggleScreenDim,
             loading: screenDimSwitching,
             background: screenDimmed
-                ? Colors.amber.withValues(alpha: 0.8)
+                ? const Color(0xFF1565C0)
                 : Colors.blueGrey.withValues(alpha: 0.75),
           ),
           SizedBox(height: gap),
@@ -3285,9 +3312,9 @@ class _CameraControlDock extends StatelessWidget {
             size: buttonSize,
             onPressed: onToggleOrientation,
             background: screenOrientation == 'landscape'
-                ? Colors.blueAccent.withValues(alpha: 0.8)
+                ? const Color(0xFF1565C0)
                 : screenOrientation == 'portrait'
-                    ? Colors.amber.withValues(alpha: 0.8)
+                    ? const Color(0xFF0288D1)
                     : null,
           ),
         ],
