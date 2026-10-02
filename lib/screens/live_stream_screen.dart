@@ -48,6 +48,16 @@ class _LiveStreamScreenState extends State<LiveStreamScreen> {
   StreamSubscription<RtspPublishState>? _rtspSubscription;
 
   bool _isLoading = true;
+  String? _selectedPreset;
+
+  String? get _effectivePreset {
+    if (_selectedPreset != null) return _selectedPreset;
+    final url = _rtspUrlController.text.trim();
+    if (url.startsWith('rtmp://') || url.startsWith('rtmps://')) return 'rtmp';
+    if (url.startsWith('rtsp://') && url.contains('.sdp')) return 'rtsp_sdp';
+    if (url.startsWith('rtsp://')) return 'rtsp_standard';
+    return null;
+  }
 
   WhipPublisherService get _whipService => widget.runtime.whipPublisherService;
   RtspPublisherService get _rtspService => widget.runtime.rtspPublisherService;
@@ -134,11 +144,14 @@ class _LiveStreamScreenState extends State<LiveStreamScreen> {
   Future<void> _handleStartRtspPush() async {
     final url = _rtspUrlController.text.trim();
     if (url.isEmpty) {
-      _showToast(appText(
-        context,
-        'Vui lòng nhập RTSP Publish URL.',
-        'Please enter RTSP Publish URL.',
-      ));
+      _showToast(
+        appText(
+          context,
+          'Vui lòng nhập hoặc chọn định dạng phát trực tiếp.',
+          'Please enter or select a live stream link.',
+        ),
+        isError: true,
+      );
       return;
     }
 
@@ -152,8 +165,8 @@ class _LiveStreamScreenState extends State<LiveStreamScreen> {
       _showToast(
         appText(
           context,
-          'Camera chưa sẵn sàng hoặc đang khởi tạo.',
-          'Camera is not ready or still initializing.',
+          'Camera đang khởi động, vui lòng thử lại sau vài giây.',
+          'Camera is starting up, please try again in a few seconds.',
         ),
         isError: true,
       );
@@ -181,6 +194,7 @@ class _LiveStreamScreenState extends State<LiveStreamScreen> {
         !text.startsWith('rtsp://')) {
       final formattedUrl = 'rtmp://media.aqvision.net:11935/live/$text';
       setState(() {
+        _selectedPreset = 'rtmp';
         _rtspUrlController.text = formattedUrl;
         final parts = text.split('?key=');
         if (parts.isNotEmpty) _rtspStreamNameController.text = parts[0];
@@ -188,8 +202,8 @@ class _LiveStreamScreenState extends State<LiveStreamScreen> {
       });
       _showToast(appText(
         context,
-        'Đã tự động tạo link RTMP chuẩn: $formattedUrl',
-        'Auto-formatted to standard RTMP: $formattedUrl',
+        'Đã nhận diện và thiết lập đường dẫn phát trực tiếp.',
+        'Recognized and configured stream link.',
       ));
       return;
     }
@@ -201,6 +215,7 @@ class _LiveStreamScreenState extends State<LiveStreamScreen> {
       final nameMatch = RegExp(r'/live/([^/?&\s]+)').firstMatch(text);
       final keyMatch = RegExp(r'[?&]key=([^&\s]+)').firstMatch(text);
       setState(() {
+        _selectedPreset = null;
         _rtspUrlController.text = text;
         if (nameMatch != null) {
           _rtspStreamNameController.text =
@@ -210,8 +225,8 @@ class _LiveStreamScreenState extends State<LiveStreamScreen> {
       });
       _showToast(appText(
         context,
-        'Đã nhận diện link đẩy luồng hợp lệ',
-        'Detected valid stream publish URL',
+        'Đã điền đường dẫn phát trực tiếp thành công.',
+        'Applied live stream link.',
       ));
       return;
     }
@@ -222,7 +237,11 @@ class _LiveStreamScreenState extends State<LiveStreamScreen> {
     if (!mounted) return;
     final text = data?.text?.trim() ?? '';
     if (text.isEmpty) {
-      _showToast(appText(context, 'Bộ nhớ tạm trống', 'Clipboard is empty'));
+      _showToast(appText(
+        context,
+        'Chưa có nội dung nào trong bộ nhớ tạm để dán.',
+        'Clipboard is empty.',
+      ));
       return;
     }
     _handleSmartPasteOrInput(text);
@@ -264,30 +283,16 @@ class _LiveStreamScreenState extends State<LiveStreamScreen> {
     if (presetType == 'rtmp') {
       newUrl =
           'rtmp://media.aqvision.net:11935/live/$cleanStreamName?key=$currentKey';
-      _showToast(appText(
-        context,
-        'Đã áp dụng RTMP (Siêu mượt cho Web FLV)',
-        'Applied RTMP (Optimized for Web FLV)',
-      ));
     } else if (presetType == 'rtsp_sdp') {
       newUrl =
           'rtsp://media.aqvision.net:18554/live/$cleanStreamName.sdp?key=$currentKey';
-      _showToast(appText(
-        context,
-        'Đã áp dụng RTSP (.sdp khuyến nghị cho Camera IP)',
-        'Applied RTSP .sdp (Recommended for IP Cam)',
-      ));
     } else {
       newUrl =
           'rtsp://media.aqvision.net:18554/live/$cleanStreamName?key=$currentKey';
-      _showToast(appText(
-        context,
-        'Đã áp dụng RTSP chuẩn',
-        'Applied standard RTSP',
-      ));
     }
 
     setState(() {
+      _selectedPreset = presetType;
       _rtspUrlController.text = newUrl;
     });
   }
@@ -299,11 +304,14 @@ class _LiveStreamScreenState extends State<LiveStreamScreen> {
   Future<void> _handleStartWhip() async {
     final url = _whipUrlController.text.trim();
     if (url.isEmpty) {
-      _showToast(appText(
-        context,
-        'Vui lòng nhập WHIP Endpoint URL.',
-        'Please enter WHIP Endpoint URL.',
-      ));
+      _showToast(
+        appText(
+          context,
+          'Vui lòng nhập địa chỉ phát trực tiếp WHIP.',
+          'Please enter WHIP stream link.',
+        ),
+        isError: true,
+      );
       return;
     }
 
@@ -321,8 +329,8 @@ class _LiveStreamScreenState extends State<LiveStreamScreen> {
       _showToast(
         appText(
           context,
-          'Camera chưa sẵn sàng hoặc đang khởi tạo.',
-          'Camera is not ready or still initializing.',
+          'Camera đang khởi động, vui lòng thử lại sau vài giây.',
+          'Camera is starting up, please try again in a few seconds.',
         ),
         isError: true,
       );
@@ -344,11 +352,37 @@ class _LiveStreamScreenState extends State<LiveStreamScreen> {
   }
 
   void _showToast(String message, {bool isError = false}) {
+    ScaffoldMessenger.of(context).hideCurrentSnackBar();
     ScaffoldMessenger.of(context).showSnackBar(
       SnackBar(
-        content: Text(message),
+        behavior: SnackBarBehavior.floating,
+        margin: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
         backgroundColor:
-            isError ? Colors.red.shade800 : Colors.orange.shade800,
+            isError ? const Color(0xFFC62828) : const Color(0xFF1565C0),
+        content: Row(
+          children: [
+            Icon(
+              isError
+                  ? Icons.error_outline_rounded
+                  : Icons.check_circle_outline_rounded,
+              color: Colors.white,
+              size: 20,
+            ),
+            const SizedBox(width: 10),
+            Expanded(
+              child: Text(
+                message,
+                style: const TextStyle(
+                  color: Colors.white,
+                  fontSize: 13,
+                  fontWeight: FontWeight.w600,
+                ),
+              ),
+            ),
+          ],
+        ),
+        duration: const Duration(seconds: 3),
       ),
     );
   }
@@ -852,9 +886,10 @@ class _LiveStreamScreenState extends State<LiveStreamScreen> {
                     children: [
                       _PresetChip(
                         label: 'RTMP (OBS / FLV)',
-                        badge: 'Khuyên Dùng',
+                        badge: appText(context, 'Khuyên Dùng', 'Recommended'),
                         badgeColor: Colors.greenAccent,
                         icon: Icons.flash_on_rounded,
+                        isSelected: _effectivePreset == 'rtmp',
                         onTap: () => _applyPreset('rtmp'),
                       ),
                       const SizedBox(width: 8),
@@ -863,12 +898,14 @@ class _LiveStreamScreenState extends State<LiveStreamScreen> {
                         badge: 'Camera IP',
                         badgeColor: Colors.blueAccent,
                         icon: Icons.videocam_rounded,
+                        isSelected: _effectivePreset == 'rtsp_sdp',
                         onTap: () => _applyPreset('rtsp_sdp'),
                       ),
                       const SizedBox(width: 8),
                       _PresetChip(
-                        label: 'RTSP Chuẩn',
+                        label: appText(context, 'RTSP Chuẩn', 'Standard RTSP'),
                         icon: Icons.stream_rounded,
+                        isSelected: _effectivePreset == 'rtsp_standard',
                         onTap: () => _applyPreset('rtsp_standard'),
                       ),
                     ],
@@ -1679,7 +1716,81 @@ class _LiveStreamScreenState extends State<LiveStreamScreen> {
     );
   }
 
+  String _translateToNaturalLanguageError(String rawError) {
+    final lower = rawError.toLowerCase();
+
+    if (lower.contains('connection refused') ||
+        lower.contains('failed to connect') ||
+        lower.contains('timeout') ||
+        lower.contains('timed out') ||
+        lower.contains('host is down') ||
+        lower.contains('unreachable') ||
+        lower.contains('socketexception') ||
+        lower.contains('errno = 110') ||
+        lower.contains('errno = 111')) {
+      return appText(
+        context,
+        'Không thể kết nối đến máy chủ phát sóng. Vui lòng kiểm tra lại kết nối mạng Wi-Fi hoặc 4G của điện thoại.',
+        'Cannot connect to streaming server. Please check your phone Wi-Fi or 4G connection.',
+      );
+    }
+
+    if (lower.contains('401') ||
+        lower.contains('unauthorized') ||
+        lower.contains('forbidden') ||
+        lower.contains('invalid stream key') ||
+        lower.contains('key invalid')) {
+      return appText(
+        context,
+        'Mã Stream Key không chính xác hoặc đã hết hạn. Vui lòng kiểm tra lại mã luồng phát sóng.',
+        'Stream key is invalid or expired. Please check your stream credentials.',
+      );
+    }
+
+    if (lower.contains('404') ||
+        lower.contains('not found') ||
+        lower.contains('no such stream')) {
+      return appText(
+        context,
+        'Không tìm thấy kênh phát sóng trên máy chủ. Vui lòng kiểm tra lại đường dẫn phát.',
+        'Stream channel not found on server. Please check the URL.',
+      );
+    }
+
+    if (lower.contains('camera') || lower.contains('not initialized')) {
+      return appText(
+        context,
+        'Camera đang bận hoặc chưa sẵn sàng. Vui lòng thử lại sau vài giây.',
+        'Camera is busy or not ready. Please try again in a few seconds.',
+      );
+    }
+
+    if (lower.contains('broken pipe') ||
+        lower.contains('connection reset') ||
+        lower.contains('disconnect') ||
+        lower.contains('end of file') ||
+        lower.contains('eof')) {
+      return appText(
+        context,
+        'Đường truyền mạng bị gián đoạn. Hệ thống đang tự động kết nối lại...',
+        'Network stream disconnected. Attempting to reconnect...',
+      );
+    }
+
+    if (lower.contains('ffmpeg') || lower.contains('exit code')) {
+      return appText(
+        context,
+        'Quá trình phát sóng bị dừng do tín hiệu mạng không ổn định. Vui lòng nhấn phát lại.',
+        'Streaming stopped due to unstable network. Please try starting again.',
+      );
+    }
+
+    return rawError;
+  }
+
   Widget _buildErrorBox(String error) {
+    final friendlyMessage = _translateToNaturalLanguageError(error);
+
     return Container(
       padding: const EdgeInsets.all(14),
       margin: const EdgeInsets.only(bottom: 16),
@@ -1700,13 +1811,27 @@ class _LiveStreamScreenState extends State<LiveStreamScreen> {
           ),
           const SizedBox(width: 10),
           Expanded(
-            child: Text(
-              error,
-              style: const TextStyle(
-                color: Color(0xFFFF8A80),
-                fontSize: 13,
-                height: 1.4,
-              ),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  appText(context, 'Thông báo sự cố:', 'Notice:'),
+                  style: const TextStyle(
+                    color: Colors.white,
+                    fontWeight: FontWeight.bold,
+                    fontSize: 13,
+                  ),
+                ),
+                const SizedBox(height: 4),
+                Text(
+                  friendlyMessage,
+                  style: const TextStyle(
+                    color: Color(0xFFFF8A80),
+                    fontSize: 12.5,
+                    height: 1.4,
+                  ),
+                ),
+              ],
             ),
           ),
         ],
@@ -1816,6 +1941,7 @@ class _PresetChip extends StatelessWidget {
   final Color? badgeColor;
   final IconData icon;
   final VoidCallback onTap;
+  final bool isSelected;
 
   const _PresetChip({
     required this.label,
@@ -1823,34 +1949,56 @@ class _PresetChip extends StatelessWidget {
     this.badgeColor,
     required this.icon,
     required this.onTap,
+    this.isSelected = false,
   });
 
   @override
   Widget build(BuildContext context) {
+    const activeColor = Color(0xFF1565C0);
+    const activeBorderColor = Color(0xFF64B5F6);
+
     return Material(
-      color: const Color(0xFF1E2633),
+      color: Colors.transparent,
       borderRadius: BorderRadius.circular(10),
       child: InkWell(
         onTap: onTap,
         borderRadius: BorderRadius.circular(10),
-        child: Container(
-          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+        child: AnimatedContainer(
+          duration: const Duration(milliseconds: 200),
+          padding: const EdgeInsets.symmetric(horizontal: 11, vertical: 8),
           decoration: BoxDecoration(
+            color: isSelected ? activeColor : const Color(0xFF1E2633),
             borderRadius: BorderRadius.circular(10),
             border: Border.all(
-              color: Colors.white.withValues(alpha: 0.12),
+              color: isSelected
+                  ? activeBorderColor
+                  : Colors.white.withValues(alpha: 0.12),
+              width: isSelected ? 1.5 : 1,
             ),
+            boxShadow: isSelected
+                ? [
+                    BoxShadow(
+                      color: activeColor.withValues(alpha: 0.4),
+                      blurRadius: 8,
+                      offset: const Offset(0, 2),
+                    ),
+                  ]
+                : null,
           ),
           child: Row(
             mainAxisSize: MainAxisSize.min,
             children: [
-              Icon(icon, size: 14, color: Colors.lightBlueAccent),
+              Icon(
+                isSelected ? Icons.check_circle_rounded : icon,
+                size: 14,
+                color: isSelected ? Colors.white : Colors.lightBlueAccent,
+              ),
               const SizedBox(width: 6),
               Text(
                 label,
-                style: const TextStyle(
+                style: TextStyle(
                   color: Colors.white,
-                  fontWeight: FontWeight.w600,
+                  fontWeight: isSelected ? FontWeight.w800 : FontWeight.w600,
                   fontSize: 11.5,
                 ),
               ),
@@ -1860,17 +2008,23 @@ class _PresetChip extends StatelessWidget {
                   padding:
                       const EdgeInsets.symmetric(horizontal: 5, vertical: 2),
                   decoration: BoxDecoration(
-                    color: (badgeColor ?? Colors.blue).withValues(alpha: 0.2),
+                    color: isSelected
+                        ? Colors.white.withValues(alpha: 0.25)
+                        : (badgeColor ?? Colors.blue).withValues(alpha: 0.2),
                     borderRadius: BorderRadius.circular(6),
                     border: Border.all(
-                      color: (badgeColor ?? Colors.blue).withValues(alpha: 0.6),
+                      color: isSelected
+                          ? Colors.white.withValues(alpha: 0.5)
+                          : (badgeColor ?? Colors.blue).withValues(alpha: 0.5),
                       width: 0.8,
                     ),
                   ),
                   child: Text(
                     badge!,
                     style: TextStyle(
-                      color: badgeColor ?? Colors.blueAccent,
+                      color: isSelected
+                          ? Colors.white
+                          : (badgeColor ?? Colors.blueAccent),
                       fontSize: 9.5,
                       fontWeight: FontWeight.bold,
                     ),
