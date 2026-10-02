@@ -849,6 +849,7 @@ class _StationScreenState extends State<StationScreen>
           return SetupScreen(
             initialIdentity: widget.identity,
             persistOnSave: false,
+            isLandscape: true,
             onConfigured: (identity) {
               Navigator.of(setupContext).pop(identity);
             },
@@ -856,6 +857,10 @@ class _StationScreenState extends State<StationScreen>
         },
       ),
     );
+
+    if (mounted) {
+      unawaited(_applyScreenOrientation(_screenOrientation));
+    }
 
     if (updated == null || !mounted) {
       return;
