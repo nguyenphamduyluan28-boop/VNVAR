@@ -86,8 +86,11 @@ class _SetupScreenState extends State<SetupScreen> {
         ? savedPosition
         : 'Tùy chỉnh';
 
+    final defaultInitialName = AppLanguageService.instance.isEnglish
+        ? 'Left-corner camera'
+        : 'Camera góc trái';
     _cameraNameController = TextEditingController(
-      text: identity?.cameraName ?? 'Camera góc trái',
+      text: identity?.cameraName ?? defaultInitialName,
     );
     _customPositionController = TextEditingController(
       text: _position == 'Tùy chỉnh' ? savedPosition : '',
@@ -183,20 +186,27 @@ class _SetupScreenState extends State<SetupScreen> {
           currentName.isEmpty ||
           currentName == 'Camera góc trái' ||
           currentName == 'Camera góc phải' ||
-          currentName == 'Camera giữa sân';
+          currentName == 'Camera giữa sân' ||
+          currentName == 'Left-corner camera' ||
+          currentName == 'Right-corner camera' ||
+          currentName == 'Center camera';
 
       if (isDefaultName) {
+        final isEn = AppLanguageService.instance.isEnglish;
         switch (id) {
           case 'CAM-01':
-            _cameraNameController.text = 'Camera góc trái';
+            _cameraNameController.text =
+                isEn ? 'Left-corner camera' : 'Camera góc trái';
             _position = 'Góc trái sân';
             break;
           case 'CAM-02':
-            _cameraNameController.text = 'Camera góc phải';
+            _cameraNameController.text =
+                isEn ? 'Right-corner camera' : 'Camera góc phải';
             _position = 'Góc phải sân';
             break;
           case 'CAM-03':
-            _cameraNameController.text = 'Camera giữa sân';
+            _cameraNameController.text =
+                isEn ? 'Center camera' : 'Camera giữa sân';
             _position = 'Giữa sân';
             break;
         }
