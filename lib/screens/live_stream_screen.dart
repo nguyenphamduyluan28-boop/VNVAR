@@ -735,10 +735,18 @@ class _LiveStreamScreenState extends State<LiveStreamScreen> {
                                   size: 16,
                                   color: Colors.lightBlueAccent,
                                 ),
-                                tooltip: 'Sao chép link RTSP nội bộ',
+                                tooltip: appText(
+                                  context,
+                                  'Sao chép link RTSP nội bộ',
+                                  'Copy local RTSP link',
+                                ),
                                 onPressed: () => _copyToClipboard(
                                   localRtspUrl,
-                                  'Đã sao chép link RTSP nội bộ!',
+                                  appText(
+                                    context,
+                                    'Đã sao chép link RTSP nội bộ!',
+                                    'Copied local RTSP link!',
+                                  ),
                                 ),
                               ),
                             ],

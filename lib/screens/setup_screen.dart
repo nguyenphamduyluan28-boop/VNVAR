@@ -267,6 +267,46 @@ class _SetupScreenState extends State<SetupScreen> {
     return null;
   }
 
+  void _showSetupToast(
+    String message, {
+    bool isError = false,
+    Duration duration = const Duration(seconds: 2),
+    IconData? icon,
+  }) {
+    if (!mounted) return;
+    final bg = isError ? const Color(0xFFC62828) : const Color(0xFF1565C0);
+    final defIcon = isError
+        ? Icons.error_outline_rounded
+        : Icons.check_circle_outline_rounded;
+    ScaffoldMessenger.of(context)
+      ..hideCurrentSnackBar()
+      ..showSnackBar(
+        SnackBar(
+          behavior: SnackBarBehavior.floating,
+          margin: const EdgeInsets.symmetric(horizontal: 20, vertical: 14),
+          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+          backgroundColor: bg,
+          duration: duration,
+          content: Row(
+            children: [
+              Icon(icon ?? defIcon, color: Colors.white, size: 20),
+              const SizedBox(width: 10),
+              Expanded(
+                child: Text(
+                  message,
+                  style: const TextStyle(
+                    color: Colors.white,
+                    fontSize: 13,
+                    fontWeight: FontWeight.w600,
+                  ),
+                ),
+              ),
+            ],
+          ),
+        ),
+      );
+  }
+
   Future<void> _save() async {
     if (_saving || !(_formKey.currentState?.validate() ?? false)) return;
 
@@ -276,16 +316,13 @@ class _SetupScreenState extends State<SetupScreen> {
         : _position.trim();
 
     if (cameraPosition.isEmpty) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(
-          content: Text(
-            appText(
-              context,
-              'Vui lòng nhập vị trí Camera.',
-              'Enter the camera position.',
-            ),
-          ),
+      _showSetupToast(
+        appText(
+          context,
+          'Vui lòng nhập vị trí Camera.',
+          'Please enter the camera position.',
         ),
+        isError: true,
       );
       return;
     }
@@ -309,16 +346,13 @@ class _SetupScreenState extends State<SetupScreen> {
       widget.onConfigured(identity);
     } catch (error) {
       if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(
-          content: Text(
-            appText(
-              context,
-              'Không thể lưu cấu hình: $error',
-              'Cannot save settings: $error',
-            ),
-          ),
+      _showSetupToast(
+        appText(
+          context,
+          'Không thể lưu cấu hình. Vui lòng thử lại sau.',
+          'Cannot save settings. Please try again later.',
         ),
+        isError: true,
       );
     } finally {
       if (mounted) setState(() => _saving = false);
@@ -706,17 +740,13 @@ class _SetupScreenState extends State<SetupScreen> {
             ),
             onPressed: () {
               Clipboard.setData(ClipboardData(text: _deviceId));
-              ScaffoldMessenger.of(context).showSnackBar(
-                SnackBar(
-                  content: Text(
-                    appText(
-                      context,
-                      'Đã sao chép Device ID',
-                      'Device ID copied',
-                    ),
-                  ),
-                  duration: const Duration(seconds: 2),
+              _showSetupToast(
+                appText(
+                  context,
+                  'Đã sao chép Device ID vào bộ nhớ tạm.',
+                  'Device ID copied to clipboard.',
                 ),
+                icon: Icons.copy_rounded,
               );
             },
           ),

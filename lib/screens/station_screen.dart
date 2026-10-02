@@ -1561,9 +1561,9 @@ class _StationScreenState extends State<StationScreen>
                     ),
                   ),
                   const SizedBox(height: 22),
-                  const Text(
-                    'CAMERA STATION ERROR',
-                    style: TextStyle(
+                  Text(
+                    appText(context, 'LỖI KHỞI ĐỘNG CAMERA', 'CAMERA STATION ERROR'),
+                    style: const TextStyle(
                       color: Colors.white,
                       fontSize: 19,
                       fontWeight: FontWeight.w900,
