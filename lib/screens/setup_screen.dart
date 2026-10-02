@@ -46,7 +46,6 @@ class _SetupScreenState extends State<SetupScreen> {
 
   final GlobalKey<FormState> _formKey = GlobalKey<FormState>();
   final StationConfigService _config = StationConfigService();
-  final ScrollController _courtChipScrollController = ScrollController();
 
   late final TextEditingController _cameraNameController;
   late final TextEditingController _customPositionController;
@@ -57,8 +56,7 @@ class _SetupScreenState extends State<SetupScreen> {
   late String _position;
   late String _deviceId;
   bool _saving = false;
-  bool _loadingCourts = true;
-  List<String> _courtIds = const ['COURT-01'];
+  bool _loadingVenue = true;
   String _venueName = '';
   String _venueMapAddress = '';
 
@@ -96,7 +94,7 @@ class _SetupScreenState extends State<SetupScreen> {
       text: _position == 'Tùy chỉnh' ? savedPosition : '',
     );
     _apiPortController = TextEditingController(text: '8080');
-    _loadCourts();
+    _loadVenueConfig();
   }
 
   void _applyOrientation() {
@@ -118,47 +116,21 @@ class _SetupScreenState extends State<SetupScreen> {
     }
   }
 
-  Future<void> _loadCourts() async {
+  Future<void> _loadVenueConfig() async {
     final prefs = await SharedPreferences.getInstance();
-    final savedCourtNumber = int.tryParse(_courtId.split('-').last) ?? 1;
-    final configuredCount = prefs.getInt('courtCount') ?? 20;
-    final count = max(configuredCount, max(savedCourtNumber, 20));
     _venueName = prefs.getString('venueName')?.trim() ?? '';
     _venueMapAddress = prefs.getString('venueMapAddress')?.trim() ?? '';
-    _apiPortController.text = (await _config.loadApiPort()).toString();
-    final courts = List.generate(
-      count,
-      (index) => 'COURT-${(index + 1).toString().padLeft(2, '0')}',
-    );
-    if (!courts.contains(_courtId)) _courtId = courts.first;
+    final port = await _config.loadApiPort();
+    _apiPortController.text = port.toString();
     if (mounted) {
       setState(() {
-        _courtIds = courts;
-        _loadingCourts = false;
+        _loadingVenue = false;
       });
-      _scrollToSelectedCourt();
     }
-  }
-
-  void _scrollToSelectedCourt() {
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (!_courtChipScrollController.hasClients) return;
-      final selectedIndex = _selectedCourtNumber - 1;
-      final targetOffset = (selectedIndex * 50.0) - 80.0;
-      _courtChipScrollController.animateTo(
-        targetOffset.clamp(
-          0.0,
-          _courtChipScrollController.position.maxScrollExtent,
-        ),
-        duration: const Duration(milliseconds: 300),
-        curve: Curves.easeOutCubic,
-      );
-    });
   }
 
   @override
   void dispose() {
-    _courtChipScrollController.dispose();
     _cameraNameController.dispose();
     _customPositionController.dispose();
     _apiPortController.dispose();
@@ -170,11 +142,56 @@ class _SetupScreenState extends State<SetupScreen> {
   }
 
   void _selectCourtNumber(int number) {
-    if (number < 1 || number > _courtIds.length) return;
+    if (number < 1) return;
     setState(() {
       _courtId = 'COURT-${number.toString().padLeft(2, '0')}';
     });
-    _scrollToSelectedCourt();
+  }
+
+  Future<void> _showCourtNumberInputDialog(int current) async {
+    final controller = TextEditingController(text: current.toString());
+    final result = await showDialog<int>(
+      context: context,
+      builder: (dialogCtx) {
+        return AlertDialog(
+          title: Text(
+            appText(dialogCtx, 'Nhập số sân', 'Enter court number'),
+            style: const TextStyle(fontSize: 16, fontWeight: FontWeight.w800),
+          ),
+          content: TextField(
+            controller: controller,
+            keyboardType: TextInputType.number,
+            autofocus: true,
+            decoration: InputDecoration(
+              hintText: appText(
+                dialogCtx,
+                'Ví dụ: 1, 2, 25...',
+                'Example: 1, 2, 25...',
+              ),
+              border: const OutlineInputBorder(),
+            ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(dialogCtx).pop(),
+              child: Text(appText(dialogCtx, 'HỦY', 'CANCEL')),
+            ),
+            FilledButton(
+              onPressed: () {
+                final num = int.tryParse(controller.text.trim());
+                if (num != null && num >= 1) {
+                  Navigator.of(dialogCtx).pop(num);
+                }
+              },
+              child: Text(appText(dialogCtx, 'XÁC NHẬN', 'CONFIRM')),
+            ),
+          ],
+        );
+      },
+    );
+    if (result != null && mounted) {
+      _selectCourtNumber(result);
+    }
   }
 
   void _onCameraIdSelected(String id) {
@@ -285,7 +302,8 @@ class _SetupScreenState extends State<SetupScreen> {
       );
       if (widget.persistOnSave) {
         await _config.saveIdentity(identity);
-        await _config.saveApiPort(int.parse(_apiPortController.text.trim()));
+        final port = int.tryParse(_apiPortController.text.trim()) ?? 8080;
+        await _config.saveApiPort(port);
       }
       if (!mounted) return;
       widget.onConfigured(identity);
@@ -314,12 +332,12 @@ class _SetupScreenState extends State<SetupScreen> {
   }) {
     return Row(
       children: [
-        Icon(icon, size: 18, color: const Color(0xFF1565C0)),
+        Icon(icon, size: 17, color: const Color(0xFF1565C0)),
         const SizedBox(width: 8),
         Text(
           title,
           style: const TextStyle(
-            fontSize: 13,
+            fontSize: 12.5,
             fontWeight: FontWeight.w800,
             letterSpacing: 0.5,
             color: Color(0xFF1E293B),
@@ -333,7 +351,7 @@ class _SetupScreenState extends State<SetupScreen> {
               maxLines: 1,
               overflow: TextOverflow.ellipsis,
               style: const TextStyle(
-                fontSize: 12,
+                fontSize: 11.5,
                 color: Color(0xFF64748B),
                 fontWeight: FontWeight.w500,
               ),
@@ -346,7 +364,6 @@ class _SetupScreenState extends State<SetupScreen> {
 
   Widget _buildCourtSelector() {
     final courtNumber = _selectedCourtNumber;
-    final totalCourts = _courtIds.length;
 
     return Container(
       decoration: BoxDecoration(
@@ -354,7 +371,7 @@ class _SetupScreenState extends State<SetupScreen> {
         borderRadius: BorderRadius.circular(16),
         border: Border.all(color: const Color(0xFFE2E8F0)),
       ),
-      padding: const EdgeInsets.all(14),
+      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
@@ -364,12 +381,12 @@ class _SetupScreenState extends State<SetupScreen> {
             subtitle: _venueName.isNotEmpty ? _venueName : null,
           ),
           if (_venueMapAddress.isNotEmpty) ...[
-            const SizedBox(height: 6),
+            const SizedBox(height: 4),
             Row(
               children: [
                 const Icon(
                   Icons.location_on_outlined,
-                  size: 14,
+                  size: 13,
                   color: Color(0xFF64748B),
                 ),
                 const SizedBox(width: 4),
@@ -387,10 +404,10 @@ class _SetupScreenState extends State<SetupScreen> {
               ],
             ),
           ],
-          const SizedBox(height: 12),
-          // Stepper bar: [-]  SÂN X  [+]
+          const SizedBox(height: 10),
+          // Stepper bar: [-]  SÂN X  [+] (Tăng giảm tự do không giới hạn 20 sân)
           Container(
-            padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
+            padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
             decoration: BoxDecoration(
               color: Colors.white,
               borderRadius: BorderRadius.circular(12),
@@ -406,97 +423,35 @@ class _SetupScreenState extends State<SetupScreen> {
                   icon: const Icon(Icons.remove_circle_outline_rounded),
                   color: const Color(0xFF1565C0),
                   iconSize: 28,
-                  tooltip: appText(context, 'Sân trước', 'Previous court'),
+                  tooltip: appText(context, 'Giảm sân', 'Decrease court'),
                 ),
-                Expanded(
-                  child: Column(
-                    children: [
-                      Text(
-                        '${appText(context, "SÂN", "COURT")} $courtNumber',
-                        style: const TextStyle(
-                          fontSize: 20,
-                          fontWeight: FontWeight.w900,
-                          color: Color(0xFF0F172A),
-                          letterSpacing: 0.5,
-                        ),
+                InkWell(
+                  onTap: () => _showCourtNumberInputDialog(courtNumber),
+                  borderRadius: BorderRadius.circular(8),
+                  child: Padding(
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 12,
+                      vertical: 4,
+                    ),
+                    child: Text(
+                      '${appText(context, "SÂN", "COURT")} $courtNumber',
+                      style: const TextStyle(
+                        fontSize: 20,
+                        fontWeight: FontWeight.w900,
+                        color: Color(0xFF0F172A),
+                        letterSpacing: 0.5,
                       ),
-                      Text(
-                        '$courtNumber / $totalCourts ${appText(context, "sân", "courts")}',
-                        style: const TextStyle(
-                          fontSize: 11,
-                          color: Color(0xFF64748B),
-                          fontWeight: FontWeight.w500,
-                        ),
-                      ),
-                    ],
+                    ),
                   ),
                 ),
                 IconButton(
-                  onPressed: courtNumber < totalCourts
-                      ? () => _selectCourtNumber(courtNumber + 1)
-                      : null,
+                  onPressed: () => _selectCourtNumber(courtNumber + 1),
                   icon: const Icon(Icons.add_circle_outline_rounded),
                   color: const Color(0xFF1565C0),
                   iconSize: 28,
-                  tooltip: appText(context, 'Sân kế tiếp', 'Next court'),
+                  tooltip: appText(context, 'Tăng sân', 'Increase court'),
                 ),
               ],
-            ),
-          ),
-          const SizedBox(height: 10),
-          // Quick-select chips bar (1, 2, 3... 20)
-          SizedBox(
-            height: 38,
-            child: ListView.separated(
-              controller: _courtChipScrollController,
-              scrollDirection: Axis.horizontal,
-              itemCount: totalCourts,
-              separatorBuilder: (_, _) => const SizedBox(width: 8),
-              itemBuilder: (context, index) {
-                final num = index + 1;
-                final isSelected = num == courtNumber;
-                return InkWell(
-                  onTap: () => _selectCourtNumber(num),
-                  borderRadius: BorderRadius.circular(10),
-                  child: AnimatedContainer(
-                    duration: const Duration(milliseconds: 200),
-                    padding: const EdgeInsets.symmetric(horizontal: 14),
-                    alignment: Alignment.center,
-                    decoration: BoxDecoration(
-                      color: isSelected
-                          ? const Color(0xFF1565C0)
-                          : Colors.white,
-                      borderRadius: BorderRadius.circular(10),
-                      border: Border.all(
-                        color: isSelected
-                            ? const Color(0xFF1565C0)
-                            : const Color(0xFFCBD5E1),
-                        width: isSelected ? 1.5 : 1.0,
-                      ),
-                      boxShadow: isSelected
-                          ? [
-                              BoxShadow(
-                                color: const Color(0xFF1565C0).withValues(alpha: 0.25),
-                                blurRadius: 4,
-                                offset: const Offset(0, 2),
-                              ),
-                            ]
-                          : null,
-                    ),
-                    child: Text(
-                      '$num',
-                      style: TextStyle(
-                        fontSize: 14,
-                        fontWeight:
-                            isSelected ? FontWeight.w800 : FontWeight.w600,
-                        color: isSelected
-                            ? Colors.white
-                            : const Color(0xFF334155),
-                      ),
-                    ),
-                  ),
-                );
-              },
             ),
           ),
         ],
@@ -511,7 +466,7 @@ class _SetupScreenState extends State<SetupScreen> {
         borderRadius: BorderRadius.circular(16),
         border: Border.all(color: const Color(0xFFE2E8F0)),
       ),
-      padding: const EdgeInsets.all(14),
+      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
@@ -519,7 +474,7 @@ class _SetupScreenState extends State<SetupScreen> {
             icon: Icons.videocam_rounded,
             title: appText(context, 'CAMERA ID', 'CAMERA ID'),
           ),
-          const SizedBox(height: 12),
+          const SizedBox(height: 10),
           Row(
             children: _cameraIds.map((id) {
               final isSelected = id == _cameraId;
@@ -537,7 +492,7 @@ class _SetupScreenState extends State<SetupScreen> {
                     borderRadius: BorderRadius.circular(12),
                     child: AnimatedContainer(
                       duration: const Duration(milliseconds: 200),
-                      padding: const EdgeInsets.symmetric(vertical: 10),
+                      padding: const EdgeInsets.symmetric(vertical: 8),
                       decoration: BoxDecoration(
                         color: isSelected
                             ? const Color(0xFF1565C0)
@@ -552,7 +507,7 @@ class _SetupScreenState extends State<SetupScreen> {
                         boxShadow: isSelected
                             ? [
                                 BoxShadow(
-                                  color: const Color(0xFF1565C0).withValues(alpha: 0.25),
+                                  color: const Color(0xFF1565C0).withValues(alpha: 0.22),
                                   blurRadius: 4,
                                   offset: const Offset(0, 2),
                                 ),
@@ -564,16 +519,16 @@ class _SetupScreenState extends State<SetupScreen> {
                         children: [
                           Icon(
                             Icons.videocam_rounded,
-                            size: 20,
+                            size: 19,
                             color: isSelected
                                 ? Colors.white
                                 : const Color(0xFF64748B),
                           ),
-                          const SizedBox(height: 4),
+                          const SizedBox(height: 3),
                           Text(
                             id,
                             style: TextStyle(
-                              fontSize: 14,
+                              fontSize: 13.5,
                               fontWeight: FontWeight.w800,
                               color: isSelected
                                   ? Colors.white
@@ -610,7 +565,7 @@ class _SetupScreenState extends State<SetupScreen> {
         borderRadius: BorderRadius.circular(16),
         border: Border.all(color: const Color(0xFFE2E8F0)),
       ),
-      padding: const EdgeInsets.all(14),
+      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
@@ -618,41 +573,58 @@ class _SetupScreenState extends State<SetupScreen> {
             icon: Icons.place_rounded,
             title: appText(context, 'VỊ TRÍ CAMERA', 'CAMERA POSITION'),
           ),
-          const SizedBox(height: 12),
+          const SizedBox(height: 8),
           Wrap(
-            spacing: 8,
-            runSpacing: 8,
+            spacing: 6,
+            runSpacing: 6,
             children: _positions.map((pos) {
               final isSelected = _position == pos;
-              return ChoiceChip(
-                label: Text(_positionLabel(pos)),
-                selected: isSelected,
-                showCheckmark: false,
-                onSelected: (selected) {
-                  if (selected) {
-                    setState(() => _position = pos);
-                  }
-                },
-                selectedColor: const Color(0xFF1565C0),
-                backgroundColor: Colors.white,
-                labelStyle: TextStyle(
-                  fontSize: 12,
-                  fontWeight: isSelected ? FontWeight.w700 : FontWeight.w500,
-                  color: isSelected ? Colors.white : const Color(0xFF334155),
+              return Theme(
+                data: Theme.of(context).copyWith(
+                  canvasColor: Colors.transparent,
                 ),
-                shape: RoundedRectangleBorder(
-                  borderRadius: BorderRadius.circular(10),
-                  side: BorderSide(
+                child: ChoiceChip(
+                  label: Text(_positionLabel(pos)),
+                  selected: isSelected,
+                  showCheckmark: false,
+                  visualDensity: const VisualDensity(
+                    horizontal: -2,
+                    vertical: -3,
+                  ),
+                  materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 8,
+                    vertical: 3,
+                  ),
+                  onSelected: (selected) {
+                    if (selected) {
+                      setState(() => _position = pos);
+                    }
+                  },
+                  selectedColor: const Color(0xFF1565C0),
+                  backgroundColor: Colors.white,
+                  labelStyle: TextStyle(
+                    fontSize: 11.5,
+                    fontWeight:
+                        isSelected ? FontWeight.w700 : FontWeight.w500,
                     color: isSelected
-                        ? const Color(0xFF1565C0)
-                        : const Color(0xFFCBD5E1),
+                        ? Colors.white
+                        : const Color(0xFF334155),
+                  ),
+                  shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(8),
+                    side: BorderSide(
+                      color: isSelected
+                          ? const Color(0xFF1565C0)
+                          : const Color(0xFFCBD5E1),
+                    ),
                   ),
                 ),
               );
             }).toList(),
           ),
           if (_position == 'Tùy chỉnh') ...[
-            const SizedBox(height: 12),
+            const SizedBox(height: 8),
             TextFormField(
               controller: _customPositionController,
               validator: _requiredValidator,
@@ -663,15 +635,18 @@ class _SetupScreenState extends State<SetupScreen> {
                   'Nhập vị trí camera tùy chỉnh',
                   'Enter custom camera position',
                 ),
-                prefixIcon: const Icon(Icons.edit_location_alt_outlined),
+                prefixIcon: const Icon(
+                  Icons.edit_location_alt_outlined,
+                  size: 20,
+                ),
                 border: OutlineInputBorder(
-                  borderRadius: BorderRadius.circular(12),
+                  borderRadius: BorderRadius.circular(10),
                 ),
                 filled: true,
                 fillColor: Colors.white,
                 contentPadding: const EdgeInsets.symmetric(
-                  horizontal: 14,
-                  vertical: 12,
+                  horizontal: 12,
+                  vertical: 10,
                 ),
               ),
             ),
@@ -683,7 +658,7 @@ class _SetupScreenState extends State<SetupScreen> {
 
   Widget _buildDeviceIdFooter() {
     return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 9),
       decoration: BoxDecoration(
         color: const Color(0xFFF1F5F9),
         borderRadius: BorderRadius.circular(12),
@@ -693,14 +668,14 @@ class _SetupScreenState extends State<SetupScreen> {
         children: [
           const Icon(
             Icons.perm_device_information_rounded,
-            size: 18,
+            size: 17,
             color: Color(0xFF64748B),
           ),
           const SizedBox(width: 8),
-          Text(
+          const Text(
             'Device ID: ',
-            style: const TextStyle(
-              fontSize: 12,
+            style: TextStyle(
+              fontSize: 11.5,
               fontWeight: FontWeight.w600,
               color: Color(0xFF64748B),
             ),
@@ -710,7 +685,7 @@ class _SetupScreenState extends State<SetupScreen> {
               _deviceId,
               style: const TextStyle(
                 fontFamily: 'monospace',
-                fontSize: 13,
+                fontSize: 12.5,
                 fontWeight: FontWeight.w700,
                 color: Color(0xFF1E293B),
               ),
@@ -721,7 +696,7 @@ class _SetupScreenState extends State<SetupScreen> {
             constraints: const BoxConstraints(),
             icon: const Icon(
               Icons.copy_rounded,
-              size: 16,
+              size: 15,
               color: Color(0xFF64748B),
             ),
             tooltip: appText(
@@ -756,26 +731,26 @@ class _SetupScreenState extends State<SetupScreen> {
       style: FilledButton.styleFrom(
         backgroundColor: const Color(0xFF1565C0),
         foregroundColor: Colors.white,
-        minimumSize: const Size.fromHeight(50),
+        minimumSize: const Size.fromHeight(48),
         shape: RoundedRectangleBorder(
-          borderRadius: BorderRadius.circular(14),
+          borderRadius: BorderRadius.circular(12),
         ),
         textStyle: const TextStyle(
-          fontSize: 16,
+          fontSize: 15.5,
           fontWeight: FontWeight.w900,
           letterSpacing: 0.5,
         ),
       ),
       icon: _saving
           ? const SizedBox(
-              width: 20,
-              height: 20,
+              width: 18,
+              height: 18,
               child: CircularProgressIndicator(
                 strokeWidth: 2,
                 color: Colors.white,
               ),
             )
-          : const Icon(Icons.check_circle_outline_rounded),
+          : const Icon(Icons.check_circle_outline_rounded, size: 20),
       label: Text(
         _saving
             ? appText(context, 'ĐANG LƯU...', 'SAVING...')
@@ -786,9 +761,22 @@ class _SetupScreenState extends State<SetupScreen> {
     );
   }
 
+  Widget _buildBrandLogo() {
+    return Center(
+      child: Padding(
+        padding: const EdgeInsets.only(bottom: 12),
+        child: Image.asset(
+          'assets/images/vnvar_logo.png',
+          height: 32,
+          fit: BoxFit.contain,
+        ),
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
-    if (_loadingCourts) {
+    if (_loadingVenue) {
       return const Scaffold(body: Center(child: CircularProgressIndicator()));
     }
 
@@ -803,6 +791,7 @@ class _SetupScreenState extends State<SetupScreen> {
         automaticallyImplyLeading: false,
         backgroundColor: Colors.white,
         elevation: 0.5,
+        centerTitle: true,
         leading: canGoBack
             ? IconButton(
                 onPressed: () {
@@ -813,26 +802,19 @@ class _SetupScreenState extends State<SetupScreen> {
                   }
                 },
                 tooltip: appText(context, 'Quay lại', 'Back'),
-                icon: const Icon(Icons.arrow_back_rounded, color: Color(0xFF0F172A)),
+                icon: const Icon(
+                  Icons.arrow_back_rounded,
+                  color: Color(0xFF0F172A),
+                ),
               )
             : null,
-        title: Row(
-          children: [
-            Image.asset(
-              'assets/images/vnvar_logo.png',
-              height: 28,
-              fit: BoxFit.contain,
-            ),
-            const SizedBox(width: 10),
-            Text(
-              appText(context, 'THIẾT LẬP CAMERA', 'CAMERA SETUP'),
-              style: const TextStyle(
-                fontSize: 16,
-                fontWeight: FontWeight.w800,
-                color: Color(0xFF0F172A),
-              ),
-            ),
-          ],
+        title: Text(
+          appText(context, 'THIẾT LẬP CAMERA', 'CAMERA SETUP'),
+          style: const TextStyle(
+            fontSize: 16,
+            fontWeight: FontWeight.w800,
+            color: Color(0xFF0F172A),
+          ),
         ),
         actions: const [
           AppLanguageButton(),
@@ -844,11 +826,11 @@ class _SetupScreenState extends State<SetupScreen> {
           child: SingleChildScrollView(
             padding: EdgeInsets.symmetric(
               horizontal: isLandscape ? 24 : 16,
-              vertical: isLandscape ? 14 : 20,
+              vertical: isLandscape ? 12 : 16,
             ),
             child: ConstrainedBox(
               constraints: BoxConstraints(
-                maxWidth: isLandscape ? 980 : 540,
+                maxWidth: isLandscape ? 960 : 520,
               ),
               child: Card(
                 elevation: 1.5,
@@ -858,7 +840,7 @@ class _SetupScreenState extends State<SetupScreen> {
                 ),
                 color: Colors.white,
                 child: Padding(
-                  padding: EdgeInsets.all(isLandscape ? 20 : 20),
+                  padding: EdgeInsets.all(isLandscape ? 18 : 18),
                   child: Form(
                     key: _formKey,
                     child: isLandscape
@@ -878,10 +860,11 @@ class _SetupScreenState extends State<SetupScreen> {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
+        _buildBrandLogo(),
         _buildCourtSelector(),
-        const SizedBox(height: 14),
+        const SizedBox(height: 12),
         _buildCameraIdSelector(),
-        const SizedBox(height: 14),
+        const SizedBox(height: 12),
         TextFormField(
           controller: _cameraNameController,
           validator: _requiredValidator,
@@ -893,7 +876,7 @@ class _SetupScreenState extends State<SetupScreen> {
               'Ví dụ: Camera góc trái',
               'Example: Left-corner camera',
             ),
-            prefixIcon: const Icon(Icons.badge_outlined),
+            prefixIcon: const Icon(Icons.badge_outlined, size: 20),
             border: OutlineInputBorder(
               borderRadius: BorderRadius.circular(12),
             ),
@@ -901,44 +884,15 @@ class _SetupScreenState extends State<SetupScreen> {
             fillColor: const Color(0xFFF8FAFC),
             contentPadding: const EdgeInsets.symmetric(
               horizontal: 14,
-              vertical: 14,
+              vertical: 12,
             ),
           ),
         ),
-        const SizedBox(height: 14),
+        const SizedBox(height: 12),
         _buildPositionSelector(),
         const SizedBox(height: 14),
-        TextFormField(
-          controller: _apiPortController,
-          keyboardType: TextInputType.number,
-          validator: (val) {
-            final port = int.tryParse(val?.trim() ?? '');
-            if (port == null || port < 1024 || port > 65535) {
-              return appText(
-                context,
-                'Port phải từ 1024 - 65535',
-                'Port must be between 1024 and 65535',
-              );
-            }
-            return null;
-          },
-          decoration: InputDecoration(
-            labelText: appText(context, 'Cổng API HTTP (Port)', 'API HTTP Port'),
-            prefixIcon: const Icon(Icons.lan_outlined),
-            border: OutlineInputBorder(
-              borderRadius: BorderRadius.circular(12),
-            ),
-            filled: true,
-            fillColor: const Color(0xFFF8FAFC),
-            contentPadding: const EdgeInsets.symmetric(
-              horizontal: 14,
-              vertical: 14,
-            ),
-          ),
-        ),
-        const SizedBox(height: 14),
         _buildDeviceIdFooter(),
-        const SizedBox(height: 22),
+        const SizedBox(height: 18),
         _buildSaveButton(),
       ],
     );
@@ -954,10 +908,11 @@ class _SetupScreenState extends State<SetupScreen> {
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.stretch,
             children: [
+              _buildBrandLogo(),
               _buildCourtSelector(),
-              const SizedBox(height: 14),
+              const SizedBox(height: 12),
               _buildCameraIdSelector(),
-              const SizedBox(height: 14),
+              const SizedBox(height: 12),
               TextFormField(
                 controller: _cameraNameController,
                 validator: _requiredValidator,
@@ -969,7 +924,7 @@ class _SetupScreenState extends State<SetupScreen> {
                     'Ví dụ: Camera góc trái',
                     'Example: Left-corner camera',
                   ),
-                  prefixIcon: const Icon(Icons.badge_outlined),
+                  prefixIcon: const Icon(Icons.badge_outlined, size: 20),
                   border: OutlineInputBorder(
                     borderRadius: BorderRadius.circular(12),
                   ),
@@ -977,7 +932,7 @@ class _SetupScreenState extends State<SetupScreen> {
                   fillColor: const Color(0xFFF8FAFC),
                   contentPadding: const EdgeInsets.symmetric(
                     horizontal: 14,
-                    vertical: 12,
+                    vertical: 11,
                   ),
                 ),
               ),
@@ -985,46 +940,16 @@ class _SetupScreenState extends State<SetupScreen> {
           ),
         ),
         const SizedBox(width: 18),
-        // Cột phải: Vị trí, Port, Device ID, Nút lưu
+        // Cột phải: Vị trí, Device ID, Nút lưu (Port đã ẩn)
         Expanded(
           flex: 5,
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.stretch,
             children: [
               _buildPositionSelector(),
-              const SizedBox(height: 14),
-              TextFormField(
-                controller: _apiPortController,
-                keyboardType: TextInputType.number,
-                validator: (val) {
-                  final port = int.tryParse(val?.trim() ?? '');
-                  if (port == null || port < 1024 || port > 65535) {
-                    return appText(
-                      context,
-                      'Port phải từ 1024 - 65535',
-                      'Port must be between 1024 and 65535',
-                    );
-                  }
-                  return null;
-                },
-                decoration: InputDecoration(
-                  labelText:
-                      appText(context, 'Cổng API HTTP (Port)', 'API HTTP Port'),
-                  prefixIcon: const Icon(Icons.lan_outlined),
-                  border: OutlineInputBorder(
-                    borderRadius: BorderRadius.circular(12),
-                  ),
-                  filled: true,
-                  fillColor: const Color(0xFFF8FAFC),
-                  contentPadding: const EdgeInsets.symmetric(
-                    horizontal: 14,
-                    vertical: 12,
-                  ),
-                ),
-              ),
-              const SizedBox(height: 14),
+              const SizedBox(height: 12),
               _buildDeviceIdFooter(),
-              const SizedBox(height: 16),
+              const SizedBox(height: 14),
               _buildSaveButton(),
             ],
           ),
