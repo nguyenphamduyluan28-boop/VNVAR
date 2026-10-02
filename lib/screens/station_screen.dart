@@ -1529,6 +1529,45 @@ class _StationScreenState extends State<StationScreen>
   // ERROR
   // ============================================================
 
+  String _formatErrorMessage(BuildContext context, String? raw) {
+    if (raw == null || raw.trim().isEmpty) {
+      return appText(
+        context,
+        'Không thể khởi động hệ thống camera. Vui lòng kiểm tra quyền truy cập camera và thử lại.',
+        'Unable to initialize camera system. Please check camera permissions and try again.',
+      );
+    }
+    final lower = raw.toLowerCase();
+    if (lower.contains('permission') || lower.contains('quyền') || lower.contains('denied')) {
+      return appText(
+        context,
+        'Ứng dụng chưa được cấp quyền truy cập Camera hoặc Micro. Vui lòng kiểm tra cài đặt thiết bị.',
+        'Camera or Microphone permissions not granted. Please check device settings.',
+      );
+    }
+    if (lower.contains('camera') &&
+        (lower.contains('busy') ||
+            lower.contains('bận') ||
+            lower.contains('in use') ||
+            lower.contains('locked'))) {
+      return appText(
+        context,
+        'Camera đang bị ứng dụng khác sử dụng hoặc chưa sẵn sàng. Vui lòng thử lại sau vài giây.',
+        'Camera is busy or in use by another app. Please try again shortly.',
+      );
+    }
+    if (lower.contains('đã xảy ra lỗi không xác định') ||
+        lower.contains('unknown error') ||
+        lower.contains('bad state')) {
+      return appText(
+        context,
+        'Đã xảy ra sự cố khi kết nối camera. Vui lòng bấm Thử lại để khôi phục.',
+        'An issue occurred while connecting the camera. Please tap Try Again to recover.',
+      );
+    }
+    return raw;
+  }
+
   Widget _buildError() {
     return Scaffold(
       backgroundColor: const Color(0xFF05070A),
@@ -1572,7 +1611,7 @@ class _StationScreenState extends State<StationScreen>
                   ),
                   const SizedBox(height: 10),
                   Text(
-                    _error ?? '',
+                    _formatErrorMessage(context, _error),
                     textAlign: TextAlign.center,
                     style: const TextStyle(
                       color: Colors.white60,
