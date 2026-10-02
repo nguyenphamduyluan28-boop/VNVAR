@@ -100,7 +100,9 @@ class _SetupScreenState extends State<SetupScreen> {
 
   Future<void> _loadCourts() async {
     final prefs = await SharedPreferences.getInstance();
-    final count = prefs.getInt('courtCount') ?? 1;
+    final savedCourtNumber = int.tryParse(_courtId.split('-').last) ?? 1;
+    final configuredCount = prefs.getInt('courtCount') ?? 20;
+    final count = max(configuredCount, max(savedCourtNumber, 20));
     _venueName = prefs.getString('venueName')?.trim() ?? '';
     _venueMapAddress = prefs.getString('venueMapAddress')?.trim() ?? '';
     _apiPortController.text = (await _config.loadApiPort()).toString();

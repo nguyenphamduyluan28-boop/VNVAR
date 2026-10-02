@@ -4,7 +4,6 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
 import 'models/station_identity.dart';
-import 'screens/court_count_screen.dart';
 import 'screens/setup_screen.dart';
 import 'screens/station_screen.dart';
 import 'screens/station_splash_screen.dart';
@@ -44,7 +43,7 @@ Future<void> main() async {
   runApp(VnvarCameraStationApp(savedIdentity: savedIdentity));
 }
 
-enum _StartupStep { splash, courtSetup, cameraSetup, station }
+enum _StartupStep { splash, cameraSetup, station }
 
 class VnvarCameraStationApp extends StatefulWidget {
   final StationIdentity? savedIdentity;
@@ -70,17 +69,11 @@ class _VnvarCameraStationAppState extends State<VnvarCameraStationApp> {
     if (_identity != null) {
       setState(() => _step = _StartupStep.station);
     } else {
-      _showCourtSetup();
+      _showCameraSetup();
     }
   }
 
-  void _showCourtSetup() {
-    if (!mounted) return;
-    lockPortraitForSetup();
-    setState(() => _step = _StartupStep.courtSetup);
-  }
-
-  void _showCameraSetup(int _) {
+  void _showCameraSetup() {
     if (!mounted) return;
     lockPortraitForSetup();
     setState(() {
@@ -112,11 +105,7 @@ class _VnvarCameraStationAppState extends State<VnvarCameraStationApp> {
         setState(() => _step = _StartupStep.cameraSetup);
         return;
       case _StartupStep.cameraSetup:
-        lockPortraitForSetup();
-        setState(() => _step = _StartupStep.courtSetup);
-        return;
       case _StartupStep.splash:
-      case _StartupStep.courtSetup:
         break;
     }
   }
@@ -125,20 +114,20 @@ class _VnvarCameraStationAppState extends State<VnvarCameraStationApp> {
     switch (_step) {
       case _StartupStep.splash:
         return StationSplashScreen(onFinished: _onSplashFinished);
-      case _StartupStep.courtSetup:
-        return CourtCountScreen(onSaved: _showCameraSetup);
       case _StartupStep.cameraSetup:
         return SetupScreen(
           initialIdentity: _identity,
           onConfigured: _startStation,
-          onBack: _showCourtSetup,
+          onBack: null,
         );
       case _StartupStep.station:
         final identity = _identity;
         if (identity == null) {
-          // Bảo vệ trạng thái không hợp lệ; bình thường không thể xảy ra vì
-          // SetupScreen chỉ chuyển bước sau khi đã tạo StationIdentity.
-          return CourtCountScreen(onSaved: _showCameraSetup);
+          return SetupScreen(
+            initialIdentity: null,
+            onConfigured: _startStation,
+            onBack: null,
+          );
         }
         return StationScreen(
           identity: identity,
@@ -160,7 +149,7 @@ class _VnvarCameraStationAppState extends State<VnvarCameraStationApp> {
         ),
         home: PopScope(
           canPop:
-              _step == _StartupStep.splash || _step == _StartupStep.courtSetup,
+              _step == _StartupStep.splash || _step == _StartupStep.cameraSetup,
           onPopInvokedWithResult: (didPop, _) => _handleSystemBack(didPop),
           child: _buildCurrentScreen(),
         ),
