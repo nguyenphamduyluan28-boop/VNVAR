@@ -87,6 +87,8 @@ class CameraStationRuntime {
   Timer? _pendingThermalThrottleTimer;
   Timer? _pendingThermalRestoreTimer;
   bool _thermalThrottled = false;
+  bool _thermalUserOverride = false;
+  DateTime? _thermalCooledDownSince;
   bool _thermalCriticalSuspended = false;
   bool _thermalCheckRunning = false;
   DateTime? _thermalNormalSince;
@@ -185,7 +187,19 @@ class CameraStationRuntime {
 
   bool get profileSwitching => _profileSwitching;
   double? get temperatureC => _temperatureC;
-  bool get thermalWarning => _thermalThrottled;
+  bool get thermalWarning =>
+      _thermalThrottled || (_temperatureC != null && _temperatureC! >= 41.0);
+  bool get thermalUserOverride => _thermalUserOverride;
+  bool get thermalThrottled => _thermalThrottled;
+  bool get justCooledDown =>
+      _thermalCooledDownSince != null &&
+      DateTime.now().difference(_thermalCooledDownSince!) <
+          const Duration(seconds: 45);
+
+  void dismissCooledDownNotice() {
+    _thermalCooledDownSince = null;
+    _emitState();
+  }
   int get cameraQuarterTurns => _cameraQuarterTurns;
 
   Future<void> setCameraQuarterTurns(int quarterTurns) async {
@@ -1127,17 +1141,32 @@ class CameraStationRuntime {
   Future<void> setResolutionProfile(
     CameraResolutionProfile profile, {
     bool ignoreLock = false,
+    bool userInitiated = true,
   }) {
     if (_resolutionLocked && !ignoreLock) {
       return Future<void>.error(
         StateError('Chế độ phân giải đang bị khóa.'),
       );
     }
-    if (_thermalThrottled &&
-        (profile.preset != CameraResolutionPreset.hd720 || profile.fps > 15)) {
-      return Future<void>.error(
-        StateError('Thiết bị đang nóng; camera tạm khóa ở 720p/15 FPS.'),
-      );
+    // Khách hàng có toàn quyền lựa chọn độ phân giải theo ý muốn.
+    // Nếu máy đang nóng hoặc đang có hẹn giờ hạ độ phân giải, ghi nhận quyền
+    // ưu tiên của khách hàng (user override) và hủy lệnh tự động ép về 720p.
+    if (userInitiated) {
+      if (_thermalThrottled ||
+          _pendingThermalThrottleTimer != null ||
+          thermalWarning) {
+        _thermalUserOverride = true;
+        _thermalThrottled = false;
+        _pendingThermalThrottleTimer?.cancel();
+        _pendingThermalThrottleTimer = null;
+        _profileBeforeThermalThrottle = profile;
+        developer.log(
+          '[THERMAL] Khách hàng chủ động chọn ${profile.shortLabel} (${profile.fps} FPS) '
+          'khi thiết bị ấm; kích hoạt user override',
+          name: 'CameraStationRuntime',
+        );
+      }
+      _thermalCooledDownSince = null;
     }
     _interruptRecovery();
     return _serializeLifecycle(() => _setResolutionProfileInternal(profile));
@@ -1152,11 +1181,17 @@ class CameraStationRuntime {
     }
     CameraResolutionProfile? selected;
     for (final supported in _supportedResolutionProfiles) {
-      if (supported.preset == profile.preset) {
-        selected = profile.fps < supported.fps
-            ? supported.withFps(profile.fps)
-            : supported;
+      if (supported.preset == profile.preset && supported.fps == profile.fps) {
+        selected = supported;
         break;
+      }
+    }
+    if (selected == null) {
+      for (final supported in _supportedResolutionProfiles) {
+        if (supported.preset == profile.preset) {
+          selected = supported.withFps(profile.fps.clamp(1, supported.fps));
+          break;
+        }
       }
     }
     if (selected == null) {
@@ -1176,6 +1211,8 @@ class CameraStationRuntime {
     final currentFacing = webRtc.currentFacingMode;
     final wasRtspPublishing = _rtspPublisherService.isLive;
     final wasWhipPublishing = _whipPublisherService.isLive;
+    final wasUltraWide = webRtc.isCurrentUltraWide;
+    final previousZoom = webRtc.cameraZoom;
     if (wasRtspPublishing) {
       await _rtspPublisherService.prepareForReconfiguration();
     }
@@ -1196,6 +1233,38 @@ class CameraStationRuntime {
       await _waitForIosCaptureWarmup(profile: selected);
       await server.ensureRecording();
       _resolutionProfile = selected;
+
+      // Khôi phục lại góc quay / zoom trước khi đổi độ phân giải
+      if (wasUltraWide && currentFacing == 'environment') {
+        try {
+          await webRtc.switchToLensMode('ultra_wide');
+          final targetRatio = webRtc.ultraWideZoomRatio;
+          await webRtc.setCameraZoom(targetRatio);
+          developer.log(
+            '[CAMERA] Restored ultra-wide lens ($targetRatio) after resolution change',
+            name: 'CameraStationRuntime',
+          );
+        } catch (e) {
+          developer.log(
+            '[CAMERA] Restore ultra-wide lens failed: $e',
+            name: 'CameraStationRuntime',
+          );
+        }
+      } else if (previousZoom > 1.05 && currentFacing == 'environment') {
+        try {
+          await webRtc.setCameraZoom(previousZoom);
+          developer.log(
+            '[CAMERA] Restored zoom ($previousZoom) after resolution change',
+            name: 'CameraStationRuntime',
+          );
+        } catch (e) {
+          developer.log(
+            '[CAMERA] Restore zoom failed: $e',
+            name: 'CameraStationRuntime',
+          );
+        }
+      }
+
       if (persistSelection) {
         await StationConfigService().saveResolutionProfile(selected);
       }
@@ -1218,6 +1287,16 @@ class CameraStationRuntime {
         recording.setFacingMode(currentFacing);
         await _waitForIosCaptureWarmup(profile: previous);
         await server.ensureRecording();
+        if (wasUltraWide && currentFacing == 'environment') {
+          try {
+            await webRtc.switchToLensMode('ultra_wide');
+            await webRtc.setCameraZoom(webRtc.ultraWideZoomRatio);
+          } catch (_) {}
+        } else if (previousZoom > 1.05 && currentFacing == 'environment') {
+          try {
+            await webRtc.setCameraZoom(previousZoom);
+          } catch (_) {}
+        }
         if (wasRtspPublishing) {
           unawaited(_rtspPublisherService.restartIfPublishing());
         }
@@ -1237,6 +1316,79 @@ class CameraStationRuntime {
       _profileSwitching = false;
       _emitState();
     }
+  }
+
+  bool _scannerSavedUltraWide = false;
+  double _scannerSavedZoom = 1.0;
+  String _scannerSavedFacing = 'environment';
+
+  /// Tạm thời giải phóng camera phần cứng để các tính năng quét QR bên ngoài
+  /// (MobileScanner / CameraX) có thể sử dụng mà không xung đột tài nguyên độc quyền.
+  Future<void> pauseCameraForScanner() async {
+    final webRtc = _webRtcService;
+    final recording = _recordingService;
+    if (webRtc == null) return;
+
+    developer.log(
+      '[RUNTIME] Pausing station camera for external QR scanner...',
+      name: 'CameraStationRuntime',
+    );
+    try {
+      _scannerSavedUltraWide = webRtc.isCurrentUltraWide;
+      _scannerSavedZoom = webRtc.cameraZoom;
+      _scannerSavedFacing = webRtc.currentFacingMode;
+
+      if (recording != null) {
+        await recording.stop();
+      }
+      await webRtc.disposeConnection();
+      await webRtc.disposeCamera();
+    } catch (e) {
+      developer.log(
+        '[RUNTIME] Error pausing camera for scanner: $e',
+        name: 'CameraStationRuntime',
+      );
+    }
+    _emitState();
+  }
+
+  /// Khôi phục camera của trạm sau khi quét mã QR hoàn tất.
+  Future<void> resumeCameraAfterScanner() async {
+    final webRtc = _webRtcService;
+    final recording = _recordingService;
+    final server = _cameraServer;
+    if (webRtc == null) return;
+
+    developer.log(
+      '[RUNTIME] Resuming station camera after QR scanner...',
+      name: 'CameraStationRuntime',
+    );
+    try {
+      await webRtc.initializeCamera(facingMode: _scannerSavedFacing);
+      recording?.setFacingMode(_scannerSavedFacing);
+      await _waitForIosCaptureWarmup(profile: _resolutionProfile);
+      if (server != null) {
+        await server.ensureRecording();
+      }
+
+      if (_scannerSavedUltraWide && _scannerSavedFacing == 'environment') {
+        try {
+          await webRtc.switchToLensMode('ultra_wide');
+          final targetRatio = webRtc.ultraWideZoomRatio;
+          await webRtc.setCameraZoom(targetRatio);
+        } catch (_) {}
+      } else if (_scannerSavedZoom > 1.05 && _scannerSavedFacing == 'environment') {
+        try {
+          await webRtc.setCameraZoom(_scannerSavedZoom);
+        } catch (_) {}
+      }
+    } catch (e) {
+      developer.log(
+        '[RUNTIME] Error resuming camera after scanner: $e',
+        name: 'CameraStationRuntime',
+      );
+    }
+    _emitState();
   }
 
   void _emitState() {
@@ -1728,32 +1880,45 @@ class CameraStationRuntime {
         _emitState();
         return;
       }
-      if (hot) _thermalNormalSince = null;
       if (hot) {
+        _thermalNormalSince = null;
+        _thermalCooledDownSince = null;
         _pendingThermalRestoreTimer?.cancel();
         _pendingThermalRestoreTimer = null;
       }
       if (hot &&
           !_thermalThrottled &&
+          !_thermalUserOverride &&
           _pendingThermalThrottleTimer == null &&
           !_profileSwitching) {
         _profileBeforeThermalThrottle = _resolutionProfile;
         _scheduleThermalThrottleAtSegmentBoundary();
-      } else if (!hot && _thermalThrottled && !_profileSwitching) {
-        final now = DateTime.now();
-        _thermalNormalSince ??= now;
-        if (now.difference(_thermalNormalSince!) < _thermalRestoreDelay) {
-          _emitState();
-          return;
+      } else if (!hot) {
+        if (_thermalUserOverride) {
+          _thermalUserOverride = false;
+          _thermalCooledDownSince = DateTime.now();
+          developer.log(
+            '[THERMAL] Thiết bị đã hạ nhiệt an toàn; giải phóng cờ user override',
+            name: 'CameraStationRuntime',
+          );
         }
-        final previous = _profileBeforeThermalThrottle;
-        if (previous != null) {
-          if (_pendingThermalRestoreTimer == null) {
-            _scheduleThermalRestoreAtSegmentBoundary(previous);
+        if (_thermalThrottled && !_profileSwitching) {
+          final now = DateTime.now();
+          _thermalNormalSince ??= now;
+          if (now.difference(_thermalNormalSince!) < _thermalRestoreDelay) {
+            _emitState();
+            return;
           }
-        } else {
-          _thermalThrottled = false;
-          _thermalNormalSince = null;
+          final previous = _profileBeforeThermalThrottle;
+          if (previous != null) {
+            if (_pendingThermalRestoreTimer == null) {
+              _scheduleThermalRestoreAtSegmentBoundary(previous);
+            }
+          } else {
+            _thermalThrottled = false;
+            _thermalNormalSince = null;
+            _thermalCooledDownSince = DateTime.now();
+          }
         }
         _emitState();
       } else {
@@ -1797,11 +1962,12 @@ class CameraStationRuntime {
     }
     _thermalThrottled = false;
     try {
-      await setResolutionProfile(profile);
+      await _setResolutionProfileInternal(profile, persistSelection: false);
       _profileBeforeThermalThrottle = null;
       _thermalNormalSince = null;
+      _thermalCooledDownSince = DateTime.now();
       developer.log(
-        '[THERMAL] Segment boundary reached; restored camera profile',
+        '[THERMAL] Segment boundary reached; restored camera profile to ${profile.shortLabel}',
         name: 'CameraStationRuntime',
       );
     } catch (error, stackTrace) {
@@ -1846,6 +2012,7 @@ class CameraStationRuntime {
         _thermalCriticalSuspended ||
         _iosLifecycleSuspended ||
         _thermalThrottled ||
+        _thermalUserOverride ||
         _profileSwitching) {
       return;
     }
@@ -1856,7 +2023,10 @@ class CameraStationRuntime {
       name: 'CameraStationRuntime',
     );
     try {
-      await setResolutionProfile(CameraResolutionProfile.hd720.withFps(15));
+      await _setResolutionProfileInternal(
+        CameraResolutionProfile.hd720.withFps(15),
+        persistSelection: false,
+      );
     } catch (error, stackTrace) {
       _thermalThrottled = false;
       developer.log(

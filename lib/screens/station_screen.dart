@@ -420,6 +420,10 @@ class _StationScreenState extends State<StationScreen>
 
       setState(() {
         _cameraQuarterTurns = _runtime.cameraQuarterTurns;
+        if (!_lensSwitching &&
+            (_zoomDebounce == null || !_zoomDebounce!.isActive)) {
+          _zoomValue = _runtime.webRtcService?.cameraZoom;
+        }
         final address = _runtime.lanAddress;
         final port =
             _runtime.cameraServer?.apiPort ?? CameraServer.defaultApiPort;
@@ -1108,9 +1112,26 @@ class _StationScreenState extends State<StationScreen>
       constraints: const BoxConstraints(maxWidth: 560),
       builder: _buildResolutionPicker,
     );
-    if (selected == null || !mounted) return;
+    if (!mounted) return;
+    _runtime.dismissCooledDownNotice();
+    if (selected == null) return;
     try {
       await _runtime.setResolutionProfile(selected);
+      if (mounted) {
+        setState(() {
+          _zoomValue = _runtime.webRtcService?.cameraZoom;
+        });
+        if (_runtime.thermalUserOverride) {
+          _showStationToast(
+            appText(
+              context,
+              'Đã áp dụng ${selected.title}. Chế độ chất lượng được duy trì theo lựa chọn của bạn.',
+              'Applied ${selected.title}. Quality maintained per your selection.',
+            ),
+            icon: Icons.check_circle_rounded,
+          );
+        }
+      }
     } catch (error) {
       if (mounted) {
         _showStationToast(
@@ -1133,10 +1154,16 @@ class _StationScreenState extends State<StationScreen>
         final landscape = media.orientation == Orientation.landscape;
         final columns = landscape && media.size.width >= 560 ? 2 : 1;
         final rows = (profiles.length / columns).ceil();
-        final contentHeight = 58.0 + (rows * 88.0) + ((rows - 1) * 10.0) + 16.0;
-        final maximumHeight = (media.size.height * (landscape ? 0.72 : 0.48)).clamp(
-          220.0,
-          400.0,
+        final hasThermalBanner =
+            (_runtime.temperatureC != null && _runtime.temperatureC! >= 38.0) ||
+            _runtime.justCooledDown;
+        final contentHeight = 58.0 +
+            (rows * 88.0) +
+            ((rows - 1) * 10.0) +
+            (hasThermalBanner ? 52.0 : 16.0);
+        final maximumHeight = (media.size.height * (landscape ? 0.85 : 0.65)).clamp(
+          240.0,
+          480.0,
         );
         final sheetHeight = contentHeight < maximumHeight
             ? contentHeight
@@ -1242,6 +1269,77 @@ class _StationScreenState extends State<StationScreen>
                       ),
                     ],
                   ),
+                  if (hasThermalBanner) ...[
+                    const SizedBox(height: 8),
+                    Container(
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 10,
+                        vertical: 6,
+                      ),
+                      decoration: BoxDecoration(
+                        color: _runtime.justCooledDown
+                            ? const Color(0xFF00C853).withValues(alpha: 0.15)
+                            : _runtime.thermalWarning
+                                ? const Color(0xFFC62828).withValues(alpha: 0.18)
+                                : const Color(0xFFE65100).withValues(alpha: 0.15),
+                        borderRadius: BorderRadius.circular(8),
+                        border: Border.all(
+                          color: _runtime.justCooledDown
+                              ? const Color(0xFF00E676).withValues(alpha: 0.35)
+                              : _runtime.thermalWarning
+                                  ? const Color(0xFFEF5350).withValues(alpha: 0.35)
+                                  : const Color(0xFFFF9800).withValues(alpha: 0.3),
+                        ),
+                      ),
+                      child: Row(
+                        children: [
+                          Icon(
+                            _runtime.justCooledDown
+                                ? Icons.ac_unit_rounded
+                                : _runtime.thermalWarning
+                                    ? Icons.whatshot_rounded
+                                    : Icons.thermostat_rounded,
+                            size: 15,
+                            color: _runtime.justCooledDown
+                                ? const Color(0xFF69F0AE)
+                                : _runtime.thermalWarning
+                                    ? const Color(0xFFFF8A80)
+                                    : const Color(0xFFFFB74D),
+                          ),
+                          const SizedBox(width: 8),
+                          Expanded(
+                            child: Text(
+                              _runtime.justCooledDown
+                                  ? appText(
+                                      context,
+                                      'Thiết bị đã hạ nhiệt an toàn (${_runtime.temperatureC?.toStringAsFixed(0) ?? ''}°C). Bạn có thể chọn lại độ phân giải mong muốn.',
+                                      'Device has cooled down (${_runtime.temperatureC?.toStringAsFixed(0) ?? ''}°C). You can re-select your preferred quality.',
+                                    )
+                                  : _runtime.thermalWarning
+                                      ? appText(
+                                          context,
+                                          'Thiết bị đang nóng (${_runtime.temperatureC?.toStringAsFixed(0)}°C). Bạn vẫn có thể chủ động chọn độ phân giải theo ý muốn.',
+                                          'Device is warm (${_runtime.temperatureC?.toStringAsFixed(0)}°C). You can still choose your preferred quality.',
+                                        )
+                                      : appText(
+                                          context,
+                                          'Nhiệt độ hiện tại: ${_runtime.temperatureC?.toStringAsFixed(0)}°C.',
+                                          'Current temperature: ${_runtime.temperatureC?.toStringAsFixed(0)}°C.',
+                                        ),
+                              style: TextStyle(
+                                color: _runtime.justCooledDown
+                                    ? const Color(0xFFB9F6CA)
+                                    : _runtime.thermalWarning
+                                        ? const Color(0xFFFFCDD2)
+                                        : const Color(0xFFFFE0B2),
+                                fontSize: 11.5,
+                              ),
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ],
                   const SizedBox(height: 10),
                   Expanded(
                     child: GridView.builder(
@@ -1255,11 +1353,8 @@ class _StationScreenState extends State<StationScreen>
                       ),
                       itemBuilder: (context, index) {
                         final profile = profiles[index];
-                        final active =
-                            profile.preset == _runtime.resolutionProfile.preset;
-                        final displayProfile = active
-                            ? _runtime.resolutionProfile
-                            : profile;
+                        final active = profile == _runtime.resolutionProfile;
+                        final displayProfile = profile;
                         return Material(
                           color: active
                               ? const Color(0xFF1565C0)
@@ -1324,48 +1419,98 @@ class _StationScreenState extends State<StationScreen>
                                               ? Colors.white24
                                               : Colors.white38,
                                     ),
-                                  const SizedBox(width: 10),
-                                  Expanded(
-                                    child: Column(
-                                      mainAxisAlignment: MainAxisAlignment.center,
-                                      crossAxisAlignment: CrossAxisAlignment.start,
-                                      children: [
-                                        Text(
-                                          displayProfile.title,
-                                          maxLines: 1,
-                                          overflow: TextOverflow.ellipsis,
-                                          style: TextStyle(
-                                            color: isLocked && !active
-                                                ? Colors.white54
-                                                : Colors.white,
-                                            fontWeight: FontWeight.w800,
+                                    const SizedBox(width: 10),
+                                    Expanded(
+                                      child: Column(
+                                        mainAxisAlignment:
+                                            MainAxisAlignment.center,
+                                        crossAxisAlignment:
+                                            CrossAxisAlignment.start,
+                                        children: [
+                                          Row(
+                                            children: [
+                                              Expanded(
+                                                child: Text(
+                                                  displayProfile.title,
+                                                  maxLines: 1,
+                                                  overflow:
+                                                      TextOverflow.ellipsis,
+                                                  style: TextStyle(
+                                                    color: isLocked && !active
+                                                        ? Colors.white54
+                                                        : Colors.white,
+                                                    fontWeight: FontWeight.w800,
+                                                  ),
+                                                ),
+                                              ),
+                                              const SizedBox(width: 6),
+                                              Container(
+                                                padding:
+                                                    const EdgeInsets.symmetric(
+                                                  horizontal: 6,
+                                                  vertical: 2,
+                                                ),
+                                                decoration: BoxDecoration(
+                                                  color: displayProfile.fps >=
+                                                          50
+                                                      ? const Color(0xFF00E676)
+                                                          .withValues(
+                                                              alpha: 0.18)
+                                                      : Colors.white
+                                                          .withValues(
+                                                              alpha: 0.08),
+                                                  borderRadius:
+                                                      BorderRadius.circular(6),
+                                                  border: Border.all(
+                                                    color: displayProfile.fps >=
+                                                            50
+                                                        ? const Color(
+                                                                0xFF00E676)
+                                                            .withValues(
+                                                                alpha: 0.5)
+                                                        : Colors.white24,
+                                                    width: 0.8,
+                                                  ),
+                                                ),
+                                                child: Text(
+                                                  '${displayProfile.fps} FPS',
+                                                  style: TextStyle(
+                                                    color: displayProfile.fps >=
+                                                            50
+                                                        ? const Color(
+                                                            0xFF69F0AE)
+                                                        : Colors.white70,
+                                                    fontSize: 10.5,
+                                                    fontWeight:
+                                                        FontWeight.w800,
+                                                  ),
+                                                ),
+                                              ),
+                                            ],
                                           ),
-                                        ),
-                                        const SizedBox(height: 4),
-                                        Text(
-                                          '${displayProfile.width} × ${displayProfile.height}  •  '
-                                          '${displayProfile.fps} FPS\n'
-                                          '${(displayProfile.bitrate / 1000000).toStringAsFixed(1)} Mbps',
-                                          maxLines: 2,
-                                          overflow: TextOverflow.ellipsis,
-                                          style: TextStyle(
-                                            color: isLocked && !active
-                                                ? Colors.white30
-                                                : Colors.white60,
-                                            fontSize: 12,
-                                            height: 1.2,
+                                          const SizedBox(height: 4),
+                                          Text(
+                                            '${displayProfile.width} × ${displayProfile.height}  •  '
+                                            '${(displayProfile.bitrate / 1000000).toStringAsFixed(1)} Mbps',
+                                            maxLines: 1,
+                                            overflow: TextOverflow.ellipsis,
+                                            style: TextStyle(
+                                              color: isLocked && !active
+                                                  ? Colors.white30
+                                                  : Colors.white60,
+                                              fontSize: 12,
+                                            ),
                                           ),
-                                        ),
-                                      ],
+                                        ],
+                                      ),
                                     ),
-                                  ),
-                                ],
+                                  ],
+                                ),
                               ),
                             ),
                           ),
-                        ),
-                      );
-                    },
+                        );
+                      },
                     ),
                   ),
                 ],
@@ -1378,22 +1523,6 @@ class _StationScreenState extends State<StationScreen>
   }
 
   void _handleResolutionPressed() {
-    if (_runtime.thermalWarning) {
-      _showStationToast(
-        appText(
-          context,
-          'Thiết bị đang nóng. Chất lượng tạm khóa ở '
-              '${_runtime.resolutionProfile.shortLabel}/'
-              '${_runtime.resolutionProfile.fps} FPS để bảo vệ máy, sẽ tự khôi phục khi nhiệt độ ổn định.',
-          'Device temperature is high. Quality is temporarily locked at '
-              '${_runtime.resolutionProfile.shortLabel}/'
-              '${_runtime.resolutionProfile.fps} FPS and will recover when temperature is stable.',
-        ),
-        icon: Icons.thermostat_rounded,
-        duration: const Duration(seconds: 3),
-      );
-      return;
-    }
     _openResolutionPicker();
   }
 
@@ -1781,6 +1910,10 @@ class _StationScreenState extends State<StationScreen>
                             courtLabel: _courtLabel(widget.identity.courtId),
                             recording: _recording,
                             thermalWarning: _runtime.thermalWarning,
+                            temperatureC: _runtime.temperatureC,
+                            thermalUserOverride: _runtime.thermalUserOverride,
+                            justCooledDown: _runtime.justCooledDown,
+                            onDismissCooledDown: _runtime.dismissCooledDownNotice,
                             compact: compact,
                             landscape: landscape,
                             resolutionProfile: _runtime.resolutionProfile,
@@ -1828,11 +1961,16 @@ class _StationScreenState extends State<StationScreen>
                               ),
                             ),
                           ],
-                          if (_runtime.thermalWarning && !landscape) ...[
+                          if ((_runtime.thermalWarning || _runtime.justCooledDown) && !landscape) ...[
                             SizedBox(height: compact ? 6 : 8),
                             _ThermalToast(
                               compact: compact,
                               landscape: landscape,
+                              temperatureC: _runtime.temperatureC,
+                              userOverride: _runtime.thermalUserOverride,
+                              isCooledDown: _runtime.justCooledDown,
+                              onTap: _openResolutionPicker,
+                              onDismiss: _runtime.dismissCooledDownNotice,
                             ),
                           ],
                         ],
@@ -2240,65 +2378,158 @@ class _FocusIndicatorState extends State<_FocusIndicator>
 }
 
 class _ThermalToast extends StatelessWidget {
-  const _ThermalToast({required this.compact, required this.landscape});
+  const _ThermalToast({
+    required this.compact,
+    required this.landscape,
+    required this.onTap,
+    this.onDismiss,
+    this.temperatureC,
+    this.userOverride = false,
+    this.isCooledDown = false,
+  });
 
   final bool compact;
   final bool landscape;
+  final VoidCallback onTap;
+  final VoidCallback? onDismiss;
+  final double? temperatureC;
+  final bool userOverride;
+  final bool isCooledDown;
 
   @override
   Widget build(BuildContext context) {
+    final tempStr =
+        temperatureC != null ? '${temperatureC!.toStringAsFixed(0)}°C' : '';
+
+    Color bgColor;
+    Color borderColor;
+    Color textColor;
+    IconData icon;
+    String message;
+
+    if (isCooledDown) {
+      bgColor = const Color(0xFF0D2818).withValues(alpha: 0.75);
+      borderColor = const Color(0xFF00E676).withValues(alpha: 0.45);
+      textColor = const Color(0xFFB9F6CA);
+      icon = Icons.ac_unit_rounded;
+      message = appText(
+        context,
+        tempStr.isNotEmpty
+            ? 'Thiết bị đã hạ nhiệt an toàn ($tempStr). Chạm để chọn lại độ phân giải.'
+            : 'Thiết bị đã hạ nhiệt an toàn. Chạm để chọn lại độ phân giải.',
+        tempStr.isNotEmpty
+            ? 'Device has cooled down ($tempStr). Tap to choose resolution.'
+            : 'Device has cooled down. Tap to choose resolution.',
+      );
+    } else if (userOverride) {
+      bgColor = const Color(0xFF2E1C0A).withValues(alpha: 0.75);
+      borderColor = const Color(0xFFFF9800).withValues(alpha: 0.45);
+      textColor = const Color(0xFFFFE0B2);
+      icon = Icons.thermostat_rounded;
+      message = appText(
+        context,
+        tempStr.isNotEmpty
+            ? 'Thiết bị đang ấm ($tempStr). Đang dùng độ phân giải bạn chọn. Chạm để đổi.'
+            : 'Thiết bị đang ấm. Đang dùng độ phân giải bạn chọn. Chạm để đổi.',
+        tempStr.isNotEmpty
+            ? 'Device is warm ($tempStr). Using your selected resolution. Tap to change.'
+            : 'Device is warm. Using your selected resolution. Tap to change.',
+      );
+    } else {
+      bgColor = const Color(0xFF2A1C08).withValues(alpha: 0.75);
+      borderColor = Colors.amber.withValues(alpha: 0.50);
+      textColor = Colors.amber.shade100;
+      icon = Icons.whatshot_rounded;
+      message = appText(
+        context,
+        tempStr.isNotEmpty
+            ? 'Thiết bị đang nóng ($tempStr). Tạm hạ để bảo vệ máy. Chạm để chọn lại.'
+            : 'Thiết bị đang nóng. Tạm hạ để bảo vệ máy. Chạm để chọn lại.',
+        tempStr.isNotEmpty
+            ? 'Device is hot ($tempStr). Temporarily lowered to protect camera. Tap to change.'
+            : 'Device is hot. Temporarily lowered to protect camera. Tap to change.',
+      );
+    }
+
     return ConstrainedBox(
       constraints: BoxConstraints(
-        maxWidth: landscape ? (compact ? 310 : 430) : double.infinity,
+        maxWidth: landscape ? (compact ? 330 : 450) : double.infinity,
       ),
       child: ClipRRect(
         borderRadius: BorderRadius.circular(18),
         child: BackdropFilter(
           filter: ui.ImageFilter.blur(sigmaX: 12, sigmaY: 12),
-          child: Container(
-            padding: EdgeInsets.symmetric(
-              horizontal: compact ? 8 : 10,
-              vertical: compact ? 5 : 7,
-            ),
-            decoration: BoxDecoration(
-              color: const Color(0xFF2A1C08).withValues(alpha: 0.38),
+          child: Material(
+            color: Colors.transparent,
+            child: InkWell(
               borderRadius: BorderRadius.circular(18),
-              border: Border.all(color: Colors.amber.withValues(alpha: 0.42)),
-              boxShadow: const [
-                BoxShadow(
-                  color: Color(0x33000000),
-                  blurRadius: 12,
-                  offset: Offset(0, 4),
+              onTap: onTap,
+              child: Container(
+                padding: EdgeInsets.symmetric(
+                  horizontal: compact ? 8 : 10,
+                  vertical: compact ? 5 : 7,
                 ),
-              ],
-            ),
-            child: Row(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                Icon(
-                  Icons.warning_amber_rounded,
-                  color: Colors.amber,
-                  size: compact ? 14 : 16,
-                ),
-                const SizedBox(width: 8),
-                Expanded(
-                  child: Text(
-                    appText(
-                      context,
-                      'Thiết bị đang nóng. Đã giảm xuống 720p/15 FPS để bảo vệ camera.',
-                      'Device temperature is high. Reduced to 720p/15 FPS to protect the camera.',
+                decoration: BoxDecoration(
+                  color: bgColor,
+                  borderRadius: BorderRadius.circular(18),
+                  border: Border.all(color: borderColor),
+                  boxShadow: const [
+                    BoxShadow(
+                      color: Color(0x33000000),
+                      blurRadius: 12,
+                      offset: Offset(0, 4),
                     ),
-                    maxLines: 2,
-                    overflow: TextOverflow.ellipsis,
-                    style: TextStyle(
-                      color: Colors.amber.shade100,
-                      fontSize: compact ? 9 : 10,
-                      height: 1.15,
-                      fontWeight: FontWeight.w700,
-                    ),
-                  ),
+                  ],
                 ),
-              ],
+                child: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Icon(
+                      icon,
+                      color: isCooledDown
+                          ? const Color(0xFF69F0AE)
+                          : (userOverride
+                              ? const Color(0xFFFFB74D)
+                              : Colors.amber),
+                      size: compact ? 14 : 16,
+                    ),
+                    const SizedBox(width: 8),
+                    Expanded(
+                      child: Text(
+                        message,
+                        maxLines: 2,
+                        overflow: TextOverflow.ellipsis,
+                        style: TextStyle(
+                          color: textColor,
+                          fontSize: compact ? 9.5 : 10.5,
+                          height: 1.18,
+                          fontWeight: FontWeight.w700,
+                        ),
+                      ),
+                    ),
+                    const SizedBox(width: 6),
+                    Icon(
+                      Icons.arrow_forward_ios_rounded,
+                      size: compact ? 10 : 12,
+                      color: textColor.withValues(alpha: 0.7),
+                    ),
+                    if (isCooledDown && onDismiss != null) ...[
+                      const SizedBox(width: 4),
+                      GestureDetector(
+                        onTap: onDismiss,
+                        child: Padding(
+                          padding: const EdgeInsets.all(2.0),
+                          child: Icon(
+                            Icons.close_rounded,
+                            size: compact ? 12 : 14,
+                            color: textColor.withValues(alpha: 0.6),
+                          ),
+                        ),
+                      ),
+                    ],
+                  ],
+                ),
+              ),
             ),
           ),
         ),
@@ -2723,6 +2954,10 @@ class _StationHeader extends StatelessWidget {
   final String courtLabel;
   final bool recording;
   final bool thermalWarning;
+  final double? temperatureC;
+  final bool thermalUserOverride;
+  final bool justCooledDown;
+  final VoidCallback? onDismissCooledDown;
   final bool compact;
   final bool landscape;
   final CameraResolutionProfile resolutionProfile;
@@ -2739,6 +2974,10 @@ class _StationHeader extends StatelessWidget {
     required this.courtLabel,
     required this.recording,
     required this.thermalWarning,
+    this.temperatureC,
+    this.thermalUserOverride = false,
+    this.justCooledDown = false,
+    this.onDismissCooledDown,
     required this.compact,
     required this.landscape,
     required this.resolutionProfile,
@@ -2848,9 +3087,17 @@ class _StationHeader extends StatelessWidget {
                     ],
                   ),
                 ),
-                if (thermalWarning) ...[
+                if (thermalWarning || justCooledDown) ...[
                   const SizedBox(height: 10),
-                  _ThermalToast(compact: compact, landscape: true),
+                  _ThermalToast(
+                    compact: compact,
+                    landscape: true,
+                    temperatureC: temperatureC,
+                    userOverride: thermalUserOverride,
+                    isCooledDown: justCooledDown,
+                    onTap: onResolution ?? () {},
+                    onDismiss: onDismissCooledDown,
+                  ),
                 ],
               ],
             ),

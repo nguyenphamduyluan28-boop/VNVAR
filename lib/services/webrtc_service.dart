@@ -521,18 +521,23 @@ class WebRtcService {
           final maxFps = item['maxFps'];
           if (profile != null && maxFps is num && maxFps.toInt() > 0) {
             final detectedFps = maxFps.toInt();
-            final platformFps =
-                Platform.isAndroid &&
-                    profile.preset == CameraResolutionPreset.ultraHd4k
-                ? math.min(detectedFps, 20)
-                : detectedFps;
-            supported.add(profile.withFps(platformFps));
+            // Nếu phần cứng hỗ trợ >= 50 FPS (tức là 60 FPS thực tế),
+            // thêm BOTH 30 FPS (tiết kiệm pin / mạng yếu) và max FPS (60).
+            // Nếu phần cứng chỉ đạt 30 FPS, chỉ thêm 1 option.
+            if (detectedFps >= 50) {
+              supported.add(profile.withFps(30)); // option tiết kiệm
+              supported.add(profile.withFps(detectedFps)); // option tối đa
+            } else {
+              supported.add(profile.withFps(detectedFps));
+            }
           }
         }
         if (supported.isNotEmpty && detectedDeviceId != null) {
-          supported.sort(
-            (left, right) => left.preset.index.compareTo(right.preset.index),
-          );
+          supported.sort((left, right) {
+            final presetCmp = left.preset.index.compareTo(right.preset.index);
+            if (presetCmp != 0) return presetCmp;
+            return left.fps.compareTo(right.fps);
+          });
           _preferredCameraDeviceIds[facingMode] = detectedDeviceId;
           _resolutionProfileDeviceIds[facingMode] = detectedDeviceId;
           _verifiedResolutionProfiles[facingMode] = List.unmodifiable(

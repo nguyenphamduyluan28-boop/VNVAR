@@ -14,6 +14,7 @@ class StationConfigService {
   static const String _cameraPositionKey = 'cameraPosition';
   static const String _courtCountKey = 'courtCount';
   static const String _resolutionProfileKey = 'camera_resolution_profile';
+  static const String _resolutionFpsKey = 'camera_resolution_fps';
   static const String _resolutionLockedKey = 'camera_resolution_locked';
   static const String _adaptiveFpsPrefix = 'ios_adaptive_fps';
   static const String _apiPortKey = 'camera_api_port';
@@ -170,13 +171,20 @@ class StationConfigService {
   Future<void> saveResolutionProfile(CameraResolutionProfile profile) async {
     final prefs = await SharedPreferences.getInstance();
     await prefs.setString(_resolutionProfileKey, profile.id);
+    await prefs.setInt(_resolutionFpsKey, profile.fps);
   }
 
   Future<CameraResolutionProfile?> loadResolutionProfile() async {
     final prefs = await SharedPreferences.getInstance();
-    return CameraResolutionProfile.fromId(
+    final profile = CameraResolutionProfile.fromId(
       prefs.getString(_resolutionProfileKey),
     );
+    if (profile == null) return null;
+    final savedFps = prefs.getInt(_resolutionFpsKey);
+    if (savedFps != null && savedFps > 0) {
+      return profile.withFps(savedFps);
+    }
+    return profile;
   }
 
   Future<void> saveResolutionLocked(bool locked) async {

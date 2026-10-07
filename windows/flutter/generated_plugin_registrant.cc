@@ -8,6 +8,7 @@
 
 #include <bonsoir_windows/bonsoir_windows_plugin_c_api.h>
 #include <ffmpeg_kit_flutter_new_video/f_fmpeg_kit_flutter_plugin.h>
+#include <file_selector_windows/file_selector_windows.h>
 #include <flutter_webrtc/flutter_web_r_t_c_plugin.h>
 
 void RegisterPlugins(flutter::PluginRegistry* registry) {
@@ -15,6 +16,8 @@ void RegisterPlugins(flutter::PluginRegistry* registry) {
       registry->GetRegistrarForPlugin("BonsoirWindowsPluginCApi"));
   FFmpegKitFlutterPluginRegisterWithRegistrar(
       registry->GetRegistrarForPlugin("FFmpegKitFlutterPlugin"));
+  FileSelectorWindowsRegisterWithRegistrar(
+      registry->GetRegistrarForPlugin("FileSelectorWindows"));
   FlutterWebRTCPluginRegisterWithRegistrar(
       registry->GetRegistrarForPlugin("FlutterWebRTCPlugin"));
 }

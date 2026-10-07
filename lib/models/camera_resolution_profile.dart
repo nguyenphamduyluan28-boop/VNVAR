@@ -73,12 +73,16 @@ class CameraResolutionProfile {
   };
 
   CameraResolutionProfile withFps(int supportedFps) {
+    final clampedFps = supportedFps.clamp(1, 60);
+    final adjustedBitrate = clampedFps >= 50
+        ? (bitrate * 1.25).toInt()
+        : (clampedFps <= 15 ? (bitrate * 0.6).toInt() : bitrate);
     return CameraResolutionProfile(
       preset: preset,
       width: width,
       height: height,
-      fps: supportedFps.clamp(1, fps),
-      bitrate: bitrate,
+      fps: clampedFps,
+      bitrate: adjustedBitrate,
     );
   }
 

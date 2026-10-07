@@ -7,6 +7,7 @@ import '../services/camera_station_runtime.dart';
 import '../services/station_config_service.dart';
 import '../services/whip_publisher_service.dart';
 import '../services/rtsp_publisher_service.dart';
+import '../widgets/qr_stream_scanner_dialog.dart';
 
 class LiveStreamScreen extends StatefulWidget {
   final CameraStationRuntime runtime;
@@ -245,6 +246,210 @@ class _LiveStreamScreenState extends State<LiveStreamScreen> {
       return;
     }
     _handleSmartPasteOrInput(text);
+  }
+
+  Future<void> _handleScanQrCode() async {
+    if (_isAnyLive) {
+      _showToast(
+        appText(
+          context,
+          'Vui lòng dừng phát trực tiếp trước khi quét mã mới.',
+          'Please stop streaming before scanning a new QR code.',
+        ),
+        isError: true,
+      );
+      return;
+    }
+
+    // 1. Tạm dừng camera của Station để nhường phần cứng độc quyền cho Scanner
+    await widget.runtime.pauseCameraForScanner();
+    if (!mounted) return;
+
+    QrStreamParseResult? result;
+    try {
+      result = await QrStreamScannerDialog.show(context);
+    } finally {
+      // 2. Chờ 300ms cho native CameraX unbind hoàn toàn
+      await Future.delayed(const Duration(milliseconds: 300));
+      // 3. Khôi phục lại Station camera (bảo toàn lens/zoom/microphone)
+      await widget.runtime.resumeCameraAfterScanner();
+      // 4. Cho camera warmup một nhịp ngắn trước khi phát tiếp
+      await Future.delayed(const Duration(milliseconds: 350));
+    }
+
+    final parseResult = result;
+    if (parseResult == null || !mounted) return;
+
+    final targetUrl = parseResult.streamUrl.trim();
+    if (targetUrl.isEmpty) return;
+
+    if (parseResult.protocol == 'whip') {
+      setState(() {
+        _selectedProtocol = 'whip';
+        _whipUrlController.text = targetUrl;
+        if (parseResult.token != null && parseResult.token!.isNotEmpty) {
+          _whipTokenController.text = parseResult.token!;
+        }
+      });
+      await widget.configService.saveWhipConfig(
+        endpointUrl: targetUrl,
+        token: _whipTokenController.text.trim(),
+      );
+      await widget.configService.saveStreamProtocol('whip');
+
+      if (!mounted) return;
+      _showToast(
+        appText(
+          context,
+          'Đã nhận diện mã trận${parseResult.matchTitle != null ? ": ${parseResult.matchTitle}" : ""}. Đang tự động kết nối WHIP...',
+          'Recognized match${parseResult.matchTitle != null ? ": ${parseResult.matchTitle}" : ""}. Connecting WHIP...',
+        ),
+      );
+
+      if (parseResult.autoStart) {
+        await _handleStartWhip();
+      }
+    } else {
+      setState(() {
+        _selectedProtocol = 'rtsp';
+      });
+      _handleSmartPasteOrInput(targetUrl);
+      await widget.configService.saveRtspPushConfig(
+        targetUrl: _rtspUrlController.text.trim(),
+      );
+      await widget.configService.saveStreamProtocol('rtsp');
+
+      if (!mounted) return;
+      _showToast(
+        appText(
+          context,
+          'Đã nhận diện mã trận${parseResult.matchTitle != null ? ": ${parseResult.matchTitle}" : ""}. Đang tự động phát sóng...',
+          'Recognized match${parseResult.matchTitle != null ? ": ${parseResult.matchTitle}" : ""}. Auto-starting stream...',
+        ),
+      );
+
+      if (parseResult.autoStart) {
+        await _handleStartRtspPush();
+      }
+    }
+  }
+
+  Widget _buildQrScanBanner(bool isLive) {
+    return Container(
+      margin: const EdgeInsets.only(bottom: 16),
+      padding: const EdgeInsets.all(14),
+      decoration: BoxDecoration(
+        gradient: LinearGradient(
+          colors: isLive
+              ? [
+                  const Color(0xFF1E2633),
+                  const Color(0xFF141A23),
+                ]
+              : [
+                  const Color(0xFF0D47A1).withValues(alpha: 0.35),
+                  const Color(0xFF161B22),
+                ],
+          begin: Alignment.topLeft,
+          end: Alignment.bottomRight,
+        ),
+        borderRadius: BorderRadius.circular(14),
+        border: Border.all(
+          color: isLive
+              ? Colors.white.withValues(alpha: 0.08)
+              : const Color(0xFF1E88E5).withValues(alpha: 0.4),
+        ),
+        boxShadow: isLive
+            ? null
+            : [
+                BoxShadow(
+                  color: const Color(0xFF1565C0).withValues(alpha: 0.15),
+                  blurRadius: 12,
+                  spreadRadius: 1,
+                ),
+              ],
+      ),
+      child: Row(
+        children: [
+          Container(
+            padding: const EdgeInsets.all(10),
+            decoration: BoxDecoration(
+              color: isLive
+                  ? Colors.white.withValues(alpha: 0.08)
+                  : const Color(0xFF1976D2).withValues(alpha: 0.25),
+              borderRadius: BorderRadius.circular(12),
+              border: Border.all(
+                color: isLive
+                    ? Colors.white10
+                    : const Color(0xFF64B5F6).withValues(alpha: 0.5),
+              ),
+            ),
+            child: Icon(
+              Icons.qr_code_scanner_rounded,
+              color: isLive ? Colors.white38 : Colors.lightBlueAccent,
+              size: 26,
+            ),
+          ),
+          const SizedBox(width: 12),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  appText(
+                    context,
+                    'QUÉT MÃ QR TRẬN ĐẤU (SPORTO)',
+                    'SCAN MATCH QR CODE (SPORTO)',
+                  ),
+                  style: TextStyle(
+                    color: isLive ? Colors.white60 : Colors.white,
+                    fontWeight: FontWeight.w900,
+                    fontSize: 12.5,
+                    letterSpacing: 0.3,
+                  ),
+                ),
+                const SizedBox(height: 2),
+                Text(
+                  appText(
+                    context,
+                    'Tự động nhận diện cấu hình và phát trực tiếp ngay.',
+                    'Scan QR code to auto-connect and stream instantly.',
+                  ),
+                  style: TextStyle(
+                    color: isLive
+                        ? Colors.white30
+                        : Colors.white.withValues(alpha: 0.7),
+                    fontSize: 11,
+                  ),
+                ),
+              ],
+            ),
+          ),
+          const SizedBox(width: 8),
+          FilledButton.icon(
+            style: FilledButton.styleFrom(
+              backgroundColor:
+                  isLive ? Colors.white10 : const Color(0xFF1E88E5),
+              foregroundColor: isLive ? Colors.white38 : Colors.white,
+              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+              minimumSize: Size.zero,
+              tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+              shape: RoundedRectangleBorder(
+                borderRadius: BorderRadius.circular(10),
+              ),
+            ),
+            onPressed: isLive ? null : _handleScanQrCode,
+            icon: const Icon(Icons.camera_alt_rounded, size: 15),
+            label: Text(
+              appText(context, 'Quét QR', 'Scan QR'),
+              style: const TextStyle(
+                fontWeight: FontWeight.bold,
+                fontSize: 12,
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
   }
 
   void _applyPreset(String presetType) {
@@ -543,6 +748,11 @@ class _LiveStreamScreenState extends State<LiveStreamScreen> {
           ),
         ),
         actions: [
+          IconButton(
+            icon: const Icon(Icons.qr_code_scanner_rounded, color: Colors.white),
+            tooltip: appText(context, 'Quét mã QR trận đấu', 'Scan match QR code'),
+            onPressed: _isAnyLive ? null : _handleScanQrCode,
+          ),
           Padding(
             padding: const EdgeInsets.only(right: 16.0),
             child: Center(child: _buildStatusChip()),
@@ -605,6 +815,9 @@ class _LiveStreamScreenState extends State<LiveStreamScreen> {
                     ),
 
                     const SizedBox(height: 16),
+
+                    // Quick QR Scan Hero Banner
+                    _buildQrScanBanner(isRtspActive || isWhipActive),
 
                     // Camera Source Banner
                     Container(
@@ -944,7 +1157,48 @@ class _LiveStreamScreenState extends State<LiveStreamScreen> {
                       ),
                     ),
                     const SizedBox(width: 8),
-                    if (!isLive)
+                    if (!isLive) ...[
+                      InkWell(
+                        onTap: _handleScanQrCode,
+                        borderRadius: BorderRadius.circular(6),
+                        child: Container(
+                          padding: const EdgeInsets.symmetric(
+                            horizontal: 8,
+                            vertical: 3,
+                          ),
+                          decoration: BoxDecoration(
+                            color: Colors.lightBlueAccent.withValues(alpha: 0.12),
+                            borderRadius: BorderRadius.circular(6),
+                            border: Border.all(
+                              color: Colors.lightBlueAccent.withValues(alpha: 0.35),
+                            ),
+                          ),
+                          child: Row(
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              const Icon(
+                                Icons.qr_code_scanner_rounded,
+                                size: 13,
+                                color: Colors.lightBlueAccent,
+                              ),
+                              const SizedBox(width: 4),
+                              Text(
+                                appText(
+                                  context,
+                                  'Quét QR',
+                                  'Scan QR',
+                                ),
+                                style: const TextStyle(
+                                  color: Colors.lightBlueAccent,
+                                  fontSize: 11.5,
+                                  fontWeight: FontWeight.bold,
+                                ),
+                              ),
+                            ],
+                          ),
+                        ),
+                      ),
+                      const SizedBox(width: 6),
                       InkWell(
                         onTap: _pasteFromClipboard,
                         borderRadius: BorderRadius.circular(6),
@@ -985,6 +1239,7 @@ class _LiveStreamScreenState extends State<LiveStreamScreen> {
                           ),
                         ),
                       ),
+                    ],
                   ],
                 ),
                 const SizedBox(height: 6),
@@ -1020,6 +1275,19 @@ class _LiveStreamScreenState extends State<LiveStreamScreen> {
                         ? Row(
                             mainAxisSize: MainAxisSize.min,
                             children: [
+                              IconButton(
+                                tooltip: appText(
+                                  context,
+                                  'Quét mã QR WHIP',
+                                  'Scan WHIP QR code',
+                                ),
+                                icon: const Icon(
+                                  Icons.qr_code_scanner_rounded,
+                                  size: 16,
+                                  color: Colors.lightBlueAccent,
+                                ),
+                                onPressed: _handleScanQrCode,
+                              ),
                               IconButton(
                                 tooltip: appText(
                                   context,

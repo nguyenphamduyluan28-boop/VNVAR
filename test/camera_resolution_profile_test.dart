@@ -31,6 +31,13 @@ void main() {
     expect(profile.rtspBitrate, 5000000);
   });
 
+  test('allows up to 60 FPS when hardware supports it', () {
+    final profile = CameraResolutionProfile.fullHd1080.withFps(60);
+    expect(profile.fps, 60);
+    expect(profile.width, 1920);
+    expect(profile.bitrate, 10000000);
+  });
+
   test(
     'treats profiles with the same preset but different FPS as different',
     () {
@@ -48,6 +55,18 @@ void main() {
     final restored = await config.loadResolutionProfile();
 
     expect(restored?.preset, CameraResolutionPreset.qhd2k);
+    expect(restored?.fps, 30);
+  });
+
+  test('persists and restores the selected resolution with custom FPS', () async {
+    final config = StationConfigService();
+    final profile60 = CameraResolutionProfile.fullHd1080.withFps(60);
+    await config.saveResolutionProfile(profile60);
+
+    final restored = await config.loadResolutionProfile();
+
+    expect(restored?.preset, CameraResolutionPreset.fullHd1080);
+    expect(restored?.fps, 60);
   });
 
   test('persists and restores resolution locked state', () async {

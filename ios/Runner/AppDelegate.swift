@@ -525,10 +525,9 @@ import UIKit
         let dimensions = CMVideoFormatDescriptionGetDimensions(format.formatDescription)
         guard dimensions.width == candidate.width,
               dimensions.height == candidate.height else { continue }
-        let sustainedFps = 30
         let formatFps = format.videoSupportedFrameRateRanges.compactMap { range -> Int? in
-          let value = min(Int(range.maxFrameRate.rounded(.down)), sustainedFps)
-          return Double(value) >= range.minFrameRate ? value : nil
+          let maxRate = Int(range.maxFrameRate.rounded(.down))
+          return Double(maxRate) >= range.minFrameRate ? min(maxRate, 60) : nil
         }.max() ?? 0
         supportedFps = max(supportedFps, formatFps)
       }

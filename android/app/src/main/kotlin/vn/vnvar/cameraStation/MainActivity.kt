@@ -728,33 +728,51 @@ class MainActivity : FlutterActivity() {
         return targets.mapNotNull { (id, width, height) ->
             val size = sizes.firstOrNull { it.width == width && it.height == height }
                 ?: return@mapNotNull null
-            // WebRTC getUserMedia opens a STANDARD capture session. High-speed
-            // ranges describe constrained high-speed sessions and must not be
-            // used here: a device may advertise 1080p60 for high-speed capture
-            // while only supporting 1080p30 in a standard session.
-            val minFrameDurationNs = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+
+            // ── 1. minFrameDuration từ SCALER_STREAM_CONFIGURATION_MAP ──────────
+            // Đây là khả năng phần cứng thực: thời gian tối thiểu (ns) để cảm biến
+            // phơi sáng 1 frame ở kích thước này. Giá trị này chính xác và đáng tin.
+            val minFrameDurationNs: Long = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
                 configuration.getOutputMinFrameDuration(SurfaceTexture::class.java, size)
             } else {
                 0L
             }
-            val standardMaxFps = if (minFrameDurationNs > 0L) {
+            val sensorMaxFps: Int = if (minFrameDurationNs > 0L) {
                 (1_000_000_000L / minFrameDurationNs).toInt().coerceAtLeast(1)
             } else {
-                // A zero duration means the camera does not publish a reliable
-                // per-output limit. Prefer a safe standard-capture fallback.
-                30
+                0
             }
-            // Keep normal capture at 30 fps. Compared with 60 fps this gives
-            // auto-exposure up to twice as much time per frame, which is much
-            // closer to the stock camera preview in indoor/low-light courts.
-            // WebRTC does not receive the vendor HDR/night-processing pipeline,
-            // so preferring 60 fps here makes its image unnecessarily dark.
-            val preferredFps = 30
+
+            // ── 2. AE ranges chỉ dùng làm fallback / cross-check ────────────────
+            // CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES phản ánh khả năng auto-exposure,
+            // không nhất thiết là FPS hardware tối đa. Nhiều máy chỉ khai báo [15, 30]
+            // hoặc [8, 30] dù sensor 1080p60 thực sự hỗ trợ 60 FPS qua camera2.
+            val aeFpsRanges = characteristics.get(
+                CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES
+            )
+            val maxAeFps = aeFpsRanges?.map { it.upper }?.maxOrNull() ?: 30
+
+            // ── 3. Quyết định FPS thực ──────────────────────────────────────────
+            // Ưu tiên sensorMaxFps (từ minFrameDuration) vì đây là ground truth.
+            // Nếu không có (thiết bị cũ, API < M), dùng maxAeFps làm fallback.
+            // Không cap theo maxAeFps vì AE range thường thấp hơn khả năng thực.
+            val actualFps = if (sensorMaxFps > 0) {
+                sensorMaxFps.coerceIn(1, 60)
+            } else {
+                maxAeFps.coerceIn(1, 60)
+            }
+
+            android.util.Log.i(
+                "MainActivity",
+                "[CAMERA] $id ${width}x${height}: minFrameDuration=${minFrameDurationNs}ns " +
+                    "→ sensorMaxFps=$sensorMaxFps, maxAeFps=$maxAeFps, actualFps=$actualFps"
+            )
+
             mapOf(
                 "id" to id,
                 "width" to width,
                 "height" to height,
-                "maxFps" to minOf(preferredFps, standardMaxFps),
+                "maxFps" to actualFps,
                 "deviceId" to cameraId,
             )
         }
