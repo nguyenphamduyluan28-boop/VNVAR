@@ -492,6 +492,17 @@ class WebRtcService {
     _resolutionProfile = profile;
   }
 
+  /// Ghi đè preferred camera device ID cho một facing mode trước khi
+  /// [initializeCamera] được gọi. Điều này đảm bảo camera mở trực tiếp
+  /// vào đúng lens (ví dụ ultra-wide) thay vì phải switch sau khi init.
+  void setPreferredCameraDevice(String facingMode, String? deviceId) {
+    if (deviceId != null && deviceId.isNotEmpty) {
+      _preferredCameraDeviceIds[facingMode] = deviceId;
+    } else {
+      _preferredCameraDeviceIds.remove(facingMode);
+    }
+  }
+
   Future<List<CameraResolutionProfile>> getSupportedResolutionProfiles({
     String facingMode = 'environment',
     bool fallbackWhenUnavailable = true,

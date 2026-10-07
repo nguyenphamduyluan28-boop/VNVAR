@@ -395,10 +395,60 @@ class CameraStationRuntime {
       }
       webRtc.setResolutionProfile(_resolutionProfile);
       if (!criticalThermal) {
+        // Nếu đã có saved lens state (ultra-wide), pre-set preferred device ID
+        // để initializeCamera mở đúng lens ngay từ đầu.
+        final savedLens = await StationConfigService().loadCameraLensState();
+        if (savedLens.isUltraWide && savedLens.deviceId != null) {
+          webRtc.setPreferredCameraDevice('environment', savedLens.deviceId);
+          developer.log(
+            '[CAMERA] Pre-setting saved ultra-wide device=${savedLens.deviceId} before startup',
+            name: 'CameraStationRuntime',
+          );
+        }
         await webRtc.initializeCamera(facingMode: 'environment');
         // Camera Station always requests microphone audio. A denied permission
         // intentionally falls back to video-only recording.
         await webRtc.ensureMicrophoneEnabled();
+        // Restore lens state sau khi camera khởi động (non-blocking)
+        if (savedLens.isUltraWide) {
+          unawaited(() async {
+            try {
+              if (Platform.isIOS) {
+                await Future<void>.delayed(const Duration(milliseconds: 500));
+              }
+              await webRtc.switchToLensMode('ultra_wide');
+              final targetZoom = webRtc.ultraWideZoomRatio;
+              await webRtc.setCameraZoom(targetZoom);
+              developer.log(
+                '[CAMERA] Restored startup ultra-wide lens ($targetZoom)',
+                name: 'CameraStationRuntime',
+              );
+            } catch (e) {
+              developer.log(
+                '[CAMERA] Startup ultra-wide restore failed: $e',
+                name: 'CameraStationRuntime',
+              );
+            }
+          }());
+        } else if (savedLens.zoom > 1.05) {
+          unawaited(() async {
+            try {
+              if (Platform.isIOS) {
+                await Future<void>.delayed(const Duration(milliseconds: 500));
+              }
+              await webRtc.setCameraZoom(savedLens.zoom);
+              developer.log(
+                '[CAMERA] Restored startup zoom (${savedLens.zoom})',
+                name: 'CameraStationRuntime',
+              );
+            } catch (e) {
+              developer.log(
+                '[CAMERA] Startup zoom restore failed: $e',
+                name: 'CameraStationRuntime',
+              );
+            }
+          }());
+        }
       }
 
       final savedQuarterTurns =
@@ -931,6 +981,14 @@ class CameraStationRuntime {
       final webRtc = _webRtcService;
       if (webRtc == null) throw StateError('Camera chưa sẵn sàng.');
       await webRtc.switchToLensMode(mode);
+      // Persist lens state để restore khi đổi resolution hoặc restart app
+      final isUltraWide = webRtc.isCurrentUltraWide;
+      final zoom = webRtc.cameraZoom;
+      unawaited(StationConfigService().saveCameraLensState(
+        isUltraWide: isUltraWide,
+        zoom: zoom,
+        deviceId: isUltraWide ? webRtc.ultraWideCamera?.id : webRtc.mainBackCamera?.id,
+      ));
       _emitState();
     });
     _lensSwitchOperation = operation;
@@ -939,6 +997,27 @@ class CameraStationRuntime {
         _lensSwitchOperation = null;
       }
     });
+  }
+
+  /// Set zoom camera và tự động persist lens state để restore sau khi đổi
+  /// resolution hoặc khởi động lại app.
+  Future<void> setCameraZoom(double zoom) async {
+    final webRtc = _webRtcService;
+    if (webRtc == null || !_cameraEnabled) return;
+    try {
+      await webRtc.setCameraZoom(zoom);
+      final isUltraWide = webRtc.isCurrentUltraWide;
+      final actualZoom = webRtc.cameraZoom;
+      unawaited(StationConfigService().saveCameraLensState(
+        isUltraWide: isUltraWide,
+        zoom: actualZoom,
+        deviceId: isUltraWide
+            ? webRtc.ultraWideCamera?.id
+            : webRtc.mainBackCamera?.id,
+      ));
+    } catch (e) {
+      developer.log('[CAMERA] setCameraZoom error: $e', name: 'CameraStationRuntime');
+    }
   }
 
   Future<void> _switchCameraInternal() async {
@@ -1227,6 +1306,23 @@ class CameraStationRuntime {
       await recording.stop();
       await webRtc.disposeConnection();
       await webRtc.disposeCamera();
+      if (Platform.isIOS) {
+        await Future<void>.delayed(const Duration(milliseconds: 200));
+      }
+
+      // Nếu đang ở ultra-wide mode, ghi nhớ preferred device ID để
+      // initializeCamera mở đúng lens ngay từ đầu (không cần switch sau init).
+      if (wasUltraWide && currentFacing == 'environment') {
+        final uwCamera = webRtc.ultraWideCamera;
+        if (uwCamera != null) {
+          webRtc.setPreferredCameraDevice('environment', uwCamera.id);
+          developer.log(
+            '[CAMERA] Pre-setting ultra-wide preferred device=${uwCamera.id} before resolution change',
+            name: 'CameraStationRuntime',
+          );
+        }
+      }
+
       webRtc.setResolutionProfile(selected);
       await webRtc.initializeCamera(facingMode: currentFacing);
       recording.setFacingMode(currentFacing);
@@ -1234,12 +1330,24 @@ class CameraStationRuntime {
       await server.ensureRecording();
       _resolutionProfile = selected;
 
-      // Khôi phục lại góc quay / zoom trước khi đổi độ phân giải
+      // Khôi phục lại góc quay / zoom trước khi đổi độ phân giải.
+      // Nếu đã pre-set preferred device ID ở trên, camera đã mở đúng lens;
+      // chỉ cần set lại zoom cho chính xác.
       if (wasUltraWide && currentFacing == 'environment') {
         try {
+          // Delay ngắn để camera ổn định sau khi mở (đặc biệt trên iOS)
+          if (Platform.isIOS) {
+            await Future<void>.delayed(const Duration(milliseconds: 300));
+          }
           await webRtc.switchToLensMode('ultra_wide');
           final targetRatio = webRtc.ultraWideZoomRatio;
           await webRtc.setCameraZoom(targetRatio);
+          // Persist lens state để restore sau app restart
+          unawaited(StationConfigService().saveCameraLensState(
+            isUltraWide: true,
+            zoom: targetRatio,
+            deviceId: webRtc.ultraWideCamera?.id,
+          ));
           developer.log(
             '[CAMERA] Restored ultra-wide lens ($targetRatio) after resolution change',
             name: 'CameraStationRuntime',
@@ -1253,6 +1361,10 @@ class CameraStationRuntime {
       } else if (previousZoom > 1.05 && currentFacing == 'environment') {
         try {
           await webRtc.setCameraZoom(previousZoom);
+          unawaited(StationConfigService().saveCameraLensState(
+            isUltraWide: false,
+            zoom: previousZoom,
+          ));
           developer.log(
             '[CAMERA] Restored zoom ($previousZoom) after resolution change',
             name: 'CameraStationRuntime',
@@ -1263,6 +1375,9 @@ class CameraStationRuntime {
             name: 'CameraStationRuntime',
           );
         }
+      } else {
+        // Reset về 1x, clear persisted lens state
+        unawaited(StationConfigService().clearCameraLensState());
       }
 
       if (persistSelection) {
@@ -1283,6 +1398,9 @@ class CameraStationRuntime {
       webRtc.setResolutionProfile(previous);
       try {
         await webRtc.disposeCamera();
+        if (Platform.isIOS) {
+          await Future<void>.delayed(const Duration(milliseconds: 200));
+        }
         await webRtc.initializeCamera(facingMode: currentFacing);
         recording.setFacingMode(currentFacing);
         await _waitForIosCaptureWarmup(profile: previous);

@@ -19,6 +19,9 @@ class StationConfigService {
   static const String _adaptiveFpsPrefix = 'ios_adaptive_fps';
   static const String _apiPortKey = 'camera_api_port';
   static const String _cameraQuarterTurnsKey = 'camera_quarter_turns';
+  static const String _cameraLensUltraWideKey = 'camera_lens_ultra_wide';
+  static const String _cameraLensZoomKey = 'camera_lens_zoom';
+  static const String _cameraLensDeviceIdKey = 'camera_lens_device_id';
 
   static const String _screenOrientationKey = 'station_screen_orientation';
   static const String _whipEndpointKey = 'whip_endpoint_url';
@@ -90,6 +93,40 @@ class StationConfigService {
   Future<int> loadCameraQuarterTurns() async {
     final prefs = await SharedPreferences.getInstance();
     return ((prefs.getInt(_cameraQuarterTurnsKey) ?? 0) % 4 + 4) % 4;
+  }
+
+  /// Lưu trạng thái lens camera (ultra-wide, zoom level, device ID).
+  /// Được gọi khi user chủ động chuyển lens hoặc zoom để có thể
+  /// restore sau khi đổi resolution hoặc khởi động lại app.
+  Future<void> saveCameraLensState({
+    required bool isUltraWide,
+    required double zoom,
+    String? deviceId,
+  }) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool(_cameraLensUltraWideKey, isUltraWide);
+    await prefs.setDouble(_cameraLensZoomKey, zoom.clamp(0.1, 10.0));
+    if (deviceId != null && deviceId.isNotEmpty) {
+      await prefs.setString(_cameraLensDeviceIdKey, deviceId);
+    } else {
+      await prefs.remove(_cameraLensDeviceIdKey);
+    }
+  }
+
+  Future<({bool isUltraWide, double zoom, String? deviceId})>
+  loadCameraLensState() async {
+    final prefs = await SharedPreferences.getInstance();
+    final isUltraWide = prefs.getBool(_cameraLensUltraWideKey) ?? false;
+    final zoom = prefs.getDouble(_cameraLensZoomKey) ?? 1.0;
+    final deviceId = _readTrimmed(prefs, _cameraLensDeviceIdKey);
+    return (isUltraWide: isUltraWide, zoom: zoom.clamp(0.1, 10.0), deviceId: deviceId);
+  }
+
+  Future<void> clearCameraLensState() async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.remove(_cameraLensUltraWideKey);
+    await prefs.remove(_cameraLensZoomKey);
+    await prefs.remove(_cameraLensDeviceIdKey);
   }
 
   Future<void> saveIdentity(StationIdentity identity) async {

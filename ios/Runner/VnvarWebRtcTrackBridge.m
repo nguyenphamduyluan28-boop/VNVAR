@@ -20,10 +20,11 @@
 }
 
 + (CVPixelBufferRef _Nullable)copyPixelBufferForFrame:(RTCVideoFrame *)frame {
-  id<RTCI420Buffer> source = [frame.buffer toI420];
-  if (source == nil) {
-    return nil;
-  }
+  @autoreleasepool {
+    id<RTCI420Buffer> source = [frame.buffer toI420];
+    if (source == nil) {
+      return nil;
+    }
 
   // RTSP clients cannot renegotiate video dimensions in the middle of an
   // active H.264 session. Keep one stable encoded canvas for the lifetime of
@@ -149,6 +150,7 @@
         colorSpace:colorSpace];
   CVPixelBufferRelease(pixelBuffer);
   return stableBuffer;
+  }
 }
 
 + (RTCCameraVideoCapturer * _Nullable)activeVideoCapturer {

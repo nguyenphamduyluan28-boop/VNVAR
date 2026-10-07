@@ -289,25 +289,25 @@ class _StationScreenState extends State<StationScreen>
         if (webRtc.hasUltraWideCamera) {
           await _runtime.switchToLensMode('ultra_wide');
           final actualRatio = webRtc.ultraWideZoomRatio;
-          await webRtc.setCameraZoom(actualRatio);
+          await _runtime.setCameraZoom(actualRatio);
           if (mounted) {
             setState(() => _zoomValue = actualRatio);
           }
         } else {
-          await webRtc.setCameraZoom(target);
+          await _runtime.setCameraZoom(target);
           if (mounted) setState(() => _zoomValue = webRtc.cameraZoom);
         }
       } else if (target >= 0.95 && target < 1.5) {
         if (webRtc.isCurrentUltraWide || webRtc.currentFacingMode == 'user') {
           await _runtime.switchToLensMode('wide');
         }
-        await webRtc.setCameraZoom(1.0);
+        await _runtime.setCameraZoom(1.0);
         if (mounted) setState(() => _zoomValue = 1.0);
       } else if (target >= 1.5) {
         if (webRtc.isCurrentUltraWide || webRtc.currentFacingMode == 'user') {
           await _runtime.switchToLensMode('wide');
         }
-        await webRtc.setCameraZoom(target);
+        await _runtime.setCameraZoom(target);
         if (mounted) setState(() => _zoomValue = target);
       }
     } catch (e) {
@@ -350,7 +350,7 @@ class _StationScreenState extends State<StationScreen>
             if (mounted) setState(() => _lensSwitching = false);
           }
         }
-        await webRtc.setCameraZoom(value);
+        await _runtime.setCameraZoom(value);
         if (mounted) setState(() => _zoomValue = value);
       } catch (error) {
         debugPrint('[CAMERA] Cannot set zoom: $error');

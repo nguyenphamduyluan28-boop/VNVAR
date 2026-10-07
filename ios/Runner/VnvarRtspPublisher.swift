@@ -139,21 +139,23 @@ final class VnvarRtspPublisher: NSObject, RTCVideoRenderer {
       return
     }
     frameQueue.async { [weak self] in
-      guard let self = self else { return }
-      guard self.stateQueue.sync(execute: { self.running }) else {
-        self.stateQueue.async { self.framePending = false }
-        return
-      }
-      guard let pixelBuffer = VnvarWebRtcTrackBridge.copyPixelBuffer(for: frame) else {
-        self.stateQueue.async { self.framePending = false }
-        self.reportError("Cannot convert WebRTC frame to CVPixelBuffer")
-        return
-      }
-      self.encoder.encode(
-        pixelBuffer: pixelBuffer,
-        timestampNs: frame.timeStampNs
-      ) { [weak self] in
-        self?.stateQueue.async { self?.framePending = false }
+      autoreleasepool {
+        guard let self = self else { return }
+        guard self.stateQueue.sync(execute: { self.running }) else {
+          self.stateQueue.async { self.framePending = false }
+          return
+        }
+        guard let pixelBuffer = VnvarWebRtcTrackBridge.copyPixelBuffer(for: frame) else {
+          self.stateQueue.async { self.framePending = false }
+          self.reportError("Cannot convert WebRTC frame to CVPixelBuffer")
+          return
+        }
+        self.encoder.encode(
+          pixelBuffer: pixelBuffer,
+          timestampNs: frame.timeStampNs
+        ) { [weak self] in
+          self?.stateQueue.async { self?.framePending = false }
+        }
       }
     }
   }
