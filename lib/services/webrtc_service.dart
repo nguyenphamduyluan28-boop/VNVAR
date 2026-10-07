@@ -1333,10 +1333,9 @@ class WebRtcService {
         }
       }
 
-      // Luôn thử switch sang camera ultra-wide nếu nó khác camera hiện tại.
-      // Không dùng _minimumCameraZoom vì giá trị này thuộc camera cũ, chưa
-      // phải camera ultra-wide → sẽ bị stale và cho kết quả sai.
-      if (uw != null && uw.id != _activeCameraId && currentFacingMode == 'environment') {
+      // Luôn thử switch sang camera ultra-wide nếu nó khác camera hiện tại
+      // và chưa ở chế độ ultra-wide (đã pre-set hoặc đã switch).
+      if (uw != null && !isCurrentUltraWide && uw.id != _activeCameraId && currentFacingMode == 'environment') {
         try {
           await switchCameraToId(uw.id);
         } catch (e) {

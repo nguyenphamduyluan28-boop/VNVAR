@@ -262,6 +262,27 @@ class CameraStationRuntime {
     if (_resolutionLocked == locked) return;
     _resolutionLocked = locked;
     await StationConfigService().saveResolutionLocked(locked);
+    if (locked) {
+      // Hủy mọi lịch trình hạ độ phân giải do nhiệt độ nếu có
+      _pendingThermalThrottleTimer?.cancel();
+      _pendingThermalThrottleTimer = null;
+      _thermalUserOverride = true;
+      developer.log(
+        '[LOCK] Chế độ độ phân giải đã được khóa. Tự động vô hiệu hóa hạ độ phân giải khi máy nóng.',
+        name: 'CameraStationRuntime',
+      );
+      // Nếu máy đang bị thermal throttled trước đó, khôi phục lại profile trước khi throttle
+      if (_thermalThrottled && _profileBeforeThermalThrottle != null) {
+        final restoreProfile = _profileBeforeThermalThrottle!;
+        _thermalThrottled = false;
+        _profileBeforeThermalThrottle = null;
+        unawaited(
+          _serializeLifecycle(
+            () => _setResolutionProfileInternal(restoreProfile, persistSelection: false),
+          ),
+        );
+      }
+    }
     _emitState();
   }
 
@@ -381,7 +402,7 @@ class CameraStationRuntime {
       final preflightThermal = await _readThermalSnapshot();
       _temperatureC = preflightThermal.temperatureC;
       final criticalThermal = preflightThermal.critical;
-      if (preflightThermal.hot) {
+      if (preflightThermal.hot && !_resolutionLocked) {
         _profileBeforeThermalThrottle = _resolutionProfile;
         _thermalThrottled = true;
         _resolutionProfile = CameraResolutionProfile.hd720.withFps(15);
@@ -409,45 +430,38 @@ class CameraStationRuntime {
         // Camera Station always requests microphone audio. A denied permission
         // intentionally falls back to video-only recording.
         await webRtc.ensureMicrophoneEnabled();
-        // Restore lens state sau khi camera khởi động (non-blocking)
+        // Restore lens state và zoom HOÀN TẤT trước khi bắt đầu recording
+        // để camera pipeline ổn định, không làm gián đoạn AVAssetWriter/MediaRecorder.
         if (savedLens.isUltraWide) {
-          unawaited(() async {
-            try {
-              if (Platform.isIOS) {
-                await Future<void>.delayed(const Duration(milliseconds: 500));
-              }
+          try {
+            if (!webRtc.isCurrentUltraWide) {
               await webRtc.switchToLensMode('ultra_wide');
-              final targetZoom = webRtc.ultraWideZoomRatio;
-              await webRtc.setCameraZoom(targetZoom);
-              developer.log(
-                '[CAMERA] Restored startup ultra-wide lens ($targetZoom)',
-                name: 'CameraStationRuntime',
-              );
-            } catch (e) {
-              developer.log(
-                '[CAMERA] Startup ultra-wide restore failed: $e',
-                name: 'CameraStationRuntime',
-              );
             }
-          }());
+            final targetZoom = webRtc.ultraWideZoomRatio;
+            await webRtc.setCameraZoom(targetZoom);
+            developer.log(
+              '[CAMERA] Restored startup ultra-wide lens ($targetZoom)',
+              name: 'CameraStationRuntime',
+            );
+          } catch (e) {
+            developer.log(
+              '[CAMERA] Startup ultra-wide restore failed: $e',
+              name: 'CameraStationRuntime',
+            );
+          }
         } else if (savedLens.zoom > 1.05) {
-          unawaited(() async {
-            try {
-              if (Platform.isIOS) {
-                await Future<void>.delayed(const Duration(milliseconds: 500));
-              }
-              await webRtc.setCameraZoom(savedLens.zoom);
-              developer.log(
-                '[CAMERA] Restored startup zoom (${savedLens.zoom})',
-                name: 'CameraStationRuntime',
-              );
-            } catch (e) {
-              developer.log(
-                '[CAMERA] Startup zoom restore failed: $e',
-                name: 'CameraStationRuntime',
-              );
-            }
-          }());
+          try {
+            await webRtc.setCameraZoom(savedLens.zoom);
+            developer.log(
+              '[CAMERA] Restored startup zoom (${savedLens.zoom})',
+              name: 'CameraStationRuntime',
+            );
+          } catch (e) {
+            developer.log(
+              '[CAMERA] Startup zoom restore failed: $e',
+              name: 'CameraStationRuntime',
+            );
+          }
         }
       }
 
@@ -1326,20 +1340,18 @@ class CameraStationRuntime {
       webRtc.setResolutionProfile(selected);
       await webRtc.initializeCamera(facingMode: currentFacing);
       recording.setFacingMode(currentFacing);
-      await _waitForIosCaptureWarmup(profile: selected);
-      await server.ensureRecording();
-      _resolutionProfile = selected;
 
-      // Khôi phục lại góc quay / zoom trước khi đổi độ phân giải.
-      // Nếu đã pre-set preferred device ID ở trên, camera đã mở đúng lens;
-      // chỉ cần set lại zoom cho chính xác.
+      // Khôi phục lại góc quay / zoom TRƯỚC KHI bắt đầu ghi hình.
+      // Cấu hình hoàn tất phần cứng camera để pipeline video ổn định,
+      // tránh làm gián đoạn AVAssetWriter / MediaRecorder dẫn đến crash app.
       if (wasUltraWide && currentFacing == 'environment') {
         try {
-          // Delay ngắn để camera ổn định sau khi mở (đặc biệt trên iOS)
-          if (Platform.isIOS) {
-            await Future<void>.delayed(const Duration(milliseconds: 300));
+          if (!webRtc.isCurrentUltraWide) {
+            if (Platform.isIOS) {
+              await Future<void>.delayed(const Duration(milliseconds: 200));
+            }
+            await webRtc.switchToLensMode('ultra_wide');
           }
-          await webRtc.switchToLensMode('ultra_wide');
           final targetRatio = webRtc.ultraWideZoomRatio;
           await webRtc.setCameraZoom(targetRatio);
           // Persist lens state để restore sau app restart
@@ -1349,7 +1361,7 @@ class CameraStationRuntime {
             deviceId: webRtc.ultraWideCamera?.id,
           ));
           developer.log(
-            '[CAMERA] Restored ultra-wide lens ($targetRatio) after resolution change',
+            '[CAMERA] Restored ultra-wide lens ($targetRatio) before recording start',
             name: 'CameraStationRuntime',
           );
         } catch (e) {
@@ -1366,7 +1378,7 @@ class CameraStationRuntime {
             zoom: previousZoom,
           ));
           developer.log(
-            '[CAMERA] Restored zoom ($previousZoom) after resolution change',
+            '[CAMERA] Restored zoom ($previousZoom) before recording start',
             name: 'CameraStationRuntime',
           );
         } catch (e) {
@@ -1379,6 +1391,11 @@ class CameraStationRuntime {
         // Reset về 1x, clear persisted lens state
         unawaited(StationConfigService().clearCameraLensState());
       }
+
+      await _waitForIosCaptureWarmup(profile: selected);
+      await server.ensureRecording();
+      _resolutionProfile = selected;
+      _lastIosFpsAdjustmentAt = DateTime.now(); // Grace period tránh bị FPS drop trigger lại ngay
 
       if (persistSelection) {
         await StationConfigService().saveResolutionProfile(selected);
@@ -1403,11 +1420,11 @@ class CameraStationRuntime {
         }
         await webRtc.initializeCamera(facingMode: currentFacing);
         recording.setFacingMode(currentFacing);
-        await _waitForIosCaptureWarmup(profile: previous);
-        await server.ensureRecording();
         if (wasUltraWide && currentFacing == 'environment') {
           try {
-            await webRtc.switchToLensMode('ultra_wide');
+            if (!webRtc.isCurrentUltraWide) {
+              await webRtc.switchToLensMode('ultra_wide');
+            }
             await webRtc.setCameraZoom(webRtc.ultraWideZoomRatio);
           } catch (_) {}
         } else if (previousZoom > 1.05 && currentFacing == 'environment') {
@@ -1415,6 +1432,8 @@ class CameraStationRuntime {
             await webRtc.setCameraZoom(previousZoom);
           } catch (_) {}
         }
+        await _waitForIosCaptureWarmup(profile: previous);
+        await server.ensureRecording();
         if (wasRtspPublishing) {
           unawaited(_rtspPublisherService.restartIfPublishing());
         }
@@ -1484,14 +1503,12 @@ class CameraStationRuntime {
     try {
       await webRtc.initializeCamera(facingMode: _scannerSavedFacing);
       recording?.setFacingMode(_scannerSavedFacing);
-      await _waitForIosCaptureWarmup(profile: _resolutionProfile);
-      if (server != null) {
-        await server.ensureRecording();
-      }
 
       if (_scannerSavedUltraWide && _scannerSavedFacing == 'environment') {
         try {
-          await webRtc.switchToLensMode('ultra_wide');
+          if (!webRtc.isCurrentUltraWide) {
+            await webRtc.switchToLensMode('ultra_wide');
+          }
           final targetRatio = webRtc.ultraWideZoomRatio;
           await webRtc.setCameraZoom(targetRatio);
         } catch (_) {}
@@ -1499,6 +1516,11 @@ class CameraStationRuntime {
         try {
           await webRtc.setCameraZoom(_scannerSavedZoom);
         } catch (_) {}
+      }
+
+      await _waitForIosCaptureWarmup(profile: _resolutionProfile);
+      if (server != null) {
+        await server.ensureRecording();
       }
     } catch (e) {
       developer.log(
@@ -1660,6 +1682,7 @@ class CameraStationRuntime {
         _recovering ||
         _profileSwitching ||
         _thermalThrottled ||
+        _resolutionLocked ||
         !_cameraEnabled ||
         _resolutionProfile.preset != CameraResolutionPreset.ultraHd4k ||
         requestedFps != _resolutionProfile.fps) {
@@ -2007,6 +2030,7 @@ class CameraStationRuntime {
       if (hot &&
           !_thermalThrottled &&
           !_thermalUserOverride &&
+          !_resolutionLocked &&
           _pendingThermalThrottleTimer == null &&
           !_profileSwitching) {
         _profileBeforeThermalThrottle = _resolutionProfile;
@@ -2131,6 +2155,7 @@ class CameraStationRuntime {
         _iosLifecycleSuspended ||
         _thermalThrottled ||
         _thermalUserOverride ||
+        _resolutionLocked ||
         _profileSwitching) {
       return;
     }

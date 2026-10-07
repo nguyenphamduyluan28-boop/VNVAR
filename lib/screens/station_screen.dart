@@ -1196,16 +1196,17 @@ class _StationScreenState extends State<StationScreen>
                           borderRadius: BorderRadius.circular(20),
                           onTap: () async {
                             final nextLock = !_runtime.resolutionLocked;
+                            final currentTitle = _runtime.resolutionProfile.title;
                             final lockMsg = nextLock
                                 ? appText(
                                     sheetContext,
-                                    'Đã khóa chế độ phân giải. Không thể đổi độ phân giải khi đang phát.',
-                                    'Resolution mode locked. Quality cannot be changed accidentally.',
+                                    'Đã khóa chế độ $currentTitle. Camera sẽ giữ nguyên chất lượng này kể cả khi máy nóng.',
+                                    'Locked $currentTitle. Camera will remain at this quality even when device is hot.',
                                   )
                                 : appText(
                                     sheetContext,
-                                    'Đã mở khóa chế độ phân giải.',
-                                    'Resolution mode unlocked.',
+                                    'Đã mở khóa chế độ phân giải. Camera sẽ tự động điều chỉnh khi máy nóng.',
+                                    'Resolution mode unlocked. Camera will automatically adjust when hot.',
                                   );
                             await _runtime.setResolutionLocked(nextLock);
                             if (!sheetContext.mounted) return;
