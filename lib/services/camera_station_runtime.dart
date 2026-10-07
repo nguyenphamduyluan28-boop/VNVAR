@@ -405,7 +405,7 @@ class CameraStationRuntime {
       if (preflightThermal.hot && !_resolutionLocked) {
         _profileBeforeThermalThrottle = _resolutionProfile;
         _thermalThrottled = true;
-        _resolutionProfile = CameraResolutionProfile.hd720.withFps(15);
+        _resolutionProfile = CameraResolutionProfile.hd720.withFps(30);
       }
       if (criticalThermal) {
         _thermalCriticalSuspended = true;
@@ -2143,7 +2143,7 @@ class CameraStationRuntime {
     // thermal state is handled separately and still stops capture at once.
     final delay = _delayUntilSegmentBoundary();
     developer.log(
-      '[THERMAL] Hot device; scheduling 720p/15fps at the segment boundary '
+      '[THERMAL] Hot device; scheduling 720p/30fps at the segment boundary '
       'in ${delay.inSeconds}s',
       name: 'CameraStationRuntime',
     );
@@ -2167,13 +2167,13 @@ class CameraStationRuntime {
     _thermalThrottled = true;
     _emitState();
     developer.log(
-      '[THERMAL] Segment boundary reached; reducing camera to 720p/15fps',
+      '[THERMAL] Segment boundary reached; reducing camera to 720p/30fps',
       name: 'CameraStationRuntime',
     );
     try {
       await _serializeLifecycle(
         () => _setResolutionProfileInternal(
-          CameraResolutionProfile.hd720.withFps(15),
+          CameraResolutionProfile.hd720.withFps(30),
           persistSelection: false,
         ),
       );
@@ -2214,7 +2214,7 @@ class CameraStationRuntime {
     _thermalCriticalSuspended = true;
     _profileBeforeThermalThrottle ??= _resolutionProfile;
     _thermalThrottled = true;
-    final safeProfile = CameraResolutionProfile.hd720.withFps(15);
+    final safeProfile = CameraResolutionProfile.hd720.withFps(30);
     _resolutionProfile = safeProfile;
     webRtc.setResolutionProfile(safeProfile);
     developer.log(
@@ -2254,7 +2254,7 @@ class CameraStationRuntime {
       }
       _thermalCriticalSuspended = false;
       developer.log(
-        '[THERMAL] Device stable; capture resumed at 720p/15fps',
+        '[THERMAL] Device stable; capture resumed at 720p/30fps',
         name: 'CameraStationRuntime',
       );
     } catch (error, stackTrace) {
