@@ -1300,12 +1300,22 @@ class CameraStationRuntime {
       throw StateError('Camera chưa sẵn sàng.');
     }
 
+    final wasUltraWide = webRtc.isCurrentUltraWide;
+    final previousZoom = webRtc.cameraZoom;
+    // Camera góc rộng (Ultra-Wide) phần cứng trên iPhone chỉ hỗ trợ tối đa 30 FPS.
+    // Giới hạn ở 30 FPS để tránh ngoại lệ phần cứng AVFoundation làm thoát app.
+    if (wasUltraWide && Platform.isIOS && selected.fps > 30) {
+      selected = selected.withFps(30);
+      developer.log(
+        '[CAMERA] Capping iOS ultra-wide to 30 FPS to prevent hardware exception',
+        name: 'CameraStationRuntime',
+      );
+    }
+
     final previous = _resolutionProfile;
     final currentFacing = webRtc.currentFacingMode;
     final wasRtspPublishing = _rtspPublisherService.isLive;
     final wasWhipPublishing = _whipPublisherService.isLive;
-    final wasUltraWide = webRtc.isCurrentUltraWide;
-    final previousZoom = webRtc.cameraZoom;
     if (wasRtspPublishing) {
       await _rtspPublisherService.prepareForReconfiguration();
     }
@@ -1321,7 +1331,9 @@ class CameraStationRuntime {
       await webRtc.disposeConnection();
       await webRtc.disposeCamera();
       if (Platform.isIOS) {
-        await Future<void>.delayed(const Duration(milliseconds: 200));
+        // Cho AVFoundation đủ thời gian giải phóng hoàn toàn AVCaptureSession cũ
+        // trước khi tạo session mới ở độ phân giải cao hơn, tránh xung đột phần cứng.
+        await Future<void>.delayed(const Duration(milliseconds: 500));
       }
 
       // Nếu đang ở ultra-wide mode, ghi nhớ preferred device ID để
@@ -1346,12 +1358,6 @@ class CameraStationRuntime {
       // tránh làm gián đoạn AVAssetWriter / MediaRecorder dẫn đến crash app.
       if (wasUltraWide && currentFacing == 'environment') {
         try {
-          if (!webRtc.isCurrentUltraWide) {
-            if (Platform.isIOS) {
-              await Future<void>.delayed(const Duration(milliseconds: 200));
-            }
-            await webRtc.switchToLensMode('ultra_wide');
-          }
           final targetRatio = webRtc.ultraWideZoomRatio;
           await webRtc.setCameraZoom(targetRatio);
           // Persist lens state để restore sau app restart
@@ -1361,12 +1367,12 @@ class CameraStationRuntime {
             deviceId: webRtc.ultraWideCamera?.id,
           ));
           developer.log(
-            '[CAMERA] Restored ultra-wide lens ($targetRatio) before recording start',
+            '[CAMERA] Restored ultra-wide zoom ($targetRatio) before recording start',
             name: 'CameraStationRuntime',
           );
         } catch (e) {
           developer.log(
-            '[CAMERA] Restore ultra-wide lens failed: $e',
+            '[CAMERA] Restore ultra-wide zoom failed: $e',
             name: 'CameraStationRuntime',
           );
         }
@@ -1416,15 +1422,12 @@ class CameraStationRuntime {
       try {
         await webRtc.disposeCamera();
         if (Platform.isIOS) {
-          await Future<void>.delayed(const Duration(milliseconds: 200));
+          await Future<void>.delayed(const Duration(milliseconds: 500));
         }
         await webRtc.initializeCamera(facingMode: currentFacing);
         recording.setFacingMode(currentFacing);
         if (wasUltraWide && currentFacing == 'environment') {
           try {
-            if (!webRtc.isCurrentUltraWide) {
-              await webRtc.switchToLensMode('ultra_wide');
-            }
             await webRtc.setCameraZoom(webRtc.ultraWideZoomRatio);
           } catch (_) {}
         } else if (previousZoom > 1.05 && currentFacing == 'environment') {
@@ -2104,7 +2107,9 @@ class CameraStationRuntime {
     }
     _thermalThrottled = false;
     try {
-      await _setResolutionProfileInternal(profile, persistSelection: false);
+      await _serializeLifecycle(
+        () => _setResolutionProfileInternal(profile, persistSelection: false),
+      );
       _profileBeforeThermalThrottle = null;
       _thermalNormalSince = null;
       _thermalCooledDownSince = DateTime.now();
@@ -2166,9 +2171,11 @@ class CameraStationRuntime {
       name: 'CameraStationRuntime',
     );
     try {
-      await _setResolutionProfileInternal(
-        CameraResolutionProfile.hd720.withFps(15),
-        persistSelection: false,
+      await _serializeLifecycle(
+        () => _setResolutionProfileInternal(
+          CameraResolutionProfile.hd720.withFps(15),
+          persistSelection: false,
+        ),
       );
     } catch (error, stackTrace) {
       _thermalThrottled = false;
