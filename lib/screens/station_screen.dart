@@ -1970,6 +1970,7 @@ class _StationScreenState extends State<StationScreen>
                               temperatureC: _runtime.temperatureC,
                               userOverride: _runtime.thermalUserOverride,
                               isCooledDown: _runtime.justCooledDown,
+                              isLocked: _runtime.resolutionLocked,
                               onTap: _openResolutionPicker,
                               onDismiss: _runtime.dismissCooledDownNotice,
                             ),
@@ -2387,6 +2388,7 @@ class _ThermalToast extends StatelessWidget {
     this.temperatureC,
     this.userOverride = false,
     this.isCooledDown = false,
+    this.isLocked = false,
   });
 
   final bool compact;
@@ -2396,6 +2398,7 @@ class _ThermalToast extends StatelessWidget {
   final double? temperatureC;
   final bool userOverride;
   final bool isCooledDown;
+  final bool isLocked;
 
   @override
   Widget build(BuildContext context) {
@@ -2436,6 +2439,20 @@ class _ThermalToast extends StatelessWidget {
             ? 'Device is warm ($tempStr). Using your selected resolution. Tap to change.'
             : 'Device is warm. Using your selected resolution. Tap to change.',
       );
+    } else if (isLocked) {
+      bgColor = const Color(0xFF2E1C0A).withValues(alpha: 0.75);
+      borderColor = const Color(0xFFFF9800).withValues(alpha: 0.45);
+      textColor = const Color(0xFFFFE0B2);
+      icon = Icons.lock_rounded;
+      message = appText(
+        context,
+        tempStr.isNotEmpty
+            ? 'Thiết bị đang nóng ($tempStr). Đang khóa giữ độ phân giải. Chạm để đổi.'
+            : 'Thiết bị đang nóng. Đang khóa giữ độ phân giải. Chạm để đổi.',
+        tempStr.isNotEmpty
+            ? 'Device is warm ($tempStr). Resolution locked. Tap to change.'
+            : 'Device is warm. Resolution locked. Tap to change.',
+      );
     } else {
       bgColor = const Color(0xFF2A1C08).withValues(alpha: 0.75);
       borderColor = Colors.amber.withValues(alpha: 0.50);
@@ -2444,11 +2461,11 @@ class _ThermalToast extends StatelessWidget {
       message = appText(
         context,
         tempStr.isNotEmpty
-            ? 'Thiết bị đang nóng ($tempStr). Tạm hạ để bảo vệ máy. Chạm để chọn lại.'
-            : 'Thiết bị đang nóng. Tạm hạ để bảo vệ máy. Chạm để chọn lại.',
+            ? 'Thiết bị đang nóng ($tempStr). Tự động hạ về 720p (30 FPS) để bảo vệ máy. Chạm để chọn lại.'
+            : 'Thiết bị đang nóng. Tự động hạ về 720p (30 FPS) để bảo vệ máy. Chạm để chọn lại.',
         tempStr.isNotEmpty
-            ? 'Device is hot ($tempStr). Temporarily lowered to protect camera. Tap to change.'
-            : 'Device is hot. Temporarily lowered to protect camera. Tap to change.',
+            ? 'Device is hot ($tempStr). Auto-lowered to 720p (30 FPS) to protect camera. Tap to change.'
+            : 'Device is hot. Auto-lowered to 720p (30 FPS) to protect camera. Tap to change.',
       );
     }
 
@@ -3096,6 +3113,7 @@ class _StationHeader extends StatelessWidget {
                     temperatureC: temperatureC,
                     userOverride: thermalUserOverride,
                     isCooledDown: justCooledDown,
+                    isLocked: resolutionLocked,
                     onTap: onResolution ?? () {},
                     onDismiss: onDismissCooledDown,
                   ),
