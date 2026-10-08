@@ -119,7 +119,7 @@ class RtspPublisherService {
     final args = <String>[
       '-nostdin',
       '-thread_queue_size',
-      '2048',
+      '4096',
       '-fflags',
       '+genpts+nobuffer+discardcorrupt',
       '-flags',
@@ -129,17 +129,17 @@ class RtspPublisherService {
       '-rtsp_transport',
       'tcp',
       '-buffer_size',
-      '2048000',
+      '4096000',
       '-i',
       _localRtspUrl!,
       '-map',
       '0:v:0',
       '-c:v',
       'copy',
-      if (!isRtmp) ...[
-        '-bsf:v',
-        'dump_extra=freq=keyframe',
-      ],
+      // Chèn SPS/PPS vào mỗi Keyframe để server Sporto và decoder người xem
+      // cập nhật độ phân giải mới mượt mà, không bị nghẽn buffer hay lỗi phân giải.
+      '-bsf:v',
+      'dump_extra=freq=keyframe',
       '-map',
       '0:a?',
       '-c:a',
@@ -151,7 +151,7 @@ class RtspPublisherService {
       '-af',
       'aresample=async=1000:min_hard_comp=0.100000:first_pts=0',
       '-max_muxing_queue_size',
-      '4096',
+      '8192',
       '-avoid_negative_ts',
       'make_zero',
       '-flush_packets',
@@ -339,8 +339,8 @@ class RtspPublisherService {
     _retryAttempt = 0;
     await _cancelActiveSession();
     _setState(RtspPublishState.connecting);
-    // Wait for the local RTSP server to stabilize with the new resolution and allow remote server to close old connection
-    await Future<void>.delayed(const Duration(milliseconds: 1000));
+    // Chờ RTSP server cục bộ ổn định với profile mới và cho phép server Sporto từ xa giải phóng hoàn toàn kết nối socket cũ
+    await Future<void>.delayed(const Duration(milliseconds: 2500));
     await _executePublish();
   }
 

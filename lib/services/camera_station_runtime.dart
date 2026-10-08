@@ -1412,6 +1412,16 @@ class CameraStationRuntime {
       if (wasWhipPublishing) {
         unawaited(_whipPublisherService.restartIfPublishing());
       }
+      try {
+        server.updateDiscoveryStatus(
+          recording.recording ? 'RECORDING' : 'READY',
+        );
+      } catch (e) {
+        developer.log(
+          '[CAMERA] Updating discovery status failed: $e',
+          name: 'CameraStationRuntime',
+        );
+      }
       developer.log(
         '[CAMERA] Resolution changed to ${selected.shortLabel} '
         '${selected.fps} FPS ($currentFacing)',
@@ -2138,13 +2148,32 @@ class CameraStationRuntime {
     return remaining - const Duration(milliseconds: 250);
   }
 
+  CameraResolutionProfile _selectThermalThrottledProfile(
+    CameraResolutionProfile current,
+  ) {
+    // Giai đoạn 1: Nếu đang chạy FPS cao (> 30 FPS, ví dụ 60 FPS), ưu tiên hạ FPS
+    // xuống 30 FPS cùng preset để giảm ngay ~50% tải encoder mà vẫn giữ nguyên
+    // độ phân giải sắc nét cho trận đấu.
+    if (current.fps > 30) {
+      for (final supported in _supportedResolutionProfiles) {
+        if (supported.preset == current.preset && supported.fps <= 30) {
+          return supported.withFps(30);
+        }
+      }
+    }
+    // Giai đoạn 2: Nếu đã ở <= 30 FPS hoặc không có cấu hình 30 FPS tương ứng,
+    // hạ an toàn về 720p 30 FPS để bảo vệ máy không bị tắt nguồn do quá nhiệt.
+    return CameraResolutionProfile.hd720.withFps(30);
+  }
+
   void _scheduleThermalThrottleAtSegmentBoundary() {
     // Finish the normal file just before its own rotation timer. Critical
     // thermal state is handled separately and still stops capture at once.
     final delay = _delayUntilSegmentBoundary();
+    final targetProfile = _selectThermalThrottledProfile(_resolutionProfile);
     developer.log(
-      '[THERMAL] Hot device; scheduling 720p/30fps at the segment boundary '
-      'in ${delay.inSeconds}s',
+      '[THERMAL] Hot device; scheduling ${targetProfile.shortLabel}/${targetProfile.fps}fps '
+      'at the segment boundary in ${delay.inSeconds}s',
       name: 'CameraStationRuntime',
     );
     _pendingThermalThrottleTimer = Timer(delay, () {
@@ -2166,14 +2195,16 @@ class CameraStationRuntime {
     }
     _thermalThrottled = true;
     _emitState();
+    final targetProfile = _selectThermalThrottledProfile(_resolutionProfile);
     developer.log(
-      '[THERMAL] Segment boundary reached; reducing camera to 720p/30fps',
+      '[THERMAL] Segment boundary reached; reducing camera to '
+      '${targetProfile.shortLabel}/${targetProfile.fps}fps',
       name: 'CameraStationRuntime',
     );
     try {
       await _serializeLifecycle(
         () => _setResolutionProfileInternal(
-          CameraResolutionProfile.hd720.withFps(30),
+          targetProfile,
           persistSelection: false,
         ),
       );

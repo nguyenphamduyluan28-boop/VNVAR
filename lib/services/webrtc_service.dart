@@ -528,9 +528,13 @@ class WebRtcService {
           if (deviceId is String && deviceId.isNotEmpty) {
             detectedDeviceId ??= deviceId;
           }
+          if (item['id'] == 'ultraHd4k') continue;
           final profile = CameraResolutionProfile.fromId(item['id'] as String?);
           final maxFps = item['maxFps'];
-          if (profile != null && maxFps is num && maxFps.toInt() > 0) {
+          if (profile != null &&
+              profile.preset != CameraResolutionPreset.ultraHd4k &&
+              maxFps is num &&
+              maxFps.toInt() > 0) {
             final detectedFps = maxFps.toInt();
             // Nếu phần cứng hỗ trợ >= 50 FPS (tức là 60 FPS thực tế),
             // thêm BOTH 30 FPS (tiết kiệm pin / mạng yếu) và max FPS (60).

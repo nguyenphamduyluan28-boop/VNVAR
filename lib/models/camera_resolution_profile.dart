@@ -46,7 +46,7 @@ class CameraResolutionProfile {
     bitrate: 10000000,
   );
 
-  static const values = [hd720, fullHd1080, qhd2k, ultraHd4k];
+  static const values = [hd720, fullHd1080, qhd2k];
 
   String get id => preset.name;
   String get shortLabel => switch (preset) {
@@ -87,6 +87,10 @@ class CameraResolutionProfile {
   }
 
   static CameraResolutionProfile? fromId(String? id) {
+    // Tự động chuyển đổi nếu máy từng lưu profile 4K trước đó về 1080p an toàn
+    if (id == 'ultraHd4k') {
+      return fullHd1080;
+    }
     for (final profile in values) {
       if (profile.id == id) return profile;
     }

@@ -249,6 +249,11 @@ class CameraServer {
     );
   }
 
+  /// Cập nhật trạng thái Discovery để tablet trên mạng LAN nhận diện ngay lập tức.
+  void updateDiscoveryStatus(String status) {
+    _discovery.updateStatus(status);
+  }
+
   Future<void> _viewerPage(HttpRequest request) async {
     request.response.headers.contentType = ContentType.html;
     request.response.write('''<!doctype html>
