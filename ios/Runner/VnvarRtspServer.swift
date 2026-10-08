@@ -38,6 +38,9 @@ final class VnvarRtspServer {
   private var sps: Data?
   private var pps: Data?
   private var audioAvailable = false
+  // Tablet (client RTSP qua mạng) có nhận tiếng không; relay livestream cục bộ
+  // (loopback) luôn nhận tiếng.
+  private var remoteAudioEnabled = false
   private let maximumClients = 4
 
   init(port: Int) {
@@ -99,6 +102,14 @@ final class VnvarRtspServer {
     queue.async { [weak self] in self?.audioAvailable = available }
   }
 
+  func setRemoteAudioEnabled(_ enabled: Bool) {
+    queue.async { [weak self] in self?.remoteAudioEnabled = enabled }
+  }
+
+  private func offersAudio(to session: ClientSession) -> Bool {
+    audioAvailable && (session.isLoopback || remoteAudioEnabled)
+  }
+
   func sendAccessUnit(
     nals: [Data],
     timestamp: UInt32,
@@ -141,7 +152,8 @@ final class VnvarRtspServer {
   func sendAudio(pcm: Data, timestamp: UInt32) {
     queue.async { [weak self] in
       guard let self = self, self.audioAvailable else { return }
-      for session in self.sessions.values where session.playing {
+      for session in self.sessions.values
+      where session.playing && session.audioConfigured {
         session.sendAudio(pcm: pcm, timestamp: timestamp)
       }
     }
@@ -335,7 +347,7 @@ final class VnvarRtspServer {
       "a=fmtp:96 packetization-mode=1;profile-level-id=\(profile);" +
       "sprop-parameter-sets=\(sps.base64EncodedString()),\(pps.base64EncodedString())\r\n" +
       "a=control:track0\r\n" +
-      (audioAvailable
+      (offersAudio(to: session)
         ? "m=audio 0 RTP/AVP 97\r\n" +
           "a=rtpmap:97 L16/48000/1\r\n" +
           "a=control:track1\r\n"
@@ -364,7 +376,7 @@ final class VnvarRtspServer {
       return
     }
     let isAudio = requestLine.localizedCaseInsensitiveContains("track1")
-    if isAudio && !audioAvailable {
+    if isAudio && !offersAudio(to: session) {
       session.sendText("RTSP/1.0 404 Not Found\r\nCSeq: \(cseq)\r\n\r\n")
       return
     }
@@ -448,18 +460,43 @@ final class VnvarRtspServer {
     // an IDR frame. Sending dependent P-frames after dropping an access unit
     // produces green/yellow macroblocks until the next keyframe.
     private var recoveryGate = VnvarVideoRecoveryGate()
-    private let maximumPendingSends = 384
-    private let sendStallTimeout: TimeInterval = 2
+    // Relay livestream cục bộ (FFmpeg qua 127.0.0.1) chỉ ngừng đọc khi upload
+    // RTMP khựng: cho hàng chờ dài hơn và không đóng nó sau 2 giây, nếu không
+    // livestream phải khởi động lại và mất tiếng.
+    let isLoopback: Bool
+    private let maximumPendingSends: Int
+    private let sendStallTimeout: TimeInterval
     private var sendProgressUptime: TimeInterval = 0
     private var stallCheckGeneration = 0
     private var connectionTerminal = false
     private var videoPacketCount: UInt32 = 0
     private var videoOctetCount: UInt32 = 0
     private var lastSenderReportUptime: TimeInterval = 0
+    private var audioPacketCount: UInt32 = 0
+    private var audioOctetCount: UInt32 = 0
+    private var lastAudioSenderReportUptime: TimeInterval = 0
 
     init(connection: NWConnection, queue: DispatchQueue) {
       self.connection = connection
       self.queue = queue
+      let loopback = ClientSession.isLoopbackEndpoint(connection.endpoint)
+      isLoopback = loopback
+      maximumPendingSends = loopback ? 4_096 : 384
+      sendStallTimeout = loopback ? 10 : 2
+    }
+
+    private static func isLoopbackEndpoint(_ endpoint: NWEndpoint) -> Bool {
+      guard case let .hostPort(host, _) = endpoint else { return false }
+      switch host {
+      case let .ipv4(address):
+        return address == IPv4Address.loopback
+      case let .ipv6(address):
+        return address == IPv6Address.loopback
+      case let .name(name, _):
+        return name == "localhost"
+      @unknown default:
+        return false
+      }
     }
 
     func respond(cseq: String, headers: String) {
@@ -531,7 +568,7 @@ final class VnvarRtspServer {
 
     private func sendVideoSenderReportIfDue(rtpTimestamp: UInt32) {
       let now = ProcessInfo.processInfo.systemUptime
-      guard now - lastSenderReportUptime >= 5 else { return }
+      guard now - lastSenderReportUptime >= 2 else { return }
       lastSenderReportUptime = now
       let report = VnvarRtpPacketizer.senderReport(
         ntpTimestamp: VnvarRtpPacketizer.currentNtpTimestamp(),
@@ -556,9 +593,30 @@ final class VnvarRtspServer {
         )
         if sendInterleaved(packet, channel: audioRtpChannel) {
           audioSequence &+= 1
+          audioPacketCount &+= 1
+          audioOctetCount &+= UInt32(truncatingIfNeeded: size)
         }
         offset += size
       }
+      sendAudioSenderReportIfDue(
+        rtpTimestamp: timestamp &+ UInt32(truncatingIfNeeded: pcm.count / 2)
+      )
+    }
+
+    /// Sender Report cho audio cùng đồng hồ NTP với video, để FFmpeg và trình
+    /// phát ghép hình–tiếng đúng thời điểm.
+    private func sendAudioSenderReportIfDue(rtpTimestamp: UInt32) {
+      let now = ProcessInfo.processInfo.systemUptime
+      guard now - lastAudioSenderReportUptime >= 2 else { return }
+      lastAudioSenderReportUptime = now
+      let report = VnvarRtpPacketizer.senderReport(
+        ssrc: 0x564E4155,
+        ntpTimestamp: VnvarRtpPacketizer.currentNtpTimestamp(),
+        rtpTimestamp: rtpTimestamp,
+        packetCount: audioPacketCount,
+        octetCount: audioOctetCount
+      )
+      sendInterleaved(report, channel: audioRtpChannel &+ 1)
     }
 
     @discardableResult

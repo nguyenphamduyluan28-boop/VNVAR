@@ -86,7 +86,7 @@ final class VnvarAudioSegmentRecorder {
     pcmOffset = 0
     let generation = pcmGeneration
     let timer = DispatchSource.makeTimerSource(queue: DispatchQueue.global(qos: .userInitiated))
-    timer.schedule(deadline: .now() + .milliseconds(200), repeating: .milliseconds(100))
+    timer.schedule(deadline: .now() + .milliseconds(100), repeating: .milliseconds(40))
     timer.setEventHandler { [weak self] in
       guard let self = self, self.pcmGeneration == generation,
             let handle = try? FileHandle(forReadingFrom: URL(fileURLWithPath: path)) else { return }
@@ -98,7 +98,10 @@ final class VnvarAudioSegmentRecorder {
         self.pcmOffset = UInt64(range.upperBound + 4)
       }
       handle.seek(toFileOffset: self.pcmOffset)
-      let data = handle.readData(ofLength: 9_600)
+      // Đọc toàn bộ phần đã ghi (tối đa 1 giây). AVAudioRecorder ghi theo từng
+      // đợt; đọc cố định 100 ms mỗi nhịp khiến luồng RTSP bị khoảng lặng khi
+      // đợt ghi đến muộn và không bao giờ đuổi kịp phần tồn sau đó.
+      let data = handle.readData(ofLength: 96_000)
       guard !data.isEmpty else { return }
       let aligned = data.count - (data.count % 2)
       guard aligned > 0 else { return }

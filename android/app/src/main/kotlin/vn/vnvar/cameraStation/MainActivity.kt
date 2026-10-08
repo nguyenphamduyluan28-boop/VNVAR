@@ -265,6 +265,7 @@ class MainActivity : FlutterActivity() {
                     val port = call.argument<Int>("port") ?: 8554
                     val bitrate = call.argument<Int>("bitrate") ?: 2_000_000
                     val fps = call.argument<Int>("fps") ?: 30
+                    val remoteAudio = call.argument<Boolean>("remoteAudio") ?: false
                     val track = trackId?.let {
                         FlutterWebRTCPlugin.sharedSingleton?.getTrackForId(it, null)
                     }
@@ -279,6 +280,7 @@ class MainActivity : FlutterActivity() {
                                 port = port,
                                 bitrate = bitrate,
                                 fps = fps,
+                                remoteAudioEnabled = remoteAudio,
                                 onEncoderConfigured = {
                                     runOnUiThread {
                                         platformChannel.invokeMethod(
@@ -316,6 +318,19 @@ class MainActivity : FlutterActivity() {
                             result.error("RTSP_START_FAILED", error.message, null)
                         }
                     }
+                }
+
+                "setRtspBitrate" -> {
+                    val bitrate = call.argument<Int>("bitrate")
+                    if (bitrate != null && bitrate > 0) {
+                        rtspPublisher?.setTargetBitrate(bitrate)
+                    }
+                    result.success(null)
+                }
+
+                "setRtspRemoteAudio" -> {
+                    rtspPublisher?.remoteAudioEnabled = call.argument<Boolean>("enabled") ?: false
+                    result.success(null)
                 }
 
                 "stopRtsp" -> {

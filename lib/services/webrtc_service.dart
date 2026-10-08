@@ -358,6 +358,10 @@ class WebRtcService {
   }
 
   bool _rtspRunning = false;
+  Completer<void>? _rtspReadyCompleter;
+  // Tablet (client RTSP qua mạng) có nhận tiếng không. Relay livestream cục bộ
+  // luôn nhận tiếng.
+  bool _rtspTabletAudio = false;
   bool _rtspAudio = false;
   bool _rtspServerStarted = false;
   String? _rtspError;
@@ -380,6 +384,47 @@ class WebRtcService {
   String? get rtspError => _rtspError;
 
   bool get rtspRunning => _rtspRunning;
+
+  bool get rtspTabletAudio => _rtspTabletAudio;
+
+  /// Bật/tắt tiếng cho Tablet xem RTSP. Áp dụng cho kết nối RTSP mới.
+  Future<void> setRtspTabletAudio(bool enabled) async {
+    _rtspTabletAudio = enabled;
+    if (!rtspSupported || !_rtspServerStarted) return;
+    try {
+      await _platformChannel.invokeMethod<void>('setRtspRemoteAudio', {
+        'enabled': enabled,
+      });
+    } catch (error) {
+      developer.log(
+        '[RTSP] Unable to update tablet audio: $error',
+        name: 'WebRtcService',
+      );
+    }
+  }
+
+  /// Chờ encoder RTSP cục bộ sẵn sàng (tối đa [timeout]).
+  Future<bool> waitForRtspReady({
+    Duration timeout = const Duration(seconds: 6),
+  }) async {
+    if (_rtspRunning) return true;
+    if (!_rtspServerStarted) return false;
+    final completer = _rtspReadyCompleter ??= Completer<void>();
+    try {
+      await completer.future.timeout(timeout);
+      return true;
+    } on TimeoutException {
+      return _rtspRunning;
+    }
+  }
+
+  /// Đổi bitrate encoder RTSP khi đang chạy (không khởi động lại encoder).
+  Future<void> setRtspTargetBitrate(int bitrateBps) async {
+    if (!rtspSupported || !_rtspServerStarted) return;
+    await _platformChannel.invokeMethod<void>('setRtspBitrate', {
+      'bitrate': bitrateBps,
+    });
+  }
   bool get rtspAudio => _rtspAudio;
 
   bool get rtspSupported => Platform.isAndroid || Platform.isIOS;
@@ -401,6 +446,8 @@ class WebRtcService {
         _rtspRetryAttempt = 0;
         _rtspRunning = true;
         _rtspError = null;
+        final ready = _rtspReadyCompleter;
+        if (ready != null && !ready.isCompleted) ready.complete();
         developer.log(
           '[RTSP] H.264 encoder ready at rtsp://0.0.0.0:8554/camera',
           name: 'WebRtcService',
@@ -1132,6 +1179,10 @@ class WebRtcService {
       _rtspAudio = false;
       _rtspError = null;
       _rtspServerStarted = true;
+      final previousReady = _rtspReadyCompleter;
+      if (previousReady == null || previousReady.isCompleted) {
+        _rtspReadyCompleter = Completer<void>();
+      }
       _rtspRetryTimer?.cancel();
       final result = await _platformChannel.invokeMethod<Map<Object?, Object?>>(
         'startRtsp',
@@ -1143,6 +1194,7 @@ class WebRtcService {
           // profile's LAN-safe budget while WebRTC keeps its higher ceiling.
           'bitrate': _resolutionProfile.rtspBitrate,
           'fps': _resolutionProfile.fps,
+          'remoteAudio': _rtspTabletAudio,
         },
       );
       _rtspAudio = result?['audio'] == true;

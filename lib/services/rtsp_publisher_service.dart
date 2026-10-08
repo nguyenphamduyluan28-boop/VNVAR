@@ -20,6 +20,98 @@ enum StreamNetworkQuality {
   poor, // Đỏ: FPS < 50% FPS camera hoặc bitrate < 800 kbps kéo dài >= 10s
 }
 
+/// Điều chỉnh bitrate encoder H.264 theo khả năng upload của relay livestream.
+///
+/// FFmpeg báo `speed` = thời lượng đã đẩy / thời gian thực. Upload không theo
+/// kịp thì speed < 1 và FPS đầu ra giảm. Khi đó hạ bitrate 25% mỗi bước (sau
+/// 3 giây nghẽn liên tục), ổn định 30 giây thì tăng lại 10% mỗi bước. Encoder
+/// đổi bitrate tại chỗ nên không ngắt luồng.
+class LiveBitrateController {
+  LiveBitrateController({required int maximumBps})
+    : _maximumBps = maximumBps,
+      _targetBps = maximumBps;
+
+  static const Duration congestionHold = Duration(seconds: 3);
+  static const Duration decreaseInterval = Duration(seconds: 4);
+  static const Duration recoveryHold = Duration(seconds: 30);
+
+  int _maximumBps;
+  int _targetBps;
+  DateTime? _congestedSince;
+  DateTime? _healthySince;
+  DateTime? _lastChange;
+
+  int get maximumBps => _maximumBps;
+  int get targetBps => _targetBps;
+  int get minimumBps {
+    final floor = (_maximumBps * 0.3).round();
+    return floor < 800000 ? 800000 : floor;
+  }
+
+  /// Trả về true nếu bitrate mục tiêu đổi theo mức tối đa mới.
+  bool setMaximum(int bps) {
+    if (bps <= 0 || bps == _maximumBps) return false;
+    _maximumBps = bps;
+    final previous = _targetBps;
+    if (_targetBps > bps) _targetBps = bps;
+    return previous != _targetBps;
+  }
+
+  /// Về lại chất lượng tối đa (camera vừa mở lại encoder, hoặc dừng phát).
+  void reset() {
+    _targetBps = _maximumBps;
+    _congestedSince = null;
+    _healthySince = null;
+    _lastChange = null;
+  }
+
+  /// Phiên FFmpeg mới: bỏ qua giai đoạn khởi động, khi speed chưa ổn định.
+  void beginSession(DateTime now) {
+    _congestedSince = null;
+    _healthySince = null;
+    _lastChange = now;
+  }
+
+  /// Trả về bitrate mới khi cần đổi, ngược lại null.
+  int? observe({
+    required double speed,
+    required double fps,
+    required int expectedFps,
+    required DateTime now,
+  }) {
+    final congested =
+        (speed > 0 && speed < 0.95) || (fps > 0 && fps < expectedFps * 0.8);
+    final healthy =
+        speed >= 0.98 && (fps <= 0 || fps >= expectedFps * 0.9);
+    final last = _lastChange;
+    if (congested) {
+      _healthySince = null;
+      final since = _congestedSince ??= now;
+      if (now.difference(since) < congestionHold) return null;
+      if (last != null && now.difference(last) < decreaseInterval) return null;
+      if (_targetBps <= minimumBps) return null;
+      final reduced = (_targetBps * 0.75).round();
+      _targetBps = reduced < minimumBps ? minimumBps : reduced;
+      _lastChange = now;
+      _congestedSince = now;
+      return _targetBps;
+    }
+    if (healthy) {
+      _congestedSince = null;
+      final since = _healthySince ??= now;
+      if (_targetBps >= _maximumBps) return null;
+      if (now.difference(since) < recoveryHold) return null;
+      if (last != null && now.difference(last) < recoveryHold) return null;
+      final raised = (_targetBps * 1.1).round();
+      _targetBps = raised > _maximumBps ? _maximumBps : raised;
+      _lastChange = now;
+      _healthySince = now;
+      return _targetBps;
+    }
+    return null;
+  }
+}
+
 class RtspPublisherService {
   RtspPublishState _state = RtspPublishState.idle;
   final StreamController<RtspPublishState> _stateController =
@@ -43,6 +135,16 @@ class RtspPublisherService {
   DateTime? _congestionStartedAt;
   DateTime? _stableStartedAt;
   int _expectedFps = 30;
+  double _currentSpeed = 0;
+  final LiveBitrateController _bitrate = LiveBitrateController(
+    maximumBps: 5000000,
+  );
+
+  /// Gọi khi cần đổi bitrate encoder RTSP (runtime nối tới WebRtcService).
+  Future<void> Function(int bitrateBps)? onTargetBitrateChanged;
+
+  /// Chờ RTSP server cục bộ có encoder sẵn sàng trước khi chạy lại relay.
+  Future<bool> Function()? waitForLocalSource;
   // Tăng mỗi khi mở/hủy một phiên FFmpeg. Callback của phiên cũ (đã bị thay
   // thế hoặc hủy) mang generation khác nên không được ghi đè trạng thái mới.
   int _sessionGeneration = 0;
@@ -70,6 +172,34 @@ class RtspPublisherService {
 
   /// FPS của profile camera hiện tại, dùng làm chuẩn đánh giá chất lượng mạng.
   set expectedFps(int fps) => _expectedFps = fps.clamp(1, 60);
+
+  /// Bitrate RTSP tối đa của profile hiện tại.
+  set maxBitrateBps(int bps) {
+    if (_bitrate.setMaximum(bps)) _applyTargetBitrate();
+  }
+
+  int get targetBitrateKbps => _bitrate.targetBps ~/ 1000;
+  int get maxBitrateKbps => _bitrate.maximumBps ~/ 1000;
+
+  /// Đã tự hạ chất lượng vì upload không theo kịp.
+  bool get bitrateReduced => _bitrate.targetBps < _bitrate.maximumBps;
+
+  /// Tốc độ đẩy so với thời gian thực (1.0 = theo kịp), 0 khi chưa có số liệu.
+  double get uploadSpeed => _currentSpeed;
+
+  void _applyTargetBitrate() {
+    final callback = onTargetBitrateChanged;
+    if (callback == null) return;
+    final bps = _bitrate.targetBps;
+    unawaited(
+      callback(bps).catchError((Object error) {
+        developer.log(
+          '[RTSP_PUSH] Unable to apply bitrate $bps: $error',
+          name: 'RtspPublisherService',
+        );
+      }),
+    );
+  }
 
   void _setState(RtspPublishState newState) {
     if (_state == newState) return;
@@ -142,6 +272,11 @@ class RtspPublisherService {
     await _cancelActiveSession();
     final generation = ++_sessionGeneration;
     _resetNetworkHealth();
+    _currentSpeed = 0;
+    _bitrate.beginSession(DateTime.now());
+    // Phiên mới (kết nối lại) giữ mức bitrate đã thích ứng; áp lại cho chắc
+    // encoder đang đúng mức đó.
+    _applyTargetBitrate();
     bool isCurrent() => generation == _sessionGeneration;
 
     final isRtmp = _targetUrl!.toLowerCase().startsWith('rtmp://') ||
@@ -277,7 +412,24 @@ class RtspPublisherService {
           if (!isCurrent()) return;
           _currentFps = stats.getVideoFps();
           _currentBitrateKbps = stats.getBitrate();
+          _currentSpeed = stats.getSpeed();
           _evaluateNetworkHealth(_currentFps, _currentBitrateKbps);
+          if (_state == RtspPublishState.publishing) {
+            final next = _bitrate.observe(
+              speed: _currentSpeed,
+              fps: _currentFps,
+              expectedFps: _expectedFps,
+              now: DateTime.now(),
+            );
+            if (next != null) {
+              developer.log(
+                '[RTSP_PUSH] Upload speed ${_currentSpeed.toStringAsFixed(2)}x, '
+                'FPS ${_currentFps.toStringAsFixed(1)}; bitrate -> ${next ~/ 1000} kbps',
+                name: 'RtspPublisherService',
+              );
+              _applyTargetBitrate();
+            }
+          }
           if (!_stateController.isClosed && _state == RtspPublishState.publishing) {
             _stateController.add(_state);
           }
@@ -409,6 +561,9 @@ class RtspPublisherService {
     _reconnectTimer = null;
     _retryAttempt = 0;
     await _cancelActiveSession();
+    // Hết livestream: trả encoder về chất lượng đầy đủ cho Tablet.
+    _bitrate.reset();
+    _applyTargetBitrate();
     _setState(RtspPublishState.idle);
   }
 
@@ -441,9 +596,20 @@ class RtspPublisherService {
     _reconnectTimer = null;
     _retryAttempt = 0;
     await _cancelActiveSession();
+    // Camera vừa mở lại encoder ở bitrate đầy đủ của profile.
+    _bitrate.reset();
     _setState(RtspPublishState.connecting);
-    // Chờ RTSP server cục bộ ổn định với profile mới và cho phép server Sporto từ xa giải phóng hoàn toàn kết nối socket cũ
-    await Future<void>.delayed(const Duration(milliseconds: 2500));
+    // Chạy lại ngay khi encoder RTSP cục bộ sẵn sàng thay vì chờ cố định 2,5
+    // giây; giữ một khoảng ngắn để server phía xa giải phóng kết nối cũ.
+    final waitForSource = waitForLocalSource;
+    if (waitForSource != null) {
+      try {
+        await waitForSource();
+      } catch (_) {}
+    } else {
+      await Future<void>.delayed(const Duration(milliseconds: 2500));
+    }
+    await Future<void>.delayed(const Duration(milliseconds: 500));
     if (_intentionalStop) return;
     await _executePublish();
   }

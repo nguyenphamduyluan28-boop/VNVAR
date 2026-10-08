@@ -30,22 +30,49 @@ class VnvarRtspPublisher(
     private val port: Int = 8554,
     private val bitrate: Int = 2_000_000,
     private val fps: Int = 30,
+    remoteAudioEnabled: Boolean = false,
     private val onEncoderConfigured: () -> Unit = {},
     private val onEncoderError: (String) -> Unit = {},
 ) : VideoSink {
     fun sendAudioPcm(pcm: ByteArray) {
         if (!running.get() || !audioAvailable || pcm.isEmpty()) return
-        val targets = sessions.values.filter { it.playing && it.audioConfigured }
-        if (targets.isEmpty()) return
-        try {
-            audioExecutor.execute {
-                if (!running.get()) return@execute
-                sessions.values.filter { it.playing && it.audioConfigured }.forEach {
-                    it.sendAudio(pcm)
-                }
-            }
-        } catch (_: Exception) {}
+        // Mỗi client gửi âm thanh trên luồng gửi riêng của nó. Trước đây mọi
+        // client dùng chung một luồng ghi chặn vào socket, nên một Tablet có
+        // Wi-Fi yếu làm ngắt tiếng của tất cả client (kể cả relay livestream).
+        for (session in sessions.values) {
+            if (session.playing && session.audioConfigured) session.enqueueAudio(pcm)
+        }
     }
+    /**
+     * Tablet (client RTSP qua mạng) có nhận tiếng không. Relay livestream cục
+     * bộ (loopback) luôn nhận tiếng. Áp dụng cho DESCRIBE/SETUP mới.
+     */
+    @Volatile var remoteAudioEnabled: Boolean = remoteAudioEnabled
+
+    /**
+     * Bitrate mục tiêu do bộ thích ứng livestream đặt. Báo cáo RTCP từ Tablet
+     * chỉ được hạ thấp hơn mức này, không được nâng vượt lên.
+     */
+    fun setTargetBitrate(target: Int) {
+        val clamped = synchronized(feedbackLock) {
+            val value = target.coerceIn(MIN_RTSP_BITRATE, bitrate.coerceAtLeast(MIN_RTSP_BITRATE))
+            maximumAdaptiveBitrate = value
+            currentBitrate = value
+            healthyReceiverReports = 0
+            value
+        }
+        synchronized(codecLock) {
+            try {
+                codec?.setParameters(Bundle().apply {
+                    putInt(MediaCodec.PARAMETER_KEY_VIDEO_BITRATE, clamped)
+                })
+                Log.i(TAG, "Live bitrate target applied: $clamped")
+            } catch (error: Exception) {
+                Log.w(TAG, "Unable to apply live bitrate $clamped", error)
+            }
+        }
+    }
+
     private val running = AtomicBoolean(false)
     private val sessions = ConcurrentHashMap<String, Session>()
     private var serverSocket: ServerSocket? = null
@@ -62,9 +89,6 @@ class VnvarRtspPublisher(
     private var healthyReceiverReports = 0
     private val encoderExecutor = Executors.newSingleThreadExecutor { task ->
         Thread(task, "VNVAR-RTSP-Encoder").apply { isDaemon = true }
-    }
-    private val audioExecutor = Executors.newSingleThreadExecutor { task ->
-        Thread(task, "VNVAR-RTSP-Audio").apply { isDaemon = true }
     }
     private val framePending = AtomicBoolean(false)
     private val encoderReady = AtomicBoolean(false)
@@ -334,10 +358,16 @@ class VnvarRtspPublisher(
             videoCapabilities.bitrateRange.lower,
             videoCapabilities.bitrateRange.upper,
         )
-        synchronized(feedbackLock) {
-            currentBitrate = supportedBitrate
-            maximumAdaptiveBitrate = supportedBitrate
+        val startBitrate = synchronized(feedbackLock) {
+            // Encoder dựng lại (đổi kích thước khung) giữ mức đã thích ứng.
+            val keep = maximumAdaptiveBitrate.coerceIn(
+                videoCapabilities.bitrateRange.lower,
+                supportedBitrate,
+            )
+            currentBitrate = keep
+            maximumAdaptiveBitrate = keep
             healthyReceiverReports = 0
+            keep
         }
         val bitrateMode = if (
             capabilities.encoderCapabilities.isBitrateModeSupported(
@@ -353,7 +383,7 @@ class VnvarRtspPublisher(
         codec = MediaCodec.createByCodecName(codecInfo.name).apply {
             val format = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, width, height)
             format.setInteger(MediaFormat.KEY_COLOR_FORMAT, encoderColorFormat)
-            format.setInteger(MediaFormat.KEY_BIT_RATE, supportedBitrate)
+            format.setInteger(MediaFormat.KEY_BIT_RATE, startBitrate)
             format.setInteger(MediaFormat.KEY_FRAME_RATE, supportedFps)
             format.setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1)
             format.setInteger(MediaFormat.KEY_PRIORITY, 0)
@@ -664,7 +694,6 @@ class VnvarRtspPublisher(
         sessions.values.forEach { it.close() }
         sessions.clear()
         encoderExecutor.shutdownNow()
-        audioExecutor.shutdownNow()
         synchronized(codecLock) {
             try { codec?.stop() } catch (_: Exception) {}
             codec?.release()
@@ -689,6 +718,18 @@ class VnvarRtspPublisher(
         }
         private var sendGeneration = 0L
         private var pendingRtpPackets = 0
+        private var pendingAudioChunks = 0
+        // Relay FFmpeg (livestream RTMP/RTSP) đọc qua loopback: khi đường upload
+        // nghẽn chốc lát nó ngừng đọc, nên cần hàng chờ dài như video thay vì bỏ
+        // tiếng sau 0,5 giây như client Wi-Fi.
+        private val isLoopbackClient = socket.inetAddress?.isLoopbackAddress == true
+        private val offersAudio: Boolean
+            get() = audioAvailable && (isLoopbackClient || remoteAudioEnabled)
+        private var videoPacketCount = 0L
+        private var videoOctetCount = 0L
+        private var audioPacketCount = 0L
+        private var audioOctetCount = 0L
+        private var lastSenderReportNanos = 0L
         private var awaitingKeyFrame = true
         private var keyFrameQueued = false
         private var closed = false
@@ -698,7 +739,7 @@ class VnvarRtspPublisher(
             if (transport.contains("TCP", true) || transport.contains("interleaved", true)) {
                 val requested = Regex("interleaved=(\\d+)").find(transport)?.groupValues?.get(1)?.toIntOrNull()
                 val isAudio = uri.contains("track1", true)
-                if (isAudio && !audioAvailable) {
+                if (isAudio && !offersAudio) {
                     writeRtsp("RTSP/1.0 404 Not Found\r\nCSeq: $cseq\r\n\r\n")
                     return
                 }
@@ -781,7 +822,7 @@ class VnvarRtspPublisher(
                 "sprop-parameter-sets=${Base64.encodeToString(localSps, Base64.NO_WRAP)}," +
                 "${Base64.encodeToString(localPps, Base64.NO_WRAP)}\r\n" +
                 "a=control:track0\r\n" +
-                if (audioAvailable) "m=audio 0 RTP/AVP 97\r\na=rtpmap:97 L16/48000/1\r\na=control:track1\r\n" else ""
+                if (offersAudio) "m=audio 0 RTP/AVP 97\r\na=rtpmap:97 L16/48000/1\r\na=control:track1\r\n" else ""
             val response = "RTSP/1.0 200 OK\r\n" +
                 "CSeq: $cseq\r\n" +
                 "Content-Type: application/sdp\r\n" +
@@ -838,8 +879,15 @@ class VnvarRtspPublisher(
             val packetCount = nals.sumOf(::rtpPacketCount)
             if (packetCount == 0) return false
             val writeStarted = writeStartedNanos
+            // Relay livestream cục bộ chỉ ngừng đọc khi upload RTMP khựng; đóng
+            // nó sau 2 giây sẽ buộc livestream khởi động lại.
+            val stallLimit = if (isLoopbackClient) {
+                LOOPBACK_WRITE_STALL_NANOS
+            } else {
+                CLIENT_WRITE_STALL_NANOS
+            }
             if (writeStarted != 0L &&
-                System.nanoTime() - writeStarted > CLIENT_WRITE_STALL_NANOS
+                System.nanoTime() - writeStarted > stallLimit
             ) {
                 Log.w(TAG, "Closing stalled RTSP client $id")
                 close()
@@ -847,8 +895,7 @@ class VnvarRtspPublisher(
             }
 
             val generation: Long
-            val isLoopback = socket.inetAddress?.isLoopbackAddress == true
-            val maxAllowedPending = if (isLoopback) 4096 else MAX_PENDING_RTP_PACKETS
+            val maxAllowedPending = if (isLoopbackClient) 4096 else MAX_PENDING_RTP_PACKETS
             synchronized(sendStateLock) {
                 if (closed || !playing) return false
                 if (awaitingKeyFrame && !isKeyFrame) return false
@@ -890,6 +937,7 @@ class VnvarRtspPublisher(
                         nals.forEachIndexed { index, nal ->
                             sendNal(nal, timestamp, index == nals.lastIndex)
                         }
+                        sendSenderReportsIfDue()
                         sent = !socket.isClosed
                     } finally {
                         writeStartedNanos = 0L
@@ -965,10 +1013,115 @@ class VnvarRtspPublisher(
                 synchronized(outputLock) {
                     output.write(interleaved)
                 }
+                videoPacketCount++
+                videoOctetCount += payload.size
             } catch (_: Exception) { close() }
         }
 
-        fun sendAudio(pcm: ByteArray) {
+        /**
+         * RTCP Sender Report cho video và audio, cùng một đồng hồ NTP. Nhờ đó
+         * FFmpeg (relay livestream) và trình phát Tablet ghép hình–tiếng đúng
+         * thời điểm thay vì coi gói đầu tiên của mỗi luồng là mốc 0.
+         */
+        private fun sendSenderReportsIfDue() {
+            val nowNanos = android.os.SystemClock.elapsedRealtimeNanos()
+            if (lastSenderReportNanos != 0L &&
+                nowNanos - lastSenderReportNanos < SENDER_REPORT_INTERVAL_NANOS
+            ) return
+            val start = streamStartNanos
+            if (start < 0L) return
+            lastSenderReportNanos = nowNanos
+            val wallMs = System.currentTimeMillis()
+            val elapsedUs = (nowNanos - start) / 1000L
+            val videoRtp = (elapsedUs * 90 / 1000) and 0xffffffffL
+            writeSenderReport(rtpChannel + 1, VIDEO_SSRC, wallMs, videoRtp, videoPacketCount, videoOctetCount)
+            val audioRtp = synchronized(sendStateLock) {
+                if (audioConfigured) audioRtpTimestamp else -1L
+            }
+            if (audioRtp >= 0L) {
+                writeSenderReport(audioRtpChannel + 1, AUDIO_SSRC, wallMs, audioRtp, audioPacketCount, audioOctetCount)
+            }
+        }
+
+        private fun writeSenderReport(
+            channel: Int,
+            ssrc: Int,
+            wallMs: Long,
+            rtpTimestamp: Long,
+            packets: Long,
+            octets: Long,
+        ) {
+            val ntpSeconds = wallMs / 1000L + NTP_UNIX_OFFSET_SECONDS
+            val ntpFraction = ((wallMs % 1000L) shl 32) / 1000L
+            val report = java.nio.ByteBuffer.allocate(4 + 28)
+            report.put('$'.code.toByte())
+            report.put(channel.toByte())
+            report.putShort(28)
+            report.put(0x80.toByte())
+            report.put(200.toByte())
+            report.putShort(6)
+            report.putInt(ssrc)
+            report.putInt(ntpSeconds.toInt())
+            report.putInt(ntpFraction.toInt())
+            report.putInt(rtpTimestamp.toInt())
+            report.putInt(packets.toInt())
+            report.putInt(octets.toInt())
+            try {
+                synchronized(outputLock) { output.write(report.array()) }
+            } catch (_: Exception) { close() }
+        }
+
+        /**
+         * Xếp một gói PCM vào luồng gửi của client này. Timestamp RTP được cấp
+         * ngay tại đây và luôn tăng theo số mẫu, kể cả khi gói bị bỏ do nghẽn,
+         * để âm thanh không lệch khỏi hình sau khi mạng hồi phục.
+         */
+        fun enqueueAudio(pcm: ByteArray) {
+            val generation: Long
+            val timestamp: Long
+            synchronized(sendStateLock) {
+                if (closed || !playing || !audioConfigured) return
+                if (audioRtpTimestamp < 0L) {
+                    val nowNanos = android.os.SystemClock.elapsedRealtimeNanos()
+                    val baseNanos = if (streamStartNanos > 0L) streamStartNanos else nowNanos
+                    val elapsedNanos = (nowNanos - baseNanos).coerceAtLeast(0L)
+                    audioRtpTimestamp = (elapsedNanos * 48_000L / 1_000_000_000L) and 0xffffffffL
+                }
+                timestamp = audioRtpTimestamp
+                audioRtpTimestamp = (audioRtpTimestamp + pcm.size / 2) and 0xffffffffL
+                // Tối đa ~0,5 giây âm thanh chờ gửi; nghẽn lâu hơn thì bỏ gói
+                // mới thay vì tích độ trễ hoặc chặn các client khác.
+                val audioLimit = if (isLoopbackClient) {
+                    MAX_PENDING_AUDIO_CHUNKS_LOOPBACK
+                } else {
+                    MAX_PENDING_AUDIO_CHUNKS
+                }
+                if (pendingAudioChunks >= audioLimit) return
+                pendingAudioChunks++
+                generation = sendGeneration
+            }
+            try {
+                senderExecutor.execute {
+                    try {
+                        val valid = synchronized(sendStateLock) {
+                            !closed && playing && generation == sendGeneration
+                        }
+                        if (valid) sendAudio(pcm, timestamp)
+                    } finally {
+                        synchronized(sendStateLock) {
+                            pendingAudioChunks = (pendingAudioChunks - 1).coerceAtLeast(0)
+                        }
+                    }
+                }
+            } catch (_: Exception) {
+                synchronized(sendStateLock) {
+                    pendingAudioChunks = (pendingAudioChunks - 1).coerceAtLeast(0)
+                }
+            }
+        }
+
+        private fun sendAudio(pcm: ByteArray, startTimestamp: Long) {
+            var packetTimestamp = startTimestamp
             val networkPcm = ByteArray(pcm.size)
             var index = 0
             while (index + 1 < pcm.size) {
@@ -983,13 +1136,7 @@ class VnvarRtspPublisher(
                 val packet = ByteArray(12 + size)
                 packet[0] = 0x80.toByte(); packet[1] = 97
                 packet[2] = (audioSequence shr 8).toByte(); packet[3] = audioSequence.toByte(); audioSequence = (audioSequence + 1) and 0xffff
-                if (audioRtpTimestamp < 0L) {
-                    val nowNanos = android.os.SystemClock.elapsedRealtimeNanos()
-                    val baseNanos = if (streamStartNanos > 0L) streamStartNanos else nowNanos
-                    val elapsedNanos = (nowNanos - baseNanos).coerceAtLeast(0L)
-                    audioRtpTimestamp = (elapsedNanos * 48_000L / 1_000_000_000L) and 0xffffffffL
-                }
-                val ts = audioRtpTimestamp.toInt()
+                val ts = packetTimestamp.toInt()
                 packet[4] = (ts shr 24).toByte(); packet[5] = (ts shr 16).toByte(); packet[6] = (ts shr 8).toByte(); packet[7] = ts.toByte()
                 packet[8] = 0x56; packet[9] = 0x4e; packet[10] = 0x41; packet[11] = 0x55
                 System.arraycopy(networkPcm, offset, packet, 12, size)
@@ -997,8 +1144,10 @@ class VnvarRtspPublisher(
                 framed[0] = '$'.code.toByte(); framed[1] = audioRtpChannel.toByte(); framed[2] = (packet.size shr 8).toByte(); framed[3] = packet.size.toByte()
                 System.arraycopy(packet, 0, framed, 4, packet.size)
                 try { synchronized(outputLock) { output.write(framed) } } catch (_: Exception) { close(); return }
+                audioPacketCount++
+                audioOctetCount += size
                 val samples = size / 2
-                audioRtpTimestamp = (audioRtpTimestamp + samples) and 0xffffffffL
+                packetTimestamp = (packetTimestamp + samples) and 0xffffffffL
                 offset += size
             }
         }
@@ -1010,6 +1159,7 @@ class VnvarRtspPublisher(
                 playing = false
                 sendGeneration++
                 pendingRtpPackets = 0
+                pendingAudioChunks = 0
             }
             senderExecutor.shutdownNow()
             try { socket.close() } catch (_: Exception) {}
@@ -1020,8 +1170,17 @@ class VnvarRtspPublisher(
         private const val TAG = "VNVAR-RTSP"
         private const val RTP_PAYLOAD_BYTES = 1200
         private const val MAX_PENDING_RTP_PACKETS = 2048
+        // 50 gói × 10 ms = 0,5 giây âm thanh chờ gửi cho mỗi client.
+        private const val MAX_PENDING_AUDIO_CHUNKS = 50
+        // 800 gói × 10 ms = 8 giây cho relay livestream cục bộ.
+        private const val MAX_PENDING_AUDIO_CHUNKS_LOOPBACK = 800
         private const val SOCKET_SEND_BUFFER_BYTES = 2 * 1024 * 1024
         private const val CLIENT_WRITE_STALL_NANOS = 2_000_000_000L
+        private const val LOOPBACK_WRITE_STALL_NANOS = 10_000_000_000L
+        private const val SENDER_REPORT_INTERVAL_NANOS = 2_000_000_000L
+        private const val NTP_UNIX_OFFSET_SECONDS = 2_208_988_800L
+        private const val VIDEO_SSRC = 0x564E5652
+        private const val AUDIO_SSRC = 0x564E4155
         private const val MAX_RTSP_CLIENTS = 4
         private const val MAX_RTSP_HEADER_BYTES = 64 * 1024
         private const val MIN_RTSP_BITRATE = 500_000

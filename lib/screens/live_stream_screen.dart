@@ -1645,17 +1645,71 @@ class _LiveStreamScreenState extends State<LiveStreamScreen> {
                     const SizedBox(width: 10),
                     Expanded(
                       child: _MetricTile(
-                        title: 'ĐỘ TRỄ TRUYỀN DẪN',
-                        value: 'Low-Latency',
-                        icon: Icons.bolt_rounded,
-                        color: Colors.purpleAccent,
+                        title: appText(
+                          context,
+                          'BITRATE TỰ ĐIỀU CHỈNH',
+                          'ADAPTIVE BITRATE',
+                        ),
+                        value:
+                            '${_rtspService.targetBitrateKbps}/${_rtspService.maxBitrateKbps} Kbps',
+                        icon: Icons.tune_rounded,
+                        color: _rtspService.bitrateReduced
+                            ? Colors.orangeAccent
+                            : Colors.purpleAccent,
                       ),
                     ),
                   ],
                 ),
+                if (_rtspService.uploadSpeed > 0 &&
+                    (_rtspService.uploadSpeed < 0.95 ||
+                        _rtspService.bitrateReduced)) ...[
+                  const SizedBox(height: 10),
+                  Text(
+                    _rtspService.uploadSpeed < 0.95
+                        ? appText(
+                            context,
+                            'Upload không theo kịp (${_rtspService.uploadSpeed.toStringAsFixed(2)}×): đang tự giảm chất lượng để giữ livestream mượt.',
+                            'Upload is falling behind (${_rtspService.uploadSpeed.toStringAsFixed(2)}×): lowering quality to keep the stream smooth.',
+                          )
+                        : appText(
+                            context,
+                            'Đã tự giảm chất lượng do mạng yếu; sẽ tăng lại khi upload ổn định 30 giây.',
+                            'Quality lowered for a weak network; it rises again after 30 s of stable upload.',
+                          ),
+                    style: const TextStyle(
+                      color: Colors.orangeAccent,
+                      fontSize: 11.5,
+                    ),
+                  ),
+                ],
               ],
             ),
           ),
+
+        SwitchListTile.adaptive(
+          contentPadding: EdgeInsets.zero,
+          value: widget.runtime.rtspTabletAudio,
+          onChanged: (value) async {
+            await widget.runtime.setRtspTabletAudio(value);
+            if (mounted) setState(() {});
+          },
+          title: Text(
+            appText(
+              context,
+              'Gửi tiếng cho Tablet xem RTSP',
+              'Send audio to RTSP tablets',
+            ),
+            style: const TextStyle(color: Colors.white, fontSize: 13),
+          ),
+          subtitle: Text(
+            appText(
+              context,
+              'Tắt để dành sóng Wi-Fi cho livestream. File ghi và livestream vẫn có tiếng. Tablet đang xem cần kết nối lại để áp dụng.',
+              'Turn off to save Wi-Fi airtime for the livestream. Recordings and the livestream keep audio. Connected tablets must reconnect to apply.',
+            ),
+            style: const TextStyle(color: Colors.white54, fontSize: 11),
+          ),
+        ),
 
         // Action Button
         if (isLive || _rtspService.state == RtspPublishState.reconnecting)

@@ -224,6 +224,20 @@ class StationConfigService {
     return profile;
   }
 
+  static const _rtspTabletAudioKey = 'rtsp_tablet_audio_enabled';
+
+  /// Tablet xem RTSP có nhận tiếng không (mặc định tắt: tiết kiệm ~0,77 Mbps
+  /// sóng Wi-Fi mỗi Tablet; file ghi và livestream vẫn có tiếng).
+  Future<void> saveRtspTabletAudio(bool enabled) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool(_rtspTabletAudioKey, enabled);
+  }
+
+  Future<bool> loadRtspTabletAudio() async {
+    final prefs = await SharedPreferences.getInstance();
+    return prefs.getBool(_rtspTabletAudioKey) ?? false;
+  }
+
   Future<void> saveResolutionLocked(bool locked) async {
     final prefs = await SharedPreferences.getInstance();
     await prefs.setBool(_resolutionLockedKey, locked);

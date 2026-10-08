@@ -89,6 +89,15 @@ import UIKit
       case "stopRtsp":
         self.stopRtsp()
         result(nil)
+      case "setRtspBitrate":
+        if let bitrate = (call.arguments as? [String: Any])?["bitrate"] as? NSNumber {
+          self.rtspPublisher?.setTargetBitrate(bitrate.intValue)
+        }
+        result(nil)
+      case "setRtspRemoteAudio":
+        let enabled = (call.arguments as? [String: Any])?["enabled"] as? Bool ?? false
+        self.rtspPublisher?.setRemoteAudioEnabled(enabled)
+        result(nil)
       case "requestMicrophonePermission":
         self.requestMicrophonePermission(result)
       case "startNativeAudioSegment":
@@ -296,6 +305,7 @@ import UIKit
     let bitrate = (arguments["bitrate"] as? NSNumber)?.intValue ?? 2_000_000
     let fps = (arguments["fps"] as? NSNumber)?.intValue ?? 30
     let audioTrackId = arguments["audioTrackId"] as? String
+    let remoteAudio = arguments["remoteAudio"] as? Bool ?? false
     guard (1...65_535).contains(port) else {
       result(
         FlutterError(
@@ -315,6 +325,7 @@ import UIKit
       bitrate: bitrate,
       fps: fps
     )
+    publisher.setRemoteAudioEnabled(remoteAudio)
     let generation = rtspGeneration
     var startResultSent = false
     publisher.onEncoderConfigured = { [weak self] in

@@ -9,6 +9,9 @@ import android.media.MediaRecorder
 import androidx.core.content.ContextCompat
 import java.io.File
 import java.io.RandomAccessFile
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.LinkedBlockingQueue
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
 
@@ -29,6 +32,47 @@ class NativeAudioSegmentRecorder(private val context: Context) {
     private val dataBytes = AtomicLong(0L)
     private val lastProgressElapsedMs = AtomicLong(0L)
 
+    // Ghi file chạy trên luồng riêng. Luồng thu âm chỉ đọc AudioRecord và đẩy
+    // dữ liệu đi, nên một lần ghi/fsync chậm của bộ nhớ (FFmpeg đóng gói
+    // segment, dọn dung lượng) không còn làm tràn bộ đệm AudioRecord và gây
+    // mất tiếng ở cả file ghi lẫn luồng RTSP.
+    private val writeQueue = LinkedBlockingQueue<Any>()
+    private val fileWriter: Thread = Thread({
+        while (true) {
+            val item = try {
+                writeQueue.take()
+            } catch (_: InterruptedException) {
+                continue
+            }
+            when (item) {
+                is ByteArray -> synchronized(fileLock) {
+                    try {
+                        val writer = output
+                        if (writer != null) {
+                            writer.write(item)
+                            dataBytes.addAndGet(item.size.toLong())
+                        }
+                    } catch (_: Exception) {}
+                }
+                is CountDownLatch -> item.countDown()
+            }
+        }
+    }, "VNVAR-NativeAudio-Writer").apply {
+        isDaemon = true
+        start()
+    }
+
+    /** Chờ luồng ghi xử lý hết dữ liệu đã nhận trước khi đóng file. */
+    private fun drainWriteQueue() {
+        val marker = CountDownLatch(1)
+        writeQueue.put(marker)
+        try {
+            marker.await(3, TimeUnit.SECONDS)
+        } catch (_: InterruptedException) {
+            Thread.currentThread().interrupt()
+        }
+    }
+
     private fun ensureAudioRecordStartedLocked() {
         if (isAudioRecordRunning.get() && audioRecord != null && worker != null) {
             return
@@ -43,7 +87,10 @@ class NativeAudioSegmentRecorder(private val context: Context) {
         val encoding = AudioFormat.ENCODING_PCM_16BIT
         val minimum = AudioRecord.getMinBufferSize(sampleRate, channelConfig, encoding)
         check(minimum > 0) { "AudioRecord buffer is unavailable: $minimum" }
-        val internalBufferSize = maxOf(minimum * 4, 16_384)
+        // ~1 giây bộ đệm (96 000 byte ở 48 kHz mono 16-bit) để luồng thu chịu
+        // được các lần bị hệ điều hành tạm dừng mà không mất mẫu. Bộ đệm cũ
+        // (16 KB ≈ 170 ms) bị tràn khi bộ nhớ chậm.
+        val internalBufferSize = maxOf(minimum * 4, 96_000)
 
         // Try CAMCORDER first for wide dynamic range, then VOICE_RECOGNITION
         // (unprocessed on most devices), MIC and DEFAULT. Hardware NoiseSuppressor,
@@ -98,6 +145,11 @@ class NativeAudioSegmentRecorder(private val context: Context) {
         // and fits cleanly within single RTP packets (<1000 bytes) without IP fragmentation.
         val chunkBytes = 960
         worker = Thread({
+            try {
+                android.os.Process.setThreadPriority(
+                    android.os.Process.THREAD_PRIORITY_URGENT_AUDIO,
+                )
+            } catch (_: Exception) {}
             val buffer = ByteArray(chunkBytes)
             while (isAudioRecordRunning.get()) {
                 val count = activeRecorder.read(buffer, 0, buffer.size)
@@ -106,16 +158,12 @@ class NativeAudioSegmentRecorder(private val context: Context) {
                         // Apply zero-allocation high-pass filter to strip wind rumble
                         windRainFilter.processInPlace(buffer, count)
                         val pcmChunk = buffer.copyOf(count)
+                        // Không bao giờ ghi file hay chờ khoá file trên luồng thu.
+                        if (recordingFileActive.get()) writeQueue.offer(pcmChunk)
                         try {
-                            synchronized(fileLock) {
-                                if (recordingFileActive.get()) {
-                                    output?.write(pcmChunk)
-                                    dataBytes.addAndGet(count.toLong())
-                                }
-                            }
                             onPcm?.invoke(pcmChunk)
-                            lastProgressElapsedMs.set(android.os.SystemClock.elapsedRealtime())
                         } catch (_: Exception) {}
+                        lastProgressElapsedMs.set(android.os.SystemClock.elapsedRealtime())
                     }
                     count == AudioRecord.ERROR_INVALID_OPERATION ||
                         count == AudioRecord.ERROR_BAD_VALUE -> {
@@ -143,6 +191,10 @@ class NativeAudioSegmentRecorder(private val context: Context) {
 
     @Synchronized
     fun start(path: String): Map<String, Any> {
+        // Dữ liệu của file trước (nếu start được gọi khi chưa stop) phải được
+        // ghi xong vào file đó, không lẫn sang file mới.
+        recordingFileActive.set(false)
+        drainWriteQueue()
         val sampleRate = 48_000
         val file = File(path)
         file.parentFile?.mkdirs()
@@ -203,10 +255,13 @@ class NativeAudioSegmentRecorder(private val context: Context) {
 
     @Synchronized
     fun stop(): Map<String, Any?> {
+        // Ngừng nhận dữ liệu mới, rồi đợi luồng ghi xả hết phần đã nhận trước
+        // khi viết header WAV và đóng file.
+        recordingFileActive.set(false)
+        drainWriteQueue()
         val bytes = dataBytes.get()
         val file = outputFile
         synchronized(fileLock) {
-            recordingFileActive.set(false)
             try {
                 output?.let {
                     writeWavHeader(it, 48_000, 1, 16, bytes)

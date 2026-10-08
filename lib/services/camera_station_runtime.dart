@@ -438,6 +438,16 @@ class CameraStationRuntime {
     webRtc.onAndroidTaskRemoved = _handleAndroidTaskRemoved;
     _webRtcService = webRtc;
     _whipPublisherService.attachWebRtcService(webRtc);
+    _rtspPublisherService.onTargetBitrateChanged = (bps) async {
+      await _webRtcService?.setRtspTargetBitrate(bps);
+    };
+    _rtspPublisherService.waitForLocalSource = () async =>
+        await _webRtcService?.waitForRtspReady() ?? false;
+    try {
+      await webRtc.setRtspTabletAudio(
+        await StationConfigService().loadRtspTabletAudio(),
+      );
+    } catch (_) {}
     _recordingService = recording;
     _cameraId = cameraId;
     _courtId = courtId;
@@ -1688,8 +1698,18 @@ class CameraStationRuntime {
     }
   }
 
+  bool get rtspTabletAudio => _webRtcService?.rtspTabletAudio ?? false;
+
+  /// Bật/tắt tiếng cho Tablet xem RTSP. Tablet đang xem cần kết nối lại.
+  Future<void> setRtspTabletAudio(bool enabled) async {
+    await StationConfigService().saveRtspTabletAudio(enabled);
+    await _webRtcService?.setRtspTabletAudio(enabled);
+    _emitState();
+  }
+
   void _emitState() {
     _rtspPublisherService.expectedFps = _resolutionProfile.fps;
+    _rtspPublisherService.maxBitrateBps = _resolutionProfile.rtspBitrate;
     if (!_stateController.isClosed) _stateController.add(null);
   }
 
@@ -2221,6 +2241,12 @@ class CameraStationRuntime {
             return;
           }
           final previous = _profileBeforeThermalThrottle;
+          if (previous != null && _livePublishingActive) {
+            // Khôi phục cấu hình = mở lại camera = livestream ngắt thêm một
+            // lần. Giữ cấu hình đã hạ cho tới khi dừng livestream.
+            _emitState();
+            return;
+          }
           if (previous != null) {
             if (_pendingThermalRestoreTimer == null) {
               _scheduleThermalRestoreAtSegmentBoundary(previous);
@@ -2334,6 +2360,10 @@ class CameraStationRuntime {
     }
   }
 
+  bool get _livePublishingActive =>
+      _rtspPublisherService.wantsPublishing ||
+      _whipPublisherService.wantsPublishing;
+
   void _scheduleThermalRestoreAtSegmentBoundary(
     CameraResolutionProfile profile,
   ) {
@@ -2358,6 +2388,7 @@ class CameraStationRuntime {
         _iosLifecycleSuspended ||
         _scannerPaused ||
         !_thermalThrottled ||
+        _livePublishingActive ||
         _profileSwitching) {
       return;
     }

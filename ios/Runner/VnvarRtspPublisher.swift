@@ -21,6 +21,11 @@ final class VnvarRtspPublisher: NSObject, RTCVideoRenderer {
   private var performanceWindowStart = ProcessInfo.processInfo.systemUptime
   private var performanceFrameCount = 0
   private let requestedFps: Int
+  private let maximumBitrate: Int
+  // Timestamp RTP âm thanh tiếp theo (đơn vị mẫu 48 kHz). Tăng theo số mẫu
+  // thực để không có khe hở/chồng lấn giữa các gói; chỉ neo lại theo đồng hồ
+  // khi lệch quá xa (sau khi micro khởi động lại giữa hai segment).
+  private var nextAudioTimestamp: UInt64?
   var audioAvailable: Bool { audioSink != nil || nativeAudioAvailable }
   private let nativeAudioAvailable: Bool
 
@@ -38,6 +43,7 @@ final class VnvarRtspPublisher: NSObject, RTCVideoRenderer {
     server = VnvarRtspServer(port: port)
     encoder = VnvarH264Encoder(bitrate: bitrate, fps: fps)
     bitrateController = VnvarRtspBitrateController(maximumBitrate: bitrate)
+    maximumBitrate = max(250_000, bitrate)
     requestedFps = max(1, fps)
     super.init()
 
@@ -86,6 +92,21 @@ final class VnvarRtspPublisher: NSObject, RTCVideoRenderer {
         bitsPerSample: bits
       )
     }
+  }
+
+  /// Bitrate mục tiêu do bộ thích ứng livestream đặt. Báo cáo RTCP từ Tablet
+  /// chỉ được hạ thấp hơn mức này.
+  func setTargetBitrate(_ bitrate: Int) {
+    stateQueue.async { [weak self] in
+      guard let self = self else { return }
+      let target = min(self.maximumBitrate, max(250_000, bitrate))
+      self.bitrateController = VnvarRtspBitrateController(maximumBitrate: target)
+      self.encoder.updateBitrate(target)
+    }
+  }
+
+  func setRemoteAudioEnabled(_ enabled: Bool) {
+    server.setRemoteAudioEnabled(enabled)
   }
 
   func sendNativePcm(_ pcm: Data) {
@@ -189,12 +210,24 @@ final class VnvarRtspPublisher: NSObject, RTCVideoRenderer {
       )
       return
     }
-    // RTCVideoFrame.timeStampNs and systemUptime are monotonic clocks. Using
-    // the same time base here gives players a stable A/V relationship even
-    // before RTCP sender reports are available.
-    let timestamp = UInt32(
-      truncatingIfNeeded: UInt64(ProcessInfo.processInfo.systemUptime * 48_000)
-    )
+    // RTCVideoFrame.timeStampNs and systemUptime are monotonic clocks. The
+    // audio clock is anchored to the same time base, then advanced by the real
+    // sample count. Stamping every chunk with its arrival time made bursty
+    // AVAudioRecorder writes overlap or leave gaps, heard as audio dropouts.
+    let chunkFrames = UInt64(pcm.count / MemoryLayout<Int16>.size / max(channels, 1))
+    let timestamp: UInt32 = stateQueue.sync {
+      let now = UInt64(ProcessInfo.processInfo.systemUptime * 48_000)
+      let expectedStart = now > chunkFrames ? now - chunkFrames : 0
+      let tolerance: UInt64 = 48_000 / 2
+      if let next = nextAudioTimestamp,
+         next + tolerance >= expectedStart,
+         next <= expectedStart + tolerance {
+        nextAudioTimestamp = next + chunkFrames
+        return UInt32(truncatingIfNeeded: next)
+      }
+      nextAudioTimestamp = expectedStart + chunkFrames
+      return UInt32(truncatingIfNeeded: expectedStart)
+    }
     frameQueue.async { [weak self] in
       guard let self = self,
             self.stateQueue.sync(execute: { self.running }),

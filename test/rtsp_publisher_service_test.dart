@@ -72,6 +72,75 @@ void main() {
       service.dispose();
     });
 
+    test('adaptive bitrate lowers after sustained congestion', () {
+      final controller = LiveBitrateController(maximumBps: 5000000);
+      final start = DateTime(2026, 10, 8, 20);
+      controller.beginSession(start.subtract(const Duration(seconds: 10)));
+      int? changed;
+      for (var second = 0; second <= 3; second++) {
+        changed = controller.observe(
+          speed: 0.8,
+          fps: 22,
+          expectedFps: 30,
+          now: start.add(Duration(seconds: second)),
+        );
+      }
+      expect(changed, 3750000);
+      expect(controller.targetBps, 3750000);
+    });
+
+    test('adaptive bitrate ignores short hiccups and never drops below floor',
+        () {
+      final controller = LiveBitrateController(maximumBps: 3000000);
+      final start = DateTime(2026, 10, 8, 20);
+      controller.beginSession(start.subtract(const Duration(seconds: 10)));
+      expect(
+        controller.observe(
+          speed: 0.5,
+          fps: 10,
+          expectedFps: 30,
+          now: start,
+        ),
+        isNull,
+      );
+      var now = start;
+      for (var step = 0; step < 40; step++) {
+        now = now.add(const Duration(seconds: 1));
+        controller.observe(speed: 0.5, fps: 10, expectedFps: 30, now: now);
+      }
+      expect(controller.targetBps, controller.minimumBps);
+      expect(controller.minimumBps, 900000);
+    });
+
+    test('adaptive bitrate recovers gradually after stable upload', () {
+      final controller = LiveBitrateController(maximumBps: 5000000);
+      final start = DateTime(2026, 10, 8, 20);
+      controller.beginSession(start.subtract(const Duration(seconds: 10)));
+      for (var second = 0; second <= 3; second++) {
+        controller.observe(
+          speed: 0.8,
+          fps: 20,
+          expectedFps: 30,
+          now: start.add(Duration(seconds: second)),
+        );
+      }
+      expect(controller.targetBps, 3750000);
+      var now = start.add(const Duration(seconds: 4));
+      int? raised;
+      for (var second = 0; second <= 40 && raised == null; second++) {
+        now = now.add(const Duration(seconds: 1));
+        raised = controller.observe(
+          speed: 1.0,
+          fps: 30,
+          expectedFps: 30,
+          now: now,
+        );
+      }
+      expect(raised, 4125000);
+      controller.reset();
+      expect(controller.targetBps, 5000000);
+    });
+
     test('network quality starts unknown', () {
       final service = RtspPublisherService()..expectedFps = 15;
       expect(service.networkQuality, StreamNetworkQuality.unknown);
