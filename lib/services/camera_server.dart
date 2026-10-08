@@ -1112,7 +1112,10 @@ class CameraServer {
         'startTime': activeStartedAt.toIso8601String(),
         'endTime': now.toIso8601String(),
         'durationMs': activeDurationMs <= 0 ? 1 : activeDurationMs,
-        'downloadUrl': '/video/$fileName',
+        // File đang ghi nằm ở staging và chưa được index nên không phục vụ
+        // được; chỉ trả URL sau khi segment hoàn tất.
+        'downloadUrl': null,
+        'downloadable': false,
         'type': 'RECORDING',
         'active': true,
       };
@@ -1395,6 +1398,10 @@ class CameraServer {
 
     final String fileName = file.uri.pathSegments.last;
 
+    // Tắt bufferOutput của HttpResponse để tránh buffer dữ liệu video vào heap RAM,
+    // đẩy thẳng qua TCP socket giúp tablet stream mượt, không bị nghẽn giật cục.
+    response.bufferOutput = false;
+
     response.headers.set('Accept-Ranges', 'bytes');
 
     response.headers.set(
@@ -1549,6 +1556,17 @@ class CameraServer {
         return;
       }
 
+      if (!webRtcService.cameraInitialized) {
+        request.response.headers.set(HttpHeaders.retryAfterHeader, '2');
+        await _sendJson(request.response, HttpStatus.serviceUnavailable, {
+          'error': 'Camera is not ready',
+          'retryable': true,
+          'captureState': captureStateProvider?.call(),
+          'peerId': peerId,
+        });
+        return;
+      }
+
       late final RTCSessionDescription answer;
       try {
         answer = await webRtcService.handleOffer(
@@ -1557,6 +1575,17 @@ class CameraServer {
           peerId: peerId,
           maximumPeers: peerLimit,
         );
+      } on CameraNotReadyException {
+        // Camera vừa bị dispose trong lúc chờ hàng đợi offer.
+        await webRtcService.disposePeerConnection(peerId);
+        request.response.headers.set(HttpHeaders.retryAfterHeader, '2');
+        await _sendJson(request.response, HttpStatus.serviceUnavailable, {
+          'error': 'Camera is not ready',
+          'retryable': true,
+          'captureState': captureStateProvider?.call(),
+          'peerId': peerId,
+        });
+        return;
       } catch (_) {
         // A malformed/aborted negotiation must not consume a peer slot.
         await webRtcService.disposePeerConnection(peerId);

@@ -13,6 +13,13 @@ enum RtspPublishState {
   error,
 }
 
+enum StreamNetworkQuality {
+  unknown,
+  good, // Xanh: FPS >= 80% FPS camera và bitrate ổn định trong 8s
+  warning, // Cam: FPS hoặc bitrate sụt giảm từ 3s
+  poor, // Đỏ: FPS < 50% FPS camera hoặc bitrate < 800 kbps kéo dài >= 10s
+}
+
 class RtspPublisherService {
   RtspPublishState _state = RtspPublishState.idle;
   final StreamController<RtspPublishState> _stateController =
@@ -32,6 +39,14 @@ class RtspPublisherService {
   double _currentFps = 0;
   double _currentBitrateKbps = 0;
 
+  StreamNetworkQuality _networkQuality = StreamNetworkQuality.unknown;
+  DateTime? _congestionStartedAt;
+  DateTime? _stableStartedAt;
+  int _expectedFps = 30;
+  // Tăng mỗi khi mở/hủy một phiên FFmpeg. Callback của phiên cũ (đã bị thay
+  // thế hoặc hủy) mang generation khác nên không được ghi đè trạng thái mới.
+  int _sessionGeneration = 0;
+
   static const int maxReconnectAttempts = 8;
   static const List<int> _backoffDelaysSeconds = [2, 3, 5, 8, 12, 15, 20, 30];
 
@@ -44,10 +59,22 @@ class RtspPublisherService {
   String? get targetUrl => _targetUrl;
   double get currentFps => _currentFps;
   double get currentBitrateKbps => _currentBitrateKbps;
+  StreamNetworkQuality get networkQuality => _networkQuality;
+
+  /// Người dùng đang muốn phát (chưa bấm dừng), kể cả khi phiên đang tạm dừng
+  /// vì camera đổi cấu hình hoặc đang kết nối lại.
+  bool get wantsPublishing =>
+      !_intentionalStop &&
+      (_targetUrl?.isNotEmpty ?? false) &&
+      _state != RtspPublishState.idle;
+
+  /// FPS của profile camera hiện tại, dùng làm chuẩn đánh giá chất lượng mạng.
+  set expectedFps(int fps) => _expectedFps = fps.clamp(1, 60);
 
   void _setState(RtspPublishState newState) {
     if (_state == newState) return;
     _state = newState;
+    if (newState != RtspPublishState.publishing) _resetNetworkHealth();
     if (newState == RtspPublishState.publishing) {
       _connectedAt ??= DateTime.now();
       _startDurationTimer();
@@ -90,6 +117,7 @@ class RtspPublisherService {
     _currentError = null;
 
     if (_targetUrl == null || _targetUrl!.isEmpty) {
+      _intentionalStop = true; // Cấu hình sai: không tự phát lại.
       _currentError = 'Chưa nhập URL đích (RTSP/RTMP).';
       _setState(RtspPublishState.error);
       return;
@@ -100,6 +128,7 @@ class RtspPublisherService {
         !lower.startsWith('rtsps://') &&
         !lower.startsWith('rtmp://') &&
         !lower.startsWith('rtmps://')) {
+      _intentionalStop = true; // Cấu hình sai: không tự phát lại.
       _currentError = 'URL không đúng định dạng rtsp:// hoặc rtmp://';
       _setState(RtspPublishState.error);
       return;
@@ -111,6 +140,9 @@ class RtspPublisherService {
 
   Future<void> _executePublish() async {
     await _cancelActiveSession();
+    final generation = ++_sessionGeneration;
+    _resetNetworkHealth();
+    bool isCurrent() => generation == _sessionGeneration;
 
     final isRtmp = _targetUrl!.toLowerCase().startsWith('rtmp://') ||
         _targetUrl!.toLowerCase().startsWith('rtmps://');
@@ -149,7 +181,13 @@ class RtspPublisherService {
       '-ar',
       '48000',
       '-af',
-      'aresample=async=1000:min_hard_comp=0.100000:first_pts=0',
+      // Rain & Wind noise suppression filter chain:
+      // 1. highpass=f=130: strips sub-bass wind rumble and tripod vibration (<130Hz).
+      // 2. lowpass=f=6500: cuts harsh rain hiss and spatter (>6.5kHz).
+      // 3. afftdn=nr=18:nf=-25:tn=1: adaptive FFT noise filter reducing rain noise floor by 18dB.
+      // 4. volume=1.2: keeps referee whistle and stadium ambience crystal clear.
+      // 5. aresample: guarantees strict A/V PTS sync.
+      'highpass=f=130,lowpass=f=6500,afftdn=nr=18:nf=-25:tn=1,volume=1.2,aresample=async=1000:min_hard_comp=0.100000:first_pts=0',
       '-max_muxing_queue_size',
       '8192',
       '-avoid_negative_ts',
@@ -183,7 +221,9 @@ class RtspPublisherService {
       final session = await FFmpegKit.executeWithArgumentsAsync(
         args,
         (completedSession) async {
+          if (!isCurrent()) return;
           final returnCode = await completedSession.getReturnCode();
+          if (!isCurrent()) return;
           final isSuccess = ReturnCode.isSuccess(returnCode);
           final isCancel = ReturnCode.isCancel(returnCode);
 
@@ -199,17 +239,23 @@ class RtspPublisherService {
             return;
           }
 
-          if (!isSuccess) {
-            final output = await completedSession.getOutput();
-            final failureReason = _extractFailureReason(output);
-            developer.log(
-              '[RTSP_PUSH] Failure reason: $failureReason',
-              name: 'RtspPublisherService',
-            );
-            _scheduleReconnect(failureReason);
-          }
+          // Luồng phát không bao giờ tự kết thúc hợp lệ: FFmpeg trả mã thành
+          // công khi nguồn RTSP cục bộ đóng (camera bị dispose / đổi mạng). Phải
+          // kết nối lại, nếu không trạng thái kẹt ở "LIVE" mà không còn phiên.
+          final output = await completedSession.getOutput();
+          if (!isCurrent()) return;
+          final failureReason = isSuccess
+              ? 'Nguồn camera cục bộ đã đóng; đang kết nối lại.'
+              : _extractFailureReason(output);
+          developer.log(
+            '[RTSP_PUSH] Session ended unexpectedly: $failureReason',
+            name: 'RtspPublisherService',
+          );
+          _currentSession = null;
+          _scheduleReconnect(failureReason);
         },
         (log) {
+          if (!isCurrent()) return;
           final message = log.getMessage();
           // Detect active streaming
           if (message.contains('Output #0') ||
@@ -228,20 +274,75 @@ class RtspPublisherService {
           }
         },
         (Statistics stats) {
+          if (!isCurrent()) return;
           _currentFps = stats.getVideoFps();
           _currentBitrateKbps = stats.getBitrate();
+          _evaluateNetworkHealth(_currentFps, _currentBitrateKbps);
           if (!_stateController.isClosed && _state == RtspPublishState.publishing) {
             _stateController.add(_state);
           }
         },
       );
 
-      _currentSession = session;
+      if (isCurrent()) {
+        _currentSession = session;
+      } else {
+        // Phiên đã bị thay thế trong lúc khởi động: hủy để không chạy song song.
+        unawaited(session.cancel());
+      }
     } catch (e) {
+      if (!isCurrent()) return;
       final err = 'Không thể khởi động lệnh đẩy luồng: $e';
       _currentError = err;
       developer.log('[RTSP_PUSH] Exception: $err', name: 'RtspPublisherService');
       _scheduleReconnect(err);
+    }
+  }
+
+  void _resetNetworkHealth() {
+    _networkQuality = StreamNetworkQuality.unknown;
+    _congestionStartedAt = null;
+    _stableStartedAt = null;
+  }
+
+  void _evaluateNetworkHealth(double fps, double bitrateKbps) {
+    if (_state != RtspPublishState.publishing) {
+      _resetNetworkHealth();
+      return;
+    }
+
+    final now = DateTime.now();
+    final poorFps = _expectedFps * 0.5;
+    final goodFps = _expectedFps * 0.8;
+    final isStruggling =
+        (fps > 0 && fps < poorFps) || (bitrateKbps > 0 && bitrateKbps < 800);
+    final isDegraded = fps > 0 && fps < goodFps;
+
+    if (isStruggling || isDegraded) {
+      _stableStartedAt = null;
+      _congestionStartedAt ??= now;
+      final congestionSec = now.difference(_congestionStartedAt!).inSeconds;
+
+      if (isStruggling && congestionSec >= 10) {
+        if (_networkQuality != StreamNetworkQuality.poor) {
+          _networkQuality = StreamNetworkQuality.poor;
+          developer.log(
+            '[RTSP_PUSH] Mạng nghẽn kéo dài ${congestionSec}s '
+            '(FPS: $fps/$_expectedFps, Bitrate: ${bitrateKbps}kbps).',
+            name: 'RtspPublisherService',
+          );
+        }
+      } else if (congestionSec >= 3 &&
+          _networkQuality != StreamNetworkQuality.poor) {
+        _networkQuality = StreamNetworkQuality.warning;
+      }
+    } else if (fps >= goodFps && bitrateKbps >= 1200) {
+      _congestionStartedAt = null;
+      _stableStartedAt ??= now;
+      final stableSec = now.difference(_stableStartedAt!).inSeconds;
+      if (stableSec >= 8) {
+        _networkQuality = StreamNetworkQuality.good;
+      }
     }
   }
 
@@ -313,7 +414,7 @@ class RtspPublisherService {
 
   /// Gracefully stops active stream before camera hardware resets to avoid broken frames
   Future<void> prepareForReconfiguration() async {
-    if (!isLive && _state != RtspPublishState.connecting) return;
+    if (!wantsPublishing) return;
     developer.log(
       '[RTSP_PUSH] Preparing for camera reconfiguration (pausing stream)...',
       name: 'RtspPublisherService',
@@ -328,6 +429,8 @@ class RtspPublisherService {
   Future<void> restartIfPublishing() async {
     final url = _targetUrl;
     if (url == null || url.isEmpty) return;
+    // Người dùng đã bấm dừng trong lúc camera đang đổi cấu hình: không tự phát lại.
+    if (_intentionalStop) return;
 
     developer.log(
       '[RTSP_PUSH] Restarting publish session due to camera reconfiguration...',
@@ -341,12 +444,15 @@ class RtspPublisherService {
     _setState(RtspPublishState.connecting);
     // Chờ RTSP server cục bộ ổn định với profile mới và cho phép server Sporto từ xa giải phóng hoàn toàn kết nối socket cũ
     await Future<void>.delayed(const Duration(milliseconds: 2500));
+    if (_intentionalStop) return;
     await _executePublish();
   }
 
   Future<void> _cancelActiveSession() async {
     final session = _currentSession;
     _currentSession = null;
+    // Vô hiệu hóa mọi callback của phiên đang bị hủy.
+    _sessionGeneration++;
     if (session != null) {
       try {
         await session.cancel();

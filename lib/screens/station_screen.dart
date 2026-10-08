@@ -250,7 +250,10 @@ class _StationScreenState extends State<StationScreen>
     setState(() => _screenDimSwitching = true);
     try {
       await StationDisplayService.setDimmed(dimmed);
-      if (mounted) setState(() => _screenDimmed = dimmed);
+      if (mounted) {
+        setState(() => _screenDimmed = dimmed);
+        _runtime.setAutoScreenDimmed(dimmed);
+      }
     } catch (error) {
       if (mounted) {
         _showStationToast(
@@ -412,6 +415,7 @@ class _StationScreenState extends State<StationScreen>
     super.initState();
     WidgetsBinding.instance.addObserver(this);
     _cameraQuarterTurns = _runtime.cameraQuarterTurns;
+    _runtime.setStationDisplayAttached(true);
 
     _runtimeSubscription = _runtime.stateChanges.listen((_) {
       if (!mounted) {
@@ -420,6 +424,9 @@ class _StationScreenState extends State<StationScreen>
 
       setState(() {
         _cameraQuarterTurns = _runtime.cameraQuarterTurns;
+        if (!_screenDimSwitching && _runtime.autoScreenDimmed != _screenDimmed) {
+          _screenDimmed = _runtime.autoScreenDimmed;
+        }
         if (!_lensSwitching &&
             (_zoomDebounce == null || !_zoomDebounce!.isActive)) {
           _zoomValue = _runtime.webRtcService?.cameraZoom;
@@ -1574,9 +1581,10 @@ class _StationScreenState extends State<StationScreen>
     _whipSubscription?.cancel();
     _rtspSubscription?.cancel();
     _zoomDebounce?.cancel();
-    if (_screenDimmed) {
+    if (_screenDimmed || _runtime.autoScreenDimmed) {
       unawaited(StationDisplayService.setDimmed(false));
     }
+    _runtime.setStationDisplayAttached(false);
     // Khôi phục hướng xoay dọc (portrait) khi thoát khỏi màn hình Station về màn hình thiết lập
     unawaited(
       SystemChrome.setPreferredOrientations(const [
@@ -1958,6 +1966,22 @@ class _StationScreenState extends State<StationScreen>
                                       letterSpacing: 0.3,
                                     ),
                                   ),
+                                  if (_runtime.rtspPublisherService.isLive &&
+                                      _runtime.rtspPublisherService.networkQuality != StreamNetworkQuality.unknown) ...[
+                                    const SizedBox(width: 6),
+                                    Icon(
+                                      _runtime.rtspPublisherService.networkQuality == StreamNetworkQuality.good
+                                          ? Icons.wifi
+                                          : Icons.wifi_off,
+                                      size: 13,
+                                      color: switch (_runtime.rtspPublisherService.networkQuality) {
+                                        StreamNetworkQuality.good => Colors.lightGreenAccent,
+                                        StreamNetworkQuality.warning => Colors.orangeAccent,
+                                        StreamNetworkQuality.poor => Colors.redAccent,
+                                        _ => Colors.white70,
+                                      },
+                                    ),
+                                  ],
                                 ],
                               ),
                             ),

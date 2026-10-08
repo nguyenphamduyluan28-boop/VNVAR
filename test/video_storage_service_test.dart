@@ -110,4 +110,35 @@ void main() {
       sandbox.absolute.path,
     );
   });
+
+  test('recognises only the exact legacy Movies/VNVAR directory', () {
+    expect(
+      VideoStorageService.isLegacyPublicStoragePath(
+        '/storage/emulated/0/Movies/VNVAR',
+      ),
+      isTrue,
+    );
+    expect(
+      VideoStorageService.isLegacyPublicStoragePath(
+        '/storage/emulated/0/Movies/VNVAR/',
+      ),
+      isTrue,
+    );
+    expect(
+      VideoStorageService.isLegacyPublicStoragePath(r'C:\Users\a\Movies\VNVAR'),
+      isTrue,
+    );
+    expect(
+      VideoStorageService.isLegacyPublicStoragePath(
+        '/storage/emulated/0/Movies/VNVAR_backup',
+      ),
+      isFalse,
+    );
+    expect(
+      VideoStorageService.isLegacyPublicStoragePath(
+        '/storage/emulated/0/Movies/VNVAR/2026',
+      ),
+      isFalse,
+    );
+  });
 }

@@ -20,6 +20,8 @@ class NativeAudioSegmentRecorder(private val context: Context) {
     private val isAudioRecordRunning = AtomicBoolean(false)
 
     private var audioRecord: AudioRecord? = null
+    private val windRainFilter = PcmWindRainFilter(48_000, 130f)
+
     private var worker: Thread? = null
     private val fileLock = Any()
     private var output: RandomAccessFile? = null
@@ -43,10 +45,15 @@ class NativeAudioSegmentRecorder(private val context: Context) {
         check(minimum > 0) { "AudioRecord buffer is unavailable: $minimum" }
         val internalBufferSize = maxOf(minimum * 4, 16_384)
 
-        // Try CAMCORDER first for wide dynamic range and natural acoustics without
-        // aggressive speech gating/clipping, then fallback to MIC and DEFAULT.
+        // Try CAMCORDER first for wide dynamic range, then VOICE_RECOGNITION
+        // (unprocessed on most devices), MIC and DEFAULT. Hardware NoiseSuppressor,
+        // AcousticEchoCanceler and AutomaticGainControl are intentionally not
+        // attached: they are tuned for calls and suppress the referee whistle and
+        // crowd ambience or make the level pump. Only the gentle software
+        // high-pass below removes wind rumble.
         val audioSources = intArrayOf(
             MediaRecorder.AudioSource.CAMCORDER,
+            MediaRecorder.AudioSource.VOICE_RECOGNITION,
             MediaRecorder.AudioSource.MIC,
             MediaRecorder.AudioSource.DEFAULT,
         )
@@ -81,6 +88,8 @@ class NativeAudioSegmentRecorder(private val context: Context) {
             throw error
         }
 
+        windRainFilter.reset()
+
         audioRecord = activeRecorder
         isAudioRecordRunning.set(true)
 
@@ -94,6 +103,8 @@ class NativeAudioSegmentRecorder(private val context: Context) {
                 val count = activeRecorder.read(buffer, 0, buffer.size)
                 when {
                     count > 0 -> {
+                        // Apply zero-allocation high-pass filter to strip wind rumble
+                        windRainFilter.processInPlace(buffer, count)
                         val pcmChunk = buffer.copyOf(count)
                         try {
                             synchronized(fileLock) {
@@ -251,3 +262,44 @@ class NativeAudioSegmentRecorder(private val context: Context) {
         file.write(value ushr 8 and 0xff)
     }
 }
+
+/**
+ * Zero-allocation in-place IIR High-Pass Filter for 16-bit Mono PCM.
+ * Cutoff at 130Hz eliminates low-frequency wind turbulence and tripod vibration,
+ * while preserving full speech and referee whistle harmonics (2.5kHz - 3.5kHz).
+ */
+private class PcmWindRainFilter(sampleRate: Int = 48_000, cutoffHz: Float = 130f) {
+    private val alpha: Float
+    private var prevX = 0f
+    private var prevY = 0f
+
+    init {
+        val dt = 1f / sampleRate
+        val rc = 1f / (2f * Math.PI.toFloat() * cutoffHz)
+        alpha = rc / (rc + dt)
+    }
+
+    fun processInPlace(buffer: ByteArray, count: Int) {
+        var i = 0
+        while (i + 1 < count) {
+            val low = buffer[i].toInt() and 0xFF
+            val high = buffer[i + 1].toInt() and 0xFF
+            val sample = ((high shl 8) or low).toShort().toFloat()
+
+            val filtered = alpha * (prevY + sample - prevX)
+            prevX = sample
+            prevY = filtered
+
+            val clamped = filtered.coerceIn(-32768f, 32767f).toInt().toShort()
+            buffer[i] = (clamped.toInt() and 0xFF).toByte()
+            buffer[i + 1] = ((clamped.toInt() shr 8) and 0xFF).toByte()
+            i += 2
+        }
+    }
+
+    fun reset() {
+        prevX = 0f
+        prevY = 0f
+    }
+}
+

@@ -325,7 +325,9 @@ class RecordingService {
 
   static String? get _hardwareH264Encoder {
     if (Platform.isAndroid) return 'h264_mediacodec';
-    if (Platform.isIOS) return 'h264_videotoolbox';
+    // Bản FFmpeg đi kèm trên iOS không có VideoToolbox (xem
+    // preparePlaybackFile); thử h264_videotoolbox chỉ thất bại rồi mới rơi về
+    // mpeg4, làm chậm việc chốt segment và cắt clip.
     return null;
   }
 
@@ -726,7 +728,6 @@ class RecordingService {
         type: 'CLIP',
       );
       _exportSegments[clip.fileName] = clip;
-      unawaited(_videoStorage.scanMediaFile(target.path));
       return clip;
     } catch (_) {
       if (output != null && await output.exists()) await output.delete();
@@ -1129,6 +1130,12 @@ class RecordingService {
         await nativeAudio.length() > 44;
     final audioInput = hasNativeAudio ? ['-i', nativeAudio.path] : <String>[];
     final audioMap = hasNativeAudio ? '1:a:0?' : '0:a:0?';
+    // Android đã lọc gió (high-pass 130 Hz) ngay trong NativeAudioSegmentRecorder.
+    // AVAudioRecorder trên iOS ghi PCM thô, nên áp cùng bộ lọc khi đóng gói để
+    // âm thanh hai nền tảng giống nhau.
+    final audioFilterArgs = Platform.isIOS && hasNativeAudio
+        ? const ['-af', 'highpass=f=130']
+        : const <String>[];
 
     ReturnCode? code;
     Session? session;
@@ -1147,8 +1154,11 @@ class RecordingService {
         '0:v:0',
         '-map',
         audioMap,
+        '-threads',
+        '1',
         '-c:v',
         'copy',
+        ...audioFilterArgs,
         '-c:a',
         'aac',
         '-b:a',
@@ -1156,11 +1166,11 @@ class RecordingService {
         '-avoid_negative_ts',
         'make_zero',
         '-muxdelay',
-        '0',
+        '0.5',
         '-muxpreload',
-        '0',
+        '0.5',
         '-mpegts_flags',
-        '+resend_headers',
+        '+resend_headers+pat_pmt_at_frames',
         '-f',
         'mpegts',
         target.path,
@@ -1189,6 +1199,7 @@ class RecordingService {
           hardwareEncoder,
           '-b:v',
           '8M',
+          ...audioFilterArgs,
           '-c:a',
           'aac',
           '-b:a',
@@ -1196,11 +1207,11 @@ class RecordingService {
           '-avoid_negative_ts',
           'make_zero',
           '-muxdelay',
-          '0',
+          '0.5',
           '-muxpreload',
-          '0',
+          '0.5',
           '-mpegts_flags',
-          '+resend_headers',
+          '+resend_headers+pat_pmt_at_frames',
           '-f',
           'mpegts',
           target.path,
@@ -1228,6 +1239,7 @@ class RecordingService {
         'mpeg4',
         '-q:v',
         '4',
+        ...audioFilterArgs,
         '-c:a',
         'aac',
         '-b:a',
@@ -1235,11 +1247,11 @@ class RecordingService {
         '-avoid_negative_ts',
         'make_zero',
         '-muxdelay',
-        '0',
+        '0.5',
         '-muxpreload',
-        '0',
+        '0.5',
         '-mpegts_flags',
-        '+resend_headers',
+        '+resend_headers+pat_pmt_at_frames',
         '-f',
         'mpegts',
         target.path,
@@ -1281,6 +1293,7 @@ class RecordingService {
             '-c:v',
             'copy',
           ],
+          ...audioFilterArgs,
           '-c:a',
           'aac',
           '-b:a',
@@ -2417,8 +2430,10 @@ class RecordingService {
               : upperParentPath.endsWith('/AUTOMODE')
               ? 'CAM1'
               : null;
+          // `.mp4` là bản dự phòng khi đóng gói TS thất bại
+          // (_convertRecordingToTs); phải được index lại sau khi khởi động.
           final newNameMatch = RegExp(
-            r'^(\d{2})-(\d{2})-(\d{2})_(\d{2})-(\d{2})-(\d{2})\.ts$',
+            r'^(\d{2})-(\d{2})-(\d{2})_(\d{2})-(\d{2})-(\d{2})\.(ts|mp4)$',
             caseSensitive: false,
           ).firstMatch(fileName);
           final dateMatch = RegExp(

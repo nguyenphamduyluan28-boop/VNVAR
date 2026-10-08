@@ -51,6 +51,32 @@ void main() {
       expect(service.isLive, isFalse);
       service.dispose();
     });
+
+    test('invalid configuration is not treated as an active publish', () async {
+      final service = RtspPublisherService();
+      await service.startPublish(targetUrl: 'http://invalid-scheme.com/live');
+      expect(service.wantsPublishing, isFalse);
+
+      // Camera reconfiguration must not resurrect a rejected configuration.
+      await service.restartIfPublishing();
+      expect(service.state, RtspPublishState.error);
+      service.dispose();
+    });
+
+    test('restartIfPublishing does not restart after the user stopped', () async {
+      final service = RtspPublisherService();
+      await service.stopPublish();
+      await service.restartIfPublishing();
+      expect(service.state, RtspPublishState.idle);
+      expect(service.wantsPublishing, isFalse);
+      service.dispose();
+    });
+
+    test('network quality starts unknown', () {
+      final service = RtspPublisherService()..expectedFps = 15;
+      expect(service.networkQuality, StreamNetworkQuality.unknown);
+      service.dispose();
+    });
   });
 
   group('StationConfigService RTSP & Protocol storage tests', () {

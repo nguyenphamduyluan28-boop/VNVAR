@@ -45,6 +45,16 @@ Map<String, dynamic> buildCameraVideoConstraints({
   };
 }
 
+/// Camera đang tắt, tạm dừng (quá nhiệt / nền iOS) hoặc đang chuyển cấu hình.
+/// Tablet nên thử lại sau thay vì để request mạng tự mở camera.
+class CameraNotReadyException implements Exception {
+  final String message;
+  const CameraNotReadyException([this.message = 'Camera chưa sẵn sàng.']);
+
+  @override
+  String toString() => 'CameraNotReadyException: $message';
+}
+
 class AvailableCameraDevice {
   final String id;
   final String facing;
@@ -120,6 +130,9 @@ class WebRtcService {
   final Map<String, List<RTCIceCandidate>> _pendingIceCandidates =
       <String, List<RTCIceCandidate>>{};
   final Set<String> _remoteDescriptionReady = <String>{};
+  // Video sender của từng peer, lưu ngay khi addTrack. Không suy ra từ
+  // `sender.track` vì track cũ đã bị dispose khi đổi camera/độ phân giải.
+  final Map<String, RTCRtpSender> _videoSenders = <String, RTCRtpSender>{};
   String? _latestPeerId;
 
   // ============================================================
@@ -840,6 +853,9 @@ class WebRtcService {
     _currentFacingMode = selectedFacingMode;
 
     await _startRtsp(videoTrack);
+    if (_peerConnections.isNotEmpty) {
+      await replaceVideoTrackOnActivePeers(videoTrack);
+    }
     try {
       await refreshAvailableCameras();
       await refreshCameraZoom();
@@ -1416,9 +1432,15 @@ class WebRtcService {
   }) async {
     // ==========================================================
     // CAMERA PHẢI SẴN SÀNG
+    //
+    // Không mở camera từ request mạng: camera có thể đang bị người dùng tắt,
+    // tạm dừng vì quá nhiệt / iOS nền, hoặc đang được runtime mở lại với
+    // cấu hình mới. Mở ở đây sẽ phá các trạng thái đó.
     // ==========================================================
 
-    await initializeCamera();
+    if (!_cameraInitialized || _localStream == null || localVideoTrack == null) {
+      throw const CameraNotReadyException();
+    }
 
     // ==========================================================
     // CHỈ ĐÓNG PEER CONNECTION CŨ
@@ -1542,6 +1564,7 @@ class WebRtcService {
 
     for (final track in tracks) {
       final sender = await pc.addTrack(track, stream);
+      _videoSenders[peerId] = sender;
 
       // Prefer fresh frames over preserving every frame. This keeps the live
       // feed responsive when Wi-Fi bandwidth fluctuates instead of allowing a
@@ -1747,6 +1770,7 @@ class WebRtcService {
       return Future<void>.value();
     }
     _peerConnections.remove(peerId);
+    _videoSenders.remove(peerId);
     _remoteDescriptionReady.remove(peerId);
     _pendingIceCandidates.remove(peerId);
     _peerDisconnectTimers.remove(peerId)?.cancel();
@@ -1773,6 +1797,43 @@ class WebRtcService {
     await Future.wait(peerIds.map(disposePeerConnection));
     if (_disposePeerOperations.isNotEmpty) {
       await Future.wait(_disposePeerOperations.values.toList(growable: false));
+    }
+  }
+
+  /// Tráo video track trên toàn bộ kết nối WebRTC với Tablet đang hoạt động
+  /// mà không cần đóng PeerConnection hay đứt luồng hiển thị.
+  ///
+  /// Peer nào không tráo được sẽ bị đóng để Tablet tự đàm phán lại, thay vì
+  /// giữ một kết nối "connected" nhưng không còn khung hình.
+  Future<void> replaceVideoTrackOnActivePeers(MediaStreamTrack newTrack) async {
+    if (_peerConnections.isEmpty) return;
+    developer.log(
+      '[WEBRTC] Replacing video track across ${_peerConnections.length} active peer(s): ${newTrack.id}',
+      name: 'WebRtcService',
+    );
+    final failedPeers = <String>[];
+    for (final entry in _peerConnections.entries.toList(growable: false)) {
+      final sender = _videoSenders[entry.key];
+      if (sender == null) {
+        failedPeers.add(entry.key);
+        continue;
+      }
+      try {
+        await sender.replaceTrack(newTrack);
+        developer.log(
+          '[WEBRTC] Replaced video track on peer ${entry.key}',
+          name: 'WebRtcService',
+        );
+      } catch (error) {
+        developer.log(
+          '[WEBRTC] Failed to replace video track on peer ${entry.key}: $error',
+          name: 'WebRtcService',
+        );
+        failedPeers.add(entry.key);
+      }
+    }
+    for (final peerId in failedPeers) {
+      await disposePeerConnection(peerId);
     }
   }
 

@@ -6,13 +6,7 @@ import 'dart:io';
 import 'package:flutter_webrtc/flutter_webrtc.dart';
 import 'webrtc_service.dart';
 
-enum WhipPublishState {
-  idle,
-  connecting,
-  publishing,
-  reconnecting,
-  error,
-}
+enum WhipPublishState { idle, connecting, publishing, reconnecting, error }
 
 class WhipPublisherService {
   WhipPublishState _state = WhipPublishState.idle;
@@ -51,6 +45,19 @@ class WhipPublisherService {
   String? get currentError => _currentError;
   String? get currentEndpoint => _endpointUrl;
   bool get isLive => _state == WhipPublishState.publishing;
+
+  /// Người dùng đang muốn phát (chưa bấm dừng), kể cả khi phiên đang tạm dừng
+  /// vì camera đổi cấu hình hoặc đang kết nối lại.
+  bool get wantsPublishing =>
+      !_intentionalStop &&
+      (_endpointUrl?.isNotEmpty ?? false) &&
+      _state != WhipPublishState.idle;
+
+  /// Runtime tạo WebRtcService mới sau mỗi lần khởi động lại; publisher phải
+  /// dùng instance hiện hành thay vì instance đã bị dispose.
+  void attachWebRtcService(WebRtcService? webRtcService) {
+    _webRtcService = webRtcService;
+  }
 
   void _setState(WhipPublishState newState) {
     if (_state == newState) return;
@@ -97,6 +104,7 @@ class WhipPublisherService {
     _currentError = null;
 
     if (_endpointUrl == null || _endpointUrl!.isEmpty) {
+      _intentionalStop = true; // Cấu hình sai: không tự phát lại.
       _currentError = 'Chưa cấu hình URL WHIP Endpoint.';
       _setState(WhipPublishState.error);
       return;
@@ -111,12 +119,14 @@ class WhipPublisherService {
     final stream = webRtc?.localStream;
 
     if (webRtc == null || stream == null || !webRtc.cameraInitialized) {
-      _currentError = 'Camera chưa sẵn sàng hoặc chưa khởi động.';
-      _setState(WhipPublishState.error);
+      // Camera có thể đang được khôi phục/đổi cấu hình: thử lại theo backoff
+      // thay vì dừng hẳn ở trạng thái lỗi.
+      _scheduleReconnect('Camera chưa sẵn sàng hoặc chưa khởi động.');
       return;
     }
 
     await _cleanupConnection();
+    HttpClient? client;
 
     try {
       final pc = await createPeerConnection(_rtcConfiguration);
@@ -150,6 +160,8 @@ class WhipPublisherService {
           '[WHIP] PeerConnection state: $connectionState',
           name: 'WhipPublisherService',
         );
+        // Bỏ qua sự kiện của PeerConnection cũ đã bị thay thế/đóng.
+        if (!identical(_peerConnection, pc)) return;
         if (connectionState ==
             RTCPeerConnectionState.RTCPeerConnectionStateConnected) {
           _retryAttempt = 0;
@@ -176,10 +188,9 @@ class WhipPublisherService {
       // Wait for ICE candidates gathering (up to 2.5s) to produce complete SDP
       if (pc.iceGatheringState !=
           RTCIceGatheringState.RTCIceGatheringStateComplete) {
-        await _waitForIceGatheringComplete(pc).timeout(
-          const Duration(milliseconds: 2500),
-          onTimeout: () {},
-        );
+        await _waitForIceGatheringComplete(
+          pc,
+        ).timeout(const Duration(milliseconds: 2500), onTimeout: () {});
       }
 
       final localDesc = await pc.getLocalDescription();
@@ -189,17 +200,18 @@ class WhipPublisherService {
       }
 
       // 6. Send HTTP POST to partner's WHIP endpoint
-      final client = HttpClient();
-      client.connectionTimeout = const Duration(seconds: 12);
+      final httpClient = HttpClient();
+      client = httpClient;
+      httpClient.connectionTimeout = const Duration(seconds: 12);
       // Support self-signed or internal test certificates
-      client.badCertificateCallback = (cert, host, port) => true;
+      httpClient.badCertificateCallback = (cert, host, port) => true;
 
       final uri = Uri.parse(_endpointUrl!);
       developer.log(
         '[WHIP] Connecting to WHIP endpoint: $uri',
         name: 'WhipPublisherService',
       );
-      final request = await client.postUrl(uri);
+      final request = await httpClient.postUrl(uri);
       request.headers.set(HttpHeaders.contentTypeHeader, 'application/sdp');
       request.headers.set(HttpHeaders.acceptHeader, 'application/sdp');
 
@@ -256,6 +268,8 @@ class WhipPublisherService {
       if (!_intentionalStop) {
         _scheduleReconnect(formattedError);
       }
+    } finally {
+      client?.close();
     }
   }
 
@@ -297,14 +311,18 @@ class WhipPublisherService {
 
     _currentError = reason;
     if (_retryAttempt >= maxReconnectAttempts) {
-      _currentError = 'Không thể kết nối lại sau $maxReconnectAttempts lần thử: $reason';
+      _currentError =
+          'Không thể kết nối lại sau $maxReconnectAttempts lần thử: $reason';
       _setState(WhipPublishState.error);
       return;
     }
 
     _setState(WhipPublishState.reconnecting);
-    final delaySeconds = _backoffDelaysSeconds[
-        _retryAttempt.clamp(0, _backoffDelaysSeconds.length - 1)];
+    final delaySeconds =
+        _backoffDelaysSeconds[_retryAttempt.clamp(
+          0,
+          _backoffDelaysSeconds.length - 1,
+        )];
     _retryAttempt++;
 
     developer.log(
@@ -332,18 +350,25 @@ class WhipPublisherService {
       try {
         final client = HttpClient();
         client.connectionTimeout = const Duration(seconds: 4);
-        final request = await client.deleteUrl(Uri.parse(_sessionResourceUrl!));
-        if (_bearerToken != null && _bearerToken!.isNotEmpty) {
-          request.headers.set(
-            HttpHeaders.authorizationHeader,
-            'Bearer $_bearerToken',
+        try {
+          final request = await client.deleteUrl(
+            Uri.parse(_sessionResourceUrl!),
           );
+          if (_bearerToken != null && _bearerToken!.isNotEmpty) {
+            request.headers.set(
+              HttpHeaders.authorizationHeader,
+              'Bearer $_bearerToken',
+            );
+          }
+          final response = await request.close();
+          await response.drain<void>();
+          developer.log(
+            '[WHIP] Session deleted: ${response.statusCode}',
+            name: 'WhipPublisherService',
+          );
+        } finally {
+          client.close();
         }
-        final response = await request.close();
-        developer.log(
-          '[WHIP] Session deleted: ${response.statusCode}',
-          name: 'WhipPublisherService',
-        );
       } catch (e) {
         developer.log(
           '[WHIP] Session delete error (non-fatal): $e',
@@ -359,7 +384,7 @@ class WhipPublisherService {
   }
 
   Future<void> prepareForReconfiguration() async {
-    if (!isLive && _state != WhipPublishState.connecting) return;
+    if (!wantsPublishing) return;
     developer.log(
       '[WHIP] Preparing for camera reconfiguration (pausing WHIP)...',
       name: 'WhipPublisherService',
@@ -373,6 +398,8 @@ class WhipPublisherService {
   Future<void> restartIfPublishing() async {
     final url = _endpointUrl;
     if (url == null || url.isEmpty) return;
+    // Người dùng đã bấm dừng trong lúc camera đang đổi cấu hình: không tự phát lại.
+    if (_intentionalStop) return;
     developer.log(
       '[WHIP] Restarting WHIP session due to camera reconfiguration...',
       name: 'WhipPublisherService',
@@ -384,6 +411,7 @@ class WhipPublisherService {
     await _cleanupConnection();
     _setState(WhipPublishState.connecting);
     await Future<void>.delayed(const Duration(milliseconds: 1000));
+    if (_intentionalStop) return;
     await _executePublish();
   }
 

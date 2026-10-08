@@ -334,10 +334,7 @@ class MainActivity : FlutterActivity() {
                 "ensurePublicVideoStorage" -> ensurePublicVideoStorage(result)
 
                 "scanMediaFile" -> {
-                    val path = call.argument<String>("path")
-                    if (!path.isNullOrBlank()) {
-                        MediaScannerConnection.scanFile(this, arrayOf(path), null, null)
-                    }
+                    // Không scanMediaFile để tránh Android MediaStore đưa video vào Bộ sưu tập
                     result.success(true)
                 }
 
@@ -374,8 +371,9 @@ class MainActivity : FlutterActivity() {
                                 if (!nomedia.exists()) {
                                     nomedia.createNewFile()
                                 }
+                                // Chỉ quét file .nomedia. Không xóa bản ghi MediaStore ở
+                                // đây: trên Android 10+ xóa bản ghi sẽ xóa luôn file video thật.
                                 MediaScannerConnection.scanFile(this, arrayOf(nomedia.absolutePath), null, null)
-                                purgeMediaStoreForVnvar(path)
                             }
                         } catch (_: Exception) {}
                     }
@@ -554,63 +552,106 @@ class MainActivity : FlutterActivity() {
             val selectionArgs = arrayOf("$folderPath/%")
             contentResolver.delete(uri, selection, selectionArgs)
         } catch (_: Exception) {}
+        try {
+            val imageUri = android.provider.MediaStore.Images.Media.EXTERNAL_CONTENT_URI
+            val selection = "${android.provider.MediaStore.Images.Media.DATA} LIKE ?"
+            val selectionArgs = arrayOf("$folderPath/%")
+            contentResolver.delete(imageUri, selection, selectionArgs)
+        } catch (_: Exception) {}
     }
 
     private fun ensurePublicVideoStorage(result: MethodChannel.Result) {
-        try {
-            val publicMovies = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_MOVIES)
-            val publicVnvar = java.io.File(publicMovies, "VNVAR")
-
-            // Test if public Movies/VNVAR is actually accessible (can create, write, and list)
-            val isPublicFullyAccessible = try {
-                if (!publicVnvar.exists()) {
-                    publicVnvar.mkdirs()
+        // Di chuyển dữ liệu cũ có thể chạm nhiều file; chạy ngoài UI thread để
+        // tránh ANR, rồi trả kết quả về MethodChannel trên main thread.
+        Thread({
+            try {
+                // Lưu tại thư mục riêng của ứng dụng (App-specific external storage):
+                // /storage/emulated/0/Android/data/vn.vnvar.cameraStation/files/VNVAR.
+                // MediaStore/Gallery không quét Android/data/ nên video không hiện
+                // trong Bộ sưu tập, và không cần quyền bộ nhớ.
+                val appStorageDir = getExternalFilesDir(null) ?: filesDir
+                val appVnvar = java.io.File(appStorageDir, "VNVAR")
+                if (!appVnvar.exists()) {
+                    appVnvar.mkdirs()
                 }
-                // Cố gắng tạo file .nomedia nếu hệ điều hành cho phép, không để lỗi tạo file ẩn làm hỏng probe
                 try {
-                    val nomedia = java.io.File(publicVnvar, ".nomedia")
+                    val nomedia = java.io.File(appVnvar, ".nomedia")
                     if (!nomedia.exists()) {
                         nomedia.createNewFile()
                     }
-                    MediaScannerConnection.scanFile(this, arrayOf(nomedia.absolutePath), null, null)
-                    purgeMediaStoreForVnvar(publicVnvar.absolutePath)
                 } catch (_: Exception) {}
 
-                // Check if directory can be listed without permission denial
-                val canList = publicVnvar.listFiles() != null
-                val testFile = java.io.File(publicVnvar, "probe_${System.currentTimeMillis()}.mp4")
-                val canWrite = testFile.createNewFile() && testFile.delete()
-                android.util.Log.i("MainActivity", "[STORAGE] Public Movies/VNVAR probe: canList=$canList canWrite=$canWrite")
-                canList && canWrite
-            } catch (e: Exception) {
-                android.util.Log.e("MainActivity", "[STORAGE] Public Movies/VNVAR probe failed: ${e.message}", e)
-                false
-            }
+                migrateLegacyPublicStorage(appVnvar)
 
-            if (isPublicFullyAccessible) {
-                result.success(publicVnvar.absolutePath)
-                return
+                android.util.Log.i("MainActivity", "[STORAGE] Private VNVAR video storage initialized at: ${appVnvar.absolutePath}")
+                runOnUiThread { result.success(appVnvar.absolutePath) }
+            } catch (error: Exception) {
+                runOnUiThread { result.error("STORAGE_INIT_FAILED", error.message, null) }
             }
+        }, "VNVAR-StorageInit").start()
+    }
 
-            // Fallback to app-specific external files dir (Movies/VNVAR).
-            // On Android, getExternalFilesDir() is located on external storage
-            // (/storage/emulated/0/Android/data/<package>/files/Movies/VNVAR).
-            // It has full storage capacity and requires ZERO permissions, guaranteed
-            // accessible via POSIX File/Directory APIs on all Android versions.
-            val appMovies = getExternalFilesDir(Environment.DIRECTORY_MOVIES) ?: filesDir
-            val appVnvar = java.io.File(appMovies, "VNVAR")
-            if (!appVnvar.exists()) {
-                appVnvar.mkdirs()
+    /**
+     * Chuyển video từ thư mục công khai cũ Movies/VNVAR sang thư mục riêng.
+     * Trước đây bản ghi MediaStore của thư mục cũ bị xóa trực tiếp, việc này
+     * trên Android 10+ xóa luôn file video. Giờ file được di chuyển trước; chỉ
+     * khi thư mục cũ không còn video nào mới dọn các bản ghi MediaStore (lúc đó
+     * đã trỏ tới file không còn tồn tại).
+     */
+    private fun migrateLegacyPublicStorage(target: java.io.File) {
+        val legacy = try {
+            java.io.File(
+                Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_MOVIES),
+                "VNVAR",
+            )
+        } catch (_: Exception) {
+            return
+        }
+        if (!legacy.isDirectory) return
+        if (legacy.canonicalPath == target.canonicalPath) return
+
+        var remaining = 0
+        legacy.walkBottomUp().forEach { source ->
+            if (source == legacy) return@forEach
+            if (source.isDirectory) {
+                // Chỉ xóa được thư mục rỗng; thư mục còn file sẽ được giữ lại.
+                source.delete()
+                return@forEach
+            }
+            if (source.name == ".nomedia") return@forEach
+            val relative = source.relativeTo(legacy).path
+            var destination = java.io.File(target, relative)
+            if (destination.exists()) {
+                // Không ghi đè dữ liệu hiện có: thêm hậu tố để giữ cả hai bản.
+                destination = java.io.File(
+                    destination.parentFile,
+                    "${destination.nameWithoutExtension}_legacy.${destination.extension}",
+                )
             }
             try {
-                val nomedia = java.io.File(appVnvar, ".nomedia")
-                if (!nomedia.exists()) {
-                    nomedia.createNewFile()
+                destination.parentFile?.mkdirs()
+                val moved = source.renameTo(destination) || run {
+                    source.copyTo(destination, overwrite = false)
+                    if (destination.length() == source.length()) {
+                        source.delete()
+                    } else {
+                        destination.delete()
+                        false
+                    }
                 }
-            } catch (_: Exception) {}
-            result.success(appVnvar.absolutePath)
-        } catch (error: Exception) {
-            result.error("PUBLIC_STORAGE_CREATE_FAILED", error.message, null)
+                if (!moved) remaining++
+            } catch (error: Exception) {
+                remaining++
+                android.util.Log.w("MainActivity", "[STORAGE] Unable to migrate ${source.absolutePath}: ${error.message}")
+            }
+        }
+        if (remaining == 0) {
+            try { java.io.File(legacy, ".nomedia").delete() } catch (_: Exception) {}
+            legacy.delete()
+            purgeMediaStoreForVnvar(legacy.absolutePath)
+            android.util.Log.i("MainActivity", "[STORAGE] Legacy Movies/VNVAR migrated to ${target.absolutePath}")
+        } else {
+            android.util.Log.w("MainActivity", "[STORAGE] $remaining legacy file(s) kept in ${legacy.absolutePath}")
         }
     }
 

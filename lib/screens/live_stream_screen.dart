@@ -261,12 +261,13 @@ class _LiveStreamScreenState extends State<LiveStreamScreen> {
       return;
     }
 
-    // 1. Tạm dừng camera của Station để nhường phần cứng độc quyền cho Scanner
-    await widget.runtime.pauseCameraForScanner();
-    if (!mounted) return;
-
     QrStreamParseResult? result;
     try {
+      // 1. Tạm dừng camera của Station để nhường phần cứng độc quyền cho Scanner
+      await widget.runtime.pauseCameraForScanner();
+      // Màn hình có thể bị đóng trong lúc tạm dừng; khối finally vẫn mở lại
+      // camera để Station không bị tắt camera vĩnh viễn.
+      if (!mounted) return;
       result = await QrStreamScannerDialog.show(context);
     } finally {
       // 2. Chờ 300ms cho native CameraX unbind hoàn toàn

@@ -17,6 +17,7 @@
     <application
         android:label="SportO Cam"
         android:requestLegacyExternalStorage="true"
+        android:hasFragileUserData="true"
         android:usesCleartextTraffic="true"
         android:icon="@mipmap/ic_launcher">
 

@@ -19,6 +19,17 @@ class VideoStorageService {
   String? _selectedPath;
   String? _androidPublicPath;
   bool _supportsFolderPicker = Platform.isAndroid;
+  final Set<String> _noMediaEnsuredPaths = <String>{};
+
+  /// Thư mục công khai cũ `Movies/VNVAR` (trước khi chuyển sang thư mục riêng
+  /// của ứng dụng). Chỉ khớp chính xác thư mục này, không khớp các thư mục
+  /// người dùng tự chọn có tên bắt đầu bằng `VNVAR` như `VNVAR_backup`.
+  static bool isLegacyPublicStoragePath(String path) {
+    final normalized = path
+        .replaceAll(r'\', '/')
+        .replaceAll(RegExp(r'/+$'), '');
+    return RegExp(r'/Movies/VNVAR$').hasMatch(normalized);
+  }
 
   String? get selectedPath => _selectedPath;
   bool get supportsFolderPicker => _supportsFolderPicker;
@@ -64,8 +75,11 @@ class VideoStorageService {
     }
     final prefs = await SharedPreferences.getInstance();
     final savedPath = prefs.getString(_storagePathKey)?.trim();
-    if (savedPath == null || savedPath.isEmpty) {
+    if (savedPath == null ||
+        savedPath.isEmpty ||
+        isLegacyPublicStoragePath(savedPath)) {
       _selectedPath = null;
+      if (savedPath != null) await prefs.remove(_storagePathKey);
       return;
     }
     final path = Directory(savedPath).absolute.path;
@@ -109,7 +123,7 @@ class VideoStorageService {
           await nomediaFile.create();
         } catch (_) {}
       }
-      if (Platform.isAndroid) {
+      if (Platform.isAndroid && _noMediaEnsuredPaths.add(directory.path)) {
         unawaited(ensureNoMedia(directory.path));
       }
       await directory.list().take(1).drain();
