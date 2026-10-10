@@ -16,7 +16,6 @@ class StationConfigService {
   static const String _resolutionProfileKey = 'camera_resolution_profile';
   static const String _resolutionFpsKey = 'camera_resolution_fps';
   static const String _resolutionLockedKey = 'camera_resolution_locked';
-  static const String _adaptiveFpsPrefix = 'ios_adaptive_fps';
   static const String _apiPortKey = 'camera_api_port';
   static const String _cameraQuarterTurnsKey = 'camera_quarter_turns';
   static const String _cameraLensUltraWideKey = 'camera_lens_ultra_wide';
@@ -225,6 +224,18 @@ class StationConfigService {
   }
 
   static const _rtspTabletAudioKey = 'rtsp_tablet_audio_enabled';
+  static const _exposureBiasKey = 'camera_exposure_bias_ev';
+
+  /// Độ sáng người dùng chọn (EV, −2…+2; 0 = tự động).
+  Future<void> saveExposureBias(double ev) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setDouble(_exposureBiasKey, ev.clamp(-2.0, 2.0).toDouble());
+  }
+
+  Future<double> loadExposureBias() async {
+    final prefs = await SharedPreferences.getInstance();
+    return (prefs.getDouble(_exposureBiasKey) ?? 0).clamp(-2.0, 2.0).toDouble();
+  }
 
   /// Tablet xem RTSP có nhận tiếng không (mặc định tắt: tiết kiệm ~0,77 Mbps
   /// sóng Wi-Fi mỗi Tablet; file ghi và livestream vẫn có tiếng).
@@ -264,42 +275,6 @@ class StationConfigService {
     }
     final prefs = await SharedPreferences.getInstance();
     await prefs.setInt(_apiPortKey, port);
-  }
-
-  Future<void> saveAdaptiveIosFps({
-    required String deviceId,
-    required String facingMode,
-    required CameraResolutionPreset preset,
-    required int fps,
-  }) async {
-    final prefs = await SharedPreferences.getInstance();
-    await prefs.setInt(
-      _adaptiveFpsKey(deviceId, facingMode, preset),
-      fps.clamp(1, 60),
-    );
-  }
-
-  Future<int?> loadAdaptiveIosFps({
-    required String deviceId,
-    required String facingMode,
-    required CameraResolutionPreset preset,
-  }) async {
-    final prefs = await SharedPreferences.getInstance();
-    final fps = prefs.getInt(_adaptiveFpsKey(deviceId, facingMode, preset));
-    return fps != null && fps > 0 && fps <= 60 ? fps : null;
-  }
-
-  String _adaptiveFpsKey(
-    String deviceId,
-    String facingMode,
-    CameraResolutionPreset preset,
-  ) {
-    final safeDevice = deviceId.trim().toLowerCase().replaceAll(
-      RegExp(r'[^a-z0-9_-]'),
-      '_',
-    );
-    final safeFacing = facingMode.trim().toLowerCase();
-    return '${_adaptiveFpsPrefix}_${safeDevice}_${safeFacing}_${preset.name}';
   }
 
   Future<void> clearIdentity() async {

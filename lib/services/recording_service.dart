@@ -13,6 +13,7 @@ import 'package:ffmpeg_kit_flutter_new_video/session.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
+import 'audio_cleanup.dart';
 import 'video_storage_service.dart';
 
 bool isPublishableVideoProbe({
@@ -133,6 +134,33 @@ bool shouldUsePreviousCheckpointSegment({
       lookback.inMilliseconds + keyframeSafetyMargin.inMilliseconds;
   final startMs = (endMs - requestedWindowMs).clamp(0, endMs).toInt();
   return (startMs: startMs, endMs: endMs);
+}
+
+/// Segment ghi liền ngay trước [current] (cùng camera, file `.ts`, khoảng hở
+/// ≤ [maxGap]). Dùng để clip Check VAR lấy đủ thời gian trước sự kiện khi
+/// trọng tài bấm ngay sau lúc chuyển segment.
+RecordedSegment? selectPrecedingSegment(
+  Iterable<RecordedSegment> segments,
+  RecordedSegment current, {
+  Duration maxGap = const Duration(seconds: 3),
+}) {
+  RecordedSegment? best;
+  for (final candidate in segments) {
+    if (identical(candidate, current) ||
+        candidate.id == current.id ||
+        candidate.type != 'RECORDING' ||
+        candidate.cameraId != current.cameraId ||
+        !candidate.path.toLowerCase().endsWith('.ts')) {
+      continue;
+    }
+    final gap = current.startedAt.difference(candidate.endedAt);
+    if (gap.isNegative && gap.abs() > const Duration(seconds: 1)) continue;
+    if (gap > maxGap) continue;
+    if (best == null || candidate.endedAt.isAfter(best.endedAt)) {
+      best = candidate;
+    }
+  }
+  return best;
 }
 
 List<String> fragmentCompanionPaths(String videoPath) {
@@ -316,10 +344,8 @@ class RecordingService {
   static const int storageLimitBytes = 20 * 1024 * 1024 * 1024;
   static const int storageDays = 1;
   static const int normalFreeSpaceThresholdBytes = 1 * 1024 * 1024 * 1024;
-  static const int matchFreeSpaceThresholdBytes = 1 * 1024 * 1024 * 1024;
   static const int autoCleanupMaxPasses = 50;
   static const int autoCleanupBatchSize = 10;
-  static const int hlsEmergencyThresholdBytes = 1 * 1024 * 1024 * 1024;
   static const int minimumStartFreeSpaceBytes = 512 * 1024 * 1024;
   static const Duration recentSegmentProtection = Duration(minutes: 5);
 
@@ -430,14 +456,7 @@ class RecordingService {
   Future<void>? _expiredCleanupOperation;
   Future<void>? _storageLimitOperation;
   Future<void>? _autoCleanupOperation;
-  Future<void>? _hlsCleanupOperation;
   Future<void>? _exportCleanupOperation;
-  bool _autoRecordingVideo = true;
-  bool _duringMatch = false;
-  String? _currentMatchDirectory;
-  bool _hlsEnabled = false;
-  int? _hlsMaxSegments;
-  String? _hlsDirectoryPath;
   final Map<String, int> _activeFileReaders = <String, int>{};
 
   bool get recording => _recording;
@@ -466,14 +485,6 @@ class RecordingService {
   bool isFileReadActive(String path) =>
       (_activeFileReaders[_leaseKey(path)] ?? 0) > 0;
 
-  bool _hasActiveReaderUnder(String directoryPath) {
-    final directory = _leaseKey(directoryPath);
-    final prefix = directory.endsWith('/') ? directory : '$directory/';
-    return _activeFileReaders.keys.any(
-      (path) => path == directory || path.startsWith(prefix),
-    );
-  }
-
   // ============================================================
   // COMPLETED SEGMENTS
   // ============================================================
@@ -501,12 +512,31 @@ class RecordingService {
 
   bool get lastCheckpointUsedPrevious => _lastCheckpointUsedPrevious;
 
+  /// Segment liền trước [segment], nếu còn trên máy.
+  RecordedSegment? precedingSegmentOf(RecordedSegment segment) =>
+      selectPrecedingSegment(_segments, segment);
+
+  /// Chờ thao tác cắt clip đang chạy (nếu có) xong.
+  Future<void> waitForTrimIdle() async {
+    final current = _trimOperation;
+    if (current == null) return;
+    try {
+      await current;
+    } catch (_) {
+      // Lỗi của thao tác trước đã được trả về cho caller của nó.
+    }
+  }
+
+  /// Cắt clip từ [segmentId]. [startMs] âm nghĩa là bắt đầu trong
+  /// [precedingSegmentId] (segment liền trước); hai file `.ts` được nối liền
+  /// rồi cắt bằng stream copy.
   Future<RecordedSegment> trimSegment({
     required String segmentId,
     required int startMs,
     required int endMs,
     bool streamCopy = false,
     int? minimumOutputDurationMs,
+    String? precedingSegmentId,
   }) {
     if (_trimOperation != null || _exportCleanupOperation != null) {
       return Future<RecordedSegment>.error(
@@ -521,6 +551,7 @@ class RecordingService {
       endMs: endMs,
       streamCopy: streamCopy,
       minimumOutputDurationMs: minimumOutputDurationMs,
+      precedingSegmentId: precedingSegmentId,
     );
     _trimOperation = operation;
     return operation.whenComplete(() {
@@ -534,8 +565,11 @@ class RecordingService {
     required int endMs,
     required bool streamCopy,
     required int? minimumOutputDurationMs,
+    String? precedingSegmentId,
   }) async {
-    if (startMs < 0 || endMs <= startMs || endMs - startMs < 500) {
+    if (endMs <= startMs ||
+        endMs - startMs < 500 ||
+        (startMs < 0 && precedingSegmentId == null)) {
       throw const InvalidTrimRangeException('Khoảng cắt video không hợp lệ.');
     }
     final source = findById(segmentId) ?? findByFileName(segmentId);
@@ -550,10 +584,36 @@ class RecordingService {
       );
     }
 
+    // Clip bắt đầu trong segment trước: dùng concat demuxer (danh sách file +
+    // inpoint/outpoint) để nối phần cuối segment trước với segment hiện tại.
+    // Không dùng giao thức `concat:` vì dấu thời gian của file TS thứ hai bắt
+    // đầu lại từ đầu, FFmpeg sẽ bỏ mất phần sau (đã kiểm chứng). Thiếu segment
+    // trước hoặc không phải TS thì cắt từ đầu segment hiện tại như trước.
+    RecordedSegment? precedingSource;
+    var precedingMs = 0;
+    var effectiveStartMs = startMs;
+    if (startMs < 0) {
+      final preceding = precedingSegmentId == null
+          ? null
+          : findById(precedingSegmentId);
+      final precedingProbe = preceding == null ||
+              !source.path.toLowerCase().endsWith('.ts') ||
+              !await File(preceding.path).exists()
+          ? null
+          : await _probeVideo(File(preceding.path));
+      precedingMs = ((precedingProbe?.durationSeconds ?? 0) * 1000).round();
+      if (preceding != null && precedingMs > 0) {
+        precedingSource = preceding;
+        effectiveStartMs = startMs < -precedingMs ? -precedingMs : startMs;
+      } else {
+        effectiveStartMs = 0;
+      }
+    }
+    File? concatList;
+
     File? output;
     try {
       final now = DateTime.now();
-      final startedAt = source.startedAt.add(Duration(milliseconds: startMs));
       final directory = await _exportDownloadDirectory();
       var timestampMs = now.millisecondsSinceEpoch;
       var fileName = buildTrimmedClipFileName(cameraId, timestampMs);
@@ -564,24 +624,53 @@ class RecordingService {
       }
       final target = output;
       final id = 'CLIP_${cameraId}_$timestampMs';
-      final durationMs = endMs - startMs;
+      final durationMs = endMs - effectiveStartMs;
       final isTsInput = source.path.toLowerCase().endsWith('.ts');
+      final crossSegment = precedingSource;
+      if (crossSegment != null) {
+        // ffconcat: đường dẫn trong nháy đơn, nháy đơn bên trong viết '\''.
+        String quote(String path) => "'${path.replaceAll("'", r"'\''")}'";
+        final inpoint = (precedingMs + effectiveStartMs) / 1000;
+        concatList = File('${target.path}.concat.txt');
+        await concatList.writeAsString(
+          'ffconcat version 1.0\n'
+          'file ${quote(crossSegment.path)}\n'
+          'inpoint ${inpoint.toStringAsFixed(3)}\n'
+          'file ${quote(source.path)}\n'
+          'outpoint ${(endMs / 1000).toStringAsFixed(3)}\n',
+          flush: true,
+        );
+      }
+      final inputArguments = crossSegment != null
+          ? <String>[
+              '-fflags',
+              '+genpts+discardcorrupt',
+              '-f',
+              'concat',
+              '-safe',
+              '0',
+              '-i',
+              concatList!.path,
+            ]
+          : <String>[
+              if (isTsInput) ...[
+                '-fflags',
+                '+genpts+discardcorrupt',
+                '-analyzeduration',
+                '10000000',
+                '-probesize',
+                '10000000',
+              ],
+              '-ss',
+              (effectiveStartMs / 1000).toStringAsFixed(3),
+              '-i',
+              source.path,
+              '-t',
+              (durationMs / 1000).toStringAsFixed(3),
+            ];
       final commonArguments = <String>[
         '-y',
-        if (isTsInput) ...[
-          '-fflags',
-          '+genpts+discardcorrupt',
-          '-analyzeduration',
-          '10000000',
-          '-probesize',
-          '10000000',
-        ],
-        '-ss',
-        (startMs / 1000).toStringAsFixed(3),
-        '-i',
-        source.path,
-        '-t',
-        (durationMs / 1000).toStringAsFixed(3),
+        ...inputArguments,
         '-map',
         '0:v:0',
         '-map',
@@ -723,8 +812,13 @@ class RecordingService {
         id: id,
         cameraId: cameraId,
         path: target.path,
-        startedAt: startedAt,
-        endedAt: startedAt.add(actualDuration),
+        // Neo theo điểm cuối (thời điểm sự kiện, cắt chính xác). Điểm đầu khi
+        // stream copy luôn lùi về keyframe gần nhất nên sớm hơn [startedAt]
+        // tới ~1 giây; tính ngược từ thời lượng thật để giờ của clip khớp hình.
+        startedAt: source.startedAt
+            .add(Duration(milliseconds: endMs))
+            .subtract(actualDuration),
+        endedAt: source.startedAt.add(Duration(milliseconds: endMs)),
         type: 'CLIP',
       );
       _exportSegments[clip.fileName] = clip;
@@ -732,6 +826,13 @@ class RecordingService {
     } catch (_) {
       if (output != null && await output.exists()) await output.delete();
       rethrow;
+    } finally {
+      final list = concatList;
+      if (list != null) {
+        try {
+          if (await list.exists()) await list.delete();
+        } catch (_) {}
+      }
     }
   }
 
@@ -1045,7 +1146,12 @@ class RecordingService {
         } else if (child is File) {
           try {
             await child.delete();
-          } catch (_) {}
+          } catch (error) {
+            developer.log(
+              '[STORAGE] Unable to delete expired file ${child.path}: $error',
+              name: 'RecordingService',
+            );
+          }
         }
       }
       try {
@@ -1130,11 +1236,10 @@ class RecordingService {
         await nativeAudio.length() > 44;
     final audioInput = hasNativeAudio ? ['-i', nativeAudio.path] : <String>[];
     final audioMap = hasNativeAudio ? '1:a:0?' : '0:a:0?';
-    // Android đã lọc gió (high-pass 130 Hz) ngay trong NativeAudioSegmentRecorder.
-    // AVAudioRecorder trên iOS ghi PCM thô, nên áp cùng bộ lọc khi đóng gói để
-    // âm thanh hai nền tảng giống nhau.
-    final audioFilterArgs = Platform.isIOS && hasNativeAudio
-        ? const ['-af', 'highpass=f=130']
+    // Lọc gió, mưa và tạp âm cho file ghi trên cả Android và iOS (trước đây
+    // Android chỉ có bộ lọc gió bậc 1, iOS chỉ có high-pass; không có khử ồn).
+    final audioFilterArgs = hasNativeAudio
+        ? const ['-af', outdoorAudioCleanupFilter]
         : const <String>[];
 
     ReturnCode? code;
@@ -2190,7 +2295,12 @@ class RecordingService {
     try {
       await _writeJournalState(journal, 'completed', finalPath: file.path);
       if (journal != null && await journal.exists()) await journal.delete();
-    } catch (_) {}
+    } catch (error) {
+      developer.log(
+        'Unable to close recording journal ${journal?.path}: $error',
+        name: 'RecordingService',
+      );
+    }
 
     if (!await file.exists()) {
       // Cleanup đã xóa file hợp lệ để đáp ứng giới hạn dung lượng. Đồng bộ lại
@@ -2353,7 +2463,8 @@ class RecordingService {
   // MARK DOWNLOADED BUT KEEP THE PHONE AS THE ORIGINAL VIDEO STORE
   // ============================================================
 
-  Future<bool> markDownloadedAndDelete(String segmentId) async {
+  /// Tablet xác nhận đã tải: chỉ đánh dấu, video vẫn giữ trên điện thoại.
+  Future<bool> acknowledgeDownloaded(String segmentId) async {
     return markDownloaded(segmentId);
   }
 
@@ -2717,147 +2828,11 @@ class RecordingService {
     return _videoStorage.availableBytes();
   }
 
-  void configureHlsRollingBuffer({
-    required bool enabled,
-    required int maxSegments,
-  }) {
-    if (maxSegments < 1) {
-      throw ArgumentError.value(
-        maxSegments,
-        'maxSegments',
-        'MAX_SEGMENTS phải lớn hơn 0.',
-      );
-    }
-    _hlsEnabled = enabled;
-    _hlsMaxSegments = maxSegments;
-  }
-
-  /// HLS service gọi hàm này ngay sau khi ghi xong một segment `.ts`.
-  Future<void> onHlsSegmentCreated(String segmentPath) {
-    if (!_hlsEnabled) return Future<void>.value();
-    final maxSegments = _hlsMaxSegments;
-    if (maxSegments == null) {
-      return Future<void>.error(
-        StateError('HLS đã bật nhưng chưa cấu hình MAX_SEGMENTS.'),
-      );
-    }
-
-    final previous = _hlsCleanupOperation ?? Future<void>.value();
-    final operation = previous
-        .catchError((Object _, StackTrace _) {})
-        .then(
-          (_) => _handleHlsSegmentCreated(
-            segmentPath: segmentPath,
-            maxSegments: maxSegments,
-          ),
-        );
-    _hlsCleanupOperation = operation;
-    return operation.whenComplete(() {
-      if (identical(_hlsCleanupOperation, operation)) {
-        _hlsCleanupOperation = null;
-      }
-    });
-  }
-
-  Future<void> _handleHlsSegmentCreated({
-    required String segmentPath,
-    required int maxSegments,
-  }) async {
-    final segment = File(segmentPath);
-    if (!segment.path.toLowerCase().endsWith('.ts')) {
-      throw ArgumentError.value(segmentPath, 'segmentPath', 'Phải là file .ts');
-    }
-    _hlsDirectoryPath = segment.parent.path;
-    await trimToMaxSegments(
-      directoryPath: segment.parent.path,
-      maxSegments: maxSegments,
-    );
-    await deleteOldSegmentsIfLowStorage(hlsDirectoryPath: segment.parent.path);
-  }
-
-  Future<int> trimToMaxSegments({
-    required String directoryPath,
-    required int maxSegments,
-  }) async {
-    if (maxSegments < 1) {
-      throw ArgumentError.value(maxSegments, 'maxSegments');
-    }
-    final directory = Directory(directoryPath);
-    if (!await directory.exists()) return 0;
-
-    final segments = <({File file, FileStat stat})>[];
-    await for (final entity in directory.list()) {
-      if (entity is! File || !entity.path.toLowerCase().endsWith('.ts')) {
-        continue;
-      }
-      try {
-        segments.add((file: entity, stat: await entity.stat()));
-      } catch (_) {}
-    }
-    segments.sort((a, b) => a.stat.modified.compareTo(b.stat.modified));
-
-    var deleted = 0;
-    final overflow = segments.length - maxSegments;
-    if (overflow <= 0) return deleted;
-    for (final item in segments.take(overflow)) {
-      if (await _deleteCleanupFile(item.file)) deleted++;
-    }
-    return deleted;
-  }
-
-  Future<void> deleteOldSegmentsIfLowStorage({
-    required String hlsDirectoryPath,
-  }) async {
-    final hlsDirectory = Directory(hlsDirectoryPath);
-    for (var pass = 0; pass < autoCleanupMaxPasses; pass++) {
-      final available = await availableStorageBytes();
-      if (available == null || available >= hlsEmergencyThresholdBytes) break;
-
-      // Ưu tiên dữ liệu trận cũ; tuyệt đối bỏ qua trận hiện tại nếu caller đã
-      // cấu hình currentMatchDirectory.
-      if (await _deleteOldestMatchData(
-        currentMatchDirectory: _currentMatchDirectory,
-      )) {
-        continue;
-      }
-
-      if (!await hlsDirectory.exists()) break;
-      final segments = <({File file, FileStat stat})>[];
-      await for (final entity in hlsDirectory.list()) {
-        if (entity is! File || !entity.path.toLowerCase().endsWith('.ts')) {
-          continue;
-        }
-        try {
-          segments.add((file: entity, stat: await entity.stat()));
-        } catch (_) {}
-      }
-      segments.sort((a, b) => a.stat.modified.compareTo(b.stat.modified));
-
-      // Luôn giữ segment mới nhất để playlist đang phát không bị rỗng.
-      if (segments.length <= 1) break;
-      if (!await _deleteCleanupFile(segments.first.file)) break;
-    }
-  }
-
-  void configureAutoCleanupMode({
-    required bool autoRecordingVideo,
-    required bool duringMatch,
-    String? currentMatchDirectory,
-  }) {
-    _autoRecordingVideo = autoRecordingVideo;
-    _duringMatch = duringMatch;
-    _currentMatchDirectory = currentMatchDirectory;
-  }
-
   Future<void> performAutoCleanup() {
     final current = _autoCleanupOperation;
     if (current != null) return current;
 
-    final operation = _performAutoCleanupInternal(
-      autoRecordingVideo: _autoRecordingVideo,
-      duringMatch: _duringMatch,
-      currentMatchDirectory: _currentMatchDirectory,
-    );
+    final operation = _performAutoCleanupInternal();
     _autoCleanupOperation = operation;
     return operation.whenComplete(() {
       if (identical(_autoCleanupOperation, operation)) {
@@ -2866,29 +2841,14 @@ class RecordingService {
     });
   }
 
-  Future<void> _performAutoCleanupInternal({
-    required bool autoRecordingVideo,
-    required bool duringMatch,
-    required String? currentMatchDirectory,
-  }) async {
-    final hlsDirectoryPath = _hlsDirectoryPath;
-    if (_hlsEnabled && hlsDirectoryPath != null) {
-      await deleteOldSegmentsIfLowStorage(hlsDirectoryPath: hlsDirectoryPath);
-    }
-
-    final threshold = duringMatch
-        ? matchFreeSpaceThresholdBytes
-        : normalFreeSpaceThresholdBytes;
-
+  Future<void> _performAutoCleanupInternal() async {
     for (var pass = 0; pass < autoCleanupMaxPasses; pass++) {
       final available = await availableStorageBytes();
-      if (available == null || available >= threshold) break;
+      if (available == null || available >= normalFreeSpaceThresholdBytes) {
+        break;
+      }
 
-      final deleted = autoRecordingVideo
-          ? await _deleteOldestAutoModeBatch()
-          : await _deleteOldestMatchData(
-              currentMatchDirectory: currentMatchDirectory,
-            );
+      final deleted = await _deleteOldestAutoModeBatch();
       if (!deleted) {
         developer.log(
           '[STORAGE] Cleanup stopped: no eligible data remains.',
@@ -2982,101 +2942,6 @@ class RecordingService {
       await cleanupEmptyStorageDirectories();
     }
     return deletedAny;
-  }
-
-  Future<bool> _deleteOldestMatchData({
-    required String? currentMatchDirectory,
-  }) async {
-    final normalizedCurrent = currentMatchDirectory
-        ?.replaceAll('\\', '/')
-        .toLowerCase();
-    final matches = <({Directory directory, FileStat stat})>[];
-
-    for (final dayDirectory in await _dayDirectories()) {
-      await for (final entity in dayDirectory.list()) {
-        if (entity is! Directory) continue;
-        final name = entity.uri.pathSegments
-            .where((part) => part.isNotEmpty)
-            .last;
-        if (name.toUpperCase() == 'AUTOMODE') continue;
-        final normalized = entity.path.replaceAll('\\', '/').toLowerCase();
-        if (normalizedCurrent != null && normalized == normalizedCurrent) {
-          continue;
-        }
-        try {
-          matches.add((directory: entity, stat: await entity.stat()));
-        } catch (_) {}
-      }
-    }
-    matches.sort((a, b) => a.stat.modified.compareTo(b.stat.modified));
-    final recentCutoff = DateTime.now().subtract(recentSegmentProtection);
-    matches.removeWhere((item) => item.stat.modified.isAfter(recentCutoff));
-    if (matches.isEmpty) return false;
-
-    if (matches.length > 3) {
-      var deletedAny = false;
-      for (final match in matches.take(3)) {
-        if (_hasActiveReaderUnder(match.directory.path)) continue;
-        try {
-          final normalizedDirectory = match.directory.path
-              .replaceAll('\\', '/')
-              .toLowerCase();
-          await match.directory.delete(recursive: true);
-          _segments.removeWhere(
-            (segment) => segment.path
-                .replaceAll('\\', '/')
-                .toLowerCase()
-                .startsWith('$normalizedDirectory/'),
-          );
-          _notifyVideoChanges();
-          deletedAny = true;
-          await _deleteDirectoryIfEmpty(match.directory.parent);
-        } catch (error, stackTrace) {
-          developer.log(
-            '[STORAGE] Unable to delete match: ${match.directory.path}',
-            error: error,
-            stackTrace: stackTrace,
-            name: 'RecordingService',
-          );
-        }
-      }
-      return deletedAny;
-    }
-
-    final clips = <({File file, FileStat stat})>[];
-    for (final match in matches) {
-      await for (final entity in match.directory.list(recursive: true)) {
-        if (!_isVideoFile(entity)) continue;
-        final normalized = entity.path.replaceAll('\\', '/').toUpperCase();
-        if (normalized.contains('/CAM2/') || normalized.contains('/CAM3/')) {
-          continue;
-        }
-        try {
-          clips.add((file: entity as File, stat: await entity.stat()));
-        } catch (_) {}
-      }
-    }
-    clips.sort((a, b) => a.stat.modified.compareTo(b.stat.modified));
-    final cutoff = DateTime.now().subtract(recentSegmentProtection);
-    clips.removeWhere((item) => item.stat.modified.isAfter(cutoff));
-    // Bảo vệ clip mới nhất khi chỉ còn ít trận, tránh xóa sạch lịch sử.
-    if (clips.length <= 1) return false;
-
-    final cam1File = clips.first.file;
-    final cam2File = File(
-      '${cam1File.parent.path}${Platform.pathSeparator}CAM2'
-      '${Platform.pathSeparator}${cam1File.uri.pathSegments.last}',
-    );
-    final deletedCam1 = await _deleteCleanupFile(cam1File);
-    final deletedCam2 = await _deleteCleanupFile(cam2File);
-    final cam3File = File(
-      '${cam1File.parent.path}${Platform.pathSeparator}CAM3'
-      '${Platform.pathSeparator}${cam1File.uri.pathSegments.last}',
-    );
-    final deletedCam3 = await _deleteCleanupFile(cam3File);
-    await _deleteDirectoryIfEmpty(cam2File.parent);
-    await _deleteDirectoryIfEmpty(cam3File.parent);
-    return deletedCam1 || deletedCam2 || deletedCam3;
   }
 
   Future<bool> _deleteCleanupFile(File file) async {
@@ -3180,7 +3045,12 @@ class RecordingService {
         if (!isFileReadActive(file.path)) {
           try {
             await file.delete();
-          } catch (_) {}
+          } catch (error) {
+            developer.log(
+              '[STORAGE] Unable to delete orphan file ${file.path}: $error',
+              name: 'RecordingService',
+            );
+          }
         }
       }
     }
@@ -3201,7 +3071,13 @@ class RecordingService {
     });
   }
 
+  DateTime? _lastStorageEnforcedAt;
+
+  /// Lần quét dung lượng toàn bộ thư mục gần nhất.
+  DateTime? get lastStorageEnforcedAt => _lastStorageEnforcedAt;
+
   Future<void> _enforceStorageLimitInternal() async {
+    _lastStorageEnforcedAt = DateTime.now();
     final availableBefore = await availableStorageBytes();
     final lowStorage =
         availableBefore != null &&

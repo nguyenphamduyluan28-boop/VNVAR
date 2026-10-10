@@ -8,6 +8,25 @@ import 'webrtc_service.dart';
 
 enum WhipPublishState { idle, connecting, publishing, reconnecting, error }
 
+/// Chỉ chấp nhận chứng chỉ TLS tự ký với máy chủ WHIP trong mạng nội bộ
+/// (ví dụ MediaMTX đặt tại sân). Máy chủ trên Internet luôn được kiểm tra
+/// chứng chỉ đầy đủ.
+bool allowsSelfSignedWhipCertificate(String host) {
+  final name = host.toLowerCase();
+  if (name == 'localhost' || name.endsWith('.local')) return true;
+  final address = InternetAddress.tryParse(host);
+  if (address == null) return false;
+  if (address.isLoopback || address.isLinkLocal) return true;
+  final bytes = address.rawAddress;
+  if (address.type == InternetAddressType.IPv4) {
+    return bytes[0] == 10 ||
+        (bytes[0] == 192 && bytes[1] == 168) ||
+        (bytes[0] == 172 && bytes[1] >= 16 && bytes[1] <= 31);
+  }
+  // IPv6 unique local fc00::/7.
+  return (bytes[0] & 0xfe) == 0xfc;
+}
+
 class WhipPublisherService {
   WhipPublishState _state = WhipPublishState.idle;
   final StreamController<WhipPublishState> _stateController =
@@ -28,6 +47,7 @@ class WhipPublisherService {
   bool _intentionalStop = false;
 
   static const int maxReconnectAttempts = 6;
+  static const int slowRetrySeconds = 30;
   static const List<int> _backoffDelaysSeconds = [2, 4, 6, 10, 15, 20];
 
   static const Map<String, dynamic> _rtcConfiguration = {
@@ -204,7 +224,10 @@ class WhipPublisherService {
       client = httpClient;
       httpClient.connectionTimeout = const Duration(seconds: 12);
       // Support self-signed or internal test certificates
-      httpClient.badCertificateCallback = (cert, host, port) => true;
+      // Không bỏ qua kiểm tra chứng chỉ với máy chủ Internet; chỉ cho phép
+      // chứng chỉ tự ký với máy chủ trong mạng nội bộ.
+      httpClient.badCertificateCallback = (cert, host, port) =>
+          allowsSelfSignedWhipCertificate(host);
 
       final uri = Uri.parse(_endpointUrl!);
       developer.log(
@@ -223,7 +246,9 @@ class WhipPublisherService {
       }
 
       request.write(offerSdp);
-      final response = await request.close();
+      final response = await request.close().timeout(
+        const Duration(seconds: 20),
+      );
 
       if (response.statusCode == HttpStatus.ok ||
           response.statusCode == HttpStatus.created) {
@@ -233,7 +258,10 @@ class WhipPublisherService {
           _sessionResourceUrl = uri.resolve(location).toString();
         }
 
-        final answerSdp = await response.transform(utf8.decoder).join();
+        final answerSdp = await response
+            .transform(utf8.decoder)
+            .join()
+            .timeout(const Duration(seconds: 20));
         if (answerSdp.isEmpty) {
           throw StateError('Server trả về Answer SDP rỗng.');
         }
@@ -250,7 +278,10 @@ class WhipPublisherService {
           name: 'WhipPublisherService',
         );
       } else {
-        final errorBody = await response.transform(utf8.decoder).join();
+        final errorBody = await response
+            .transform(utf8.decoder)
+            .join()
+            .timeout(const Duration(seconds: 20));
         throw HttpException(
           'WHIP Server từ chối (${response.statusCode}): ${errorBody.isEmpty ? response.reasonPhrase : errorBody}',
           uri: uri,
@@ -310,19 +341,20 @@ class WhipPublisherService {
     if (_intentionalStop) return;
 
     _currentError = reason;
-    if (_retryAttempt >= maxReconnectAttempts) {
+    // Hết các lần thử nhanh thì vẫn thử tiếp thưa hơn cho tới khi có mạng.
+    final slowRetry = _retryAttempt >= maxReconnectAttempts;
+    if (slowRetry) {
       _currentError =
-          'Không thể kết nối lại sau $maxReconnectAttempts lần thử: $reason';
-      _setState(WhipPublishState.error);
-      return;
+          'Mất kết nối tới server WHIP; tự thử lại mỗi $slowRetrySeconds giây: $reason';
     }
 
     _setState(WhipPublishState.reconnecting);
-    final delaySeconds =
-        _backoffDelaysSeconds[_retryAttempt.clamp(
-          0,
-          _backoffDelaysSeconds.length - 1,
-        )];
+    final delaySeconds = slowRetry
+        ? slowRetrySeconds
+        : _backoffDelaysSeconds[_retryAttempt.clamp(
+            0,
+            _backoffDelaysSeconds.length - 1,
+          )];
     _retryAttempt++;
 
     developer.log(
@@ -336,6 +368,20 @@ class WhipPublisherService {
         _executePublish();
       }
     });
+  }
+
+  /// Mạng của điện thoại vừa thay đổi: nếu đang chờ kết nối lại thì thử ngay.
+  /// Phiên đang phát để WebRTC/ICE tự phát hiện và báo mất kết nối.
+  void handleNetworkChange() {
+    if (!wantsPublishing) return;
+    if (_state != WhipPublishState.reconnecting &&
+        _state != WhipPublishState.error) {
+      return;
+    }
+    _retryAttempt = 0;
+    _reconnectTimer?.cancel();
+    _reconnectTimer = null;
+    unawaited(_executePublish());
   }
 
   /// Stops publishing and gracefully tears down the remote session.
@@ -360,8 +406,10 @@ class WhipPublisherService {
               'Bearer $_bearerToken',
             );
           }
-          final response = await request.close();
-          await response.drain<void>();
+          final response = await request.close().timeout(
+            const Duration(seconds: 6),
+          );
+          await response.drain<void>().timeout(const Duration(seconds: 6));
           developer.log(
             '[WHIP] Session deleted: ${response.statusCode}',
             name: 'WhipPublisherService',

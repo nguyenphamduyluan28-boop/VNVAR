@@ -16,6 +16,7 @@ import '../services/camera_station_runtime.dart';
 import '../services/recording_service.dart';
 import '../services/station_config_service.dart';
 import '../services/station_display_service.dart';
+import '../services/station_platform_events.dart';
 import '../services/whip_publisher_service.dart';
 import '../services/rtsp_publisher_service.dart';
 import 'package:wakelock_plus/wakelock_plus.dart';
@@ -435,7 +436,7 @@ class _StationScreenState extends State<StationScreen>
         final port =
             _runtime.cameraServer?.apiPort ?? CameraServer.defaultApiPort;
         _viewerAddress = address == null
-            ? 'Chưa kết nối Wi-Fi/LAN'
+            ? 'Chưa kết nối Wi-Fi'
             : 'http://$address:$port/viewer';
       });
       _showRtspWarningIfNeeded();
@@ -444,7 +445,7 @@ class _StationScreenState extends State<StationScreen>
     unawaited(_initScreenOrientation());
     unawaited(WakelockPlus.enable());
     if (Platform.isAndroid) {
-      _platformChannel.setMethodCallHandler((call) async {
+      StationPlatformEvents.instance.addListener(this, (call) async {
         if (call.method == 'onDisplayRotationChanged') {
           final args = call.arguments as Map<dynamic, dynamic>?;
           final effectiveRot = args?['effectiveRotation'] as int? ?? 0;
@@ -647,7 +648,7 @@ class _StationScreenState extends State<StationScreen>
   }
 
   Future<void> _loadViewerAddress() async {
-    var result = 'Chưa kết nối Wi-Fi/LAN';
+    var result = 'Chưa kết nối Wi-Fi';
     final apiPort =
         _runtime.cameraServer?.apiPort ?? CameraServer.defaultApiPort;
     try {
@@ -1585,6 +1586,7 @@ class _StationScreenState extends State<StationScreen>
       unawaited(StationDisplayService.setDimmed(false));
     }
     _runtime.setStationDisplayAttached(false);
+    StationPlatformEvents.instance.removeListener(this);
     // Khôi phục hướng xoay dọc (portrait) khi thoát khỏi màn hình Station về màn hình thiết lập
     unawaited(
       SystemChrome.setPreferredOrientations(const [
@@ -1958,7 +1960,7 @@ class _StationScreenState extends State<StationScreen>
                                   const Icon(Icons.circle, color: Colors.white, size: 8),
                                   const SizedBox(width: 6),
                                   Text(
-                                    'LIVE (${_runtime.rtspPublisherService.isLive ? "RTSP" : "WHIP"}) · ${_formatLiveDuration(_runtime.rtspPublisherService.isLive ? _runtime.rtspPublisherService.liveDuration : _runtime.whipPublisherService.liveDuration)}',
+                                    'ĐANG PHÁT · ${_formatLiveDuration(_runtime.rtspPublisherService.isLive ? _runtime.rtspPublisherService.liveDuration : _runtime.whipPublisherService.liveDuration)}',
                                     style: const TextStyle(
                                       color: Colors.white,
                                       fontSize: 11.5,
@@ -2165,6 +2167,11 @@ class _StationScreenState extends State<StationScreen>
                                 _runtime.webRtcService?.ultraWideLabel ?? '0.5×',
                             onZoomChanged: _changeZoom,
                             onQuickSelectZoom: _quickSelectZoom,
+                            exposureEv: _runtime.exposureBiasEv,
+                            onExposureChanged: (ev) async {
+                              await _runtime.setExposureBias(ev);
+                              if (mounted) setState(() {});
+                            },
                           ),
                         ],
                       ),
@@ -2594,9 +2601,13 @@ class _BottomControlPanel extends StatelessWidget {
     required this.ultraWideLabel,
     required this.onZoomChanged,
     required this.onQuickSelectZoom,
+    required this.exposureEv,
+    required this.onExposureChanged,
   });
 
   final bool compact;
+  final double exposureEv;
+  final ValueChanged<double> onExposureChanged;
   final bool cameraReady;
   final bool recording;
   final bool zoomSupported;
@@ -2611,6 +2622,8 @@ class _BottomControlPanel extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    // Camera chưa sẵn sàng: không có zoom hay độ sáng để chỉnh, ẩn hẳn khung.
+    if (!cameraReady && !zoomSupported) return const SizedBox.shrink();
     return ClipRRect(
       borderRadius: BorderRadius.circular(compact ? 18 : 20),
       child: BackdropFilter(
@@ -2653,11 +2666,12 @@ class _BottomControlPanel extends StatelessWidget {
                   color: Colors.white.withValues(alpha: 0.09),
                 ),
               ],
-              _BottomStatusBar(
-                compact: compact,
-                cameraReady: cameraReady,
-                recording: recording,
-              ),
+              if (cameraReady)
+                _BrightnessControl(
+                  compact: compact,
+                  ev: exposureEv,
+                  onChanged: onExposureChanged,
+                ),
             ],
           ),
         ),
@@ -2692,8 +2706,8 @@ class _NetworkStatusBanner extends StatelessWidget {
         : connectedAddress == null
         ? appText(
             context,
-            'Chưa có Wi-Fi/LAN. Camera vẫn ghi hình và sẽ tự kết nối khi có IP.',
-            'No Wi-Fi/LAN. Recording continues and live will connect automatically.',
+            'Chưa có Wi-Fi. Camera vẫn ghi hình bình thường; Tablet sẽ kết nối được khi điện thoại vào Wi-Fi.',
+            'No Wi-Fi. Recording continues; tablets can connect once the phone joins Wi-Fi.',
           )
         : appText(
             context,
@@ -2751,6 +2765,88 @@ class _NetworkStatusBanner extends StatelessWidget {
               style: const TextStyle(fontWeight: FontWeight.w900),
             ),
           ),
+        ],
+      ),
+    );
+  }
+}
+
+/// Nút chỉnh độ sáng hình cho người dùng phổ thông: "Tối hơn / Tự động /
+/// Sáng hơn", mỗi bước 0,5 EV, từ −1 tới +2.
+class _BrightnessControl extends StatelessWidget {
+  const _BrightnessControl({
+    required this.compact,
+    required this.ev,
+    required this.onChanged,
+  });
+
+  static const double _step = 0.5;
+  static const double _min = -1.0;
+  static const double _max = 2.0;
+
+  final bool compact;
+  final double ev;
+  final ValueChanged<double> onChanged;
+
+  @override
+  Widget build(BuildContext context) {
+    final label = ev.abs() < 0.01
+        ? appText(context, 'Tự động', 'Auto')
+        : ev > 0
+        ? appText(
+            context,
+            'Sáng hơn +${ev.toStringAsFixed(1)}',
+            'Brighter +${ev.toStringAsFixed(1)}',
+          )
+        : appText(
+            context,
+            'Tối hơn ${ev.toStringAsFixed(1)}',
+            'Darker ${ev.toStringAsFixed(1)}',
+          );
+    Widget button(IconData icon, double next, bool enabled) {
+      return IconButton(
+        visualDensity: VisualDensity.compact,
+        iconSize: compact ? 18 : 20,
+        color: Colors.white,
+        disabledColor: Colors.white24,
+        onPressed: enabled ? () => onChanged(next) : null,
+        icon: Icon(icon),
+      );
+    }
+
+    return Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+      child: Row(
+        children: [
+          Icon(
+            Icons.wb_sunny_rounded,
+            size: compact ? 16 : 18,
+            color: Colors.amberAccent,
+          ),
+          const SizedBox(width: 6),
+          Text(
+            appText(context, 'Độ sáng', 'Brightness'),
+            style: TextStyle(
+              color: Colors.white70,
+              fontSize: compact ? 12 : 13,
+              fontWeight: FontWeight.w600,
+            ),
+          ),
+          const Spacer(),
+          button(Icons.remove_rounded, ev - _step, ev > _min + 0.01),
+          SizedBox(
+            width: compact ? 92 : 104,
+            child: Text(
+              label,
+              textAlign: TextAlign.center,
+              style: TextStyle(
+                color: Colors.white,
+                fontSize: compact ? 12 : 13,
+                fontWeight: FontWeight.w800,
+              ),
+            ),
+          ),
+          button(Icons.add_rounded, ev + _step, ev < _max - 0.01),
         ],
       ),
     );
@@ -3182,16 +3278,33 @@ class _StationHeader extends StatelessWidget {
               ),
               const SizedBox(width: 8),
               Expanded(
-                child: Text(
-                  identity.cameraName,
-                  maxLines: 1,
-                  overflow: TextOverflow.ellipsis,
-                  style: TextStyle(
-                    color: Colors.white,
-                    fontSize: compact ? 13 : 15,
-                    fontWeight: FontWeight.w900,
-                    height: 1.0,
-                  ),
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      identity.cameraName,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: TextStyle(
+                        color: Colors.white,
+                        fontSize: compact ? 13 : 15,
+                        fontWeight: FontWeight.w900,
+                        height: 1.0,
+                      ),
+                    ),
+                    const SizedBox(height: 3),
+                    Text(
+                      '${identity.cameraId} · $courtLabel · ${identity.cameraPosition}',
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: TextStyle(
+                        color: Colors.white60,
+                        fontSize: compact ? 10.5 : 11.5,
+                        fontWeight: FontWeight.w600,
+                      ),
+                    ),
+                  ],
                 ),
               ),
               const SizedBox(width: 6),
@@ -3232,15 +3345,9 @@ class _StationHeader extends StatelessWidget {
           ),
 
           SizedBox(height: compact ? 6 : 8),
-          Divider(
-            height: 1,
-            thickness: 1,
-            color: Colors.white.withValues(alpha: 0.08),
-          ),
-          SizedBox(height: compact ? 6 : 8),
 
           // -------------------------------------------------
-          // ROW 2 — Recording status + Resolution + Identifiers (All in Wrap)
+          // ROW 2 — Recording status + Resolution
           // -------------------------------------------------
           Wrap(
             spacing: 6,
@@ -3253,12 +3360,6 @@ class _StationHeader extends StatelessWidget {
                 switching: resolutionSwitching,
                 locked: resolutionLocked,
                 onTap: onResolution,
-              ),
-              _HeaderTag(icon: Icons.videocam_rounded, text: identity.cameraId),
-              _HeaderTag(icon: Icons.stadium_rounded, text: courtLabel),
-              _HeaderTag(
-                icon: Icons.location_on_rounded,
-                text: identity.cameraPosition,
               ),
             ],
           ),
@@ -3468,50 +3569,6 @@ class _HeaderIconButton extends StatelessWidget {
 // HEADER TAG
 // ============================================================
 
-class _HeaderTag extends StatelessWidget {
-  final IconData icon;
-  final String text;
-
-  const _HeaderTag({required this.icon, required this.text});
-
-  @override
-  Widget build(BuildContext context) {
-    return ConstrainedBox(
-      constraints: const BoxConstraints(maxWidth: 160),
-      child: Container(
-        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 5),
-        decoration: BoxDecoration(
-          color: Colors.white.withValues(alpha: 0.09),
-          borderRadius: BorderRadius.circular(20),
-        ),
-        child: Row(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            Icon(icon, size: 12, color: Colors.white70),
-            const SizedBox(width: 4),
-            Flexible(
-              child: Text(
-                text,
-                maxLines: 1,
-                overflow: TextOverflow.ellipsis,
-                style: const TextStyle(
-                  color: Colors.white70,
-                  fontSize: 9.5,
-                  fontWeight: FontWeight.w700,
-                ),
-              ),
-            ),
-          ],
-        ),
-      ),
-    );
-  }
-}
-
-// ============================================================
-// CAMERA CONTROL DOCK (rotate / switch lens / toggle camera)
-// ============================================================
-
 class _CameraControlDock extends StatelessWidget {
   final bool compact;
   final bool cameraReady;
@@ -3702,104 +3759,6 @@ class _DockButton extends StatelessWidget {
           ),
         ),
       ),
-    );
-  }
-}
-
-// ============================================================
-// BOTTOM STATUS BAR
-// ============================================================
-
-class _BottomStatusBar extends StatelessWidget {
-  final bool compact;
-  final bool cameraReady;
-  final bool recording;
-
-  const _BottomStatusBar({
-    required this.compact,
-    required this.cameraReady,
-    required this.recording,
-  });
-
-  @override
-  Widget build(BuildContext context) {
-    return Padding(
-      padding: EdgeInsets.symmetric(
-        horizontal: compact ? 8 : 10,
-        vertical: compact ? 7 : 9,
-      ),
-      child: Row(
-        children: [
-          Expanded(
-            child: _CompactStatus(
-              icon: Icons.videocam_rounded,
-              text: cameraReady
-                  ? appText(context, 'CAMERA SẴN SÀNG', 'CAMERA READY')
-                  : appText(context, 'CAMERA TẮT', 'CAMERA OFF'),
-              color: cameraReady ? Colors.greenAccent : Colors.orangeAccent,
-              compact: compact,
-            ),
-          ),
-          Container(
-            width: 1,
-            height: 22,
-            color: Colors.white.withValues(alpha: 0.10),
-          ),
-          Expanded(
-            child: _CompactStatus(
-              icon: Icons.fiber_manual_record_rounded,
-              text: recording
-                  ? appText(context, 'ĐANG GHI', 'RECORDING')
-                  : appText(context, 'SẴN SÀNG', 'READY'),
-              color: recording ? Colors.redAccent : Colors.greenAccent,
-              compact: compact,
-            ),
-          ),
-        ],
-      ),
-    );
-  }
-}
-
-// ============================================================
-// COMPACT STATUS
-// ============================================================
-
-class _CompactStatus extends StatelessWidget {
-  final IconData icon;
-  final String text;
-  final Color color;
-  final bool compact;
-
-  const _CompactStatus({
-    required this.icon,
-    required this.text,
-    required this.color,
-    required this.compact,
-  });
-
-  @override
-  Widget build(BuildContext context) {
-    return Row(
-      mainAxisAlignment: MainAxisAlignment.center,
-      mainAxisSize: MainAxisSize.min,
-      children: [
-        Icon(icon, color: color, size: compact ? 12 : 13),
-        const SizedBox(width: 5),
-        Flexible(
-          child: Text(
-            text,
-            maxLines: 1,
-            overflow: TextOverflow.ellipsis,
-            style: TextStyle(
-              color: color,
-              fontSize: compact ? 8 : 9,
-              fontWeight: FontWeight.w900,
-              letterSpacing: 0.2,
-            ),
-          ),
-        ),
-      ],
     );
   }
 }

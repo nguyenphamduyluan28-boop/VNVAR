@@ -5,6 +5,9 @@ import 'package:ffmpeg_kit_flutter_new_video/ffmpeg_session.dart';
 import 'package:ffmpeg_kit_flutter_new_video/return_code.dart';
 import 'package:ffmpeg_kit_flutter_new_video/statistics.dart';
 
+import 'audio_cleanup.dart';
+import 'cellular_uplink_service.dart';
+
 enum RtspPublishState {
   idle,
   connecting,
@@ -112,6 +115,24 @@ class LiveBitrateController {
   }
 }
 
+/// Lỗi relay có thể do đường mạng (timeout, từ chối kết nối, DNS…) hay không.
+/// Server từ chối xác thực hoặc không có luồng (401/403/404) thì đổi Wi-Fi ↔
+/// 4G/5G cũng không giúp được.
+bool isRouteRelatedRelayFailure(String? output) {
+  if (output == null || output.isEmpty) return true;
+  const serverRejections = [
+    '401',
+    'Unauthorized',
+    '403',
+    'Forbidden',
+    '404',
+    'Not Found',
+    'Stream not found',
+    'NetStream.Publish.BadName',
+  ];
+  return !serverRejections.any(output.contains);
+}
+
 class RtspPublisherService {
   RtspPublishState _state = RtspPublishState.idle;
   final StreamController<RtspPublishState> _stateController =
@@ -145,11 +166,33 @@ class RtspPublisherService {
 
   /// Chờ RTSP server cục bộ có encoder sẵn sàng trước khi chạy lại relay.
   Future<bool> Function()? waitForLocalSource;
+
+  /// Máy đang có Wi-Fi/Ethernet (runtime cung cấp). Dùng để biết khi nào nên
+  /// thử quay lại mạng mặc định sau khi đã chuyển sang 4G/5G dự phòng.
+  bool Function()? hasWifiNetwork;
+
+  // Đường truyền livestream: luôn thử mạng mặc định trước (Wi-Fi khi có, 4G/5G
+  // khi không có Wi-Fi). Thất bại liên tiếp [routeFailuresBeforeSwitch] lần thì
+  // đổi sang đường còn lại; vì vậy Wi-Fi không có Internet sẽ tự chuyển sang
+  // 4G/5G dự phòng, và ngược lại.
+  static const int routeFailuresBeforeSwitch = 2;
+  static const Duration routeProbeInterval = Duration(seconds: 60);
+  bool _preferCellular = false;
+  bool _cellularActive = false;
+  int _routeFailures = 0;
+  Timer? _routeProbeTimer;
+  bool _routeProbeRunning = false;
+
+  /// Livestream đang đi 4G/5G dự phòng (mạng mặc định không tới được server).
+  bool get cellularFallbackActive => _cellularActive;
   // Tăng mỗi khi mở/hủy một phiên FFmpeg. Callback của phiên cũ (đã bị thay
   // thế hoặc hủy) mang generation khác nên không được ghi đè trạng thái mới.
   int _sessionGeneration = 0;
 
+  /// Số lần thử nhanh theo [_backoffDelaysSeconds]; sau đó vẫn thử tiếp mỗi
+  /// [slowRetrySeconds] giây cho tới khi có mạng hoặc người dùng bấm Dừng.
   static const int maxReconnectAttempts = 8;
+  static const int slowRetrySeconds = 30;
   static const List<int> _backoffDelaysSeconds = [2, 3, 5, 8, 12, 15, 20, 30];
 
   RtspPublishState get state => _state;
@@ -204,6 +247,7 @@ class RtspPublisherService {
   void _setState(RtspPublishState newState) {
     if (_state == newState) return;
     _state = newState;
+    _updateRouteProbe();
     if (newState != RtspPublishState.publishing) _resetNetworkHealth();
     if (newState == RtspPublishState.publishing) {
       _connectedAt ??= DateTime.now();
@@ -282,6 +326,26 @@ class RtspPublisherService {
     final isRtmp = _targetUrl!.toLowerCase().startsWith('rtmp://') ||
         _targetUrl!.toLowerCase().startsWith('rtmps://');
 
+    var outputUrl = _targetUrl!;
+    final outputRouteArgs = <String>[];
+    final wasCellular = _cellularActive;
+    _cellularActive = false;
+    if (_preferCellular) {
+      final endpoint = cellularTunnelEndpoint(outputUrl);
+      final localPort = endpoint == null
+          ? null
+          : await CellularUplinkService.openTunnel(endpoint);
+      if (!isCurrent()) return;
+      if (localPort != null) {
+        final relay = buildCellularRelayTarget(outputUrl, localPort);
+        outputUrl = relay.url;
+        outputRouteArgs.addAll(relay.args);
+        _cellularActive = true;
+      }
+    }
+    if (wasCellular && !_cellularActive) {
+      unawaited(CellularUplinkService.closeTunnel());
+    }
     // Build optimized realtime low-latency stream arguments
     final args = <String>[
       '-nostdin',
@@ -297,6 +361,9 @@ class RtspPublisherService {
       'tcp',
       '-buffer_size',
       '4096000',
+      // Timeout I/O với RTSP cục bộ (micro giây): không treo nếu nguồn ngừng.
+      '-timeout',
+      '10000000',
       '-i',
       _localRtspUrl!,
       '-map',
@@ -316,13 +383,9 @@ class RtspPublisherService {
       '-ar',
       '48000',
       '-af',
-      // Rain & Wind noise suppression filter chain:
-      // 1. highpass=f=130: strips sub-bass wind rumble and tripod vibration (<130Hz).
-      // 2. lowpass=f=6500: cuts harsh rain hiss and spatter (>6.5kHz).
-      // 3. afftdn=nr=18:nf=-25:tn=1: adaptive FFT noise filter reducing rain noise floor by 18dB.
-      // 4. volume=1.2: keeps referee whistle and stadium ambience crystal clear.
-      // 5. aresample: guarantees strict A/V PTS sync.
-      'highpass=f=130,lowpass=f=6500,afftdn=nr=18:nf=-25:tn=1,volume=1.2,aresample=async=1000:min_hard_comp=0.100000:first_pts=0',
+      // Lọc gió/mưa/tạp âm giống file ghi (xem audio_cleanup.dart), rồi
+      // aresample để giữ hình–tiếng khớp nhau.
+      '$outdoorAudioCleanupFilter,aresample=async=1000:min_hard_comp=0.100000:first_pts=0',
       '-max_muxing_queue_size',
       '8192',
       '-avoid_negative_ts',
@@ -336,6 +399,11 @@ class RtspPublisherService {
         'no_duration_filesize',
         '-rtmp_live',
         'live',
+        // Timeout đọc/ghi socket tới server (micro giây). Khi đổi Wi-Fi ↔ 4G/5G,
+        // kết nối TCP cũ chết im lặng; không có timeout FFmpeg có thể treo ở
+        // trạng thái LIVE nhiều phút mà không đẩy được dữ liệu.
+        '-rw_timeout',
+        '15000000',
       ] else ...[
         '-f',
         'rtsp',
@@ -343,12 +411,15 @@ class RtspPublisherService {
         'tcp',
         '-rtsp_flags',
         'prefer_tcp',
+        '-timeout',
+        '15000000',
       ],
-      _targetUrl!,
+      ...outputRouteArgs,
+      outputUrl,
     ];
 
     developer.log(
-      '[RTSP_PUSH] Starting FFmpeg push: ${args.join(" ")}',
+      '[RTSP_PUSH] Starting FFmpeg push to $_targetUrl',
       name: 'RtspPublisherService',
     );
 
@@ -387,7 +458,10 @@ class RtspPublisherService {
             name: 'RtspPublisherService',
           );
           _currentSession = null;
-          _scheduleReconnect(failureReason);
+          _scheduleReconnect(
+            failureReason,
+            routeRelated: isSuccess || isRouteRelatedRelayFailure(output),
+          );
         },
         (log) {
           if (!isCurrent()) return;
@@ -398,11 +472,13 @@ class RtspPublisherService {
               message.contains('bitrate=')) {
             if (_state != RtspPublishState.publishing) {
               _retryAttempt = 0;
+              _routeFailures = 0;
               _reconnectTimer?.cancel();
               _currentError = null;
               _setState(RtspPublishState.publishing);
               developer.log(
-                '[RTSP_PUSH] Stream is now LIVE on $_targetUrl',
+                '[RTSP_PUSH] Stream is now LIVE on $_targetUrl '
+                '(${_cellularActive ? '4G/5G fallback' : 'default network'})',
                 name: 'RtspPublisherService',
               );
             }
@@ -526,20 +602,37 @@ class RtspPublisherService {
     return 'Lỗi truyền luồng RTSP.';
   }
 
-  void _scheduleReconnect(String reason) {
+  void _scheduleReconnect(String reason, {bool routeRelated = true}) {
     if (_intentionalStop) return;
 
+    // Đường hiện tại thất bại liên tiếp: lần sau thử đường còn lại. Lỗi do
+    // server từ chối (sai stream key, sai đường dẫn) không phải lỗi mạng nên
+    // không đổi Wi-Fi ↔ 4G/5G.
+    if (routeRelated) _routeFailures++;
+    if (_routeFailures >= routeFailuresBeforeSwitch) {
+      _routeFailures = 0;
+      _preferCellular = !_preferCellular;
+      developer.log(
+        '[RTSP_PUSH] Switching livestream route to '
+        '${_preferCellular ? '4G/5G fallback' : 'the default network'}',
+        name: 'RtspPublisherService',
+      );
+    }
+
     _currentError = reason;
-    if (_retryAttempt >= maxReconnectAttempts) {
+    // Hết các lần thử nhanh thì vẫn tiếp tục thử thưa hơn: mạng di động có thể
+    // mất vài phút mới có lại. Trước đây livestream dừng hẳn sau ~95 giây.
+    final slowRetry = _retryAttempt >= maxReconnectAttempts;
+    if (slowRetry) {
       _currentError =
-          'Không thể kết nối lại sau $maxReconnectAttempts lần thử: $reason';
-      _setState(RtspPublishState.error);
-      return;
+          'Mất kết nối tới server phát; tự thử lại mỗi $slowRetrySeconds giây: $reason';
     }
 
     _setState(RtspPublishState.reconnecting);
-    final delaySeconds = _backoffDelaysSeconds[
-        _retryAttempt.clamp(0, _backoffDelaysSeconds.length - 1)];
+    final delaySeconds = slowRetry
+        ? slowRetrySeconds
+        : _backoffDelaysSeconds[
+            _retryAttempt.clamp(0, _backoffDelaysSeconds.length - 1)];
     _retryAttempt++;
 
     developer.log(
@@ -555,12 +648,101 @@ class RtspPublisherService {
     });
   }
 
+  /// Mạng của điện thoại vừa thay đổi (Wi-Fi ↔ 4G/5G, mất hoặc có lại mạng).
+  ///
+  /// Đang chờ kết nối lại: thử ngay thay vì đợi hết backoff. Đang phát mà
+  /// mạng mang luồng vừa mất (ví dụ rời Wi-Fi, hệ điều hành chuyển sang
+  /// 4G/5G): kết nối TCP cũ đã chết nên nối lại ngay thay vì đợi timeout.
+  void handleNetworkChange({required bool interfaceLost}) {
+    if (!wantsPublishing) return;
+    final waiting = _state == RtspPublishState.reconnecting ||
+        _state == RtspPublishState.error;
+    // Luồng đi 4G/5G dự phòng không phụ thuộc Wi-Fi nên Wi-Fi đổi không
+    // làm hỏng nó; chỉ cần thử xem Wi-Fi đã có Internet để quay lại chưa.
+    if (_cellularActive && _state == RtspPublishState.publishing) {
+      unawaited(_probeDefaultRoute());
+      return;
+    }
+    final staleRoute =
+        interfaceLost && _state == RtspPublishState.publishing;
+    if (!waiting && !staleRoute) return;
+    developer.log(
+      '[RTSP_PUSH] Network changed; reconnecting now',
+      name: 'RtspPublisherService',
+    );
+    _retryAttempt = 0;
+    _reconnectTimer?.cancel();
+    _reconnectTimer = null;
+    _setState(RtspPublishState.reconnecting);
+    unawaited(_executePublish());
+  }
+
+  void _updateRouteProbe() {
+    final shouldProbe =
+        _cellularActive && _state == RtspPublishState.publishing;
+    if (!shouldProbe) {
+      _routeProbeTimer?.cancel();
+      _routeProbeTimer = null;
+      return;
+    }
+    _routeProbeTimer ??= Timer.periodic(
+      routeProbeInterval,
+      (_) => unawaited(_probeDefaultRoute()),
+    );
+  }
+
+  /// Đang đi 4G/5G dự phòng mà máy có Wi-Fi: thử xem Wi-Fi đã tới được server
+  /// chưa. Được thì quay lại mạng mặc định để tiết kiệm dữ liệu di động
+  /// (ngắt khoảng 1–2 giây).
+  Future<void> _probeDefaultRoute() async {
+    if (_routeProbeRunning ||
+        !_cellularActive ||
+        _state != RtspPublishState.publishing ||
+        !(hasWifiNetwork?.call() ?? false)) {
+      return;
+    }
+    final url = _targetUrl;
+    final endpoint = url == null ? null : cellularTunnelEndpoint(url);
+    if (endpoint == null) return;
+    _routeProbeRunning = true;
+    try {
+      final reachable = await CellularUplinkService.defaultRouteReaches(
+        endpoint,
+      );
+      if (!reachable ||
+          !_cellularActive ||
+          _state != RtspPublishState.publishing ||
+          _intentionalStop) {
+        return;
+      }
+      developer.log(
+        '[RTSP_PUSH] Wi-Fi reaches the server again; leaving 4G/5G fallback',
+        name: 'RtspPublisherService',
+      );
+      _preferCellular = false;
+      _routeFailures = 0;
+      _retryAttempt = 0;
+      _reconnectTimer?.cancel();
+      _reconnectTimer = null;
+      _setState(RtspPublishState.reconnecting);
+      unawaited(_executePublish());
+    } finally {
+      _routeProbeRunning = false;
+    }
+  }
+
   Future<void> stopPublish() async {
     _intentionalStop = true;
     _reconnectTimer?.cancel();
     _reconnectTimer = null;
     _retryAttempt = 0;
     await _cancelActiveSession();
+    _preferCellular = false;
+    _routeFailures = 0;
+    if (_cellularActive) {
+      _cellularActive = false;
+      unawaited(CellularUplinkService.closeTunnel());
+    }
     // Hết livestream: trả encoder về chất lượng đầy đủ cho Tablet.
     _bitrate.reset();
     _applyTargetBitrate();
@@ -633,6 +815,7 @@ class RtspPublisherService {
 
   void dispose() {
     _intentionalStop = true;
+    _routeProbeTimer?.cancel();
     _reconnectTimer?.cancel();
     _stopDurationTimer();
     _cancelActiveSession();

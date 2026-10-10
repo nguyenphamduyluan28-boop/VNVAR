@@ -508,11 +508,14 @@ object CameraExposureController {
                         characteristics.get(CameraCharacteristics.EDGE_AVAILABLE_EDGE_MODES),
                         CaptureRequest.EDGE_MODE_HIGH_QUALITY,
                     )
+                    // Trạm đặt cố định trên chân máy: chống rung điện tử (EIS) chỉ cắt
+                    // bớt khung hình và làm giảm độ nét/gây trôi hình nhẹ. Tắt EIS;
+                    // chống rung quang học (OIS) của ống kính không bị ảnh hưởng.
                     setFirstSupportedMode(
                         this,
                         CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE,
                         characteristics.get(CameraCharacteristics.CONTROL_AVAILABLE_VIDEO_STABILIZATION_MODES),
-                        CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE_ON,
+                        CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE_OFF,
                     )
                 }
                 captureSession.setRepeatingRequest(

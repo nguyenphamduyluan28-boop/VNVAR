@@ -13,8 +13,6 @@ dependencies:
 
   cupertino_icons: ^1.0.8
   path_provider: ^2.1.5
-  shelf: ^1.4.2
-  bonsoir: ^7.1.5
   shared_preferences: ^2.3.3
   flutter_webrtc: ^1.5.2
   ffmpeg_kit_flutter_new_video: ^2.5.2
@@ -24,8 +22,13 @@ dependencies:
   image_picker: ^1.2.4
 
 
+# Bản flutter_webrtc 1.6.0 có vá bitrate và profile H.264 của trình ghi video
+# (xem các dòng "VNVAR patch" trong packages/flutter_webrtc).
+dependency_overrides:
+  flutter_webrtc:
+    path: packages/flutter_webrtc
+
 dev_dependencies:
-  change_app_package_name: ^1.1.0
   flutter_test:
     sdk: flutter
   flutter_lints: ^6.0.0

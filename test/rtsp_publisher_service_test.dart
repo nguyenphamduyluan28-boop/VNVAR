@@ -21,9 +21,7 @@ void main() {
       final states = <RtspPublishState>[];
       final sub = service.onStateChanged.listen(states.add);
 
-      await service.startPublish(
-        targetUrl: '   ',
-      );
+      await service.startPublish(targetUrl: '   ');
 
       expect(service.state, RtspPublishState.error);
       expect(service.currentError, contains('Chưa nhập URL đích'));
@@ -35,9 +33,7 @@ void main() {
 
     test('startPublish with invalid scheme sets error state', () async {
       final service = RtspPublisherService();
-      await service.startPublish(
-        targetUrl: 'http://invalid-scheme.com/live',
-      );
+      await service.startPublish(targetUrl: 'http://invalid-scheme.com/live');
 
       expect(service.state, RtspPublishState.error);
       expect(service.currentError, contains('URL không đúng định dạng'));
@@ -63,14 +59,17 @@ void main() {
       service.dispose();
     });
 
-    test('restartIfPublishing does not restart after the user stopped', () async {
-      final service = RtspPublisherService();
-      await service.stopPublish();
-      await service.restartIfPublishing();
-      expect(service.state, RtspPublishState.idle);
-      expect(service.wantsPublishing, isFalse);
-      service.dispose();
-    });
+    test(
+      'restartIfPublishing does not restart after the user stopped',
+      () async {
+        final service = RtspPublisherService();
+        await service.stopPublish();
+        await service.restartIfPublishing();
+        expect(service.state, RtspPublishState.idle);
+        expect(service.wantsPublishing, isFalse);
+        service.dispose();
+      },
+    );
 
     test('adaptive bitrate lowers after sustained congestion', () {
       final controller = LiveBitrateController(maximumBps: 5000000);
@@ -89,28 +88,25 @@ void main() {
       expect(controller.targetBps, 3750000);
     });
 
-    test('adaptive bitrate ignores short hiccups and never drops below floor',
-        () {
-      final controller = LiveBitrateController(maximumBps: 3000000);
-      final start = DateTime(2026, 10, 8, 20);
-      controller.beginSession(start.subtract(const Duration(seconds: 10)));
-      expect(
-        controller.observe(
-          speed: 0.5,
-          fps: 10,
-          expectedFps: 30,
-          now: start,
-        ),
-        isNull,
-      );
-      var now = start;
-      for (var step = 0; step < 40; step++) {
-        now = now.add(const Duration(seconds: 1));
-        controller.observe(speed: 0.5, fps: 10, expectedFps: 30, now: now);
-      }
-      expect(controller.targetBps, controller.minimumBps);
-      expect(controller.minimumBps, 900000);
-    });
+    test(
+      'adaptive bitrate ignores short hiccups and never drops below floor',
+      () {
+        final controller = LiveBitrateController(maximumBps: 3000000);
+        final start = DateTime(2026, 10, 8, 20);
+        controller.beginSession(start.subtract(const Duration(seconds: 10)));
+        expect(
+          controller.observe(speed: 0.5, fps: 10, expectedFps: 30, now: start),
+          isNull,
+        );
+        var now = start;
+        for (var step = 0; step < 40; step++) {
+          now = now.add(const Duration(seconds: 1));
+          controller.observe(speed: 0.5, fps: 10, expectedFps: 30, now: now);
+        }
+        expect(controller.targetBps, controller.minimumBps);
+        expect(controller.minimumBps, 900000);
+      },
+    );
 
     test('adaptive bitrate recovers gradually after stable upload', () {
       final controller = LiveBitrateController(maximumBps: 5000000);
@@ -139,6 +135,28 @@ void main() {
       expect(raised, 4125000);
       controller.reset();
       expect(controller.targetBps, 5000000);
+    });
+
+    test('network change does not resurrect a stopped stream', () async {
+      final service = RtspPublisherService();
+      await service.stopPublish();
+      service.handleNetworkChange(interfaceLost: true);
+      expect(service.state, RtspPublishState.idle);
+      service.dispose();
+    });
+
+    test('server rejections do not switch Wi-Fi/4G routes', () {
+      expect(
+        isRouteRelatedRelayFailure('Server returned 401 Unauthorized'),
+        isFalse,
+      );
+      expect(
+        isRouteRelatedRelayFailure('rtmp: NetStream.Publish.BadName'),
+        isFalse,
+      );
+      expect(isRouteRelatedRelayFailure('Connection timed out'), isTrue);
+      expect(isRouteRelatedRelayFailure('Connection refused'), isTrue);
+      expect(isRouteRelatedRelayFailure(null), isTrue);
     });
 
     test('network quality starts unknown', () {

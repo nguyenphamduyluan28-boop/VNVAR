@@ -29,14 +29,20 @@ class _LiveStreamScreenState extends State<LiveStreamScreen> {
 
   // RTSP Push Form Controllers
   final TextEditingController _rtspUrlController = TextEditingController();
-  final TextEditingController _rtspServerController =
-      TextEditingController(text: 'media.aqvision.net:18554');
-  final TextEditingController _rtspAppController =
-      TextEditingController(text: 'live');
-  final TextEditingController _rtspStreamNameController =
-      TextEditingController(text: 'camera_demo');
+  final TextEditingController _rtspServerController = TextEditingController(
+    text: 'media.aqvision.net:18554',
+  );
+  final TextEditingController _rtspAppController = TextEditingController(
+    text: 'live',
+  );
+  final TextEditingController _rtspStreamNameController = TextEditingController(
+    text: 'camera_demo',
+  );
   final TextEditingController _rtspKeyController = TextEditingController();
   bool _useDetailedRtspBuilder = false;
+  // Mục dành cho kỹ thuật viên (giao thức, link RTSP nội bộ, số liệu FPS/Kbps).
+  // Thu gọn mặc định để người dùng phổ thông chỉ thấy: quét QR → phát.
+  bool _showAdvanced = false;
   bool _obscureRtspKey = true;
 
   // WHIP Form Controllers
@@ -201,11 +207,13 @@ class _LiveStreamScreenState extends State<LiveStreamScreen> {
         if (parts.isNotEmpty) _rtspStreamNameController.text = parts[0];
         if (parts.length > 1) _rtspKeyController.text = parts[1];
       });
-      _showToast(appText(
-        context,
-        'Đã nhận diện và thiết lập đường dẫn phát trực tiếp.',
-        'Recognized and configured stream link.',
-      ));
+      _showToast(
+        appText(
+          context,
+          'Đã nhận diện và thiết lập đường dẫn phát trực tiếp.',
+          'Recognized and configured stream link.',
+        ),
+      );
       return;
     }
 
@@ -224,11 +232,13 @@ class _LiveStreamScreenState extends State<LiveStreamScreen> {
         }
         if (keyMatch != null) _rtspKeyController.text = keyMatch.group(1) ?? '';
       });
-      _showToast(appText(
-        context,
-        'Đã điền đường dẫn phát trực tiếp thành công.',
-        'Applied live stream link.',
-      ));
+      _showToast(
+        appText(
+          context,
+          'Đã điền đường dẫn phát trực tiếp thành công.',
+          'Applied live stream link.',
+        ),
+      );
       return;
     }
   }
@@ -238,11 +248,13 @@ class _LiveStreamScreenState extends State<LiveStreamScreen> {
     if (!mounted) return;
     final text = data?.text?.trim() ?? '';
     if (text.isEmpty) {
-      _showToast(appText(
-        context,
-        'Chưa có nội dung nào trong bộ nhớ tạm để dán.',
-        'Clipboard is empty.',
-      ));
+      _showToast(
+        appText(
+          context,
+          'Chưa có nội dung nào trong bộ nhớ tạm để dán.',
+          'Clipboard is empty.',
+        ),
+      );
       return;
     }
     _handleSmartPasteOrInput(text);
@@ -342,10 +354,7 @@ class _LiveStreamScreenState extends State<LiveStreamScreen> {
       decoration: BoxDecoration(
         gradient: LinearGradient(
           colors: isLive
-              ? [
-                  const Color(0xFF1E2633),
-                  const Color(0xFF141A23),
-                ]
+              ? [const Color(0xFF1E2633), const Color(0xFF141A23)]
               : [
                   const Color(0xFF0D47A1).withValues(alpha: 0.35),
                   const Color(0xFF161B22),
@@ -428,8 +437,9 @@ class _LiveStreamScreenState extends State<LiveStreamScreen> {
           const SizedBox(width: 8),
           FilledButton.icon(
             style: FilledButton.styleFrom(
-              backgroundColor:
-                  isLive ? Colors.white10 : const Color(0xFF1E88E5),
+              backgroundColor: isLive
+                  ? Colors.white10
+                  : const Color(0xFF1E88E5),
               foregroundColor: isLive ? Colors.white38 : Colors.white,
               padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
               minimumSize: Size.zero,
@@ -442,10 +452,7 @@ class _LiveStreamScreenState extends State<LiveStreamScreen> {
             icon: const Icon(Icons.camera_alt_rounded, size: 15),
             label: Text(
               appText(context, 'Quét QR', 'Scan QR'),
-              style: const TextStyle(
-                fontWeight: FontWeight.bold,
-                fontSize: 12,
-              ),
+              style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 12),
             ),
           ),
         ],
@@ -468,22 +475,30 @@ class _LiveStreamScreenState extends State<LiveStreamScreen> {
       _rtspKeyController.text = currentKey;
     }
 
-    String streamName =
-        _rtspStreamNameController.text.trim().replaceAll('.sdp', '');
-    if (streamName.isEmpty || streamName.contains('http') || streamName.contains('rtsp') || streamName.contains('/')) {
+    String streamName = _rtspStreamNameController.text.trim().replaceAll(
+      '.sdp',
+      '',
+    );
+    if (streamName.isEmpty ||
+        streamName.contains('http') ||
+        streamName.contains('rtsp') ||
+        streamName.contains('/')) {
       final currentUrl = _rtspUrlController.text.trim();
-      final lastSlashMatch = RegExp(r'/live/([^/?&\s]+)').allMatches(currentUrl);
+      final lastSlashMatch = RegExp(
+        r'/live/([^/?&\s]+)',
+      ).allMatches(currentUrl);
       if (lastSlashMatch.isNotEmpty) {
         final last = lastSlashMatch.last.group(1)?.replaceAll('.sdp', '') ?? '';
         streamName = last.replaceAll(RegExp(r'[^a-zA-Z0-9_\-]'), '');
       }
-      if (streamName.isEmpty || streamName.contains('http') || streamName.contains('rtsp')) {
+      if (streamName.isEmpty ||
+          streamName.contains('http') ||
+          streamName.contains('rtsp')) {
         streamName = 'cam1';
       }
       _rtspStreamNameController.text = streamName;
     }
-    final String cleanStreamName =
-        streamName.isEmpty ? 'cam1' : streamName;
+    final String cleanStreamName = streamName.isEmpty ? 'cam1' : streamName;
 
     String newUrl = '';
     if (presetType == 'rtmp') {
@@ -522,10 +537,7 @@ class _LiveStreamScreenState extends State<LiveStreamScreen> {
     }
 
     final token = _whipTokenController.text.trim();
-    await widget.configService.saveWhipConfig(
-      endpointUrl: url,
-      token: token,
-    );
+    await widget.configService.saveWhipConfig(endpointUrl: url, token: token);
     await widget.configService.saveStreamProtocol('whip');
 
     if (!mounted) return;
@@ -564,8 +576,9 @@ class _LiveStreamScreenState extends State<LiveStreamScreen> {
         behavior: SnackBarBehavior.floating,
         margin: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
         shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
-        backgroundColor:
-            isError ? const Color(0xFFC62828) : const Color(0xFF1565C0),
+        backgroundColor: isError
+            ? const Color(0xFFC62828)
+            : const Color(0xFF1565C0),
         content: Row(
           children: [
             Icon(
@@ -599,7 +612,11 @@ class _LiveStreamScreenState extends State<LiveStreamScreen> {
       SnackBar(
         content: Row(
           children: [
-            const Icon(Icons.check_circle_rounded, color: Colors.white, size: 18),
+            const Icon(
+              Icons.check_circle_rounded,
+              color: Colors.white,
+              size: 18,
+            ),
             const SizedBox(width: 8),
             Text(successMsg),
           ],
@@ -626,7 +643,8 @@ class _LiveStreamScreenState extends State<LiveStreamScreen> {
         case RtspPublishState.publishing:
           bg = Colors.red.shade900.withValues(alpha: 0.35);
           fg = Colors.redAccent.shade100;
-          label = '🔴 RTSP LIVE (${_formatDuration(_rtspService.liveDuration)})';
+          label =
+              '🔴 RTSP LIVE (${_formatDuration(_rtspService.liveDuration)})';
           icon = Icons.radio_button_checked_rounded;
           break;
         case RtspPublishState.connecting:
@@ -660,7 +678,8 @@ class _LiveStreamScreenState extends State<LiveStreamScreen> {
         case WhipPublishState.publishing:
           bg = Colors.red.shade900.withValues(alpha: 0.35);
           fg = Colors.redAccent.shade100;
-          label = '🔴 WHIP LIVE (${_formatDuration(_whipService.liveDuration)})';
+          label =
+              '🔴 WHIP LIVE (${_formatDuration(_whipService.liveDuration)})';
           icon = Icons.radio_button_checked_rounded;
           break;
         case WhipPublishState.connecting:
@@ -735,11 +754,14 @@ class _LiveStreamScreenState extends State<LiveStreamScreen> {
         backgroundColor: const Color(0xFF161B22),
         elevation: 0,
         leading: IconButton(
-          icon: const Icon(Icons.arrow_back_ios_new_rounded, color: Colors.white),
+          icon: const Icon(
+            Icons.arrow_back_ios_new_rounded,
+            color: Colors.white,
+          ),
           onPressed: () => Navigator.of(context).pop(),
         ),
         title: Text(
-          appText(context, 'Phát Trực Tiếp Lên Server', 'Live Stream Publisher'),
+          appText(context, 'Phát trực tiếp', 'Live streaming'),
           maxLines: 1,
           overflow: TextOverflow.ellipsis,
           style: const TextStyle(
@@ -750,8 +772,15 @@ class _LiveStreamScreenState extends State<LiveStreamScreen> {
         ),
         actions: [
           IconButton(
-            icon: const Icon(Icons.qr_code_scanner_rounded, color: Colors.white),
-            tooltip: appText(context, 'Quét mã QR trận đấu', 'Scan match QR code'),
+            icon: const Icon(
+              Icons.qr_code_scanner_rounded,
+              color: Colors.white,
+            ),
+            tooltip: appText(
+              context,
+              'Quét mã QR trận đấu',
+              'Scan match QR code',
+            ),
             onPressed: _isAnyLive ? null : _handleScanQrCode,
           ),
           Padding(
@@ -769,56 +798,64 @@ class _LiveStreamScreenState extends State<LiveStreamScreen> {
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.stretch,
                   children: [
-                    // Protocol Selector Tabs
-                    Container(
-                      padding: const EdgeInsets.all(4),
-                      decoration: BoxDecoration(
-                        color: const Color(0xFF161B22),
-                        borderRadius: BorderRadius.circular(12),
-                        border: Border.all(
-                          color: Colors.white.withValues(alpha: 0.1),
+                    // Bước chính cho người dùng phổ thông: quét mã QR trận đấu.
+                    _buildQrScanBanner(isRtspActive || isWhipActive),
+
+                    // Protocol Selector Tabs (nâng cao)
+                    if (_showAdvanced || _selectedProtocol == 'whip') ...[
+                      Container(
+                        padding: const EdgeInsets.all(4),
+                        decoration: BoxDecoration(
+                          color: const Color(0xFF161B22),
+                          borderRadius: BorderRadius.circular(12),
+                          border: Border.all(
+                            color: Colors.white.withValues(alpha: 0.1),
+                          ),
+                        ),
+                        child: Row(
+                          children: [
+                            Expanded(
+                              child: _ProtocolTab(
+                                title: 'YouTube / Facebook',
+                                icon: Icons.cell_tower_rounded,
+                                isSelected: _selectedProtocol == 'rtsp',
+                                isLive: isRtspActive,
+                                onTap: _isAnyLive
+                                    ? null
+                                    : () {
+                                        setState(
+                                          () => _selectedProtocol = 'rtsp',
+                                        );
+                                        widget.configService.saveStreamProtocol(
+                                          'rtsp',
+                                        );
+                                      },
+                              ),
+                            ),
+                            Expanded(
+                              child: _ProtocolTab(
+                                title: 'Máy chủ WHIP',
+                                icon: Icons.podcasts_rounded,
+                                isSelected: _selectedProtocol == 'whip',
+                                isLive: isWhipActive,
+                                onTap: _isAnyLive
+                                    ? null
+                                    : () {
+                                        setState(
+                                          () => _selectedProtocol = 'whip',
+                                        );
+                                        widget.configService.saveStreamProtocol(
+                                          'whip',
+                                        );
+                                      },
+                              ),
+                            ),
+                          ],
                         ),
                       ),
-                      child: Row(
-                        children: [
-                          Expanded(
-                            child: _ProtocolTab(
-                              title: 'RTSP / RTMP ĐẨY',
-                              icon: Icons.cell_tower_rounded,
-                              isSelected: _selectedProtocol == 'rtsp',
-                              isLive: isRtspActive,
-                              onTap: _isAnyLive
-                                  ? null
-                                  : () {
-                                      setState(() => _selectedProtocol = 'rtsp');
-                                      widget.configService
-                                          .saveStreamProtocol('rtsp');
-                                    },
-                            ),
-                          ),
-                          Expanded(
-                            child: _ProtocolTab(
-                              title: 'WebRTC WHIP',
-                              icon: Icons.podcasts_rounded,
-                              isSelected: _selectedProtocol == 'whip',
-                              isLive: isWhipActive,
-                              onTap: _isAnyLive
-                                  ? null
-                                  : () {
-                                      setState(() => _selectedProtocol = 'whip');
-                                      widget.configService
-                                          .saveStreamProtocol('whip');
-                                    },
-                            ),
-                          ),
-                        ],
-                      ),
-                    ),
 
-                    const SizedBox(height: 16),
-
-                    // Quick QR Scan Hero Banner
-                    _buildQrScanBanner(isRtspActive || isWhipActive),
+                      const SizedBox(height: 16),
+                    ],
 
                     // Camera Source Banner
                     Container(
@@ -869,7 +906,13 @@ class _LiveStreamScreenState extends State<LiveStreamScreen> {
                                 ),
                                 const SizedBox(height: 3),
                                 Text(
-                                  'H.264 phần cứng · $resolution @ ${fps}fps · Bitstream Copy',
+                                  _showAdvanced
+                                      ? 'H.264 phần cứng · $resolution @ ${fps}fps · Bitstream Copy'
+                                      : appText(
+                                          context,
+                                          'Chất lượng hình: $resolution · $fps hình/giây',
+                                          'Picture quality: $resolution · $fps frames/s',
+                                        ),
                                   style: TextStyle(
                                     color: Colors.white.withValues(alpha: 0.7),
                                     fontSize: 12,
@@ -887,7 +930,6 @@ class _LiveStreamScreenState extends State<LiveStreamScreen> {
                     // ========================================================
                     // PROTOCOL CONTENT
                     // ========================================================
-
                     if (_selectedProtocol == 'rtsp') ...[
                       // RTSP PUSH FORM
                       _buildRtspPushSection(isRtspActive, isRtspBusy),
@@ -898,113 +940,138 @@ class _LiveStreamScreenState extends State<LiveStreamScreen> {
 
                     const SizedBox(height: 20),
 
-                    // Local Camera RTSP Information Card
-                    Container(
-                      padding: const EdgeInsets.all(14),
-                      decoration: BoxDecoration(
-                        color: const Color(0xFF161B22),
-                        borderRadius: BorderRadius.circular(14),
-                        border: Border.all(
-                          color: Colors.white.withValues(alpha: 0.08),
-                        ),
+                    TextButton.icon(
+                      onPressed: () =>
+                          setState(() => _showAdvanced = !_showAdvanced),
+                      icon: Icon(
+                        _showAdvanced
+                            ? Icons.expand_less_rounded
+                            : Icons.tune_rounded,
+                        size: 18,
                       ),
-                      child: Column(
-                        crossAxisAlignment: CrossAxisAlignment.start,
-                        children: [
-                          Row(
-                            mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                            children: [
-                              Expanded(
-                                child: Row(
-                                  children: [
-                                    const Icon(
-                                      Icons.wifi_tethering_rounded,
-                                      size: 16,
-                                      color: Colors.white70,
-                                    ),
-                                    const SizedBox(width: 8),
-                                    Expanded(
-                                      child: Text(
-                                        appText(
-                                          context,
-                                          'LINK RTSP NỘI BỘ (PULL TỪ ĐIỆN THOẠI)',
-                                          'LOCAL RTSP FEED (PULL FROM PHONE)',
-                                        ),
-                                        maxLines: 1,
-                                        overflow: TextOverflow.ellipsis,
-                                        style: const TextStyle(
-                                          color: Colors.white70,
-                                          fontWeight: FontWeight.bold,
-                                          fontSize: 11.5,
-                                          letterSpacing: 0.5,
-                                        ),
-                                      ),
-                                    ),
-                                  ],
-                                ),
+                      label: Text(
+                        _showAdvanced
+                            ? appText(
+                                context,
+                                'Ẩn tuỳ chọn nâng cao',
+                                'Hide advanced options',
+                              )
+                            : appText(
+                                context,
+                                'Tuỳ chọn nâng cao (dành cho kỹ thuật viên)',
+                                'Advanced options (for technicians)',
                               ),
-                              IconButton(
-                                icon: const Icon(
-                                  Icons.copy_rounded,
-                                  size: 16,
-                                  color: Colors.lightBlueAccent,
-                                ),
-                                tooltip: appText(
-                                  context,
-                                  'Sao chép link RTSP nội bộ',
-                                  'Copy local RTSP link',
-                                ),
-                                onPressed: () => _copyToClipboard(
-                                  localRtspUrl,
-                                  appText(
-                                    context,
-                                    'Đã sao chép link RTSP nội bộ!',
-                                    'Copied local RTSP link!',
-                                  ),
-                                ),
-                              ),
-                            ],
+                      ),
+                    ),
+
+                    // Local Camera RTSP Information Card (nâng cao)
+                    if (_showAdvanced)
+                      Container(
+                        padding: const EdgeInsets.all(14),
+                        decoration: BoxDecoration(
+                          color: const Color(0xFF161B22),
+                          borderRadius: BorderRadius.circular(14),
+                          border: Border.all(
+                            color: Colors.white.withValues(alpha: 0.08),
                           ),
-                          const SizedBox(height: 6),
-                          Container(
-                            padding: const EdgeInsets.symmetric(
-                              horizontal: 12,
-                              vertical: 10,
-                            ),
-                            decoration: BoxDecoration(
-                              color: const Color(0xFF0F1218),
-                              borderRadius: BorderRadius.circular(8),
-                            ),
-                            child: Row(
+                        ),
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Row(
+                              mainAxisAlignment: MainAxisAlignment.spaceBetween,
                               children: [
                                 Expanded(
-                                  child: SelectableText(
+                                  child: Row(
+                                    children: [
+                                      const Icon(
+                                        Icons.wifi_tethering_rounded,
+                                        size: 16,
+                                        color: Colors.white70,
+                                      ),
+                                      const SizedBox(width: 8),
+                                      Expanded(
+                                        child: Text(
+                                          appText(
+                                            context,
+                                            'LINK RTSP NỘI BỘ (PULL TỪ ĐIỆN THOẠI)',
+                                            'LOCAL RTSP FEED (PULL FROM PHONE)',
+                                          ),
+                                          maxLines: 1,
+                                          overflow: TextOverflow.ellipsis,
+                                          style: const TextStyle(
+                                            color: Colors.white70,
+                                            fontWeight: FontWeight.bold,
+                                            fontSize: 11.5,
+                                            letterSpacing: 0.5,
+                                          ),
+                                        ),
+                                      ),
+                                    ],
+                                  ),
+                                ),
+                                IconButton(
+                                  icon: const Icon(
+                                    Icons.copy_rounded,
+                                    size: 16,
+                                    color: Colors.lightBlueAccent,
+                                  ),
+                                  tooltip: appText(
+                                    context,
+                                    'Sao chép link RTSP nội bộ',
+                                    'Copy local RTSP link',
+                                  ),
+                                  onPressed: () => _copyToClipboard(
                                     localRtspUrl,
-                                    style: const TextStyle(
-                                      fontFamily: 'monospace',
-                                      color: Color(0xFF81D4FA),
-                                      fontSize: 12,
+                                    appText(
+                                      context,
+                                      'Đã sao chép link RTSP nội bộ!',
+                                      'Copied local RTSP link!',
                                     ),
                                   ),
                                 ),
                               ],
                             ),
-                          ),
-                          const SizedBox(height: 6),
-                          Text(
-                            appText(
-                              context,
-                              'Dùng link này để kiểm tra nhanh trong mạng Wi-Fi bằng VLC Player hoặc NVR nội bộ.',
-                              'Use this link for local LAN testing with VLC or local NVR.',
+                            const SizedBox(height: 6),
+                            Container(
+                              padding: const EdgeInsets.symmetric(
+                                horizontal: 12,
+                                vertical: 10,
+                              ),
+                              decoration: BoxDecoration(
+                                color: const Color(0xFF0F1218),
+                                borderRadius: BorderRadius.circular(8),
+                              ),
+                              child: Row(
+                                children: [
+                                  Expanded(
+                                    child: SelectableText(
+                                      localRtspUrl,
+                                      style: const TextStyle(
+                                        fontFamily: 'monospace',
+                                        color: Color(0xFF81D4FA),
+                                        fontSize: 12,
+                                      ),
+                                    ),
+                                  ),
+                                ],
+                              ),
                             ),
-                            style: TextStyle(
-                              color: Colors.white.withValues(alpha: 0.5),
-                              fontSize: 11,
+                            const SizedBox(height: 6),
+                            Text(
+                              appText(
+                                context,
+                                'Dùng link này để kiểm tra nhanh trong mạng Wi-Fi bằng VLC Player hoặc NVR nội bộ.',
+                                'Use this link for local LAN testing with VLC or local NVR.',
+                              ),
+                              style: TextStyle(
+                                color: Colors.white.withValues(alpha: 0.5),
+                                fontSize: 11,
+                              ),
                             ),
-                          ),
-                        ],
+                          ],
+                        ),
                       ),
-                    ),
                   ],
                 ),
               ),
@@ -1028,9 +1095,7 @@ class _LiveStreamScreenState extends State<LiveStreamScreen> {
           decoration: BoxDecoration(
             color: const Color(0xFF161B22),
             borderRadius: BorderRadius.circular(14),
-            border: Border.all(
-              color: Colors.white.withValues(alpha: 0.08),
-            ),
+            border: Border.all(color: Colors.white.withValues(alpha: 0.08)),
           ),
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.start,
@@ -1042,8 +1107,8 @@ class _LiveStreamScreenState extends State<LiveStreamScreen> {
                     child: Text(
                       appText(
                         context,
-                        'CẤU HÌNH RTSP PUSH',
-                        'RTSP PUSH CONFIG',
+                        'ĐỊA CHỈ PHÁT TRỰC TIẾP',
+                        'LIVE STREAM ADDRESS',
                       ),
                       maxLines: 1,
                       overflow: TextOverflow.ellipsis,
@@ -1090,11 +1155,7 @@ class _LiveStreamScreenState extends State<LiveStreamScreen> {
               // Quick Presets Row
               if (!isLive) ...[
                 Text(
-                  appText(
-                    context,
-                    'Định dạng đẩy nhanh:',
-                    'Quick Presets:',
-                  ),
+                  appText(context, 'Định dạng đẩy nhanh:', 'Quick Presets:'),
                   style: TextStyle(
                     color: Colors.white.withValues(alpha: 0.65),
                     fontSize: 11.5,
@@ -1168,10 +1229,14 @@ class _LiveStreamScreenState extends State<LiveStreamScreen> {
                             vertical: 3,
                           ),
                           decoration: BoxDecoration(
-                            color: Colors.lightBlueAccent.withValues(alpha: 0.12),
+                            color: Colors.lightBlueAccent.withValues(
+                              alpha: 0.12,
+                            ),
                             borderRadius: BorderRadius.circular(6),
                             border: Border.all(
-                              color: Colors.lightBlueAccent.withValues(alpha: 0.35),
+                              color: Colors.lightBlueAccent.withValues(
+                                alpha: 0.35,
+                              ),
                             ),
                           ),
                           child: Row(
@@ -1184,11 +1249,7 @@ class _LiveStreamScreenState extends State<LiveStreamScreen> {
                               ),
                               const SizedBox(width: 4),
                               Text(
-                                appText(
-                                  context,
-                                  'Quét QR',
-                                  'Scan QR',
-                                ),
+                                appText(context, 'Quét QR', 'Scan QR'),
                                 style: const TextStyle(
                                   color: Colors.lightBlueAccent,
                                   fontSize: 11.5,
@@ -1225,11 +1286,7 @@ class _LiveStreamScreenState extends State<LiveStreamScreen> {
                               ),
                               const SizedBox(width: 4),
                               Text(
-                                appText(
-                                  context,
-                                  'Dán Link',
-                                  'Paste Link',
-                                ),
+                                appText(context, 'Dán Link', 'Paste Link'),
                                 style: const TextStyle(
                                   color: Colors.amberAccent,
                                   fontSize: 11.5,
@@ -1365,7 +1422,7 @@ class _LiveStreamScreenState extends State<LiveStreamScreen> {
                         child: Text(
                           appText(
                             context,
-                            'Khuyên dùng RTMP: 1080p @ 3.5 Mbps cho mạng 4G mượt mà nhất.',
+                            'Mẹo: chọn 720p hoặc 1080p để phát ổn định khi dùng 4G/5G.',
                             'Recommended RTMP: 1080p @ 3.5 Mbps for smooth 4G streaming.',
                           ),
                           style: TextStyle(
@@ -1388,7 +1445,10 @@ class _LiveStreamScreenState extends State<LiveStreamScreen> {
                         children: [
                           const Text(
                             'Máy chủ & Port',
-                            style: TextStyle(color: Colors.white70, fontSize: 12),
+                            style: TextStyle(
+                              color: Colors.white70,
+                              fontSize: 12,
+                            ),
                           ),
                           const SizedBox(height: 4),
                           TextFormField(
@@ -1415,7 +1475,10 @@ class _LiveStreamScreenState extends State<LiveStreamScreen> {
                         children: [
                           const Text(
                             'App',
-                            style: TextStyle(color: Colors.white70, fontSize: 12),
+                            style: TextStyle(
+                              color: Colors.white70,
+                              fontSize: 12,
+                            ),
                           ),
                           const SizedBox(height: 4),
                           TextFormField(
@@ -1443,7 +1506,10 @@ class _LiveStreamScreenState extends State<LiveStreamScreen> {
                         children: [
                           const Text(
                             'Tên luồng (Stream Name)',
-                            style: TextStyle(color: Colors.white70, fontSize: 12),
+                            style: TextStyle(
+                              color: Colors.white70,
+                              fontSize: 12,
+                            ),
                           ),
                           const SizedBox(height: 4),
                           TextFormField(
@@ -1467,7 +1533,10 @@ class _LiveStreamScreenState extends State<LiveStreamScreen> {
                         children: [
                           const Text(
                             'Stream Key',
-                            style: TextStyle(color: Colors.white70, fontSize: 12),
+                            style: TextStyle(
+                              color: Colors.white70,
+                              fontSize: 12,
+                            ),
                           ),
                           const SizedBox(height: 4),
                           TextFormField(
@@ -1500,8 +1569,9 @@ class _LiveStreamScreenState extends State<LiveStreamScreen> {
                                   color: Colors.white54,
                                 ),
                                 onPressed: () {
-                                  setState(() =>
-                                      _obscureRtspKey = !_obscureRtspKey);
+                                  setState(
+                                    () => _obscureRtspKey = !_obscureRtspKey,
+                                  );
                                 },
                               ),
                               contentPadding: const EdgeInsets.symmetric(
@@ -1580,7 +1650,7 @@ class _LiveStreamScreenState extends State<LiveStreamScreen> {
                         Text(
                           appText(
                             context,
-                            'TRẠNG THÁI TRUYỀN TẢI THỜI GIAN THỰC',
+                            'ĐANG PHÁT TRỰC TIẾP',
                             'REALTIME STREAM HEALTH',
                           ),
                           style: const TextStyle(
@@ -1608,23 +1678,27 @@ class _LiveStreamScreenState extends State<LiveStreamScreen> {
                   children: [
                     Expanded(
                       child: _MetricTile(
-                        title: 'TỐC ĐỘ KHUNG HÌNH',
-                        value: _rtspService.currentFps > 0
-                            ? '${_rtspService.currentFps.toStringAsFixed(1)} FPS'
-                            : '$fps FPS',
-                        icon: Icons.speed_rounded,
-                        color: Colors.lightBlueAccent,
+                        title: appText(context, 'ĐƯỜNG TRUYỀN', 'CONNECTION'),
+                        value: _plainNetworkQuality(context),
+                        icon: Icons.signal_cellular_alt_rounded,
+                        color: _networkQualityColor(),
                       ),
                     ),
                     const SizedBox(width: 10),
                     Expanded(
                       child: _MetricTile(
-                        title: 'BĂNG THÔNG ĐẨY',
-                        value: _rtspService.currentBitrateKbps > 0
-                            ? '${(_rtspService.currentBitrateKbps).toStringAsFixed(0)} Kbps'
-                            : '${(webRtc?.resolutionProfile.rtspBitrate ?? 3000000) ~/ 1000} Kbps',
-                        icon: Icons.network_check_rounded,
-                        color: Colors.greenAccent,
+                        title: appText(context, 'CHẤT LƯỢNG HÌNH', 'PICTURE'),
+                        value: _rtspService.bitrateReduced
+                            ? appText(
+                                context,
+                                'Tạm giảm (mạng yếu)',
+                                'Lowered (weak network)',
+                              )
+                            : appText(context, 'Tốt nhất', 'Best'),
+                        icon: Icons.hd_rounded,
+                        color: _rtspService.bitrateReduced
+                            ? Colors.orangeAccent
+                            : Colors.greenAccent,
                       ),
                     ),
                   ],
@@ -1634,32 +1708,101 @@ class _LiveStreamScreenState extends State<LiveStreamScreen> {
                   children: [
                     Expanded(
                       child: _MetricTile(
-                        title: 'GIAO THỨC ĐẨY',
-                        value: _rtspUrlController.text.toLowerCase().startsWith('rtmp')
-                            ? 'RTMP (FLV)'
-                            : 'RTSP (TCP)',
-                        icon: Icons.alt_route_rounded,
-                        color: Colors.amberAccent,
+                        title: appText(context, 'PHÁT QUA', 'SENDING VIA'),
+                        value: _rtspService.cellularFallbackActive
+                            ? appText(
+                                context,
+                                '4G/5G (dự phòng)',
+                                '4G/5G (backup)',
+                              )
+                            : widget.runtime.onWifiNetwork
+                            ? 'Wi-Fi'
+                            : '4G/5G',
+                        icon: Icons.router_rounded,
+                        color: Colors.lightBlueAccent,
                       ),
                     ),
                     const SizedBox(width: 10),
                     Expanded(
                       child: _MetricTile(
-                        title: appText(
-                          context,
-                          'BITRATE TỰ ĐIỀU CHỈNH',
-                          'ADAPTIVE BITRATE',
-                        ),
-                        value:
-                            '${_rtspService.targetBitrateKbps}/${_rtspService.maxBitrateKbps} Kbps',
-                        icon: Icons.tune_rounded,
-                        color: _rtspService.bitrateReduced
-                            ? Colors.orangeAccent
-                            : Colors.purpleAccent,
+                        title: appText(context, 'ĐỘ MƯỢT', 'SMOOTHNESS'),
+                        value: _rtspService.currentFps <= 0
+                            ? appText(context, 'Đang đo…', 'Measuring…')
+                            : _rtspService.currentFps >= fps * 0.8
+                            ? appText(context, 'Mượt', 'Smooth')
+                            : appText(context, 'Hơi giật', 'Choppy'),
+                        icon: Icons.speed_rounded,
+                        color:
+                            _rtspService.currentFps <= 0 ||
+                                _rtspService.currentFps >= fps * 0.8
+                            ? Colors.greenAccent
+                            : Colors.orangeAccent,
                       ),
                     ),
                   ],
                 ),
+                if (_showAdvanced) ...[
+                  const SizedBox(height: 10),
+                  Row(
+                    children: [
+                      Expanded(
+                        child: _MetricTile(
+                          title: 'TỐC ĐỘ KHUNG HÌNH',
+                          value: _rtspService.currentFps > 0
+                              ? '${_rtspService.currentFps.toStringAsFixed(1)} FPS'
+                              : '$fps FPS',
+                          icon: Icons.speed_rounded,
+                          color: Colors.lightBlueAccent,
+                        ),
+                      ),
+                      const SizedBox(width: 10),
+                      Expanded(
+                        child: _MetricTile(
+                          title: 'BĂNG THÔNG ĐẨY',
+                          value: _rtspService.currentBitrateKbps > 0
+                              ? '${(_rtspService.currentBitrateKbps).toStringAsFixed(0)} Kbps'
+                              : '${(webRtc?.resolutionProfile.rtspBitrate ?? 3000000) ~/ 1000} Kbps',
+                          icon: Icons.network_check_rounded,
+                          color: Colors.greenAccent,
+                        ),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 10),
+                  Row(
+                    children: [
+                      Expanded(
+                        child: _MetricTile(
+                          title: 'GIAO THỨC ĐẨY',
+                          value:
+                              _rtspUrlController.text.toLowerCase().startsWith(
+                                'rtmp',
+                              )
+                              ? 'RTMP (FLV)'
+                              : 'RTSP (TCP)',
+                          icon: Icons.alt_route_rounded,
+                          color: Colors.amberAccent,
+                        ),
+                      ),
+                      const SizedBox(width: 10),
+                      Expanded(
+                        child: _MetricTile(
+                          title: appText(
+                            context,
+                            'BITRATE TỰ ĐIỀU CHỈNH',
+                            'ADAPTIVE BITRATE',
+                          ),
+                          value:
+                              '${_rtspService.targetBitrateKbps}/${_rtspService.maxBitrateKbps} Kbps',
+                          icon: Icons.tune_rounded,
+                          color: _rtspService.bitrateReduced
+                              ? Colors.orangeAccent
+                              : Colors.purpleAccent,
+                        ),
+                      ),
+                    ],
+                  ),
+                ],
                 if (_rtspService.uploadSpeed > 0 &&
                     (_rtspService.uploadSpeed < 0.95 ||
                         _rtspService.bitrateReduced)) ...[
@@ -1668,16 +1811,30 @@ class _LiveStreamScreenState extends State<LiveStreamScreen> {
                     _rtspService.uploadSpeed < 0.95
                         ? appText(
                             context,
-                            'Upload không theo kịp (${_rtspService.uploadSpeed.toStringAsFixed(2)}×): đang tự giảm chất lượng để giữ livestream mượt.',
-                            'Upload is falling behind (${_rtspService.uploadSpeed.toStringAsFixed(2)}×): lowering quality to keep the stream smooth.',
+                            'Mạng đang yếu: app tự giảm độ nét để hình không bị giật. Không cần làm gì.',
+                            'Weak network: the app is lowering sharpness so the stream does not stutter. No action needed.',
                           )
                         : appText(
                             context,
-                            'Đã tự giảm chất lượng do mạng yếu; sẽ tăng lại khi upload ổn định 30 giây.',
-                            'Quality lowered for a weak network; it rises again after 30 s of stable upload.',
+                            'Độ nét đang tạm giảm do mạng yếu; sẽ tự nét lại khi mạng ổn định.',
+                            'Sharpness is temporarily lowered; it recovers automatically when the network is stable.',
                           ),
                     style: const TextStyle(
                       color: Colors.orangeAccent,
+                      fontSize: 11.5,
+                    ),
+                  ),
+                ],
+                if (_rtspService.cellularFallbackActive) ...[
+                  const SizedBox(height: 10),
+                  Text(
+                    appText(
+                      context,
+                      'Wi-Fi không có Internet nên app đang phát bằng 4G/5G của điện thoại. Khi Wi-Fi có Internet trở lại, app tự chuyển về Wi-Fi.',
+                      'Wi-Fi has no Internet, so the app is streaming over the phone 4G/5G. It switches back to Wi-Fi automatically.',
+                    ),
+                    style: const TextStyle(
+                      color: Colors.lightBlueAccent,
                       fontSize: 11.5,
                     ),
                   ),
@@ -1696,7 +1853,7 @@ class _LiveStreamScreenState extends State<LiveStreamScreen> {
           title: Text(
             appText(
               context,
-              'Gửi tiếng cho Tablet xem RTSP',
+              'Tablet nghe được tiếng khi xem trực tiếp',
               'Send audio to RTSP tablets',
             ),
             style: const TextStyle(color: Colors.white, fontSize: 13),
@@ -1704,7 +1861,7 @@ class _LiveStreamScreenState extends State<LiveStreamScreen> {
           subtitle: Text(
             appText(
               context,
-              'Tắt để dành sóng Wi-Fi cho livestream. File ghi và livestream vẫn có tiếng. Tablet đang xem cần kết nối lại để áp dụng.',
+              'Nên để tắt: livestream ổn định hơn. Video lưu trên máy và livestream vẫn luôn có tiếng. Tablet đang xem cần mở lại hình để áp dụng.',
               'Turn off to save Wi-Fi airtime for the livestream. Recordings and the livestream keep audio. Connected tablets must reconnect to apply.',
             ),
             style: const TextStyle(color: Colors.white54, fontSize: 11),
@@ -1759,7 +1916,7 @@ class _LiveStreamScreenState extends State<LiveStreamScreen> {
                   ? appText(context, 'ĐANG KẾT NỐI...', 'CONNECTING...')
                   : appText(
                       context,
-                      'BẮT ĐẦU ĐẨY LUỒNG RTSP',
+                      'BẮT ĐẦU PHÁT TRỰC TIẾP',
                       'START RTSP PUSH',
                     ),
               style: const TextStyle(
@@ -1786,9 +1943,7 @@ class _LiveStreamScreenState extends State<LiveStreamScreen> {
           decoration: BoxDecoration(
             color: const Color(0xFF161B22),
             borderRadius: BorderRadius.circular(14),
-            border: Border.all(
-              color: Colors.white.withValues(alpha: 0.08),
-            ),
+            border: Border.all(color: Colors.white.withValues(alpha: 0.08)),
           ),
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.start,
@@ -1796,7 +1951,7 @@ class _LiveStreamScreenState extends State<LiveStreamScreen> {
               Text(
                 appText(
                   context,
-                  'CẤU HÌNH WEBRTC WHIP (RFC 9450)',
+                  'ĐỊA CHỈ MÁY CHỦ WHIP',
                   'WEBRTC WHIP CONFIG (RFC 9450)',
                 ),
                 style: const TextStyle(
@@ -1810,7 +1965,11 @@ class _LiveStreamScreenState extends State<LiveStreamScreen> {
 
               // Endpoint URL
               Text(
-                appText(context, 'WHIP Endpoint URL *', 'WHIP Endpoint URL *'),
+                appText(
+                  context,
+                  'Địa chỉ máy chủ WHIP *',
+                  'Địa chỉ máy chủ WHIP *',
+                ),
                 style: const TextStyle(
                   color: Colors.white,
                   fontSize: 13,
@@ -1859,7 +2018,9 @@ class _LiveStreamScreenState extends State<LiveStreamScreen> {
                                 );
                                 final text = data?.text?.trim() ?? '';
                                 if (text.isNotEmpty && mounted) {
-                                  setState(() => _whipUrlController.text = text);
+                                  setState(
+                                    () => _whipUrlController.text = text,
+                                  );
                                 }
                               },
                             ),
@@ -1901,7 +2062,7 @@ class _LiveStreamScreenState extends State<LiveStreamScreen> {
               Text(
                 appText(
                   context,
-                  'Bearer Auth Token (Tùy chọn)',
+                  'Mã bảo mật (nếu có)',
                   'Bearer Auth Token (Optional)',
                 ),
                 style: const TextStyle(
@@ -1941,8 +2102,7 @@ class _LiveStreamScreenState extends State<LiveStreamScreen> {
                       color: Colors.white54,
                     ),
                     onPressed: () {
-                      setState(() =>
-                          _obscureWhipToken = !_obscureWhipToken);
+                      setState(() => _obscureWhipToken = !_obscureWhipToken);
                     },
                   ),
                   contentPadding: const EdgeInsets.symmetric(
@@ -2033,7 +2193,7 @@ class _LiveStreamScreenState extends State<LiveStreamScreen> {
                   ? appText(context, 'ĐANG KẾT NỐI...', 'CONNECTING...')
                   : appText(
                       context,
-                      'BẮT ĐẦU PHÁT WEBRTC WHIP',
+                      'BẮT ĐẦU PHÁT TRỰC TIẾP',
                       'START WHIP PUBLISH',
                     ),
               style: const TextStyle(
@@ -2047,8 +2207,67 @@ class _LiveStreamScreenState extends State<LiveStreamScreen> {
     );
   }
 
+  String _plainNetworkQuality(BuildContext context) {
+    return switch (_rtspService.networkQuality) {
+      StreamNetworkQuality.good => appText(context, 'Tốt', 'Good'),
+      StreamNetworkQuality.warning => appText(context, 'Trung bình', 'Fair'),
+      StreamNetworkQuality.poor => appText(context, 'Yếu', 'Weak'),
+      StreamNetworkQuality.unknown => appText(
+        context,
+        'Đang đo…',
+        'Measuring…',
+      ),
+    };
+  }
+
+  Color _networkQualityColor() {
+    return switch (_rtspService.networkQuality) {
+      StreamNetworkQuality.good => Colors.greenAccent,
+      StreamNetworkQuality.warning => Colors.orangeAccent,
+      StreamNetworkQuality.poor => Colors.redAccent,
+      StreamNetworkQuality.unknown => Colors.white70,
+    };
+  }
+
   String _translateToNaturalLanguageError(String rawError) {
     final lower = rawError.toLowerCase();
+
+    if (lower.contains('tự thử lại mỗi') ||
+        lower.contains('mất kết nối tới server')) {
+      return appText(
+        context,
+        'Mất kết nối Internet. App sẽ tự phát lại khi có mạng, không cần làm gì.',
+        'Internet connection lost. The app resumes the stream by itself when the network returns.',
+      );
+    }
+
+    if (lower.contains('nguồn camera cục bộ') ||
+        lower.contains('camera chưa sẵn sàng')) {
+      return appText(
+        context,
+        'Camera vừa khởi động lại. App đang tự phát lại sau vài giây.',
+        'The camera just restarted. The app resumes the stream in a few seconds.',
+      );
+    }
+
+    if (lower.contains('badname') ||
+        lower.contains('already publishing') ||
+        lower.contains('stream not found')) {
+      return appText(
+        context,
+        'Máy chủ không nhận mã phát. Hãy quét lại mã QR trận đấu hoặc kiểm tra mã phát (Stream Key).',
+        'The server rejected the stream key. Scan the match QR code again or check the stream key.',
+      );
+    }
+
+    if (lower.contains('url không đúng định dạng') ||
+        lower.contains('chưa nhập url')) {
+      return appText(
+        context,
+        'Địa chỉ phát chưa đúng. Hãy quét mã QR trận đấu để app tự điền.',
+        'The stream address is not valid. Scan the match QR code to fill it in automatically.',
+      );
+    }
 
     if (lower.contains('connection refused') ||
         lower.contains('failed to connect') ||
@@ -2116,7 +2335,13 @@ class _LiveStreamScreenState extends State<LiveStreamScreen> {
       );
     }
 
-    return rawError;
+    // Lỗi chưa nhận diện được: không hiện thông báo kỹ thuật cho người dùng
+    // phổ thông (chi tiết vẫn xem được trong "Tuỳ chọn nâng cao").
+    return appText(
+      context,
+      'Chưa phát được. App đang tự thử lại. Nếu kéo dài, hãy kiểm tra mạng của điện thoại hoặc quét lại mã QR trận đấu.',
+      'Not streaming yet. The app keeps retrying. If this lasts, check the phone network or scan the match QR code again.',
+    );
   }
 
   Widget _buildErrorBox(String error) {
@@ -2128,9 +2353,7 @@ class _LiveStreamScreenState extends State<LiveStreamScreen> {
       decoration: BoxDecoration(
         color: Colors.red.shade900.withValues(alpha: 0.25),
         borderRadius: BorderRadius.circular(12),
-        border: Border.all(
-          color: Colors.redAccent.withValues(alpha: 0.4),
-        ),
+        border: Border.all(color: Colors.redAccent.withValues(alpha: 0.4)),
       ),
       child: Row(
         crossAxisAlignment: CrossAxisAlignment.start,
@@ -2146,7 +2369,7 @@ class _LiveStreamScreenState extends State<LiveStreamScreen> {
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
                 Text(
-                  appText(context, 'Thông báo sự cố:', 'Notice:'),
+                  appText(context, 'Chưa phát được', 'Not streaming yet'),
                   style: const TextStyle(
                     color: Colors.white,
                     fontWeight: FontWeight.bold,
@@ -2162,6 +2385,17 @@ class _LiveStreamScreenState extends State<LiveStreamScreen> {
                     height: 1.4,
                   ),
                 ),
+                if (_showAdvanced && friendlyMessage != error) ...[
+                  const SizedBox(height: 6),
+                  Text(
+                    error,
+                    style: TextStyle(
+                      color: Colors.white.withValues(alpha: 0.5),
+                      fontSize: 11,
+                      fontFamily: 'monospace',
+                    ),
+                  ),
+                ],
               ],
             ),
           ),
@@ -2182,9 +2416,7 @@ class _LiveStreamScreenState extends State<LiveStreamScreen> {
       contentPadding: const EdgeInsets.symmetric(horizontal: 10, vertical: 10),
       border: OutlineInputBorder(
         borderRadius: BorderRadius.circular(8),
-        borderSide: BorderSide(
-          color: Colors.white.withValues(alpha: 0.15),
-        ),
+        borderSide: BorderSide(color: Colors.white.withValues(alpha: 0.15)),
       ),
     );
   }
@@ -2219,7 +2451,9 @@ class _ProtocolTab extends StatelessWidget {
               : Colors.transparent,
           borderRadius: BorderRadius.circular(10),
           border: isSelected
-              ? Border.all(color: const Color(0xFF1976D2).withValues(alpha: 0.8))
+              ? Border.all(
+                  color: const Color(0xFF1976D2).withValues(alpha: 0.8),
+                )
               : null,
         ),
         child: Row(
@@ -2231,8 +2465,8 @@ class _ProtocolTab extends StatelessWidget {
               color: isLive
                   ? Colors.redAccent
                   : isSelected
-                      ? const Color(0xFF64B5F6)
-                      : Colors.white54,
+                  ? const Color(0xFF64B5F6)
+                  : Colors.white54,
             ),
             const SizedBox(width: 6),
             Flexible(
@@ -2242,8 +2476,7 @@ class _ProtocolTab extends StatelessWidget {
                 overflow: TextOverflow.ellipsis,
                 style: TextStyle(
                   color: isSelected ? Colors.white : Colors.white60,
-                  fontWeight:
-                      isSelected ? FontWeight.bold : FontWeight.normal,
+                  fontWeight: isSelected ? FontWeight.bold : FontWeight.normal,
                   fontSize: 11.5,
                 ),
               ),
@@ -2336,8 +2569,10 @@ class _PresetChip extends StatelessWidget {
               if (badge != null) ...[
                 const SizedBox(width: 6),
                 Container(
-                  padding:
-                      const EdgeInsets.symmetric(horizontal: 5, vertical: 2),
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 5,
+                    vertical: 2,
+                  ),
                   decoration: BoxDecoration(
                     color: isSelected
                         ? Colors.white.withValues(alpha: 0.25)
@@ -2390,9 +2625,7 @@ class _MetricTile extends StatelessWidget {
       decoration: BoxDecoration(
         color: const Color(0xFF161B22),
         borderRadius: BorderRadius.circular(10),
-        border: Border.all(
-          color: Colors.white.withValues(alpha: 0.06),
-        ),
+        border: Border.all(color: Colors.white.withValues(alpha: 0.06)),
       ),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,

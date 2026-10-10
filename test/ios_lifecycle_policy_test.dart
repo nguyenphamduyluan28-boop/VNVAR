@@ -83,39 +83,4 @@ void main() {
       );
     });
   });
-
-  group('iOS adaptive 4K FPS policy', () {
-    test('steps down without skipping stability levels', () {
-      expect(nextLowerIos4kFps(30), 24);
-      expect(nextLowerIos4kFps(24), 20);
-      expect(nextLowerIos4kFps(20), 15);
-    });
-
-    test('stops reducing at the safe floor', () {
-      expect(nextLowerIos4kFps(15), isNull);
-    });
-
-    test('falls back to 1080p after the 4K safe floor also fails', () {
-      final result = nextIosOverloadProfile(
-        CameraResolutionProfile.ultraHd4k.withFps(15),
-        const [
-          CameraResolutionProfile.hd720,
-          CameraResolutionProfile.fullHd1080,
-          CameraResolutionProfile.ultraHd4k,
-        ],
-      );
-
-      expect(result, CameraResolutionProfile.fullHd1080);
-    });
-
-    test('does not adapt a non-4K profile', () {
-      expect(
-        nextIosOverloadProfile(
-          CameraResolutionProfile.fullHd1080,
-          CameraResolutionProfile.values,
-        ),
-        isNull,
-      );
-    });
-  });
 }

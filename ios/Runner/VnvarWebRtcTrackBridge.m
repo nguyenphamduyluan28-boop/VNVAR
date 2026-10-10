@@ -254,6 +254,29 @@
   }];
 }
 
++ (float)setExposureBiasForTrackId:(NSString *)trackId bias:(float)bias {
+  AVCaptureDevice *device = [self activeVideoDeviceForTrackId:trackId];
+  if (device == nil) {
+    NSLog(@"[CAMERA_EV] No active AVCaptureDevice found for trackId %@", trackId);
+    return NAN;
+  }
+  NSError *error = nil;
+  if (![device lockForConfiguration:&error]) {
+    NSLog(@"[CAMERA_EV] lockForConfiguration failed: %@", error);
+    return NAN;
+  }
+  float clamped = MAX(device.minExposureTargetBias, MIN(device.maxExposureTargetBias, bias));
+  @try {
+    [device setExposureTargetBias:clamped completionHandler:nil];
+  } @catch (NSException *exception) {
+    NSLog(@"[CAMERA_EV] Exception while setting exposure bias: %@", exception);
+    [device unlockForConfiguration];
+    return NAN;
+  }
+  [device unlockForConfiguration];
+  return clamped;
+}
+
 + (BOOL)setCameraLockForTrackId:(NSString *)trackId locked:(BOOL)locked {
   AVCaptureDevice *device = [self activeVideoDeviceForTrackId:trackId];
   if (device == nil) {

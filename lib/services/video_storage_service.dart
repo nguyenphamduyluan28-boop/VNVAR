@@ -202,14 +202,24 @@ class VideoStorageService {
     if (!Platform.isAndroid) return;
     try {
       await _androidChannel.invokeMethod('scanMediaFile', {'path': path});
-    } catch (_) {}
+    } catch (error) {
+      developer.log(
+        '[STORAGE] scanMediaFile failed: $error',
+        name: 'VideoStorageService',
+      );
+    }
   }
 
   Future<void> ensureNoMedia(String directoryPath) async {
     if (!Platform.isAndroid) return;
     try {
       await _androidChannel.invokeMethod('ensureNoMedia', {'path': directoryPath});
-    } catch (_) {}
+    } catch (error) {
+      developer.log(
+        '[STORAGE] ensureNoMedia failed: $error',
+        name: 'VideoStorageService',
+      );
+    }
   }
 
   Future<bool> deleteDirectoryRecursively(String directoryPath) async {

@@ -166,9 +166,8 @@ class CameraServer {
     await recordingService.loadSettings();
 
     // Nạp lại video đã lưu trên điện thoại.
+    // Đã gồm dọn toàn bộ thư mục ngày hết hạn (removeExpiredData).
     await recordingService.cleanupOldTempFiles();
-    // Dọn sạch toàn bộ thư mục ngày cũ trước hôm nay ngay khi khởi động.
-    await recordingService.removeExpiredData();
 
     // Legacy tablet discovery uses a short TCP request/response on port 40404.
     try {
@@ -760,7 +759,26 @@ class CameraServer {
   // AUTO START RECORDING
   // ============================================================
 
+  // Tablet đã gọi /stop: không tự ghi lại (health monitor, khôi phục camera,
+  // đổi cấu hình…) cho tới khi Tablet gọi /start hoặc /recording/auto-start.
+  bool _stoppedByRequest = false;
+
+  bool get stoppedByRequest => _stoppedByRequest;
+
+  /// Tablet yêu cầu dừng ghi: chốt segment cuối và giữ trạng thái dừng.
+  Future<RecordedSegment?> stopRecordingByRequest() {
+    _stoppedByRequest = true;
+    return recordingService.stop();
+  }
+
+  /// Tablet yêu cầu ghi lại sau khi đã dừng.
+  Future<void> resumeRecordingByRequest() {
+    _stoppedByRequest = false;
+    return ensureRecording();
+  }
+
   Future<void> ensureRecording() async {
+    if (_stoppedByRequest) return;
     if (recordingService.recording) {
       recording = true;
       _discovery.updateStatus('RECORDING');
@@ -801,7 +819,7 @@ class CameraServer {
       return;
     }
 
-    await ensureRecording();
+    await resumeRecordingByRequest();
 
     await _sendJson(request.response, HttpStatus.ok, {
       'success': true,
@@ -821,7 +839,9 @@ class CameraServer {
   Future<void> _startRecording(HttpRequest request) async {
     final alreadyRunning = recordingService.recording;
     if (!alreadyRunning) {
-      await ensureRecording();
+      await resumeRecordingByRequest();
+    } else {
+      _stoppedByRequest = false;
     }
 
     await _sendJson(request.response, HttpStatus.ok, {
@@ -878,7 +898,7 @@ class CameraServer {
   Future<void> _stopRecording(HttpRequest request) async {
     // Luôn gọi stop để chốt cả recorder/rotation đang finalize, kể cả khi cờ
     // recording vừa đổi trạng thái do một thao tác lifecycle đồng thời.
-    final finalSegment = await recordingService.stop();
+    final finalSegment = await stopRecordingByRequest();
 
     recording = false;
 
@@ -1018,15 +1038,34 @@ class CameraServer {
       lookback: Duration(seconds: lookbackSeconds),
       keyframeSafetyMargin: const Duration(seconds: 5),
     );
-    if (range.endMs - range.startMs >= 500) {
+    // Trọng tài bấm ngay sau lúc chuyển segment: đoạn trước sự kiện nằm ở
+    // segment trước. Lấy phần còn thiếu từ đó để clip luôn đủ thời lượng.
+    final requestedWindowMs = (lookbackSeconds + 5) * 1000;
+    final missingBeforeMs = requestedWindowMs - (range.endMs - range.startMs);
+    final preceding = range.startMs == 0 && missingBeforeMs > 500
+        ? recordingService.precedingSegmentOf(segment)
+        : null;
+    final clipStartMs = preceding == null
+        ? range.startMs
+        : range.endMs - requestedWindowMs;
+    if (range.endMs - clipStartMs >= 500) {
       try {
-        checkpoint = await recordingService.trimSegment(
+        Future<RecordedSegment> trim() => recordingService.trimSegment(
           segmentId: segment.id,
-          startMs: range.startMs,
+          startMs: clipStartMs,
           endMs: range.endMs,
           streamCopy: true,
           minimumOutputDurationMs: 500,
+          precedingSegmentId: preceding?.id,
         );
+        try {
+          checkpoint = await trim();
+        } on TrimInProgressException {
+          // Một lệnh cắt clip thủ công đang chạy: chờ xong rồi cắt, không bỏ
+          // clip Check VAR.
+          await recordingService.waitForTrimIdle();
+          checkpoint = await trim();
+        }
         autoTrimmed = true;
         developer.log(
           '[CHECKVAR] Clip ready: ${checkpoint.fileName} '
@@ -1177,7 +1216,7 @@ class CameraServer {
       name: 'CameraServer',
     );
 
-    final marked = await recordingService.markDownloadedAndDelete(segmentId);
+    final marked = await recordingService.acknowledgeDownloaded(segmentId);
 
     if (!marked) {
       await _sendJson(request.response, HttpStatus.notFound, {

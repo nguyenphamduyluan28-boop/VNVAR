@@ -7,6 +7,7 @@ import UIKit
 @objc class AppDelegate: FlutterAppDelegate, FlutterImplicitEngineDelegate {
   private var stationChannel: FlutterMethodChannel?
   private var rtspPublisher: VnvarRtspPublisher?
+  private let cellularUplink = VnvarCellularUplink()
   private let audioSegmentRecorder = VnvarAudioSegmentRecorder()
   private var rtspGeneration: UInt64 = 0
   private var finalizationTask: UIBackgroundTaskIdentifier = .invalid
@@ -89,6 +90,27 @@ import UIKit
       case "stopRtsp":
         self.stopRtsp()
         result(nil)
+      case "openCellularTunnel":
+        guard let arguments = call.arguments as? [String: Any],
+              let host = arguments["host"] as? String, !host.isEmpty,
+              let port = (arguments["port"] as? NSNumber)?.intValue,
+              (1...65_535).contains(port) else {
+          result(
+            FlutterError(
+              code: "INVALID_TUNNEL_TARGET",
+              message: "Thiếu máy chủ hoặc cổng.",
+              details: nil
+            )
+          )
+          return
+        }
+        let tls = arguments["tls"] as? Bool ?? false
+        self.cellularUplink.open(host: host, port: port, tls: tls) { localPort in
+          DispatchQueue.main.async { result(localPort) }
+        }
+      case "closeCellularTunnel":
+        self.cellularUplink.close()
+        result(nil)
       case "setRtspBitrate":
         if let bitrate = (call.arguments as? [String: Any])?["bitrate"] as? NSNumber {
           self.rtspPublisher?.setTargetBitrate(bitrate.intValue)
@@ -140,6 +162,19 @@ import UIKit
         self.switchCameraToId(call, result)
       case "setCameraLock":
         self.setCameraLock(call, result)
+      case "setCameraExposureBoost":
+        guard let arguments = call.arguments as? [String: Any],
+              let trackId = arguments["trackId"] as? String, !trackId.isEmpty else {
+          result(["applied": false, "reason": "invalid_track"])
+          return
+        }
+        let target = (arguments["targetEv"] as? NSNumber)?.floatValue ?? 0
+        let applied = VnvarWebRtcTrackBridge.setExposureBias(forTrackId: trackId, bias: target)
+        if applied.isNaN {
+          result(["applied": false, "reason": "unsupported_capturer"])
+        } else {
+          result(["applied": true, "appliedEv": Double(applied)])
+        }
       default:
         result(FlutterMethodNotImplemented)
       }

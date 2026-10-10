@@ -43,6 +43,7 @@ class MainActivity : FlutterActivity() {
     private var lastKnownLandscapeRotation: Int = ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE
     private var manualQuarterTurns = 0
     private var orientationListener: OrientationEventListener? = null
+    private val cellularUplink by lazy { CellularUplink(applicationContext) }
     private val nativeAudioRecorder: NativeAudioSegmentRecorder
         get() = sharedAudioRecorder ?: synchronized(MainActivity::class.java) {
             sharedAudioRecorder ?: NativeAudioSegmentRecorder(applicationContext).also {
@@ -318,6 +319,31 @@ class MainActivity : FlutterActivity() {
                             result.error("RTSP_START_FAILED", error.message, null)
                         }
                     }
+                }
+
+                "openCellularTunnel" -> {
+                    val host = call.argument<String>("host")
+                    val port = call.argument<Int>("port")
+                    val tls = call.argument<Boolean>("tls") ?: false
+                    if (host.isNullOrBlank() || port == null || port !in 1..65535) {
+                        result.error("INVALID_TUNNEL_TARGET", "Thiếu máy chủ hoặc cổng.", null)
+                    } else {
+                        // Chờ mạng di động có thể mất vài giây: không chặn UI thread.
+                        Thread({
+                            val localPort = try {
+                                cellularUplink.open(host, port, tls)
+                            } catch (error: Exception) {
+                                android.util.Log.w("MainActivity", "Cellular tunnel failed: ${error.message}")
+                                null
+                            }
+                            runOnUiThread { result.success(localPort) }
+                        }, "VNVAR-Cellular-Open").start()
+                    }
+                }
+
+                "closeCellularTunnel" -> {
+                    Thread({ cellularUplink.close() }, "VNVAR-Cellular-Close").start()
+                    result.success(null)
                 }
 
                 "setRtspBitrate" -> {
@@ -1137,6 +1163,7 @@ class MainActivity : FlutterActivity() {
         try { nativeAudioRecorder.stopStreaming() } catch (_: Exception) {}
         try { rtspPublisher?.stop() } catch (_: Exception) {}
         rtspPublisher = null
+        try { cellularUplink.close() } catch (_: Exception) {}
         super.onDestroy()
     }
 }

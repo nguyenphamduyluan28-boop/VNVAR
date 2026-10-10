@@ -78,4 +78,27 @@ void main() {
       expect(await config.loadWhipAuthToken(), isNull);
     });
   });
+
+  group('WHIP TLS policy', () {
+    test('accepts self-signed certificates only on the local network', () {
+      expect(allowsSelfSignedWhipCertificate('192.168.1.10'), isTrue);
+      expect(allowsSelfSignedWhipCertificate('10.0.0.5'), isTrue);
+      expect(allowsSelfSignedWhipCertificate('172.20.10.1'), isTrue);
+      expect(allowsSelfSignedWhipCertificate('mediamtx.local'), isTrue);
+      expect(allowsSelfSignedWhipCertificate('localhost'), isTrue);
+    });
+
+    test('always verifies certificates of Internet servers', () {
+      expect(allowsSelfSignedWhipCertificate('whip.example.com'), isFalse);
+      expect(allowsSelfSignedWhipCertificate('8.8.8.8'), isFalse);
+      expect(allowsSelfSignedWhipCertificate('172.32.0.1'), isFalse);
+      expect(allowsSelfSignedWhipCertificate('2001:db8::1'), isFalse);
+    });
+
+    test('network change does nothing when not publishing', () {
+      final service = WhipPublisherService();
+      service.handleNetworkChange();
+      expect(service.state, WhipPublishState.idle);
+    });
+  });
 }

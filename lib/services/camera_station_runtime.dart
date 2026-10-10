@@ -28,26 +28,6 @@ Duration iosCaptureWarmupDuration(CameraResolutionProfile profile) {
   };
 }
 
-int? nextLowerIos4kFps(int currentFps) {
-  if (currentFps > 24) return 24;
-  if (currentFps > 20) return 20;
-  if (currentFps > 15) return 15;
-  return null;
-}
-
-CameraResolutionProfile? nextIosOverloadProfile(
-  CameraResolutionProfile current,
-  List<CameraResolutionProfile> supported,
-) {
-  if (current.preset != CameraResolutionPreset.ultraHd4k) return null;
-  final lowerFps = nextLowerIos4kFps(current.fps);
-  if (lowerFps != null) return current.withFps(lowerFps);
-  for (final profile in supported) {
-    if (profile.preset == CameraResolutionPreset.fullHd1080) return profile;
-  }
-  return null;
-}
-
 /// Chuẩn hóa mức nhiệt của hai nền tảng về cùng một ngưỡng.
 ///
 /// - Android `PowerManager.currentThermalStatus`: 0 NONE, 1 LIGHT, 2 MODERATE,
@@ -66,6 +46,56 @@ CameraResolutionProfile? nextIosOverloadProfile(
     return (hot: status >= 4, critical: status >= 5, cool: status <= 1);
   }
   return (hot: status >= 3, critical: status >= 4, cool: status <= 1);
+}
+
+/// Mức ưu tiên của một giao diện mạng khi chọn địa chỉ LAN cho Tablet:
+/// 0 = Wi-Fi/Ethernet, 1 = hotspot do điện thoại phát, null = không dùng
+/// (mạng di động 4G/5G, VPN, CLAT…). IP 4G thường là 10.x nên nếu không lọc
+/// theo tên sẽ bị nhận nhầm là LAN.
+int? lanInterfacePriority(String interfaceName) {
+  final name = interfaceName.toLowerCase();
+  const primary = ['wlan', 'eth', 'en', 'wigig'];
+  const hotspot = ['ap', 'swlan', 'softap', 'br', 'bridge'];
+  if (primary.any(name.startsWith)) return 0;
+  if (hotspot.any(name.startsWith)) return 1;
+  return null;
+}
+
+/// Chọn địa chỉ LAN riêng tư từ danh sách (tên giao diện, địa chỉ), ưu tiên
+/// Wi-Fi/Ethernet rồi tới hotspot; bỏ qua mạng di động.
+String? selectStationLanAddress(
+  Iterable<({String interface, String address})> candidates,
+) {
+  final ranked = candidates
+      .map((c) => (priority: lanInterfacePriority(c.interface), c: c))
+      .where((entry) => entry.priority != null)
+      .toList()
+    ..sort((a, b) => a.priority!.compareTo(b.priority!));
+  return selectPrivateLanIpv4(ranked.map((entry) => entry.c.address));
+}
+
+/// Mạng đang mang livestream có vừa mất không, từ các mục "giao diện|IP" đã
+/// mất ([lost]) và còn lại ([current]). Còn Wi-Fi/Ethernet thì luồng đi qua đó,
+/// nên IP 4G/5G chạy nền (Android giữ sẵn) hay hotspot thay đổi không ảnh hưởng.
+bool activeRouteLost(Set<String> lost, Set<String> current) {
+  int? priority(String entry) => lanInterfacePriority(entry.split('|').first);
+  final relevant = lost.where((entry) => priority(entry) != 1);
+  if (relevant.any((entry) => priority(entry) == 0)) return true;
+  if (relevant.isEmpty) return false;
+  return !current.any((entry) => priority(entry) == 0);
+}
+
+/// Bộ đếm định kỳ 60 giây chỉ quét lại toàn bộ thư mục video khi dung lượng
+/// đang thấp hoặc đã lâu chưa quét. Khi đang ghi, mỗi segment hoàn tất đã tự
+/// quét một lần (3 phút/lần), nên quét thêm mỗi phút là lãng phí I/O.
+bool shouldRunPeriodicStorageEnforcement({
+  required bool lowStorage,
+  required DateTime? lastRun,
+  required DateTime now,
+  Duration interval = const Duration(minutes: 10),
+}) {
+  if (lowStorage || lastRun == null) return true;
+  return now.difference(lastRun) >= interval;
 }
 
 String? selectPrivateLanIpv4(Iterable<String> addresses) {
@@ -142,8 +172,9 @@ class CameraStationRuntime {
   bool _networkRecovering = false;
   String? _lanAddress;
   String? _networkError;
-  int _iosLowFpsReports = 0;
-  DateTime? _lastIosFpsAdjustmentAt;
+  // Tập "giao diện|địa chỉ IPv4" của mọi mạng (Wi-Fi, 4G/5G, hotspot) để phát
+  // hiện chuyển mạng. Không dùng IPv6 vì iOS đổi địa chỉ tạm IPv6 thường xuyên.
+  Set<String>? _networkSignature;
   int _cameraQuarterTurns = 0;
   double? _iosActualFps;
   int? _iosRequestedFps;
@@ -306,10 +337,10 @@ class CameraStationRuntime {
   Map<String, dynamic> get captureMetrics => {
     'actualFps': _iosActualFps,
     'requestedFps': _iosRequestedFps ?? _resolutionProfile.fps,
-    'lowFpsReports': _iosLowFpsReports,
+    'lowFpsReports': 0,
     'lastMeasuredAt': _iosPerformanceMeasuredAt?.toIso8601String(),
-    'lastAdaptedAt': _lastIosFpsAdjustmentAt?.toIso8601String(),
-    'adaptive': Platform.isIOS,
+    'lastAdaptedAt': null,
+    'adaptive': false,
   };
 
   CameraResolutionProfile get resolutionProfile => _resolutionProfile;
@@ -443,6 +474,18 @@ class CameraStationRuntime {
     };
     _rtspPublisherService.waitForLocalSource = () async =>
         await _webRtcService?.waitForRtspReady() ?? false;
+    _rtspPublisherService.hasWifiNetwork = () =>
+        _networkSignature?.any(
+          (entry) => lanInterfacePriority(entry.split('|').first) == 0,
+        ) ??
+        false;
+    try {
+      final ev = await StationConfigService().loadExposureBias();
+      // Áp trước khi mở camera để lần đo sáng đầu tiên đã dùng đúng mức.
+      if (webRtc.localVideoTrack == null) {
+        await webRtc.setExposureBias(ev);
+      }
+    } catch (_) {}
     try {
       await webRtc.setRtspTabletAudio(
         await StationConfigService().loadRtspTabletAudio(),
@@ -464,10 +507,6 @@ class CameraStationRuntime {
           (profile) => profile.preset == CameraResolutionPreset.fullHd1080,
           orElse: () => _supportedResolutionProfiles.first,
         ),
-      );
-      _resolutionProfile = await _applySavedIosAdaptiveFps(
-        _resolutionProfile,
-        facingMode: 'environment',
       );
       final preflightThermal = await _readThermalSnapshot();
       _temperatureC = preflightThermal.temperatureC;
@@ -641,6 +680,7 @@ class CameraStationRuntime {
     _networkRecovering = false;
     _lanAddress = null;
     _networkError = null;
+    _networkSignature = null;
     _pendingThermalThrottleTimer?.cancel();
     _pendingThermalThrottleTimer = null;
     _pendingThermalRestoreTimer?.cancel();
@@ -661,11 +701,9 @@ class CameraStationRuntime {
     _storageCleanupTimer?.cancel();
     _storageCleanupTimer = null;
     _healthCheckRunning = false;
-    _iosLowFpsReports = 0;
     _iosActualFps = null;
     _iosRequestedFps = null;
     _iosPerformanceMeasuredAt = null;
-    _lastIosFpsAdjustmentAt = null;
     _resetRecordingProgressWatchdog();
 
     final server = _cameraServer;
@@ -1163,10 +1201,6 @@ class CameraStationRuntime {
         (profile) => profile.preset == previousProfile.preset,
         orElse: () => targetProfiles.last,
       );
-      selectedProfile = await _applySavedIosAdaptiveFps(
-        selectedProfile,
-        facingMode: targetFacing,
-      );
     }
 
     if (wasRtspPublishing) {
@@ -1405,7 +1439,6 @@ class CameraStationRuntime {
     if (wasWhipPublishing) {
       await _whipPublisherService.prepareForReconfiguration();
     }
-    _iosLowFpsReports = 0;
     _profileSwitching = true;
     _generation++;
     _emitState();
@@ -1484,7 +1517,6 @@ class CameraStationRuntime {
       await _waitForIosCaptureWarmup(profile: selected);
       await server.ensureRecording();
       _resolutionProfile = selected;
-      _lastIosFpsAdjustmentAt = DateTime.now(); // Grace period tránh bị FPS drop trigger lại ngay
 
       if (persistSelection) {
         await StationConfigService().saveResolutionProfile(selected);
@@ -1522,11 +1554,21 @@ class CameraStationRuntime {
         if (wasUltraWide && currentFacing == 'environment') {
           try {
             await webRtc.setCameraZoom(webRtc.ultraWideZoomRatio);
-          } catch (_) {}
+          } catch (error) {
+            developer.log(
+              '[CAMERA] Unable to restore ultra-wide zoom after rollback: $error',
+              name: 'CameraStationRuntime',
+            );
+          }
         } else if (previousZoom > 1.05 && currentFacing == 'environment') {
           try {
             await webRtc.setCameraZoom(previousZoom);
-          } catch (_) {}
+          } catch (error) {
+            developer.log(
+              '[CAMERA] Unable to restore zoom after rollback: $error',
+              name: 'CameraStationRuntime',
+            );
+          }
         }
         await _waitForIosCaptureWarmup(profile: previous);
         await server.ensureRecording();
@@ -1643,11 +1685,21 @@ class CameraStationRuntime {
           }
           final targetRatio = webRtc.ultraWideZoomRatio;
           await webRtc.setCameraZoom(targetRatio);
-        } catch (_) {}
+        } catch (error) {
+          developer.log(
+            '[CAMERA] Unable to restore ultra-wide lens after QR scan: $error',
+            name: 'CameraStationRuntime',
+          );
+        }
       } else if (_scannerSavedZoom > 1.05 && _scannerSavedFacing == 'environment') {
         try {
           await webRtc.setCameraZoom(_scannerSavedZoom);
-        } catch (_) {}
+        } catch (error) {
+          developer.log(
+            '[CAMERA] Unable to restore zoom after QR scan: $error',
+            name: 'CameraStationRuntime',
+          );
+        }
       }
 
       await _waitForIosCaptureWarmup(profile: _resolutionProfile);
@@ -1700,6 +1752,22 @@ class CameraStationRuntime {
 
   bool get rtspTabletAudio => _webRtcService?.rtspTabletAudio ?? false;
 
+  double get exposureBiasEv => _webRtcService?.exposureBiasEv ?? 0;
+
+  /// Người dùng chỉnh độ sáng hình: lưu lại và áp ngay cho camera đang mở.
+  Future<void> setExposureBias(double ev) async {
+    await StationConfigService().saveExposureBias(ev);
+    await _webRtcService?.setExposureBias(ev);
+    _emitState();
+  }
+
+  /// Điện thoại đang kết nối Wi-Fi/Ethernet (không tính hotspot, 4G/5G).
+  bool get onWifiNetwork =>
+      _networkSignature?.any(
+        (entry) => lanInterfacePriority(entry.split('|').first) == 0,
+      ) ??
+      false;
+
   /// Bật/tắt tiếng cho Tablet xem RTSP. Tablet đang xem cần kết nối lại.
   Future<void> setRtspTabletAudio(bool enabled) async {
     await StationConfigService().saveRtspTabletAudio(enabled);
@@ -1739,6 +1807,40 @@ class CameraStationRuntime {
     unawaited(_checkNetworkState());
   }
 
+  /// Phát hiện chuyển đổi Wi-Fi ↔ 4G/5G, mất hoặc có lại mạng và báo cho
+  /// luồng livestream để nối lại ngay.
+  Future<void> _observeNetworkPaths() async {
+    final Set<String> current;
+    try {
+      final interfaces = await NetworkInterface.list(
+        type: InternetAddressType.IPv4,
+        includeLoopback: false,
+      );
+      current = {
+        for (final interface in interfaces)
+          for (final address in interface.addresses)
+            if (!address.address.startsWith('169.254.'))
+              '${interface.name}|${address.address}',
+      };
+    } catch (_) {
+      return;
+    }
+    final previous = _networkSignature;
+    _networkSignature = current;
+    if (previous == null) return;
+    final lost = previous.difference(current);
+    final gained = current.difference(previous);
+    if (lost.isEmpty && gained.isEmpty) return;
+    developer.log(
+      '[NETWORK] Network paths changed: lost=$lost gained=$gained',
+      name: 'CameraStationRuntime',
+    );
+    _rtspPublisherService.handleNetworkChange(
+      interfaceLost: activeRouteLost(lost, current),
+    );
+    _whipPublisherService.handleNetworkChange();
+  }
+
   Future<String?> _readLanAddress() async {
     if (Platform.isIOS) {
       final value = await _platformChannel
@@ -1750,9 +1852,11 @@ class CameraStationRuntime {
       type: InternetAddressType.IPv4,
       includeLoopback: false,
     );
-    return selectPrivateLanIpv4(
+    return selectStationLanAddress(
       interfaces.expand(
-        (interface) => interface.addresses.map((address) => address.address),
+        (interface) => interface.addresses.map(
+          (address) => (interface: interface.name, address: address.address),
+        ),
       ),
     );
   }
@@ -1761,6 +1865,7 @@ class CameraStationRuntime {
     if (_networkCheckRunning || _stopping) return;
     _networkCheckRunning = true;
     try {
+      await _observeNetworkPaths();
       final address = await _readLanAddress();
       final previous = _lanAddress;
       final hadRecoveryError = _networkError != null;
@@ -1823,8 +1928,9 @@ class CameraStationRuntime {
     _emitState();
     try {
       await server.reconnectNetworkServices();
-      // RTSP server cục bộ vừa được mở lại: relay FFmpeg/WHIP phải nối lại.
-      _resumeLivePublishers();
+      // RTSP server cục bộ không bị khởi động lại khi đổi mạng, nên relay
+      // livestream (đặc biệt khi đi 4G/5G) giữ nguyên. Nếu đường mạng của nó
+      // thực sự đứt, FFmpeg/WHIP tự kết nối lại.
       _lanAddress = await _readLanAddress();
       developer.log(
         '[NETWORK] Live services ready at ${_lanAddress ?? 'no LAN address'}',
@@ -1852,93 +1958,12 @@ class CameraStationRuntime {
     return Future<void>.delayed(delay);
   }
 
+  /// FPS thực tế iOS báo về: dùng cho /status và health monitor.
   void _handleIosCapturePerformance(double actualFps, int requestedFps) {
     _iosActualFps = actualFps;
     _iosRequestedFps = requestedFps;
     _iosPerformanceMeasuredAt = DateTime.now();
     _emitState();
-    if (!Platform.isIOS ||
-        _stopping ||
-        _recovering ||
-        _profileSwitching ||
-        _thermalThrottled ||
-        _resolutionLocked ||
-        !_cameraEnabled ||
-        _resolutionProfile.preset != CameraResolutionPreset.ultraHd4k ||
-        requestedFps != _resolutionProfile.fps) {
-      return;
-    }
-    // Sustaining at least 90% avoids reacting to normal measurement jitter,
-    // while still catching the repeated frame loss visible in saved sports
-    // footage (for example 22 FPS delivered for a 30 FPS request).
-    if (actualFps >= requestedFps * 0.90) {
-      _iosLowFpsReports = 0;
-      return;
-    }
-    _iosLowFpsReports++;
-    if (_iosLowFpsReports < 2) return;
-    final now = DateTime.now();
-    final lastAdjustment = _lastIosFpsAdjustmentAt;
-    if (lastAdjustment != null &&
-        now.difference(lastAdjustment) < const Duration(seconds: 30)) {
-      return;
-    }
-    final adjusted = nextIosOverloadProfile(
-      _resolutionProfile,
-      _supportedResolutionProfiles,
-    );
-    if (adjusted == null) return;
-    _iosLowFpsReports = 0;
-    _lastIosFpsAdjustmentAt = now;
-    developer.log(
-      '[CAMERA] iOS 4K delivered ${actualFps.toStringAsFixed(1)}/$requestedFps FPS; '
-      'adapting to ${adjusted.shortLabel}/${adjusted.fps} FPS',
-      name: 'CameraStationRuntime',
-    );
-    unawaited(() async {
-      try {
-        _interruptRecovery();
-        await _serializeLifecycle(
-          () =>
-              _setResolutionProfileInternal(adjusted, persistSelection: false),
-        );
-        final deviceId = _deviceId;
-        if (deviceId != null &&
-            adjusted.preset == CameraResolutionPreset.ultraHd4k) {
-          await StationConfigService().saveAdaptiveIosFps(
-            deviceId: deviceId,
-            facingMode: _webRtcService?.currentFacingMode ?? 'environment',
-            preset: adjusted.preset,
-            fps: adjusted.fps,
-          );
-        }
-      } catch (error, stackTrace) {
-        developer.log(
-          '[CAMERA] Unable to apply adaptive iOS FPS',
-          error: error,
-          stackTrace: stackTrace,
-          name: 'CameraStationRuntime',
-        );
-      }
-    }());
-  }
-
-  Future<CameraResolutionProfile> _applySavedIosAdaptiveFps(
-    CameraResolutionProfile profile, {
-    required String facingMode,
-  }) async {
-    final deviceId = _deviceId;
-    if (!Platform.isIOS ||
-        deviceId == null ||
-        profile.preset != CameraResolutionPreset.ultraHd4k) {
-      return profile;
-    }
-    final savedFps = await StationConfigService().loadAdaptiveIosFps(
-      deviceId: deviceId,
-      facingMode: facingMode,
-      preset: profile.preset,
-    );
-    return savedFps == null ? profile : profile.withFps(savedFps);
   }
 
   void _startHealthMonitor() {
@@ -1959,7 +1984,13 @@ class CameraStationRuntime {
           if (!recording.recording && !recording.rotating) {
             await recording.cleanupStagingFiles();
           }
-          await recording.enforceStorageLimit();
+          if (shouldRunPeriodicStorageEnforcement(
+            lowStorage: recording.lowStorageWarning,
+            lastRun: recording.lastStorageEnforcedAt,
+            now: DateTime.now(),
+          )) {
+            await recording.enforceStorageLimit();
+          }
         } catch (error, stackTrace) {
           developer.log(
             '[STORAGE] Periodic cleanup failed',
@@ -2000,7 +2031,7 @@ class CameraStationRuntime {
       if (recording == null || server == null) return;
       if (!recording.recording && !recording.rotating) {
         _resetRecordingProgressWatchdog();
-        if (!recording.storageRetryDue) return;
+        if (server.stoppedByRequest || !recording.storageRetryDue) return;
         try {
           await server.ensureRecording();
         } catch (error, stackTrace) {

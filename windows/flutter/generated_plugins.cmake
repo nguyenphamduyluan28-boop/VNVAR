@@ -3,7 +3,6 @@
 #
 
 list(APPEND FLUTTER_PLUGIN_LIST
-  bonsoir_windows
   ffmpeg_kit_flutter_new_video
   file_selector_windows
   flutter_webrtc

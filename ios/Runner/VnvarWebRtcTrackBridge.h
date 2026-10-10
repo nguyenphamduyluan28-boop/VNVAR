@@ -18,6 +18,11 @@ NS_ASSUME_NONNULL_BEGIN
                     toDeviceId:(NSString *)deviceId
                     completion:(void (^)(BOOL success, NSString * _Nullable error))completion
     NS_SWIFT_NAME(switchCamera(forTrackId:toDeviceId:completion:));
+/// Bù sáng (EV) cho camera đang mở; trả về mức đã áp dụng hoặc NAN khi lỗi.
++ (float)setExposureBiasForTrackId:(NSString *)trackId
+                              bias:(float)bias
+    NS_SWIFT_NAME(setExposureBias(forTrackId:bias:));
+
 + (BOOL)setCameraLockForTrackId:(NSString *)trackId
                          locked:(BOOL)locked
     NS_SWIFT_NAME(setCameraLock(forTrackId:locked:));

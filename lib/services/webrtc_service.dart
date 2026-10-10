@@ -7,6 +7,7 @@ import 'package:flutter/services.dart';
 import 'package:flutter_webrtc/flutter_webrtc.dart';
 
 import '../models/camera_resolution_profile.dart';
+import 'station_platform_events.dart';
 
 Map<String, dynamic> buildCameraVideoConstraints({
   required bool isEmulator,
@@ -106,7 +107,7 @@ class WebRtcService {
 
   WebRtcService() {
     if (Platform.isAndroid || Platform.isIOS) {
-      _platformChannel.setMethodCallHandler(_handlePlatformCallback);
+      StationPlatformEvents.instance.addListener(this, _handlePlatformCallback);
     }
   }
 
@@ -169,6 +170,11 @@ class WebRtcService {
   List<AvailableCameraDevice> _availableCameras = <AvailableCameraDevice>[];
   String? _activeCameraId;
   Timer? _cameraAutoLockTimer;
+  Timer? _cameraRemeterTimer;
+  // Mức bù sáng người dùng chọn (EV); 0 = để camera tự quyết.
+  double _exposureBiasEv = 0;
+  static const Duration _remeterInterval = Duration(seconds: 90);
+  static const Duration _remeterSettle = Duration(seconds: 3);
   bool _isCameraLocked = false;
   bool get isCameraLocked => _isCameraLocked;
   double _cameraZoom = 1;
@@ -978,7 +984,7 @@ class WebRtcService {
     // request intact; selecting the 1x sensor and capturing at 30 fps already
     // gives its automatic exposure the best input available through WebRTC.
     if (Platform.isAndroid) {
-      await _applyAndroidExposureBoost(track);
+      await _applyExposureBias(track);
       _scheduleAutoLock(track);
       return;
     }
@@ -1025,11 +1031,26 @@ class WebRtcService {
       );
     }
 
+    await _applyExposureBias(track);
+    _scheduleAutoLock(track);
+  }
+
+  double get exposureBiasEv => _exposureBiasEv;
+
+  /// Đổi độ sáng (bù sáng EV). Bù sáng chỉ có tác dụng khi phơi sáng tự động
+  /// đang chạy: mở khoá, áp mức mới, để camera đo lại vài giây rồi khoá lại.
+  Future<void> setExposureBias(double ev) async {
+    _exposureBiasEv = ev.clamp(-2.0, 2.0).toDouble();
+    final track = localVideoTrack;
+    if (track == null || (!Platform.isAndroid && !Platform.isIOS)) return;
+    await setCameraLock(locked: false, trackId: track.id);
+    await _applyExposureBias(track);
     _scheduleAutoLock(track);
   }
 
   void _scheduleAutoLock(MediaStreamTrack track) {
     _cameraAutoLockTimer?.cancel();
+    _cameraRemeterTimer?.cancel();
     _cameraAutoLockTimer = Timer(const Duration(seconds: 4), () async {
       if (_localStream == null || localVideoTrack?.id != track.id) return;
       developer.log(
@@ -1037,6 +1058,27 @@ class WebRtcService {
         name: 'WebRtcService',
       );
       await setCameraLock(locked: true, trackId: track.id);
+      _scheduleRemeter(track);
+    });
+  }
+
+  /// Ánh sáng sân đổi theo thời gian (mây, chiều tối, bật đèn). Khoá cứng mãi
+  /// làm hình tối/chói dần, nên định kỳ mở khoá vài giây cho camera tự đo lại
+  /// rồi khoá lại (vẫn tránh được chớp sáng khi cầu thủ chạy qua khung hình).
+  void _scheduleRemeter(MediaStreamTrack track) {
+    _cameraRemeterTimer?.cancel();
+    _cameraRemeterTimer = Timer(_remeterInterval, () async {
+      if (_localStream == null ||
+          localVideoTrack?.id != track.id ||
+          _switchingCamera) {
+        return;
+      }
+      await setCameraLock(locked: false, trackId: track.id);
+      _cameraRemeterTimer = Timer(_remeterSettle, () async {
+        if (_localStream == null || localVideoTrack?.id != track.id) return;
+        await setCameraLock(locked: true, trackId: track.id);
+        _scheduleRemeter(track);
+      });
     });
   }
 
@@ -1104,8 +1146,8 @@ class WebRtcService {
     _scheduleAutoLock(track);
   }
 
-  Future<void> _applyAndroidExposureBoost(MediaStreamTrack track) async {
-    const targetEv = 0.0;
+  Future<void> _applyExposureBias(MediaStreamTrack track) async {
+    final targetEv = _exposureBiasEv;
     const retryDelay = Duration(milliseconds: 300);
     Map<String, dynamic>? lastResult;
 
@@ -1122,7 +1164,7 @@ class WebRtcService {
             .timeout(const Duration(seconds: 2));
         if (lastResult?['applied'] == true) {
           developer.log(
-            '[CAMERA] Android exposure boost: '
+            '[CAMERA] Exposure bias: '
             '${lastResult?['appliedEv']} EV (attempt $attempt)',
             name: 'WebRtcService',
           );
@@ -1142,7 +1184,7 @@ class WebRtcService {
     }
 
     developer.log(
-      '[CAMERA] Keeping default Android auto-exposure: '
+      '[CAMERA] Keeping default auto-exposure: '
       '${lastResult?['reason'] ?? 'unknown'}',
       name: 'WebRtcService',
     );
@@ -1244,6 +1286,10 @@ class WebRtcService {
     await disposeConnection();
     final track = localVideoTrack;
     if (track == null || !_cameraInitialized) return;
+    // RTSP server lắng nghe trên mọi giao diện nên đổi IP không cần mở lại.
+    // Khởi động lại nó sẽ cắt relay livestream (kể cả khi relay đi 4G/5G và
+    // không hề bị ảnh hưởng). Chỉ mở lại khi server đang lỗi.
+    if (_rtspServerStarted && _rtspRunning) return;
     await _stopRtsp();
     await _startRtsp(track);
   }
@@ -1969,6 +2015,8 @@ class WebRtcService {
     _receivedFirstFrame = false;
     _cameraAutoLockTimer?.cancel();
     _cameraAutoLockTimer = null;
+    _cameraRemeterTimer?.cancel();
+    _cameraRemeterTimer = null;
     _isCameraLocked = false;
     localRenderer.srcObject = null;
 
@@ -2025,9 +2073,7 @@ class WebRtcService {
     onRtspStateChanged = null;
     onIosCapturePerformance = null;
     onAndroidTaskRemoved = null;
-    if (Platform.isAndroid || Platform.isIOS) {
-      _platformChannel.setMethodCallHandler(null);
-    }
+    StationPlatformEvents.instance.removeListener(this);
 
     // ==========================================================
     // RENDERER
