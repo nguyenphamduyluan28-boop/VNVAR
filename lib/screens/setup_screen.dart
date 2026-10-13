@@ -56,9 +56,7 @@ class _SetupScreenState extends State<SetupScreen> {
   late String _position;
   late String _deviceId;
   bool _saving = false;
-  bool _loadingVenue = true;
-  String _venueName = '';
-  String _venueMapAddress = '';
+  bool _loadingConfig = true;
 
   @override
   void initState() {
@@ -94,7 +92,7 @@ class _SetupScreenState extends State<SetupScreen> {
       text: _position == 'Tùy chỉnh' ? savedPosition : '',
     );
     _apiPortController = TextEditingController(text: '8080');
-    _loadVenueConfig();
+    _loadConfig();
   }
 
   void _applyOrientation() {
@@ -116,15 +114,15 @@ class _SetupScreenState extends State<SetupScreen> {
     }
   }
 
-  Future<void> _loadVenueConfig() async {
+  Future<void> _loadConfig() async {
     final prefs = await SharedPreferences.getInstance();
-    _venueName = prefs.getString('venueName')?.trim() ?? '';
-    _venueMapAddress = prefs.getString('venueMapAddress')?.trim() ?? '';
+    if (prefs.containsKey('venueName')) await prefs.remove('venueName');
+    if (prefs.containsKey('venueMapAddress')) await prefs.remove('venueMapAddress');
     final port = await _config.loadApiPort();
     _apiPortController.text = port.toString();
     if (mounted) {
       setState(() {
-        _loadingVenue = false;
+        _loadingConfig = false;
       });
     }
   }
@@ -197,38 +195,42 @@ class _SetupScreenState extends State<SetupScreen> {
   void _onCameraIdSelected(String id) {
     setState(() {
       _cameraId = id;
-      // Gợi ý tên và vị trí thông minh nếu tên hiện tại theo quy chuẩn mặc định
-      final currentName = _cameraNameController.text.trim();
-      final isDefaultName =
-          currentName.isEmpty ||
-          currentName == 'Camera góc trái' ||
-          currentName == 'Camera góc phải' ||
-          currentName == 'Camera giữa sân' ||
-          currentName == 'Left-corner camera' ||
-          currentName == 'Right-corner camera' ||
-          currentName == 'Center camera';
-
-      if (isDefaultName) {
-        final isEn = AppLanguageService.instance.isEnglish;
-        switch (id) {
-          case 'CAM-01':
-            _cameraNameController.text =
-                isEn ? 'Left-corner camera' : 'Camera góc trái';
-            _position = 'Góc trái sân';
-            break;
-          case 'CAM-02':
-            _cameraNameController.text =
-                isEn ? 'Right-corner camera' : 'Camera góc phải';
-            _position = 'Góc phải sân';
-            break;
-          case 'CAM-03':
-            _cameraNameController.text =
-                isEn ? 'Center camera' : 'Camera giữa sân';
-            _position = 'Giữa sân';
-            break;
-        }
+      switch (id) {
+        case 'CAM-01':
+          _position = 'Góc trái sân';
+          break;
+        case 'CAM-02':
+          _position = 'Góc phải sân';
+          break;
+        case 'CAM-03':
+          _position = 'Giữa sân';
+          break;
       }
+      _syncCameraNameForPosition(_position);
     });
+  }
+
+  void _syncCameraNameForPosition(String position) {
+    final isEn = AppLanguageService.instance.isEnglish;
+    if (position == 'Tùy chỉnh') {
+      final custom = _customPositionController.text.trim();
+      _cameraNameController.text = custom.isNotEmpty
+          ? (isEn ? '$custom camera' : 'Camera $custom')
+          : (isEn ? 'Custom camera' : 'Camera tùy chỉnh');
+      return;
+    }
+    _cameraNameController.text = switch (position) {
+      'Góc trái sân' => isEn ? 'Left-corner camera' : 'Camera góc trái',
+      'Góc phải sân' => isEn ? 'Right-corner camera' : 'Camera góc phải',
+      'Giữa sân' => isEn ? 'Center camera' : 'Camera giữa sân',
+      'Trên cao trung tâm' =>
+        isEn ? 'High-center camera' : 'Camera trên cao trung tâm',
+      'Baseline A' => isEn ? 'Baseline A camera' : 'Camera Baseline A',
+      'Baseline B' => isEn ? 'Baseline B camera' : 'Camera Baseline B',
+      'Góc A' => isEn ? 'Corner A camera' : 'Camera góc A',
+      'Góc B' => isEn ? 'Corner B camera' : 'Camera góc B',
+      _ => isEn ? 'Custom camera' : 'Camera tùy chỉnh',
+    };
   }
 
   String _positionLabel(String position) {
@@ -412,32 +414,7 @@ class _SetupScreenState extends State<SetupScreen> {
           _buildSectionHeader(
             icon: Icons.stadium_rounded,
             title: appText(context, 'SÂN THI ĐẤU', 'COURT'),
-            subtitle: _venueName.isNotEmpty ? _venueName : null,
           ),
-          if (_venueMapAddress.isNotEmpty) ...[
-            const SizedBox(height: 4),
-            Row(
-              children: [
-                const Icon(
-                  Icons.location_on_outlined,
-                  size: 13,
-                  color: Color(0xFF64748B),
-                ),
-                const SizedBox(width: 4),
-                Expanded(
-                  child: Text(
-                    _venueMapAddress,
-                    maxLines: 1,
-                    overflow: TextOverflow.ellipsis,
-                    style: const TextStyle(
-                      fontSize: 11,
-                      color: Color(0xFF64748B),
-                    ),
-                  ),
-                ),
-              ],
-            ),
-          ],
           const SizedBox(height: 10),
           // Stepper bar: [-]  SÂN X  [+] (Tăng giảm tự do không giới hạn 20 sân)
           Container(
@@ -632,7 +609,10 @@ class _SetupScreenState extends State<SetupScreen> {
                   ),
                   onSelected: (selected) {
                     if (selected) {
-                      setState(() => _position = pos);
+                      setState(() {
+                        _position = pos;
+                        _syncCameraNameForPosition(pos);
+                      });
                     }
                   },
                   selectedColor: const Color(0xFF1565C0),
@@ -663,6 +643,11 @@ class _SetupScreenState extends State<SetupScreen> {
               controller: _customPositionController,
               validator: _requiredValidator,
               textInputAction: TextInputAction.done,
+              onChanged: (_) {
+                if (_position == 'Tùy chỉnh') {
+                  _syncCameraNameForPosition('Tùy chỉnh');
+                }
+              },
               decoration: InputDecoration(
                 labelText: appText(
                   context,
@@ -806,7 +791,7 @@ class _SetupScreenState extends State<SetupScreen> {
 
   @override
   Widget build(BuildContext context) {
-    if (_loadingVenue) {
+    if (_loadingConfig) {
       return const Scaffold(body: Center(child: CircularProgressIndicator()));
     }
 
@@ -895,30 +880,6 @@ class _SetupScreenState extends State<SetupScreen> {
         const SizedBox(height: 12),
         _buildCameraIdSelector(),
         const SizedBox(height: 12),
-        TextFormField(
-          controller: _cameraNameController,
-          validator: _requiredValidator,
-          textInputAction: TextInputAction.next,
-          decoration: InputDecoration(
-            labelText: appText(context, 'Tên Camera', 'Camera name'),
-            hintText: appText(
-              context,
-              'Ví dụ: Camera góc trái',
-              'Example: Left-corner camera',
-            ),
-            prefixIcon: const Icon(Icons.badge_outlined, size: 20),
-            border: OutlineInputBorder(
-              borderRadius: BorderRadius.circular(12),
-            ),
-            filled: true,
-            fillColor: const Color(0xFFF8FAFC),
-            contentPadding: const EdgeInsets.symmetric(
-              horizontal: 14,
-              vertical: 12,
-            ),
-          ),
-        ),
-        const SizedBox(height: 12),
         _buildPositionSelector(),
         const SizedBox(height: 14),
         _buildDeviceIdFooter(),
@@ -932,7 +893,7 @@ class _SetupScreenState extends State<SetupScreen> {
     return Row(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
-        // Cột trái: Sân, Camera ID, Tên camera
+        // Cột trái: Sân, Camera ID
         Expanded(
           flex: 5,
           child: Column(
@@ -942,35 +903,11 @@ class _SetupScreenState extends State<SetupScreen> {
               _buildCourtSelector(),
               const SizedBox(height: 12),
               _buildCameraIdSelector(),
-              const SizedBox(height: 12),
-              TextFormField(
-                controller: _cameraNameController,
-                validator: _requiredValidator,
-                textInputAction: TextInputAction.next,
-                decoration: InputDecoration(
-                  labelText: appText(context, 'Tên Camera', 'Camera name'),
-                  hintText: appText(
-                    context,
-                    'Ví dụ: Camera góc trái',
-                    'Example: Left-corner camera',
-                  ),
-                  prefixIcon: const Icon(Icons.badge_outlined, size: 20),
-                  border: OutlineInputBorder(
-                    borderRadius: BorderRadius.circular(12),
-                  ),
-                  filled: true,
-                  fillColor: const Color(0xFFF8FAFC),
-                  contentPadding: const EdgeInsets.symmetric(
-                    horizontal: 14,
-                    vertical: 11,
-                  ),
-                ),
-              ),
             ],
           ),
         ),
         const SizedBox(width: 18),
-        // Cột phải: Vị trí, Device ID, Nút lưu (Port đã ẩn)
+        // Cột phải: Vị trí, Device ID, Nút lưu
         Expanded(
           flex: 5,
           child: Column(
