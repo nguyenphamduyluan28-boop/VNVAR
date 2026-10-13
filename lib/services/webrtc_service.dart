@@ -169,12 +169,8 @@ class WebRtcService {
   bool? _isEmulator;
   List<AvailableCameraDevice> _availableCameras = <AvailableCameraDevice>[];
   String? _activeCameraId;
-  Timer? _cameraAutoLockTimer;
-  Timer? _cameraRemeterTimer;
   // Mức bù sáng người dùng chọn (EV); 0 = để camera tự quyết.
   double _exposureBiasEv = 0;
-  static const Duration _remeterInterval = Duration(seconds: 90);
-  static const Duration _remeterSettle = Duration(seconds: 3);
   bool _isCameraLocked = false;
   bool get isCameraLocked => _isCameraLocked;
   double _cameraZoom = 1;
@@ -985,7 +981,6 @@ class WebRtcService {
     // gives its automatic exposure the best input available through WebRTC.
     if (Platform.isAndroid) {
       await _applyExposureBias(track);
-      _scheduleAutoLock(track);
       return;
     }
 
@@ -1032,54 +1027,17 @@ class WebRtcService {
     }
 
     await _applyExposureBias(track);
-    _scheduleAutoLock(track);
   }
 
   double get exposureBiasEv => _exposureBiasEv;
 
-  /// Đổi độ sáng (bù sáng EV). Bù sáng chỉ có tác dụng khi phơi sáng tự động
-  /// đang chạy: mở khoá, áp mức mới, để camera đo lại vài giây rồi khoá lại.
+  /// Đổi độ sáng (bù sáng EV) mượt mà trong chế độ Auto Exposure liên tục.
   Future<void> setExposureBias(double ev) async {
     _exposureBiasEv = ev.clamp(-2.0, 2.0).toDouble();
     final track = localVideoTrack;
     if (track == null || (!Platform.isAndroid && !Platform.isIOS)) return;
     await setCameraLock(locked: false, trackId: track.id);
     await _applyExposureBias(track);
-    _scheduleAutoLock(track);
-  }
-
-  void _scheduleAutoLock(MediaStreamTrack track) {
-    _cameraAutoLockTimer?.cancel();
-    _cameraRemeterTimer?.cancel();
-    _cameraAutoLockTimer = Timer(const Duration(seconds: 4), () async {
-      if (_localStream == null || localVideoTrack?.id != track.id) return;
-      developer.log(
-        '[CAMERA] Auto-locking AE/AF/AWB after 4 seconds of natural metering',
-        name: 'WebRtcService',
-      );
-      await setCameraLock(locked: true, trackId: track.id);
-      _scheduleRemeter(track);
-    });
-  }
-
-  /// Ánh sáng sân đổi theo thời gian (mây, chiều tối, bật đèn). Khoá cứng mãi
-  /// làm hình tối/chói dần, nên định kỳ mở khoá vài giây cho camera tự đo lại
-  /// rồi khoá lại (vẫn tránh được chớp sáng khi cầu thủ chạy qua khung hình).
-  void _scheduleRemeter(MediaStreamTrack track) {
-    _cameraRemeterTimer?.cancel();
-    _cameraRemeterTimer = Timer(_remeterInterval, () async {
-      if (_localStream == null ||
-          localVideoTrack?.id != track.id ||
-          _switchingCamera) {
-        return;
-      }
-      await setCameraLock(locked: false, trackId: track.id);
-      _cameraRemeterTimer = Timer(_remeterSettle, () async {
-        if (_localStream == null || localVideoTrack?.id != track.id) return;
-        await setCameraLock(locked: true, trackId: track.id);
-        _scheduleRemeter(track);
-      });
-    });
   }
 
   Future<bool> setCameraLock({required bool locked, String? trackId}) async {
@@ -1114,14 +1072,13 @@ class WebRtcService {
 
     final targetPoint = point ?? const math.Point<double>(0.5, 0.5);
     developer.log(
-      '[CAMERA] Tap-to-remeter triggered at (${targetPoint.x.toStringAsFixed(2)}, ${targetPoint.y.toStringAsFixed(2)})',
+      '[CAMERA] Tap-to-meter triggered at (${targetPoint.x.toStringAsFixed(2)}, ${targetPoint.y.toStringAsFixed(2)})',
       name: 'WebRtcService',
     );
 
-    // 1. Reset lock to continuous auto before allowing natural adaptation
+    // Luôn duy trì Continuous Auto Exposure, không khoá cứng thông số
     await setCameraLock(locked: false, trackId: track.id);
 
-    // 2. Set metering / focus point
     try {
       await Helper.setExposurePoint(track, targetPoint)
           .timeout(const Duration(seconds: 2));
@@ -1141,9 +1098,6 @@ class WebRtcService {
             .timeout(const Duration(seconds: 2));
       } catch (_) {}
     }
-
-    // 3. Restart auto-lock countdown (4 seconds)
-    _scheduleAutoLock(track);
   }
 
   Future<void> _applyExposureBias(MediaStreamTrack track) async {
@@ -2013,10 +1967,6 @@ class WebRtcService {
     }
     _firstFrameCompleter = null;
     _receivedFirstFrame = false;
-    _cameraAutoLockTimer?.cancel();
-    _cameraAutoLockTimer = null;
-    _cameraRemeterTimer?.cancel();
-    _cameraRemeterTimer = null;
     _isCameraLocked = false;
     localRenderer.srcObject = null;
 

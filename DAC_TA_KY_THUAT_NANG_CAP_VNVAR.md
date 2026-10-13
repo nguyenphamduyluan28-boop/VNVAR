@@ -271,17 +271,18 @@ final class NativeGopRingBuffer {
 
 ---
 
-## 4. MODULE 3: ĐO HỘI TỤ & KHÓA NÉT/SÁNG (MEASURE-THEN-LOCK & FAST SHUTTER)
+## 4. MODULE 3: TỰ ĐỘNG ĐO SÁNG LIÊN TỤC & MÀN TRẬP NHANH (CONTINUOUS SMOOTH AE & FAST SHUTTER)
 
-### 4.1. Bối cảnh & Nguyên Lý Đo Hội Tụ (Measure-Then-Lock)
-- **Vấn đề bản trước:** Cài đặt tọa độ và gán cờ `LOCK` cùng một lúc sẽ khiến máy ảnh khóa ngay giá trị hiện tại mà **chưa kịp tính toán vùng đo mới**.
-- **Quy trình đúng:**
-  $$\text{Chạm điểm } (x, y) \longrightarrow \text{Kích hoạt AF/AE Trigger} \longrightarrow \text{Chờ cảm biến hội tụ } (\text{Converged}) \longrightarrow \text{Khóa cứng } (\text{Lock})$$
+### 4.1. Bối cảnh & Nguyên Lý Vận Hành Tối Ưu (Zero-Touch Auto Exposure)
+- **Vấn đề của cơ chế Khóa sáng thủ công (AE Lock):** Camera VAR thường đặt trên cao (2.5m - 3m); việc bắt buộc chạm màn hình để khóa sáng rất bất tiện. Khi thời tiết ngoài trời thay đổi (mây che rồi nắng lại, hoặc hoàng hôn bật đèn sân), việc bị khóa cứng sẽ khiến video bị **cháy trắng** hoặc **tối đen**.
+- **Giải pháp tối ưu chuẩn hóa:**
+  - **Mặc định:** Camera luôn vận hành ở chế độ **Auto Exposure liên tục (Continuous Smooth AE)**, vùng đo sáng ưu tiên trọng tâm mặt sân (Center-weighted). Loại bỏ hoàn toàn chu kỳ khóa cứng 4 giây và chu kỳ mở/khóa chập chờn 90 giây.
+  - **Chạm màn hình:** Đóng vai trò kích hoạt lấy nét và đo sáng tại điểm chạm (Focus/Exposure Trigger), nhưng **vẫn duy trì chế độ Auto**, không khóa cứng thông số.
+  - **Tinh chỉnh độ sáng:** Người dùng có thể bù sáng thủ công qua thanh trượt EV (+/- 2.0 EV) mượt mà mà không làm mất tính năng tự động thích ứng.
 - **Yêu cầu thể thao:**
   1. Tích hợp **Màn trập nhanh ($\ge 1/250\text{s}$)** để loại bỏ bóng mờ chân và quả bóng.
   2. Bật chế độ chống chớp đèn sân 50Hz (`ANTIBANDING_50HZ`).
-  3. Khóa cân bằng trắng (AWB Lock) để màu áo không bị đổi màu.
-  4. Hỗ trợ **Mở khóa / Khóa lại từ xa thông qua Tablet**.
+  3. Cân bằng trắng tự động mượt mà (Continuous AWB) hoặc khóa tĩnh khi ánh sáng ổn định.
 
 ### 4.2. Triển Khai Hoàn Chỉnh Trên Android (Camera2 API)
 

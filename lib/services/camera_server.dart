@@ -269,23 +269,69 @@ class CameraServer {
 </head>
 <body><main><header>VNVAR · $courtId · $cameraId</header><span class="state" id="state">Đang kết nối...</span><video id="video" autoplay playsinline muted></video></main>
 <script>
-(async()=>{
+(()=>{
   const state=document.getElementById('state');
-  const peerId='viewer_'+(globalThis.crypto?.randomUUID?.()||Date.now()+'_'+Math.random());
-  try{
-    const pc=new RTCPeerConnection({iceServers:[{urls:'stun:stun.l.google.com:19302'}]});
-    pc.addTransceiver('video',{direction:'recvonly'});
-    pc.ontrack=e=>{try{e.receiver.playoutDelayHint=0;e.receiver.jitterBufferTarget=0}catch(_){}document.getElementById('video').srcObject=e.streams[0];state.textContent='LIVE'};
-    pc.onconnectionstatechange=()=>state.textContent=pc.connectionState==='connected'?'LIVE':pc.connectionState;
-    await pc.setLocalDescription(await pc.createOffer());
-    if(pc.iceGatheringState!=='complete')await new Promise(resolve=>{const done=()=>{if(pc.iceGatheringState==='complete'){pc.removeEventListener('icegatheringstatechange',done);resolve()}};pc.addEventListener('icegatheringstatechange',done);setTimeout(resolve,8000)});
-    const offer=pc.localDescription;
-    const response=await fetch('/webrtc/offer',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({sdp:offer.sdp,type:offer.type,peerId})});
-    if(!response.ok)throw new Error('HTTP '+response.status);
-    const answer=await response.json();
-    await pc.setRemoteDescription(answer);
-    addEventListener('pagehide',()=>navigator.sendBeacon('/webrtc/disconnect',new Blob([JSON.stringify({peerId})],{type:'application/json'})),{once:true});
-  }catch(error){state.textContent='Lỗi kết nối';document.body.insertAdjacentHTML('beforeend','<div style="position:fixed;left:16px;bottom:16px;color:#ff8a80">'+String(error)+'</div>')}
+  const video=document.getElementById('video');
+  let pc=null;
+  let peerId=null;
+  let reconnectTimer=null;
+  let lastW=0, lastH=0;
+
+  async function connect(){
+    if(reconnectTimer){clearTimeout(reconnectTimer);reconnectTimer=null;}
+    if(pc){try{pc.close()}catch(_){}}
+    peerId='viewer_'+(globalThis.crypto?.randomUUID?.()||Date.now()+'_'+Math.random());
+    state.textContent='Đang kết nối...';
+    try{
+      pc=new RTCPeerConnection({iceServers:[{urls:'stun:stun.l.google.com:19302'}]});
+      pc.addTransceiver('video',{direction:'recvonly'});
+      pc.ontrack=e=>{
+        try{e.receiver.playoutDelayHint=0;e.receiver.jitterBufferTarget=0}catch(_){}
+        video.srcObject=e.streams[0];
+        state.textContent='LIVE';
+      };
+      pc.onconnectionstatechange=()=>{
+        state.textContent=pc.connectionState==='connected'?'LIVE':pc.connectionState;
+        if(pc.connectionState==='failed'||pc.connectionState==='disconnected'){
+          scheduleReconnect(1000);
+        }
+      };
+      await pc.setLocalDescription(await pc.createOffer());
+      if(pc.iceGatheringState!=='complete')await new Promise(resolve=>{
+        const done=()=>{if(pc.iceGatheringState==='complete'){pc.removeEventListener('icegatheringstatechange',done);resolve()}};
+        pc.addEventListener('icegatheringstatechange',done);
+        setTimeout(resolve,8000);
+      });
+      const offer=pc.localDescription;
+      const response=await fetch('/webrtc/offer',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({sdp:offer.sdp,type:offer.type,peerId})});
+      if(!response.ok)throw new Error('HTTP '+response.status);
+      const answer=await response.json();
+      await pc.setRemoteDescription(answer);
+    }catch(error){
+      state.textContent='Lỗi kết nối';
+      scheduleReconnect(2000);
+    }
+  }
+
+  function scheduleReconnect(ms){
+    if(reconnectTimer)return;
+    reconnectTimer=setTimeout(()=>connect(),ms);
+  }
+
+  // Tự động giải phóng decoder cũ và kết nối lại ngay khi phát hiện đổi độ phân giải, không cần F5
+  video.addEventListener('resize',()=>{
+    const w=video.videoWidth, h=video.videoHeight;
+    if(lastW>0 && (w!==lastW || h!==lastH)){
+      scheduleReconnect(300);
+    }
+    lastW=w; lastH=h;
+  });
+
+  addEventListener('pagehide',()=>{
+    if(peerId)navigator.sendBeacon('/webrtc/disconnect',new Blob([JSON.stringify({peerId})],{type:'application/json'}));
+  },{once:true});
+
+  connect();
 })();
 </script></body></html>''');
     await request.response.close();

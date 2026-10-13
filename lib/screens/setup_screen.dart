@@ -32,28 +32,14 @@ class SetupScreen extends StatefulWidget {
 class _SetupScreenState extends State<SetupScreen> {
   static const List<String> _cameraIds = ['CAM-01', 'CAM-02', 'CAM-03'];
 
-  static const List<String> _positions = [
-    'Góc trái sân',
-    'Góc phải sân',
-    'Giữa sân',
-    'Trên cao trung tâm',
-    'Baseline A',
-    'Baseline B',
-    'Góc A',
-    'Góc B',
-    'Tùy chỉnh',
-  ];
-
   final GlobalKey<FormState> _formKey = GlobalKey<FormState>();
   final StationConfigService _config = StationConfigService();
 
   late final TextEditingController _cameraNameController;
-  late final TextEditingController _customPositionController;
   late final TextEditingController _apiPortController;
 
   late String _cameraId;
   late String _courtId;
-  late String _position;
   late String _deviceId;
   bool _saving = false;
   bool _loadingConfig = true;
@@ -77,19 +63,8 @@ class _SetupScreenState extends State<SetupScreen> {
     _courtId = identity?.courtId ?? 'COURT-01';
     _deviceId = identity?.deviceId ?? _generateDeviceId();
 
-    final savedPosition = identity?.cameraPosition ?? _positions.first;
-    _position = _positions.contains(savedPosition)
-        ? savedPosition
-        : 'Tùy chỉnh';
-
-    final defaultInitialName = AppLanguageService.instance.isEnglish
-        ? 'Left-corner camera'
-        : 'Camera góc trái';
     _cameraNameController = TextEditingController(
-      text: identity?.cameraName ?? defaultInitialName,
-    );
-    _customPositionController = TextEditingController(
-      text: _position == 'Tùy chỉnh' ? savedPosition : '',
+      text: identity?.cameraName ?? 'Camera ${_cameraId.replaceAll('CAM-', '')}',
     );
     _apiPortController = TextEditingController(text: '8080');
     _loadConfig();
@@ -130,7 +105,6 @@ class _SetupScreenState extends State<SetupScreen> {
   @override
   void dispose() {
     _cameraNameController.dispose();
-    _customPositionController.dispose();
     _apiPortController.dispose();
     super.dispose();
   }
@@ -195,58 +169,8 @@ class _SetupScreenState extends State<SetupScreen> {
   void _onCameraIdSelected(String id) {
     setState(() {
       _cameraId = id;
-      switch (id) {
-        case 'CAM-01':
-          _position = 'Góc trái sân';
-          break;
-        case 'CAM-02':
-          _position = 'Góc phải sân';
-          break;
-        case 'CAM-03':
-          _position = 'Giữa sân';
-          break;
-      }
-      _syncCameraNameForPosition(_position);
+      _cameraNameController.text = 'Camera ${id.replaceAll('CAM-', '')}';
     });
-  }
-
-  void _syncCameraNameForPosition(String position) {
-    final isEn = AppLanguageService.instance.isEnglish;
-    if (position == 'Tùy chỉnh') {
-      final custom = _customPositionController.text.trim();
-      _cameraNameController.text = custom.isNotEmpty
-          ? (isEn ? '$custom camera' : 'Camera $custom')
-          : (isEn ? 'Custom camera' : 'Camera tùy chỉnh');
-      return;
-    }
-    _cameraNameController.text = switch (position) {
-      'Góc trái sân' => isEn ? 'Left-corner camera' : 'Camera góc trái',
-      'Góc phải sân' => isEn ? 'Right-corner camera' : 'Camera góc phải',
-      'Giữa sân' => isEn ? 'Center camera' : 'Camera giữa sân',
-      'Trên cao trung tâm' =>
-        isEn ? 'High-center camera' : 'Camera trên cao trung tâm',
-      'Baseline A' => isEn ? 'Baseline A camera' : 'Camera Baseline A',
-      'Baseline B' => isEn ? 'Baseline B camera' : 'Camera Baseline B',
-      'Góc A' => isEn ? 'Corner A camera' : 'Camera góc A',
-      'Góc B' => isEn ? 'Corner B camera' : 'Camera góc B',
-      _ => isEn ? 'Custom camera' : 'Camera tùy chỉnh',
-    };
-  }
-
-  String _positionLabel(String position) {
-    if (!AppLanguageService.instance.isEnglish) return position;
-    return switch (position) {
-      'Góc trái sân' => 'Left corner',
-      'Góc phải sân' => 'Right corner',
-      'Giữa sân' => 'Center',
-      'Trên cao trung tâm' => 'High center',
-      'Baseline A' => 'Baseline A',
-      'Baseline B' => 'Baseline B',
-      'Góc A' => 'Corner A',
-      'Góc B' => 'Corner B',
-      'Tùy chỉnh' => 'Custom',
-      _ => position,
-    };
   }
 
   String _generateDeviceId() {
@@ -258,16 +182,7 @@ class _SetupScreenState extends State<SetupScreen> {
     return 'PHONE-$suffix';
   }
 
-  String? _requiredValidator(String? value) {
-    if (value == null || value.trim().isEmpty) {
-      return appText(
-        context,
-        'Vui lòng nhập thông tin này.',
-        'Required field.',
-      );
-    }
-    return null;
-  }
+
 
   void _showSetupToast(
     String message, {
@@ -312,22 +227,9 @@ class _SetupScreenState extends State<SetupScreen> {
   Future<void> _save() async {
     if (_saving || !(_formKey.currentState?.validate() ?? false)) return;
 
-    final cameraName = _cameraNameController.text.trim();
-    final cameraPosition = _position == 'Tùy chỉnh'
-        ? _customPositionController.text.trim()
-        : _position.trim();
-
-    if (cameraPosition.isEmpty) {
-      _showSetupToast(
-        appText(
-          context,
-          'Vui lòng nhập vị trí Camera.',
-          'Please enter the camera position.',
-        ),
-        isError: true,
-      );
-      return;
-    }
+    final cameraName = _cameraNameController.text.trim().isNotEmpty
+        ? _cameraNameController.text.trim()
+        : _cameraId;
 
     setState(() => _saving = true);
 
@@ -337,7 +239,7 @@ class _SetupScreenState extends State<SetupScreen> {
         cameraId: _cameraId.trim(),
         deviceId: _deviceId.trim(),
         cameraName: cameraName,
-        cameraPosition: cameraPosition,
+        cameraPosition: '',
       );
       if (widget.persistOnSave) {
         await _config.saveIdentity(identity);
@@ -569,111 +471,7 @@ class _SetupScreenState extends State<SetupScreen> {
     );
   }
 
-  Widget _buildPositionSelector() {
-    return Container(
-      decoration: BoxDecoration(
-        color: const Color(0xFFF8FAFC),
-        borderRadius: BorderRadius.circular(16),
-        border: Border.all(color: const Color(0xFFE2E8F0)),
-      ),
-      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.stretch,
-        children: [
-          _buildSectionHeader(
-            icon: Icons.place_rounded,
-            title: appText(context, 'VỊ TRÍ CAMERA', 'CAMERA POSITION'),
-          ),
-          const SizedBox(height: 8),
-          Wrap(
-            spacing: 6,
-            runSpacing: 6,
-            children: _positions.map((pos) {
-              final isSelected = _position == pos;
-              return Theme(
-                data: Theme.of(context).copyWith(
-                  canvasColor: Colors.transparent,
-                ),
-                child: ChoiceChip(
-                  label: Text(_positionLabel(pos)),
-                  selected: isSelected,
-                  showCheckmark: false,
-                  visualDensity: const VisualDensity(
-                    horizontal: -2,
-                    vertical: -3,
-                  ),
-                  materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
-                  padding: const EdgeInsets.symmetric(
-                    horizontal: 8,
-                    vertical: 3,
-                  ),
-                  onSelected: (selected) {
-                    if (selected) {
-                      setState(() {
-                        _position = pos;
-                        _syncCameraNameForPosition(pos);
-                      });
-                    }
-                  },
-                  selectedColor: const Color(0xFF1565C0),
-                  backgroundColor: Colors.white,
-                  labelStyle: TextStyle(
-                    fontSize: 11.5,
-                    fontWeight:
-                        isSelected ? FontWeight.w700 : FontWeight.w500,
-                    color: isSelected
-                        ? Colors.white
-                        : const Color(0xFF334155),
-                  ),
-                  shape: RoundedRectangleBorder(
-                    borderRadius: BorderRadius.circular(8),
-                    side: BorderSide(
-                      color: isSelected
-                          ? const Color(0xFF1565C0)
-                          : const Color(0xFFCBD5E1),
-                    ),
-                  ),
-                ),
-              );
-            }).toList(),
-          ),
-          if (_position == 'Tùy chỉnh') ...[
-            const SizedBox(height: 8),
-            TextFormField(
-              controller: _customPositionController,
-              validator: _requiredValidator,
-              textInputAction: TextInputAction.done,
-              onChanged: (_) {
-                if (_position == 'Tùy chỉnh') {
-                  _syncCameraNameForPosition('Tùy chỉnh');
-                }
-              },
-              decoration: InputDecoration(
-                labelText: appText(
-                  context,
-                  'Nhập vị trí camera tùy chỉnh',
-                  'Enter custom camera position',
-                ),
-                prefixIcon: const Icon(
-                  Icons.edit_location_alt_outlined,
-                  size: 20,
-                ),
-                border: OutlineInputBorder(
-                  borderRadius: BorderRadius.circular(10),
-                ),
-                filled: true,
-                fillColor: Colors.white,
-                contentPadding: const EdgeInsets.symmetric(
-                  horizontal: 12,
-                  vertical: 10,
-                ),
-              ),
-            ),
-          ],
-        ],
-      ),
-    );
-  }
+
 
   Widget _buildDeviceIdFooter() {
     return Container(
@@ -879,8 +677,6 @@ class _SetupScreenState extends State<SetupScreen> {
         _buildCourtSelector(),
         const SizedBox(height: 12),
         _buildCameraIdSelector(),
-        const SizedBox(height: 12),
-        _buildPositionSelector(),
         const SizedBox(height: 14),
         _buildDeviceIdFooter(),
         const SizedBox(height: 18),
@@ -893,7 +689,7 @@ class _SetupScreenState extends State<SetupScreen> {
     return Row(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
-        // Cột trái: Sân, Camera ID
+        // Cột trái: Logo, Sân
         Expanded(
           flex: 5,
           child: Column(
@@ -901,19 +697,17 @@ class _SetupScreenState extends State<SetupScreen> {
             children: [
               _buildBrandLogo(),
               _buildCourtSelector(),
-              const SizedBox(height: 12),
-              _buildCameraIdSelector(),
             ],
           ),
         ),
         const SizedBox(width: 18),
-        // Cột phải: Vị trí, Device ID, Nút lưu
+        // Cột phải: Camera ID, Device ID, Nút lưu
         Expanded(
           flex: 5,
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.stretch,
             children: [
-              _buildPositionSelector(),
+              _buildCameraIdSelector(),
               const SizedBox(height: 12),
               _buildDeviceIdFooter(),
               const SizedBox(height: 14),

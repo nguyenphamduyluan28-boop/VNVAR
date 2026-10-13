@@ -10,7 +10,7 @@ class StationIdentity {
     required this.cameraId,
     required this.deviceId,
     required this.cameraName,
-    required this.cameraPosition,
+    this.cameraPosition = '',
   });
 
   String get namespace => '$courtId/$cameraId';
@@ -47,7 +47,7 @@ class StationIdentity {
     final deviceId = (json['deviceId'] as String? ?? '').trim();
     final cameraName = (json['cameraName'] as String? ?? cameraId).trim();
     final cameraPosition =
-        (json['cameraPosition'] as String? ?? 'Chưa cấu hình').trim();
+        (json['cameraPosition'] as String? ?? '').trim();
 
     if (courtId.isEmpty || cameraId.isEmpty || deviceId.isEmpty) {
       throw const FormatException('Station identity is incomplete.');
@@ -58,7 +58,7 @@ class StationIdentity {
       cameraId: cameraId,
       deviceId: deviceId,
       cameraName: cameraName.isEmpty ? cameraId : cameraName,
-      cameraPosition: cameraPosition.isEmpty ? 'Chưa cấu hình' : cameraPosition,
+      cameraPosition: cameraPosition,
     );
   }
 

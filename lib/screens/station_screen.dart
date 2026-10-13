@@ -922,10 +922,6 @@ class _StationScreenState extends State<StationScreen>
                           title: appText(context, 'Sân', 'Court'),
                           value: _courtLabel(newIdentity.courtId),
                         ),
-                        _ConfigLine(
-                          title: appText(context, 'Vị trí', 'Position'),
-                          value: newIdentity.cameraPosition,
-                        ),
                       ],
                     ),
                   ),
@@ -942,10 +938,6 @@ class _StationScreenState extends State<StationScreen>
                   _ConfigLine(
                     title: appText(context, 'Sân', 'Court'),
                     value: _courtLabel(newIdentity.courtId),
-                  ),
-                  _ConfigLine(
-                    title: appText(context, 'Vị trí', 'Position'),
-                    value: newIdentity.cameraPosition,
                   ),
                 ],
               );
@@ -1997,6 +1989,7 @@ class _StationScreenState extends State<StationScreen>
                               userOverride: _runtime.thermalUserOverride,
                               isCooledDown: _runtime.justCooledDown,
                               isLocked: _runtime.resolutionLocked,
+                              profile: _runtime.resolutionProfile,
                               onTap: _openResolutionPicker,
                               onDismiss: _runtime.dismissCooledDownNotice,
                             ),
@@ -2257,18 +2250,18 @@ class _StationScreenState extends State<StationScreen>
                               color: Colors.amber.withValues(alpha: 0.7),
                             ),
                           ),
-                          child: const Row(
+                          child: Row(
                             mainAxisSize: MainAxisSize.min,
                             children: [
-                              Icon(
+                              const Icon(
                                 Icons.warning_amber_rounded,
                                 color: Colors.amber,
                                 size: 10,
                               ),
-                              SizedBox(width: 3),
+                              const SizedBox(width: 3),
                               Text(
-                                '720p',
-                                style: TextStyle(
+                                _runtime.resolutionProfile.shortLabel,
+                                style: const TextStyle(
                                   color: Colors.amber,
                                   fontSize: 9,
                                   fontWeight: FontWeight.w800,
@@ -2420,6 +2413,7 @@ class _ThermalToast extends StatelessWidget {
     this.userOverride = false,
     this.isCooledDown = false,
     this.isLocked = false,
+    this.profile,
   });
 
   final bool compact;
@@ -2430,6 +2424,7 @@ class _ThermalToast extends StatelessWidget {
   final bool userOverride;
   final bool isCooledDown;
   final bool isLocked;
+  final CameraResolutionProfile? profile;
 
   @override
   Widget build(BuildContext context) {
@@ -2489,14 +2484,17 @@ class _ThermalToast extends StatelessWidget {
       borderColor = Colors.amber.withValues(alpha: 0.50);
       textColor = Colors.amber.shade100;
       icon = Icons.whatshot_rounded;
+      final profileStr = profile != null
+          ? '${profile!.shortLabel} (${profile!.fps} FPS)'
+          : '720p (30 FPS)';
       message = appText(
         context,
         tempStr.isNotEmpty
-            ? 'Thiết bị đang nóng ($tempStr). Tự động hạ về 720p (30 FPS) để bảo vệ máy. Chạm để chọn lại.'
-            : 'Thiết bị đang nóng. Tự động hạ về 720p (30 FPS) để bảo vệ máy. Chạm để chọn lại.',
+            ? 'Thiết bị đang nóng ($tempStr). Tự động hạ về $profileStr để bảo vệ máy. Chạm để chọn lại.'
+            : 'Thiết bị đang nóng. Tự động hạ về $profileStr để bảo vệ máy. Chạm để chọn lại.',
         tempStr.isNotEmpty
-            ? 'Device is hot ($tempStr). Auto-lowered to 720p (30 FPS) to protect camera. Tap to change.'
-            : 'Device is hot. Auto-lowered to 720p (30 FPS) to protect camera. Tap to change.',
+            ? 'Device is hot ($tempStr). Auto-lowered to $profileStr to protect camera. Tap to change.'
+            : 'Device is hot. Auto-lowered to $profileStr to protect camera. Tap to change.',
       );
     }
 
@@ -3138,110 +3136,79 @@ class _StationHeader extends StatelessWidget {
     // phone still needs the second row below, where the quality selector has
     // enough room and cannot be pushed off-screen by the action buttons.
     if (landscape) {
-      return Row(
-        children: [
-          Expanded(
-            child: Align(
-              alignment: Alignment.centerLeft,
-              child: _HeaderGlassCluster(
+      return Align(
+        alignment: Alignment.topRight,
+        child: IntrinsicWidth(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.end,
+            children: [
+              _HeaderGlassCluster(
                 child: Row(
                   mainAxisSize: MainAxisSize.min,
                   children: [
-                    const Icon(
-                      Icons.videocam_rounded,
-                      color: Colors.white70,
-                      size: 18,
+                    _RecordingChip(recording: recording, compact: true),
+                    const SizedBox(width: 5),
+                    _ResolutionChip(
+                      profile: resolutionProfile,
+                      switching: resolutionSwitching,
+                      locked: resolutionLocked,
+                      onTap: onResolution,
                     ),
-                    const SizedBox(width: 7),
-                    Flexible(
-                      child: Text(
-                        '${identity.cameraName} · ${identity.cameraId} · $courtLabel',
-                        maxLines: 1,
-                        overflow: TextOverflow.ellipsis,
-                        style: const TextStyle(
-                          color: Colors.white,
-                          fontSize: 12,
-                          fontWeight: FontWeight.w800,
-                        ),
+                    const SizedBox(width: 5),
+                    _HeaderIconButton(
+                      icon: Icons.video_settings_rounded,
+                      tooltip: appText(context, 'Kho video', 'Video storage'),
+                      size: 32,
+                      onTap: onVideoStorage,
+                    ),
+                    const SizedBox(width: 4),
+                    _HeaderIconButton(
+                      icon: Icons.podcasts_rounded,
+                      tooltip: whipLive
+                          ? appText(context, 'Đang phát trực tiếp', 'Live streaming')
+                          : appText(context, 'Phát trực tiếp lên máy chủ', 'Live stream to server'),
+                      iconColor: whipLive ? Colors.redAccent : Colors.white,
+                      backgroundColor: whipLive ? Colors.red.withValues(alpha: 0.35) : null,
+                      size: 32,
+                      onTap: onWhipLive,
+                    ),
+                    const SizedBox(width: 4),
+                    AppLanguageButton(
+                      foregroundColor: Colors.white,
+                      size: 32,
+                    ),
+                    const SizedBox(width: 4),
+                    _HeaderIconButton(
+                      icon: Icons.settings_rounded,
+                      tooltip: appText(
+                        context,
+                        'Cấu hình Camera Station',
+                        'Camera Station settings',
                       ),
+                      size: 32,
+                      onTap: onSettings,
                     ),
                   ],
                 ),
               ),
-            ),
-          ),
-          const SizedBox(width: 12),
-          IntrinsicWidth(
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
-              crossAxisAlignment: CrossAxisAlignment.stretch,
-              children: [
-                _HeaderGlassCluster(
-                  child: Row(
-                    mainAxisSize: MainAxisSize.min,
-                    children: [
-                      _RecordingChip(recording: recording, compact: true),
-                      const SizedBox(width: 5),
-                      _ResolutionChip(
-                        profile: resolutionProfile,
-                        switching: resolutionSwitching,
-                        locked: resolutionLocked,
-                        onTap: onResolution,
-                      ),
-                      const SizedBox(width: 5),
-                      _HeaderIconButton(
-                        icon: Icons.video_settings_rounded,
-                        tooltip: appText(context, 'Kho video', 'Video storage'),
-                        size: 32,
-                        onTap: onVideoStorage,
-                      ),
-                      const SizedBox(width: 4),
-                      _HeaderIconButton(
-                        icon: Icons.podcasts_rounded,
-                        tooltip: whipLive
-                            ? appText(context, 'Đang phát trực tiếp', 'Live streaming')
-                            : appText(context, 'Phát trực tiếp lên máy chủ', 'Live stream to server'),
-                        iconColor: whipLive ? Colors.redAccent : Colors.white,
-                        backgroundColor: whipLive ? Colors.red.withValues(alpha: 0.35) : null,
-                        size: 32,
-                        onTap: onWhipLive,
-                      ),
-                      const SizedBox(width: 4),
-                      AppLanguageButton(
-                        foregroundColor: Colors.white,
-                        size: 32,
-                      ),
-                      const SizedBox(width: 4),
-                      _HeaderIconButton(
-                        icon: Icons.settings_rounded,
-                        tooltip: appText(
-                          context,
-                          'Cấu hình Camera Station',
-                          'Camera Station settings',
-                        ),
-                        size: 32,
-                        onTap: onSettings,
-                      ),
-                    ],
-                  ),
+              if (thermalWarning || justCooledDown) ...[
+                const SizedBox(height: 10),
+                _ThermalToast(
+                  compact: compact,
+                  landscape: true,
+                  temperatureC: temperatureC,
+                  userOverride: thermalUserOverride,
+                  isCooledDown: justCooledDown,
+                  isLocked: resolutionLocked,
+                  profile: resolutionProfile,
+                  onTap: onResolution ?? () {},
+                  onDismiss: onDismissCooledDown,
                 ),
-                if (thermalWarning || justCooledDown) ...[
-                  const SizedBox(height: 10),
-                  _ThermalToast(
-                    compact: compact,
-                    landscape: true,
-                    temperatureC: temperatureC,
-                    userOverride: thermalUserOverride,
-                    isCooledDown: justCooledDown,
-                    isLocked: resolutionLocked,
-                    onTap: onResolution ?? () {},
-                    onDismiss: onDismissCooledDown,
-                  ),
-                ],
               ],
-            ),
+            ],
           ),
-        ],
+        ),
       );
     }
 
@@ -3258,7 +3225,7 @@ class _StationHeader extends StatelessWidget {
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
           // -------------------------------------------------
-          // ROW 1 — Camera Info (left) + Action Buttons (right)
+          // ROW 1 — Logo (left) + Action Buttons (right)
           // -------------------------------------------------
           Row(
             crossAxisAlignment: CrossAxisAlignment.center,
@@ -3276,38 +3243,7 @@ class _StationHeader extends StatelessWidget {
                   ),
                 ),
               ),
-              const SizedBox(width: 8),
-              Expanded(
-                child: Column(
-                  mainAxisSize: MainAxisSize.min,
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Text(
-                      identity.cameraName,
-                      maxLines: 1,
-                      overflow: TextOverflow.ellipsis,
-                      style: TextStyle(
-                        color: Colors.white,
-                        fontSize: compact ? 13 : 15,
-                        fontWeight: FontWeight.w900,
-                        height: 1.0,
-                      ),
-                    ),
-                    const SizedBox(height: 3),
-                    Text(
-                      '${identity.cameraId} · $courtLabel · ${identity.cameraPosition}',
-                      maxLines: 1,
-                      overflow: TextOverflow.ellipsis,
-                      style: TextStyle(
-                        color: Colors.white60,
-                        fontSize: compact ? 10.5 : 11.5,
-                        fontWeight: FontWeight.w600,
-                      ),
-                    ),
-                  ],
-                ),
-              ),
-              const SizedBox(width: 6),
+              const Spacer(),
               _HeaderIconButton(
                 icon: Icons.video_settings_rounded,
                 tooltip: appText(context, 'Kho video', 'Video storage'),

@@ -162,7 +162,7 @@ class StationConfigService {
     final deviceId = existingDeviceId ?? _generateDeviceId();
     final cameraName = _readTrimmed(prefs, _cameraNameKey) ?? cameraId;
     final cameraPosition =
-        _readTrimmed(prefs, _cameraPositionKey) ?? 'Chưa cấu hình';
+        _readTrimmed(prefs, _cameraPositionKey) ?? '';
 
     final identity = StationIdentity(
       courtId: courtId,
@@ -176,8 +176,7 @@ class StationConfigService {
         currentCameraId == null ||
         existingDeviceId == null ||
         _readTrimmed(prefs, _courtKey) == null ||
-        _readTrimmed(prefs, _cameraNameKey) == null ||
-        _readTrimmed(prefs, _cameraPositionKey) == null;
+        _readTrimmed(prefs, _cameraNameKey) == null;
 
     if (needsMigration) await saveIdentity(identity);
 
@@ -186,6 +185,21 @@ class StationConfigService {
       name: 'StationConfigService',
     );
     return identity;
+  }
+
+  Future<StationIdentity> getOrCreateIdentity() async {
+    final existing = await loadIdentity();
+    if (existing != null) return existing;
+
+    final defaultIdentity = StationIdentity(
+      courtId: 'COURT-01',
+      cameraId: 'CAM-01',
+      deviceId: _generateDeviceId(),
+      cameraName: 'Camera 01',
+      cameraPosition: '',
+    );
+    await saveIdentity(defaultIdentity);
+    return defaultIdentity;
   }
 
   Future<bool> hasIdentity() async => await loadIdentity() != null;
@@ -301,8 +315,7 @@ class StationConfigService {
     if (normalized.courtId.isEmpty ||
         normalized.cameraId.isEmpty ||
         normalized.deviceId.isEmpty ||
-        normalized.cameraName.isEmpty ||
-        normalized.cameraPosition.isEmpty) {
+        normalized.cameraName.isEmpty) {
       throw ArgumentError('Station identity fields must not be empty.');
     }
 
