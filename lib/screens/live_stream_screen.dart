@@ -7,9 +7,8 @@ import '../services/camera_station_runtime.dart';
 import '../services/station_config_service.dart';
 import '../services/whip_publisher_service.dart';
 import '../services/rtsp_publisher_service.dart';
+import '../utils/stream_url_parser.dart';
 import '../widgets/qr_stream_scanner_dialog.dart';
-
-enum StreamPlatform { youtube, facebook, tiktok, custom }
 
 class LiveStreamScreen extends StatefulWidget {
   final CameraStationRuntime runtime;
@@ -31,17 +30,18 @@ class _LiveStreamScreenState extends State<LiveStreamScreen> {
   // Controllers
   final TextEditingController _streamKeyController = TextEditingController();
   final TextEditingController _customUrlController = TextEditingController();
-  final TextEditingController _tiktokServerController = TextEditingController(
-    text: 'rtmp://live-push.tiktok.com/live',
-  );
+  final TextEditingController _serverController = TextEditingController();
 
   // WHIP (Advanced)
   final TextEditingController _whipUrlController = TextEditingController();
   final TextEditingController _whipTokenController = TextEditingController();
 
   bool _obscureKey = true;
+  bool _obscureWhipToken = true;
   bool _showAdvanced = false;
   bool _isLoading = true;
+  bool _editServer = false;
+  bool _actionInFlight = false;
 
   StreamSubscription<WhipPublishState>? _whipSubscription;
   StreamSubscription<RtspPublishState>? _rtspSubscription;
@@ -50,6 +50,16 @@ class _LiveStreamScreenState extends State<LiveStreamScreen> {
   RtspPublisherService get _rtspService => widget.runtime.rtspPublisherService;
 
   bool get _isLive => _rtspService.isLive || _whipService.isLive;
+
+  // "Active" gồm cả connecting/reconnecting — dùng cho loại trừ RTMP/WHIP,
+  // vì publisher đang tự kết nối lại vẫn sẽ phát tiếp khi mạng về.
+  bool get _isRtspActive =>
+      _rtspService.state != RtspPublishState.idle &&
+      _rtspService.state != RtspPublishState.error;
+  bool get _isWhipActive =>
+      _whipService.wantsPublishing ||
+      (_whipService.state != WhipPublishState.idle &&
+          _whipService.state != WhipPublishState.error);
   bool get _isBusy =>
       _rtspService.state == RtspPublishState.connecting ||
       _whipService.state == WhipPublishState.connecting;
@@ -69,49 +79,85 @@ class _LiveStreamScreenState extends State<LiveStreamScreen> {
   }
 
   Future<void> _loadInitialConfig() async {
-    final rtspUrl = await widget.configService.loadRtspPushUrl();
-    final whipUrl = await widget.configService.loadWhipEndpointUrl();
-    final whipToken = await widget.configService.loadWhipAuthToken();
+    String? rtspUrl;
+    String? whipUrl;
+    String? whipToken;
+    var partialFailure = false;
 
-    if (mounted) {
-      setState(() {
-        _whipUrlController.text = whipUrl ?? '';
-        _whipTokenController.text = whipToken ?? '';
+    try {
+      try {
+        rtspUrl = await widget.configService.loadRtspPushUrl();
+      } catch (e) {
+        debugPrint('[LIVESTREAM] Failed to load RTSP push URL: $e');
+        partialFailure = true;
+      }
+      try {
+        whipUrl = await widget.configService.loadWhipEndpointUrl();
+      } catch (e) {
+        debugPrint('[LIVESTREAM] Failed to load WHIP endpoint: $e');
+        partialFailure = true;
+      }
+      try {
+        whipToken = await widget.configService.loadWhipAuthToken();
+      } catch (e) {
+        debugPrint('[LIVESTREAM] Failed to load WHIP token: $e');
+        partialFailure = true;
+      }
 
-        if (rtspUrl != null && rtspUrl.isNotEmpty) {
-          _detectPlatformAndParse(rtspUrl);
-        } else {
-          _platform = StreamPlatform.youtube;
+      if (mounted) {
+        setState(() {
+          _whipUrlController.text = whipUrl ?? '';
+          _whipTokenController.text = whipToken ?? '';
+
+          if (rtspUrl != null && rtspUrl.isNotEmpty) {
+            _detectPlatformAndParse(rtspUrl);
+          } else {
+            _platform = StreamPlatform.youtube;
+            _serverController.text =
+                kDefaultServers[StreamPlatform.youtube] ?? '';
+          }
+        });
+        if (partialFailure) {
+          _showToast(
+            appText(
+              context,
+              'Không nạp được một phần cấu hình livestream.',
+              'Some stream settings could not be loaded.',
+            ),
+            isError: true,
+          );
         }
-        _isLoading = false;
-      });
+      }
+    } catch (e, st) {
+      debugPrint('[LIVESTREAM] Initial config load error: $e\n$st');
+      if (mounted) {
+        _showToast(
+          appText(
+            context,
+            'Lỗi nạp cấu hình livestream.',
+            'Failed to load stream config.',
+          ),
+          isError: true,
+        );
+      }
+    } finally {
+      if (mounted) {
+        setState(() => _isLoading = false);
+      }
     }
   }
 
   void _detectPlatformAndParse(String url) {
     _customUrlController.text = url;
-    final lower = url.toLowerCase();
-
-    if (lower.contains('youtube.com')) {
-      _platform = StreamPlatform.youtube;
-      const prefix = 'rtmp://a.rtmp.youtube.com/live2/';
-      if (lower.startsWith(prefix.toLowerCase())) {
-        _streamKeyController.text = url.substring(prefix.length);
-      }
-    } else if (lower.contains('facebook.com')) {
-      _platform = StreamPlatform.facebook;
-      const prefix = 'rtmps://live-api-s.facebook.com:443/rtmp/';
-      if (lower.startsWith(prefix.toLowerCase())) {
-        _streamKeyController.text = url.substring(prefix.length);
-      }
-    } else if (lower.contains('tiktok')) {
-      _platform = StreamPlatform.tiktok;
-      final uri = Uri.tryParse(url);
-      if (uri != null && uri.pathSegments.isNotEmpty) {
-        _streamKeyController.text = uri.pathSegments.last;
-      }
+    final parsed = parseStreamUrl(url);
+    _platform = parsed.platform;
+    _serverController.text = parsed.server.isNotEmpty
+        ? parsed.server
+        : (kDefaultServers[parsed.platform] ?? '');
+    if (parsed.platform == StreamPlatform.custom) {
+      _streamKeyController.clear();
     } else {
-      _platform = StreamPlatform.custom;
+      _streamKeyController.text = parsed.key;
     }
   }
 
@@ -121,38 +167,71 @@ class _LiveStreamScreenState extends State<LiveStreamScreen> {
     _rtspSubscription?.cancel();
     _streamKeyController.dispose();
     _customUrlController.dispose();
-    _tiktokServerController.dispose();
+    _serverController.dispose();
     _whipUrlController.dispose();
     _whipTokenController.dispose();
     super.dispose();
   }
 
   String _buildEffectiveUrl() {
-    switch (_platform) {
-      case StreamPlatform.youtube:
-        final key = _streamKeyController.text.trim();
-        return 'rtmp://a.rtmp.youtube.com/live2/$key';
-      case StreamPlatform.facebook:
-        final key = _streamKeyController.text.trim();
-        return 'rtmps://live-api-s.facebook.com:443/rtmp/$key';
-      case StreamPlatform.tiktok:
-        final server = _tiktokServerController.text.trim();
-        final key = _streamKeyController.text.trim();
-        if (key.isEmpty) return server;
-        return server.endsWith('/') ? '$server$key' : '$server/$key';
-      case StreamPlatform.custom:
-        return _customUrlController.text.trim();
+    if (_platform == StreamPlatform.custom) {
+      return _customUrlController.text.trim();
     }
+    return buildStreamUrl(_serverController.text, _streamKeyController.text);
   }
 
   Future<void> _handleStartLive() async {
+    if (_actionInFlight || _isBusy) return;
+
+    if (_isWhipActive) {
+      _showToast(
+        appText(
+          context,
+          'Đang phát trực tiếp qua WHIP. Vui lòng dừng WHIP trước.',
+          'Currently live via WHIP. Please stop WHIP first.',
+        ),
+        isError: true,
+      );
+      return;
+    }
+
+    if (_platform == StreamPlatform.tiktok &&
+        _serverController.text.trim().isEmpty) {
+      _showToast(
+        appText(
+          context,
+          'Vui lòng nhập Server URL của TikTok.',
+          'Please enter TikTok Server URL.',
+        ),
+        isError: true,
+      );
+      return;
+    }
+
     final url = _buildEffectiveUrl();
-    if (url.isEmpty || (_platform != StreamPlatform.custom && _streamKeyController.text.trim().isEmpty)) {
+    if (url.isEmpty ||
+        (_platform != StreamPlatform.custom &&
+            _streamKeyController.text.trim().isEmpty)) {
       _showToast(
         appText(
           context,
           'Vui lòng nhập Khóa luồng (Stream Key).',
           'Please enter your Stream Key.',
+        ),
+        isError: true,
+      );
+      return;
+    }
+
+    final lowerUrl = url.toLowerCase();
+    if (!lowerUrl.startsWith('rtmp://') &&
+        !lowerUrl.startsWith('rtmps://') &&
+        !lowerUrl.startsWith('rtsp://')) {
+      _showToast(
+        appText(
+          context,
+          'URL phải bắt đầu bằng rtmp://, rtmps:// hoặc rtsp://.',
+          'URL must start with rtmp://, rtmps:// or rtsp://.',
         ),
         isError: true,
       );
@@ -172,22 +251,140 @@ class _LiveStreamScreenState extends State<LiveStreamScreen> {
       return;
     }
 
-    await widget.configService.saveRtspPushConfig(targetUrl: url);
-    await widget.configService.saveStreamProtocol('rtsp');
-
+    _actionInFlight = true;
     setState(() {});
-    await _rtspService.startPublish(targetUrl: url);
-    if (mounted) setState(() {});
+    try {
+      await widget.configService.saveRtspPushConfig(targetUrl: url);
+      await widget.configService.saveStreamProtocol('rtsp');
+      await _rtspService.startPublish(targetUrl: url);
+    } catch (e) {
+      if (mounted) {
+        _showToast(
+          appText(context, 'Lỗi bắt đầu phát: $e', 'Failed to start stream: $e'),
+          isError: true,
+        );
+      }
+    } finally {
+      _actionInFlight = false;
+      if (mounted) setState(() {});
+    }
   }
 
   Future<void> _handleStopLive() async {
-    if (_rtspService.isLive) {
-      await _rtspService.stopPublish();
+    if (_actionInFlight) return;
+    _actionInFlight = true;
+    setState(() {});
+    try {
+      if (_rtspService.state != RtspPublishState.idle &&
+          _rtspService.state != RtspPublishState.error) {
+        await _rtspService.stopPublish();
+      }
+      if (_whipService.wantsPublishing ||
+          (_whipService.state != WhipPublishState.idle &&
+              _whipService.state != WhipPublishState.error)) {
+        await _whipService.stopPublish();
+      }
+    } catch (e) {
+      if (mounted) {
+        _showToast(
+          appText(context, 'Lỗi dừng phát: $e', 'Stop publish error: $e'),
+          isError: true,
+        );
+      }
+    } finally {
+      _actionInFlight = false;
+      if (mounted) setState(() {});
     }
-    if (_whipService.isLive) {
+  }
+
+  // ============================================================
+  // START / STOP WHIP
+  // ============================================================
+
+  Future<void> _handleStartWhip() async {
+    if (_actionInFlight || _isBusy) return;
+
+    if (_isRtspActive) {
+      _showToast(
+        appText(
+          context,
+          'Đang phát trực tiếp qua RTMP/RTSP. Vui lòng dừng phát trước.',
+          'Currently live via RTMP/RTSP. Please stop streaming first.',
+        ),
+        isError: true,
+      );
+      return;
+    }
+
+    final url = _whipUrlController.text.trim();
+    if (url.isEmpty) {
+      _showToast(
+        appText(
+          context,
+          'Vui lòng nhập địa chỉ phát trực tiếp WHIP.',
+          'Please enter WHIP stream link.',
+        ),
+        isError: true,
+      );
+      return;
+    }
+
+    final token = _whipTokenController.text.trim();
+
+    final webRtc = widget.runtime.webRtcService;
+    if (webRtc == null || !webRtc.cameraInitialized) {
+      _showToast(
+        appText(
+          context,
+          'Camera đang khởi động, vui lòng thử lại sau vài giây.',
+          'Camera is starting up, please try again in a few seconds.',
+        ),
+        isError: true,
+      );
+      return;
+    }
+
+    _actionInFlight = true;
+    setState(() {});
+    try {
+      await widget.configService.saveWhipConfig(endpointUrl: url, token: token);
+      await widget.configService.saveStreamProtocol('whip');
+
+      await _whipService.startPublish(
+        endpointUrl: url,
+        webRtcService: webRtc,
+        bearerToken: token,
+      );
+    } catch (e) {
+      if (mounted) {
+        _showToast(
+          appText(context, 'Lỗi phát WHIP: $e', 'WHIP publish error: $e'),
+          isError: true,
+        );
+      }
+    } finally {
+      _actionInFlight = false;
+      if (mounted) setState(() {});
+    }
+  }
+
+  Future<void> _handleStopWhip() async {
+    if (_actionInFlight) return;
+    _actionInFlight = true;
+    setState(() {});
+    try {
       await _whipService.stopPublish();
+    } catch (e) {
+      if (mounted) {
+        _showToast(
+          appText(context, 'Lỗi dừng WHIP: $e', 'Stop WHIP error: $e'),
+          isError: true,
+        );
+      }
+    } finally {
+      _actionInFlight = false;
+      if (mounted) setState(() {});
     }
-    if (mounted) setState(() {});
   }
 
   Future<void> _pasteFromClipboard() async {
@@ -209,8 +406,9 @@ class _LiveStreamScreenState extends State<LiveStreamScreen> {
       if (_platform == StreamPlatform.custom) {
         _customUrlController.text = text;
       } else {
-        // Nếu user dán cả link rtmp
-        if (text.startsWith('rtmp://') || text.startsWith('rtmps://')) {
+        if (text.startsWith('rtmp://') ||
+            text.startsWith('rtmps://') ||
+            text.startsWith('rtsp://')) {
           _detectPlatformAndParse(text);
         } else {
           _streamKeyController.text = text;
@@ -224,7 +422,8 @@ class _LiveStreamScreenState extends State<LiveStreamScreen> {
   }
 
   Future<void> _handleScanQrCode() async {
-    if (_isLive) {
+    if (_actionInFlight) return;
+    if (_isRtspActive || _isWhipActive) {
       _showToast(
         appText(
           context,
@@ -236,28 +435,55 @@ class _LiveStreamScreenState extends State<LiveStreamScreen> {
       return;
     }
 
+    _actionInFlight = true;
+    bool shouldAutoStart = false;
+    bool isWhip = false;
     try {
       await widget.runtime.pauseCameraForScanner();
       if (!mounted) return;
       final result = await QrStreamScannerDialog.show(context);
       if (result != null && mounted) {
+        isWhip = result.protocol == 'whip';
+        shouldAutoStart = result.autoStart;
         setState(() {
-          _detectPlatformAndParse(result.streamUrl);
-          if (result.token != null && result.token!.isNotEmpty) {
-            _streamKeyController.text = result.token!;
+          if (isWhip) {
+            _whipUrlController.text = result.streamUrl;
+            if (result.token != null && result.token!.isNotEmpty) {
+              _whipTokenController.text = result.token!;
+            }
+            _showAdvanced = true;
+          } else {
+            _detectPlatformAndParse(
+              mergeStreamUrlWithKey(result.streamUrl, result.token),
+            );
           }
         });
-        if (result.autoStart) {
-          unawaited(_handleStartLive());
-        }
+      }
+    } catch (e) {
+      if (mounted) {
+        _showToast(
+          appText(context, 'Lỗi quét QR: $e', 'QR scan error: $e'),
+          isError: true,
+        );
       }
     } finally {
       await widget.runtime.resumeCameraAfterScanner();
+      _actionInFlight = false;
+      if (mounted) setState(() {});
+    }
+
+    if (shouldAutoStart && mounted) {
+      if (isWhip) {
+        await _handleStartWhip();
+      } else {
+        await _handleStartLive();
+      }
     }
   }
 
   void _showToast(String message, {bool isError = false}) {
     if (!mounted) return;
+    ScaffoldMessenger.of(context).hideCurrentSnackBar();
     ScaffoldMessenger.of(context).showSnackBar(
       SnackBar(
         content: Text(message),
@@ -281,13 +507,19 @@ class _LiveStreamScreenState extends State<LiveStreamScreen> {
     final resolution = webRtc?.resolutionProfile.shortLabel ?? '1080p';
     final fps = webRtc?.resolutionProfile.fps ?? 30;
 
+    final statusBanner = _buildStatusBanner();
+
     return Scaffold(
       backgroundColor: const Color(0xFF0F1218),
       appBar: AppBar(
         backgroundColor: const Color(0xFF161B22),
         elevation: 0,
         leading: IconButton(
-          icon: const Icon(Icons.arrow_back_ios_new_rounded, color: Colors.white, size: 20),
+          icon: const Icon(
+            Icons.arrow_back_ios_new_rounded,
+            color: Colors.white,
+            size: 20,
+          ),
           onPressed: () => Navigator.of(context).pop(),
         ),
         title: Text(
@@ -300,9 +532,14 @@ class _LiveStreamScreenState extends State<LiveStreamScreen> {
         ),
         actions: [
           IconButton(
-            icon: const Icon(Icons.qr_code_scanner_rounded, color: Colors.lightBlueAccent),
+            icon: const Icon(
+              Icons.qr_code_scanner_rounded,
+              color: Colors.lightBlueAccent,
+            ),
             tooltip: appText(context, 'Quét mã QR', 'Scan QR Code'),
-            onPressed: _isLive ? null : _handleScanQrCode,
+            onPressed: (_isRtspActive || _isWhipActive || _actionInFlight)
+                ? null
+                : _handleScanQrCode,
           ),
           const SizedBox(width: 8),
         ],
@@ -340,14 +577,22 @@ class _LiveStreamScreenState extends State<LiveStreamScreen> {
                     ],
 
                     // ========================================================
-                    // 4. NÚT ĐIỀU KHIỂN CHÍNH (ACTION BUTTON)
+                    // 4. BANNER TRẠNG THÁI / LỖI
+                    // ========================================================
+                    if (statusBanner != null) ...[
+                      statusBanner,
+                      const SizedBox(height: 8),
+                    ],
+
+                    // ========================================================
+                    // 5. NÚT ĐIỀU KHIỂN CHÍNH (ACTION BUTTON)
                     // ========================================================
                     _buildActionButton(),
 
                     const SizedBox(height: 16),
 
                     // ========================================================
-                    // 5. THÔNG TIN NGUỒN CAMERA & CÀI ĐẶT NÂNG CAO
+                    // 6. THÔNG TIN NGUỒN CAMERA & CÀI ĐẶT NÂNG CAO
                     // ========================================================
                     Center(
                       child: Text(
@@ -368,15 +613,26 @@ class _LiveStreamScreenState extends State<LiveStreamScreen> {
                           foregroundColor: Colors.white60,
                           visualDensity: VisualDensity.compact,
                         ),
-                        onPressed: () => setState(() => _showAdvanced = !_showAdvanced),
+                        onPressed: () =>
+                            setState(() => _showAdvanced = !_showAdvanced),
                         icon: Icon(
-                          _showAdvanced ? Icons.expand_less_rounded : Icons.expand_more_rounded,
+                          _showAdvanced
+                              ? Icons.expand_less_rounded
+                              : Icons.expand_more_rounded,
                           size: 18,
                         ),
                         label: Text(
                           _showAdvanced
-                              ? appText(context, 'Ẩn cài đặt nâng cao', 'Hide advanced')
-                              : appText(context, 'Cài đặt nâng cao', 'Advanced settings'),
+                              ? appText(
+                                  context,
+                                  'Ẩn cài đặt nâng cao',
+                                  'Hide advanced',
+                                )
+                              : appText(
+                                  context,
+                                  'Cài đặt nâng cao',
+                                  'Advanced settings',
+                                ),
                           style: const TextStyle(fontSize: 12),
                         ),
                       ),
@@ -388,6 +644,101 @@ class _LiveStreamScreenState extends State<LiveStreamScreen> {
               ),
             ),
     );
+  }
+
+  // ============================================================
+  // WIDGET: STATUS BANNER
+  // ============================================================
+  Widget? _buildStatusBanner() {
+    final rtspError = _rtspService.state == RtspPublishState.error
+        ? _rtspService.currentError
+        : null;
+    final whipError = _whipService.state == WhipPublishState.error
+        ? _whipService.currentError
+        : null;
+    final err = rtspError ?? whipError;
+    final isReconnecting =
+        _rtspService.state == RtspPublishState.reconnecting ||
+        _whipService.state == WhipPublishState.reconnecting;
+
+    if (err != null && err.isNotEmpty) {
+      return Container(
+        margin: const EdgeInsets.only(bottom: 4),
+        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+        decoration: BoxDecoration(
+          color: const Color(0xFF3E1A1A),
+          borderRadius: BorderRadius.circular(10),
+          border: Border.all(color: Colors.redAccent.withValues(alpha: 0.5)),
+        ),
+        child: Row(
+          children: [
+            const Icon(
+              Icons.error_outline_rounded,
+              color: Colors.redAccent,
+              size: 20,
+            ),
+            const SizedBox(width: 8),
+            Expanded(
+              child: Text(
+                err,
+                style: const TextStyle(color: Colors.white, fontSize: 12),
+              ),
+            ),
+            TextButton(
+              onPressed: (_isBusy || _actionInFlight)
+                  ? null
+                  : (_rtspService.state == RtspPublishState.error
+                      ? _handleStartLive
+                      : _handleStartWhip),
+              child: Text(
+                appText(context, 'Thử lại', 'Retry'),
+                style: const TextStyle(
+                  color: Colors.lightBlueAccent,
+                  fontWeight: FontWeight.bold,
+                ),
+              ),
+            ),
+          ],
+        ),
+      );
+    }
+
+    if (isReconnecting) {
+      return Container(
+        margin: const EdgeInsets.only(bottom: 4),
+        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+        decoration: BoxDecoration(
+          color: const Color(0xFF332A15),
+          borderRadius: BorderRadius.circular(10),
+          border: Border.all(color: Colors.amber.withValues(alpha: 0.5)),
+        ),
+        child: Row(
+          children: [
+            const SizedBox(
+              width: 16,
+              height: 16,
+              child: CircularProgressIndicator(
+                strokeWidth: 2,
+                color: Colors.amber,
+              ),
+            ),
+            const SizedBox(width: 10),
+            Expanded(
+              child: Text(
+                appText(
+                  context,
+                  'Mất kết nối, đang thử lại…',
+                  'Connection lost, reconnecting…',
+                ),
+                style: const TextStyle(color: Colors.amberAccent, fontSize: 12),
+              ),
+            ),
+          ],
+        ),
+      );
+    }
+
+    return null;
   }
 
   // ============================================================
@@ -423,7 +774,7 @@ class _LiveStreamScreenState extends State<LiveStreamScreen> {
           ),
           _buildPlatformItem(
             platform: StreamPlatform.custom,
-            title: 'Tùy chỉnh',
+            title: appText(context, 'Tùy chỉnh', 'Custom'),
             icon: Icons.tune_rounded,
             color: const Color(0xFF00E676),
           ),
@@ -441,20 +792,33 @@ class _LiveStreamScreenState extends State<LiveStreamScreen> {
     final isSelected = _platform == platform;
     return Expanded(
       child: InkWell(
-        onTap: _isLive
+        onTap: (_isLive || _actionInFlight)
             ? null
             : () {
-                setState(() => _platform = platform);
+                setState(() {
+                  final oldDefault = kDefaultServers[_platform] ?? '';
+                  final currentServer = _serverController.text.trim();
+                  _platform = platform;
+                  _editServer = false;
+                  final newDefault = kDefaultServers[platform] ?? '';
+                  if (currentServer.isEmpty || currentServer == oldDefault) {
+                    _serverController.text = newDefault;
+                  }
+                });
               },
         borderRadius: BorderRadius.circular(10),
         child: AnimatedContainer(
           duration: const Duration(milliseconds: 150),
           padding: const EdgeInsets.symmetric(vertical: 10),
           decoration: BoxDecoration(
-            color: isSelected ? color.withValues(alpha: 0.18) : Colors.transparent,
+            color: isSelected
+                ? color.withValues(alpha: 0.18)
+                : Colors.transparent,
             borderRadius: BorderRadius.circular(10),
             border: Border.all(
-              color: isSelected ? color.withValues(alpha: 0.7) : Colors.transparent,
+              color: isSelected
+                  ? color.withValues(alpha: 0.7)
+                  : Colors.transparent,
               width: 1.5,
             ),
           ),
@@ -486,23 +850,23 @@ class _LiveStreamScreenState extends State<LiveStreamScreen> {
   // WIDGET: INPUT CARD
   // ============================================================
   Widget _buildInputCard() {
-    String serverHint = '';
-    String fieldLabel = appText(context, 'Khóa luồng (Stream Key)', 'Stream Key');
-
-    switch (_platform) {
-      case StreamPlatform.youtube:
-        serverHint = 'rtmp://a.rtmp.youtube.com/live2';
-        break;
-      case StreamPlatform.facebook:
-        serverHint = 'rtmps://live-api-s.facebook.com:443/rtmp/';
-        break;
-      case StreamPlatform.tiktok:
-        serverHint = 'RTMP TikTok Live Studio';
-        break;
-      case StreamPlatform.custom:
-        fieldLabel = appText(context, 'Đường dẫn RTMP / RTSP', 'RTMP / RTSP URL');
-        break;
+    String fieldLabel = appText(
+      context,
+      'Khóa luồng (Stream Key)',
+      'Stream Key',
+    );
+    if (_platform == StreamPlatform.custom) {
+      fieldLabel = appText(
+        context,
+        'Đường dẫn RTMP / RTSP',
+        'RTMP / RTSP URL',
+      );
     }
+
+    final defaultServer = kDefaultServers[_platform] ?? '';
+    final isCustomOrTiktok =
+        _platform == StreamPlatform.tiktok ||
+        _platform == StreamPlatform.custom;
 
     return Container(
       padding: const EdgeInsets.all(14),
@@ -514,53 +878,140 @@ class _LiveStreamScreenState extends State<LiveStreamScreen> {
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          if (serverHint.isNotEmpty && _platform != StreamPlatform.custom) ...[
-            Row(
-              children: [
-                Icon(Icons.dns_rounded, size: 14, color: Colors.white.withValues(alpha: 0.4)),
-                const SizedBox(width: 6),
-                Expanded(
-                  child: Text(
-                    serverHint,
-                    style: TextStyle(
-                      color: Colors.white.withValues(alpha: 0.45),
-                      fontSize: 11.5,
-                      fontFamily: 'monospace',
-                    ),
-                    overflow: TextOverflow.ellipsis,
-                  ),
-                ),
-              ],
-            ),
-            const SizedBox(height: 10),
-          ],
-
+          // TikTok Server Input
           if (_platform == StreamPlatform.tiktok) ...[
             Text(
               appText(context, 'Máy chủ (Server URL)', 'Server URL'),
-              style: const TextStyle(color: Colors.white70, fontSize: 11.5, fontWeight: FontWeight.bold),
+              style: const TextStyle(
+                color: Colors.white70,
+                fontSize: 11.5,
+                fontWeight: FontWeight.bold,
+              ),
             ),
             const SizedBox(height: 6),
             TextFormField(
-              controller: _tiktokServerController,
+              controller: _serverController,
               enabled: !_isLive,
-              style: const TextStyle(color: Colors.white, fontSize: 13, fontFamily: 'monospace'),
-              decoration: _inputDecoration(hint: 'rtmp://live-push.tiktok.com/live'),
+              style: const TextStyle(
+                color: Colors.white,
+                fontSize: 13,
+                fontFamily: 'monospace',
+              ),
+              decoration: _inputDecoration(
+                hint: appText(
+                  context,
+                  'Dán Server URL từ TikTok LIVE Studio',
+                  'Paste Server URL from TikTok LIVE Studio',
+                ),
+              ),
             ),
             const SizedBox(height: 12),
           ],
 
+          // YouTube / Facebook Server display or edit
+          if (!isCustomOrTiktok) ...[
+            if (_editServer) ...[
+              Row(
+                mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                children: [
+                  Text(
+                    appText(context, 'Máy chủ (Server URL)', 'Server URL'),
+                    style: const TextStyle(
+                      color: Colors.white70,
+                      fontSize: 11.5,
+                      fontWeight: FontWeight.bold,
+                    ),
+                  ),
+                  TextButton(
+                    onPressed: () {
+                      setState(() {
+                        _serverController.text = defaultServer;
+                        _editServer = false;
+                      });
+                    },
+                    child: Text(
+                      appText(context, 'Đặt lại mặc định', 'Reset default'),
+                      style: const TextStyle(fontSize: 11),
+                    ),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 4),
+              TextFormField(
+                controller: _serverController,
+                enabled: !_isLive,
+                style: const TextStyle(
+                  color: Colors.white,
+                  fontSize: 12.5,
+                  fontFamily: 'monospace',
+                ),
+                decoration: _inputDecoration(hint: defaultServer),
+              ),
+              const SizedBox(height: 12),
+            ] else ...[
+              Row(
+                children: [
+                  Icon(
+                    Icons.dns_rounded,
+                    size: 14,
+                    color: Colors.white.withValues(alpha: 0.4),
+                  ),
+                  const SizedBox(width: 6),
+                  Expanded(
+                    child: Text(
+                      _serverController.text.isNotEmpty
+                          ? _serverController.text
+                          : defaultServer,
+                      style: TextStyle(
+                        color: Colors.white.withValues(alpha: 0.45),
+                        fontSize: 11.5,
+                        fontFamily: 'monospace',
+                      ),
+                      overflow: TextOverflow.ellipsis,
+                    ),
+                  ),
+                  IconButton(
+                    icon: const Icon(
+                      Icons.edit_rounded,
+                      size: 14,
+                      color: Colors.white54,
+                    ),
+                    tooltip: appText(
+                      context,
+                      'Chỉnh sửa máy chủ',
+                      'Edit server',
+                    ),
+                    onPressed: _isLive
+                        ? null
+                        : () => setState(() => _editServer = true),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 10),
+            ],
+          ],
+
           Text(
             fieldLabel,
-            style: const TextStyle(color: Colors.white70, fontSize: 11.5, fontWeight: FontWeight.bold),
+            style: const TextStyle(
+              color: Colors.white70,
+              fontSize: 11.5,
+              fontWeight: FontWeight.bold,
+            ),
           ),
           const SizedBox(height: 6),
 
           TextFormField(
-            controller: _platform == StreamPlatform.custom ? _customUrlController : _streamKeyController,
+            controller: _platform == StreamPlatform.custom
+                ? _customUrlController
+                : _streamKeyController,
             enabled: !_isLive,
             obscureText: _platform != StreamPlatform.custom && _obscureKey,
-            style: const TextStyle(color: Colors.white, fontSize: 13, fontFamily: 'monospace'),
+            style: const TextStyle(
+              color: Colors.white,
+              fontSize: 13,
+              fontFamily: 'monospace',
+            ),
             decoration: _inputDecoration(
               hint: _platform == StreamPlatform.custom
                   ? 'rtmp://server.com/live/stream_key'
@@ -571,20 +1022,31 @@ class _LiveStreamScreenState extends State<LiveStreamScreen> {
                   if (_platform != StreamPlatform.custom)
                     IconButton(
                       icon: Icon(
-                        _obscureKey ? Icons.visibility_off_rounded : Icons.visibility_rounded,
+                        _obscureKey
+                            ? Icons.visibility_off_rounded
+                            : Icons.visibility_rounded,
                         size: 18,
                         color: Colors.white54,
                       ),
-                      onPressed: () => setState(() => _obscureKey = !_obscureKey),
+                      onPressed: () =>
+                          setState(() => _obscureKey = !_obscureKey),
                     ),
                   IconButton(
-                    icon: const Icon(Icons.content_paste_rounded, size: 18, color: Colors.amberAccent),
+                    icon: const Icon(
+                      Icons.content_paste_rounded,
+                      size: 18,
+                      color: Colors.amberAccent,
+                    ),
                     tooltip: appText(context, 'Dán', 'Paste'),
                     onPressed: _pasteFromClipboard,
                   ),
                   if (_platform == StreamPlatform.custom)
                     IconButton(
-                      icon: const Icon(Icons.qr_code_scanner_rounded, size: 18, color: Colors.lightBlueAccent),
+                      icon: const Icon(
+                        Icons.qr_code_scanner_rounded,
+                        size: 18,
+                        color: Colors.lightBlueAccent,
+                      ),
                       tooltip: appText(context, 'Quét QR', 'Scan QR'),
                       onPressed: _handleScanQrCode,
                     ),
@@ -600,7 +1062,10 @@ class _LiveStreamScreenState extends State<LiveStreamScreen> {
   InputDecoration _inputDecoration({required String hint, Widget? suffixIcon}) {
     return InputDecoration(
       hintText: hint,
-      hintStyle: TextStyle(color: Colors.white.withValues(alpha: 0.25), fontSize: 12),
+      hintStyle: TextStyle(
+        color: Colors.white.withValues(alpha: 0.25),
+        fontSize: 12,
+      ),
       filled: true,
       fillColor: const Color(0xFF0F1218),
       contentPadding: const EdgeInsets.symmetric(horizontal: 12, vertical: 12),
@@ -624,16 +1089,28 @@ class _LiveStreamScreenState extends State<LiveStreamScreen> {
   // WIDGET: LIVE MONITOR CARD (HIỂN THỊ KHI ĐANG PHÁT)
   // ============================================================
   Widget _buildLiveMonitorCard() {
-    final duration = _rtspService.isLive ? _rtspService.liveDuration : _whipService.liveDuration;
-    final fps = _rtspService.currentFps;
-    final bitrate = _rtspService.currentBitrateKbps;
+    final isWhip = _whipService.isLive;
+    final duration =
+        isWhip ? _whipService.liveDuration : _rtspService.liveDuration;
+    final fps = isWhip ? 0.0 : _rtspService.currentFps;
+    final bitrate = isWhip ? 0 : _rtspService.currentBitrateKbps;
+
+    final fpsStr = fps > 0 ? fps.toStringAsFixed(0) : '—';
+    final bitrateStr =
+        bitrate > 0 ? '${(bitrate / 1000).toStringAsFixed(1)}M' : '—';
+    final networkStr = isWhip
+        ? 'WebRTC'
+        : (_rtspService.cellularFallbackActive ? '4G/5G' : 'Wi-Fi');
 
     return Container(
       padding: const EdgeInsets.all(16),
       decoration: BoxDecoration(
         color: const Color(0xFF161B22),
         borderRadius: BorderRadius.circular(14),
-        border: Border.all(color: Colors.redAccent.withValues(alpha: 0.6), width: 1.5),
+        border: Border.all(
+          color: Colors.redAccent.withValues(alpha: 0.6),
+          width: 1.5,
+        ),
         boxShadow: [
           BoxShadow(
             color: Colors.red.withValues(alpha: 0.15),
@@ -660,7 +1137,11 @@ class _LiveStreamScreenState extends State<LiveStreamScreen> {
                     SizedBox(width: 5),
                     Text(
                       'LIVE',
-                      style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold, fontSize: 11),
+                      style: TextStyle(
+                        color: Colors.white,
+                        fontWeight: FontWeight.bold,
+                        fontSize: 11,
+                      ),
                     ),
                   ],
                 ),
@@ -683,17 +1164,17 @@ class _LiveStreamScreenState extends State<LiveStreamScreen> {
             children: [
               _buildMetricChip(
                 label: 'FPS',
-                value: fps > 0 ? fps.toStringAsFixed(0) : '30',
+                value: fpsStr,
                 color: Colors.lightBlueAccent,
               ),
               _buildMetricChip(
-                label: 'Bitrate',
-                value: bitrate > 0 ? '${(bitrate / 1000).toStringAsFixed(1)}M' : 'Auto',
+                label: appText(context, 'Bitrate', 'Bitrate'),
+                value: bitrateStr,
                 color: Colors.greenAccent,
               ),
               _buildMetricChip(
-                label: 'Mạng',
-                value: _rtspService.cellularFallbackActive ? '4G/5G' : 'Wi-Fi',
+                label: appText(context, 'Mạng', 'Network'),
+                value: networkStr,
                 color: Colors.amberAccent,
               ),
             ],
@@ -703,7 +1184,11 @@ class _LiveStreamScreenState extends State<LiveStreamScreen> {
     );
   }
 
-  Widget _buildMetricChip({required String label, required String value, required Color color}) {
+  Widget _buildMetricChip({
+    required String label,
+    required String value,
+    required Color color,
+  }) {
     return Column(
       children: [
         Text(
@@ -731,19 +1216,48 @@ class _LiveStreamScreenState extends State<LiveStreamScreen> {
   // WIDGET: ACTION BUTTON
   // ============================================================
   Widget _buildActionButton() {
-    if (_isLive || _rtspService.state == RtspPublishState.reconnecting) {
+    if (_isRtspActive) {
       return FilledButton.icon(
         style: FilledButton.styleFrom(
           backgroundColor: Colors.redAccent.shade700,
           foregroundColor: Colors.white,
           padding: const EdgeInsets.symmetric(vertical: 14),
-          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+          shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(12),
+          ),
         ),
-        onPressed: _handleStopLive,
+        onPressed: _actionInFlight ? null : _handleStopLive,
         icon: const Icon(Icons.stop_circle_rounded, size: 20),
         label: Text(
           appText(context, 'DỪNG PHÁT TRỰC TIẾP', 'STOP STREAM'),
-          style: const TextStyle(fontSize: 14, fontWeight: FontWeight.bold, letterSpacing: 0.5),
+          style: const TextStyle(
+            fontSize: 14,
+            fontWeight: FontWeight.bold,
+            letterSpacing: 0.5,
+          ),
+        ),
+      );
+    }
+
+    if (_isWhipActive) {
+      return FilledButton.icon(
+        style: FilledButton.styleFrom(
+          backgroundColor: Colors.white12,
+          foregroundColor: Colors.white38,
+          padding: const EdgeInsets.symmetric(vertical: 14),
+          shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(12),
+          ),
+        ),
+        onPressed: null,
+        icon: const Icon(Icons.block_rounded, size: 20),
+        label: Text(
+          appText(context, 'ĐANG PHÁT QUA WHIP', 'STREAMING VIA WHIP'),
+          style: const TextStyle(
+            fontSize: 14,
+            fontWeight: FontWeight.bold,
+            letterSpacing: 0.5,
+          ),
         ),
       );
     }
@@ -755,19 +1269,26 @@ class _LiveStreamScreenState extends State<LiveStreamScreen> {
         padding: const EdgeInsets.symmetric(vertical: 14),
         shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
       ),
-      onPressed: _isBusy ? null : _handleStartLive,
-      icon: _isBusy
+      onPressed: (_isBusy || _actionInFlight) ? null : _handleStartLive,
+      icon: (_isBusy || _actionInFlight)
           ? const SizedBox(
               width: 18,
               height: 18,
-              child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white),
+              child: CircularProgressIndicator(
+                strokeWidth: 2,
+                color: Colors.white,
+              ),
             )
           : const Icon(Icons.cell_tower_rounded, size: 20),
       label: Text(
-        _isBusy
+        (_isBusy || _actionInFlight)
             ? appText(context, 'ĐANG KẾT NỐI...', 'CONNECTING...')
             : appText(context, 'BẮT ĐẦU PHÁT TRỰC TIẾP', 'START LIVE STREAM'),
-        style: const TextStyle(fontSize: 14, fontWeight: FontWeight.bold, letterSpacing: 0.5),
+        style: const TextStyle(
+          fontSize: 14,
+          fontWeight: FontWeight.bold,
+          letterSpacing: 0.5,
+        ),
       ),
     );
   }
@@ -778,6 +1299,9 @@ class _LiveStreamScreenState extends State<LiveStreamScreen> {
   Widget _buildAdvancedSection() {
     final lanIp = widget.runtime.lanAddress ?? '127.0.0.1';
     final localRtspUrl = 'rtsp://$lanIp:8554/camera';
+    final isWhipActive = _isWhipActive;
+    final isWhipBusy = _whipService.state == WhipPublishState.connecting;
+    final canStartWhip = !_isRtspActive && !_isBusy && !_actionInFlight;
 
     return Container(
       margin: const EdgeInsets.only(top: 8),
@@ -794,21 +1318,43 @@ class _LiveStreamScreenState extends State<LiveStreamScreen> {
             mainAxisAlignment: MainAxisAlignment.spaceBetween,
             children: [
               Text(
-                appText(context, 'Link RTSP nội bộ (VLC / NVR):', 'Local RTSP Link:'),
-                style: const TextStyle(color: Colors.white70, fontSize: 11.5, fontWeight: FontWeight.bold),
+                appText(
+                  context,
+                  'Link RTSP nội bộ (VLC / NVR):',
+                  'Local RTSP Link:',
+                ),
+                style: const TextStyle(
+                  color: Colors.white70,
+                  fontSize: 11.5,
+                  fontWeight: FontWeight.bold,
+                ),
               ),
               IconButton(
-                icon: const Icon(Icons.copy_rounded, size: 16, color: Colors.lightBlueAccent),
+                icon: const Icon(
+                  Icons.copy_rounded,
+                  size: 16,
+                  color: Colors.lightBlueAccent,
+                ),
                 onPressed: () {
                   Clipboard.setData(ClipboardData(text: localRtspUrl));
-                  _showToast(appText(context, 'Đã sao chép link RTSP!', 'Copied RTSP link!'));
+                  _showToast(
+                    appText(
+                      context,
+                      'Đã sao chép link RTSP!',
+                      'Copied RTSP link!',
+                    ),
+                  );
                 },
               ),
             ],
           ),
           SelectableText(
             localRtspUrl,
-            style: const TextStyle(color: Color(0xFF81D4FA), fontSize: 11.5, fontFamily: 'monospace'),
+            style: const TextStyle(
+              color: Color(0xFF81D4FA),
+              fontSize: 11.5,
+              fontFamily: 'monospace',
+            ),
           ),
           const SizedBox(height: 8),
           SwitchListTile.adaptive(
@@ -821,6 +1367,112 @@ class _LiveStreamScreenState extends State<LiveStreamScreen> {
             title: Text(
               appText(context, 'Âm thanh cho Tablet', 'Audio for Tablets'),
               style: const TextStyle(color: Colors.white, fontSize: 12),
+            ),
+          ),
+          const Divider(color: Colors.white12, height: 20),
+
+          // WHIP Section
+          Text(
+            appText(
+              context,
+              'WHIP (Máy chủ nội bộ MediaMTX):',
+              'WHIP (Internal MediaMTX server):',
+            ),
+            style: const TextStyle(
+              color: Colors.white70,
+              fontSize: 11.5,
+              fontWeight: FontWeight.bold,
+            ),
+          ),
+          const SizedBox(height: 8),
+          TextFormField(
+            controller: _whipUrlController,
+            enabled: !isWhipActive,
+            style: const TextStyle(
+              color: Colors.white,
+              fontSize: 12.5,
+              fontFamily: 'monospace',
+            ),
+            decoration: _inputDecoration(
+              hint: 'http://server:8889/live/whip',
+            ),
+          ),
+          const SizedBox(height: 8),
+          TextFormField(
+            controller: _whipTokenController,
+            enabled: !isWhipActive,
+            obscureText: _obscureWhipToken,
+            style: const TextStyle(
+              color: Colors.white,
+              fontSize: 12.5,
+              fontFamily: 'monospace',
+            ),
+            decoration: _inputDecoration(
+              hint: appText(
+                context,
+                'Bearer Token (tùy chọn)',
+                'Bearer Token (optional)',
+              ),
+              suffixIcon: IconButton(
+                icon: Icon(
+                  _obscureWhipToken
+                      ? Icons.visibility_off_rounded
+                      : Icons.visibility_rounded,
+                  size: 18,
+                  color: Colors.white54,
+                ),
+                onPressed: () =>
+                    setState(() => _obscureWhipToken = !_obscureWhipToken),
+              ),
+            ),
+          ),
+          const SizedBox(height: 10),
+          SizedBox(
+            width: double.infinity,
+            child: FilledButton.icon(
+              style: FilledButton.styleFrom(
+                backgroundColor: isWhipActive
+                    ? Colors.redAccent.shade700
+                    : const Color(0xFF00897B),
+                foregroundColor: Colors.white,
+                padding: const EdgeInsets.symmetric(vertical: 11),
+                shape: RoundedRectangleBorder(
+                  borderRadius: BorderRadius.circular(10),
+                ),
+              ),
+              onPressed: isWhipActive
+                  ? (_actionInFlight ? null : _handleStopWhip)
+                  : (canStartWhip ? _handleStartWhip : null),
+              icon: isWhipBusy
+                  ? const SizedBox(
+                      width: 16,
+                      height: 16,
+                      child: CircularProgressIndicator(
+                        strokeWidth: 2,
+                        color: Colors.white,
+                      ),
+                    )
+                  : Icon(
+                      isWhipActive
+                          ? Icons.stop_rounded
+                          : Icons.podcasts_rounded,
+                      size: 18,
+                    ),
+              label: Text(
+                isWhipActive
+                    ? appText(context, 'DỪNG WHIP', 'STOP WHIP')
+                    : isWhipBusy
+                        ? appText(
+                            context,
+                            'ĐANG KẾT NỐI WHIP...',
+                            'CONNECTING WHIP...',
+                          )
+                        : appText(context, 'PHÁT WHIP', 'START WHIP'),
+                style: const TextStyle(
+                  fontSize: 12.5,
+                  fontWeight: FontWeight.bold,
+                ),
+              ),
             ),
           ),
         ],
