@@ -270,67 +270,125 @@ class CameraServer {
 <body><main><header>VNVAR · $courtId · $cameraId</header><span class="state" id="state">Đang kết nối...</span><video id="video" autoplay playsinline muted></video></main>
 <script>
 (()=>{
-  const state=document.getElementById('state');
-  const video=document.getElementById('video');
-  let pc=null;
-  let peerId=null;
-  let reconnectTimer=null;
-  let lastW=0, lastH=0;
+  const state=document.getElementById('state'), video=document.getElementById('video');
+  let cur=null;
+  let connecting=false, timer=null, backoff=1000;
+  const beacon=function(id){
+    if(id&&navigator.sendBeacon){
+      navigator.sendBeacon('/webrtc/disconnect',new Blob([JSON.stringify({peerId:id})],{type:'application/json'}));
+    }
+  };
+  const getEpoch=async()=>{
+    try{
+      const r=await fetch('/webrtc/epoch',{cache:'no-store'});
+      if(!r.ok)return null;
+      const data=await r.json();
+      return data.epoch;
+    }catch(_){return null;}
+  };
+
+  function teardown(){
+    if(!cur)return;
+    const old=cur; cur=null;
+    old.pc.ontrack=null;
+    old.pc.onconnectionstatechange=null;
+    try{old.pc.close();}catch(_){}
+    beacon(old.peerId);
+  }
+  function schedule(ms){
+    if(timer||connecting)return;
+    timer=setTimeout(()=>{timer=null;connect();},ms);
+  }
+  function scheduleBackoff(){
+    schedule(backoff);
+    backoff=Math.min(backoff*2,15000);
+  }
 
   async function connect(){
-    if(reconnectTimer){clearTimeout(reconnectTimer);reconnectTimer=null;}
-    if(pc){try{pc.close()}catch(_){}}
-    peerId='viewer_'+(globalThis.crypto?.randomUUID?.()||Date.now()+'_'+Math.random());
-    state.textContent='Đang kết nối...';
+    if(connecting)return;
+    connecting=true;
+    teardown();
+    const peerId='viewer_'+(globalThis.crypto?.randomUUID?.()||Date.now()+'_'+Math.random());
+    const pc=new RTCPeerConnection({iceServers:[{urls:'stun:stun.l.google.com:19302'}]});
+    const currentEpoch=await getEpoch();
+    const me={pc:pc,peerId:peerId,epoch:currentEpoch,lastFrames:-1,stallSince:0};
+    cur=me;
+    pc.addTransceiver('video',{direction:'recvonly'});
+    pc.ontrack=function(e){
+      try{e.receiver.playoutDelayHint=0;e.receiver.jitterBufferTarget=0;}catch(_){}
+      video.srcObject=e.streams[0];
+    };
+    pc.onconnectionstatechange=function(){
+      if(cur!==me)return;
+      state.textContent=pc.connectionState==='connected'?'LIVE':pc.connectionState;
+      if(pc.connectionState==='failed')scheduleBackoff();
+    };
     try{
-      pc=new RTCPeerConnection({iceServers:[{urls:'stun:stun.l.google.com:19302'}]});
-      pc.addTransceiver('video',{direction:'recvonly'});
-      pc.ontrack=e=>{
-        try{e.receiver.playoutDelayHint=0;e.receiver.jitterBufferTarget=0}catch(_){}
-        video.srcObject=e.streams[0];
-        state.textContent='LIVE';
-      };
-      pc.onconnectionstatechange=()=>{
-        state.textContent=pc.connectionState==='connected'?'LIVE':pc.connectionState;
-        if(pc.connectionState==='failed'||pc.connectionState==='disconnected'){
-          scheduleReconnect(1000);
-        }
-      };
       await pc.setLocalDescription(await pc.createOffer());
-      if(pc.iceGatheringState!=='complete')await new Promise(resolve=>{
-        const done=()=>{if(pc.iceGatheringState==='complete'){pc.removeEventListener('icegatheringstatechange',done);resolve()}};
-        pc.addEventListener('icegatheringstatechange',done);
-        setTimeout(resolve,8000);
-      });
+      if(pc.iceGatheringState!=='complete'){
+        await new Promise(function(resolve){
+          const done=function(){
+            if(pc.iceGatheringState==='complete'){
+              pc.removeEventListener('icegatheringstatechange',done);
+              resolve();
+            }
+          };
+          pc.addEventListener('icegatheringstatechange',done);
+          setTimeout(resolve,8000);
+        });
+      }
       const offer=pc.localDescription;
-      const response=await fetch('/webrtc/offer',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({sdp:offer.sdp,type:offer.type,peerId})});
+      const response=await fetch('/webrtc/offer',{
+        method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({sdp:offer.sdp,type:offer.type,peerId:peerId})
+      });
       if(!response.ok)throw new Error('HTTP '+response.status);
       const answer=await response.json();
       await pc.setRemoteDescription(answer);
-    }catch(error){
+    }catch(e){
       state.textContent='Lỗi kết nối';
-      scheduleReconnect(2000);
+      connecting=false;
+      scheduleBackoff();
+    }finally{
+      connecting=false;
     }
   }
 
-  function scheduleReconnect(ms){
-    if(reconnectTimer)return;
-    reconnectTimer=setTimeout(()=>connect(),ms);
-  }
-
-  // Tự động giải phóng decoder cũ và kết nối lại ngay khi phát hiện đổi độ phân giải, không cần F5
-  video.addEventListener('resize',()=>{
-    const w=video.videoWidth, h=video.videoHeight;
-    if(lastW>0 && (w!==lastW || h!==lastH)){
-      scheduleReconnect(300);
+  setInterval(async()=>{
+    const me=cur;
+    if(!me||connecting)return;
+    const ep=await getEpoch();
+    if(ep!==null&&me.epoch===null){
+      me.epoch=ep;
+      return;
     }
-    lastW=w; lastH=h;
-  });
+    if(ep!==null&&me.epoch!==null&&ep!==me.epoch){
+      schedule(300);
+      return;
+    }
+    if(me.pc.connectionState!=='connected')return;
+    try{
+      const stats=await me.pc.getStats();
+      let frames=-1;
+      stats.forEach(function(s){
+        if(s.type==='inbound-rtp'&&s.kind==='video')frames=s.framesDecoded;
+      });
+      const now=Date.now();
+      if(frames>me.lastFrames){
+        me.lastFrames=frames;
+        me.stallSince=0;
+        backoff=1000;
+      }else if(!me.stallSince){
+        me.stallSince=now;
+      }else if(now-me.stallSince>=4000){
+        me.stallSince=0;
+        scheduleBackoff();
+      }
+    }catch(_){}
+  },1000);
 
-  addEventListener('pagehide',()=>{
-    if(peerId)navigator.sendBeacon('/webrtc/disconnect',new Blob([JSON.stringify({peerId})],{type:'application/json'}));
-  },{once:true});
-
+  addEventListener('pagehide',function(){teardown();});
   connect();
 })();
 </script></body></html>''');
@@ -584,6 +642,15 @@ class CameraServer {
       }
 
       // ========================================================
+      // WEBRTC EPOCH
+      // ========================================================
+
+      if (path == '/webrtc/epoch' && method == 'GET') {
+        await _handleWebRtcEpoch(request);
+        return;
+      }
+
+      // ========================================================
       // WEBRTC OFFER
       // ========================================================
 
@@ -659,8 +726,11 @@ class CameraServer {
     var window = const Duration(minutes: 1);
     if (path == '/webrtc/offer') {
       bucket = 'webrtc-offer';
-      maximum = 6;
+      maximum = 30;
       window = const Duration(minutes: 1);
+    } else if (path == '/webrtc/epoch') {
+      bucket = 'webrtc-epoch';
+      maximum = 120;
     } else if (path == '/webrtc/ice') {
       bucket = 'webrtc-ice';
       maximum = 120;
@@ -1747,6 +1817,13 @@ class CameraServer {
       'peerId': peerId,
       'disconnected': existed,
       'activePeers': webRtcService.activePeerCount,
+    });
+  }
+
+  Future<void> _handleWebRtcEpoch(HttpRequest request) async {
+    request.response.headers.set(HttpHeaders.cacheControlHeader, 'no-store');
+    await _sendJson(request.response, HttpStatus.ok, {
+      'epoch': webRtcService.videoEpoch,
     });
   }
 

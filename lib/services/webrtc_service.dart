@@ -135,6 +135,8 @@ class WebRtcService {
   // `sender.track` vì track cũ đã bị dispose khi đổi camera/độ phân giải.
   final Map<String, RTCRtpSender> _videoSenders = <String, RTCRtpSender>{};
   String? _latestPeerId;
+  int _videoEpoch = 0;
+  int get videoEpoch => _videoEpoch;
 
   // ============================================================
   // LOCAL PREVIEW
@@ -902,9 +904,7 @@ class WebRtcService {
     _currentFacingMode = selectedFacingMode;
 
     await _startRtsp(videoTrack);
-    if (_peerConnections.isNotEmpty) {
-      await replaceVideoTrackOnActivePeers(videoTrack);
-    }
+    await replaceVideoTrackOnActivePeers(videoTrack);
     try {
       await refreshAvailableCameras();
       await refreshCameraZoom();
@@ -1858,9 +1858,10 @@ class WebRtcService {
   /// Peer nào không tráo được sẽ bị đóng để Tablet tự đàm phán lại, thay vì
   /// giữ một kết nối "connected" nhưng không còn khung hình.
   Future<void> replaceVideoTrackOnActivePeers(MediaStreamTrack newTrack) async {
+    _videoEpoch++;
     if (_peerConnections.isEmpty) return;
     developer.log(
-      '[WEBRTC] Replacing video track across ${_peerConnections.length} active peer(s): ${newTrack.id}',
+      '[WEBRTC] Replacing video track across ${_peerConnections.length} active peer(s): ${newTrack.id} (epoch: $_videoEpoch)',
       name: 'WebRtcService',
     );
     final failedPeers = <String>[];
