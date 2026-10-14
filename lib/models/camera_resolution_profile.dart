@@ -62,6 +62,9 @@ class CameraResolutionProfile {
     CameraResolutionPreset.ultraHd4k => '4K Ultra HD',
   };
 
+  String get compactLabel => '$shortLabel${fps > 30 ? ' $fps' : ''}';
+  String get labelWithFps => '$shortLabel $fps FPS';
+
   /// RTSP/TCP has no WebRTC-style congestion controller. Keep enough bitrate
   /// for sports motion while leaving headroom for Wi-Fi retransmissions and
   /// protocol overhead so latency does not grow without bound on a weak LAN.
@@ -106,3 +109,5 @@ class CameraResolutionProfile {
   @override
   int get hashCode => Object.hash(preset, fps);
 }
+
+String profileLabel(CameraResolutionProfile p) => p.compactLabel;

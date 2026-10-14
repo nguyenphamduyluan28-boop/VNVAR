@@ -1922,6 +1922,9 @@ class _StationScreenState extends State<StationScreen>
                             resolutionProfile: _runtime.resolutionProfile,
                             resolutionSwitching: _runtime.profileSwitching,
                             resolutionLocked: _runtime.resolutionLocked,
+                            thermalThrottled: _runtime.thermalThrottled,
+                            pendingThermalTarget: _runtime.pendingThermalTarget,
+                            pendingThermalIn: _runtime.pendingThermalIn,
                             whipLive: _runtime.isLiveStreaming,
                             onVideoStorage: _openVideoStorage,
                             onResolution: _handleResolutionPressed,
@@ -1989,6 +1992,9 @@ class _StationScreenState extends State<StationScreen>
                               userOverride: _runtime.thermalUserOverride,
                               isCooledDown: _runtime.justCooledDown,
                               isLocked: _runtime.resolutionLocked,
+                              isThrottled: _runtime.thermalThrottled,
+                              targetProfile: _runtime.pendingThermalTarget,
+                              pendingIn: _runtime.pendingThermalIn,
                               profile: _runtime.resolutionProfile,
                               onTap: _openResolutionPicker,
                               onDismiss: _runtime.dismissCooledDownNotice,
@@ -2260,7 +2266,7 @@ class _StationScreenState extends State<StationScreen>
                               ),
                               const SizedBox(width: 3),
                               Text(
-                                _runtime.resolutionProfile.shortLabel,
+                                profileLabel(_runtime.resolutionProfile),
                                 style: const TextStyle(
                                   color: Colors.amber,
                                   fontSize: 9,
@@ -2413,6 +2419,9 @@ class _ThermalToast extends StatelessWidget {
     this.userOverride = false,
     this.isCooledDown = false,
     this.isLocked = false,
+    this.isThrottled = false,
+    this.targetProfile,
+    this.pendingIn,
     this.profile,
   });
 
@@ -2424,12 +2433,19 @@ class _ThermalToast extends StatelessWidget {
   final bool userOverride;
   final bool isCooledDown;
   final bool isLocked;
+  final bool isThrottled;
+  final CameraResolutionProfile? targetProfile;
+  final Duration? pendingIn;
   final CameraResolutionProfile? profile;
 
   @override
   Widget build(BuildContext context) {
     final tempStr =
         temperatureC != null ? '${temperatureC!.toStringAsFixed(0)}°C' : '';
+    final hotPrefixVi =
+        tempStr.isNotEmpty ? 'Máy nóng ($tempStr).' : 'Máy nóng.';
+    final hotPrefixEn =
+        tempStr.isNotEmpty ? 'Device is hot ($tempStr).' : 'Device is hot.';
 
     Color bgColor;
     Color borderColor;
@@ -2451,51 +2467,60 @@ class _ThermalToast extends StatelessWidget {
             ? 'Device has cooled down ($tempStr). Tap to choose resolution.'
             : 'Device has cooled down. Tap to choose resolution.',
       );
-    } else if (userOverride) {
-      bgColor = const Color(0xFF2E1C0A).withValues(alpha: 0.75);
-      borderColor = const Color(0xFFFF9800).withValues(alpha: 0.45);
-      textColor = const Color(0xFFFFE0B2);
-      icon = Icons.thermostat_rounded;
+    } else if (targetProfile != null) {
+      bgColor = const Color(0xFF2A1C08).withValues(alpha: 0.75);
+      borderColor = Colors.amber.withValues(alpha: 0.50);
+      textColor = Colors.amber.shade100;
+      icon = Icons.timer_outlined;
+      final secs = (pendingIn?.inSeconds ?? 0).clamp(0, 999);
+      final targetStr = '${targetProfile!.shortLabel} ${targetProfile!.fps} FPS';
+      final timeStrVi =
+          secs < 5 ? 'trong ít giây tới' : 'khi chuyển đoạn video (~$secs s)';
+      final timeStrEn =
+          secs < 5 ? 'in a few seconds' : 'when rotating segment (~$secs s)';
       message = appText(
         context,
-        tempStr.isNotEmpty
-            ? 'Thiết bị đang ấm ($tempStr). Đang dùng độ phân giải bạn chọn. Chạm để đổi.'
-            : 'Thiết bị đang ấm. Đang dùng độ phân giải bạn chọn. Chạm để đổi.',
-        tempStr.isNotEmpty
-            ? 'Device is warm ($tempStr). Using your selected resolution. Tap to change.'
-            : 'Device is warm. Using your selected resolution. Tap to change.',
+        '$hotPrefixVi Sẽ hạ về $targetStr $timeStrVi.',
+        '$hotPrefixEn Will lower to $targetStr $timeStrEn.',
       );
-    } else if (isLocked) {
-      bgColor = const Color(0xFF2E1C0A).withValues(alpha: 0.75);
-      borderColor = const Color(0xFFFF9800).withValues(alpha: 0.45);
-      textColor = const Color(0xFFFFE0B2);
-      icon = Icons.lock_rounded;
-      message = appText(
-        context,
-        tempStr.isNotEmpty
-            ? 'Thiết bị đang nóng ($tempStr). Đang khóa giữ độ phân giải. Chạm để đổi.'
-            : 'Thiết bị đang nóng. Đang khóa giữ độ phân giải. Chạm để đổi.',
-        tempStr.isNotEmpty
-            ? 'Device is warm ($tempStr). Resolution locked. Tap to change.'
-            : 'Device is warm. Resolution locked. Tap to change.',
-      );
-    } else {
+    } else if (isThrottled) {
       bgColor = const Color(0xFF2A1C08).withValues(alpha: 0.75);
       borderColor = Colors.amber.withValues(alpha: 0.50);
       textColor = Colors.amber.shade100;
       icon = Icons.whatshot_rounded;
-      final profileStr = profile != null
-          ? '${profile!.shortLabel} (${profile!.fps} FPS)'
-          : '720p (30 FPS)';
+      final currentStr = profile != null
+          ? '${profile!.shortLabel} ${profile!.fps} FPS'
+          : '720p 30 FPS';
       message = appText(
         context,
-        tempStr.isNotEmpty
-            ? 'Thiết bị đang nóng ($tempStr). Tự động hạ về $profileStr để bảo vệ máy. Chạm để chọn lại.'
-            : 'Thiết bị đang nóng. Tự động hạ về $profileStr để bảo vệ máy. Chạm để chọn lại.',
-        tempStr.isNotEmpty
-            ? 'Device is hot ($tempStr). Auto-lowered to $profileStr to protect camera. Tap to change.'
-            : 'Device is hot. Auto-lowered to $profileStr to protect camera. Tap to change.',
+        '$hotPrefixVi Đã hạ về $currentStr để bảo vệ máy. Chạm để chọn lại.',
+        '$hotPrefixEn Lowered to $currentStr to protect camera. Tap to change.',
       );
+    } else {
+      bgColor = const Color(0xFF2E1C0A).withValues(alpha: 0.75);
+      borderColor = const Color(0xFFFF9800).withValues(alpha: 0.45);
+      textColor = const Color(0xFFFFE0B2);
+      icon = isLocked ? Icons.lock_rounded : Icons.thermostat_rounded;
+      final currentStr = profile != null
+          ? '${profile!.shortLabel} ${profile!.fps} FPS'
+          : '720p 30 FPS';
+      if (userOverride || isLocked) {
+        message = appText(
+          context,
+          '$hotPrefixVi Đang giữ $currentStr theo lựa chọn của bạn. Chạm để đổi.',
+          '$hotPrefixEn Keeping $currentStr per your selection. Tap to change.',
+        );
+      } else {
+        final warmPrefixVi =
+            tempStr.isNotEmpty ? 'Máy ấm ($tempStr).' : 'Máy ấm.';
+        final warmPrefixEn =
+            tempStr.isNotEmpty ? 'Device is warm ($tempStr).' : 'Device is warm.';
+        message = appText(
+          context,
+          '$warmPrefixVi Đang theo dõi nhiệt độ. Chạm để đổi.',
+          '$warmPrefixEn Monitoring temperature. Tap to change.',
+        );
+      }
     }
 
     return ConstrainedBox(
@@ -3099,6 +3124,9 @@ class _StationHeader extends StatelessWidget {
   final CameraResolutionProfile resolutionProfile;
   final bool resolutionSwitching;
   final bool resolutionLocked;
+  final bool thermalThrottled;
+  final CameraResolutionProfile? pendingThermalTarget;
+  final Duration? pendingThermalIn;
   final bool whipLive;
   final VoidCallback onVideoStorage;
   final VoidCallback? onResolution;
@@ -3119,6 +3147,9 @@ class _StationHeader extends StatelessWidget {
     required this.resolutionProfile,
     required this.resolutionSwitching,
     required this.resolutionLocked,
+    this.thermalThrottled = false,
+    this.pendingThermalTarget,
+    this.pendingThermalIn,
     required this.whipLive,
     required this.onVideoStorage,
     required this.onResolution,
@@ -3201,6 +3232,9 @@ class _StationHeader extends StatelessWidget {
                   userOverride: thermalUserOverride,
                   isCooledDown: justCooledDown,
                   isLocked: resolutionLocked,
+                  isThrottled: thermalThrottled,
+                  targetProfile: pendingThermalTarget,
+                  pendingIn: pendingThermalIn,
                   profile: resolutionProfile,
                   onTap: onResolution ?? () {},
                   onDismiss: onDismissCooledDown,
@@ -3394,7 +3428,7 @@ class _ResolutionChip extends StatelessWidget {
                 const Icon(Icons.high_quality_rounded, size: 13),
               const SizedBox(width: 5),
               Text(
-                '${profile.shortLabel} ${profile.fps}FPS',
+                '${profile.shortLabel} ${profile.fps} FPS',
                 style: const TextStyle(
                   color: Colors.white,
                   fontSize: 10,

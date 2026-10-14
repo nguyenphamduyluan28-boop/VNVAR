@@ -136,6 +136,8 @@ class CameraStationRuntime {
   Timer? _thermalTimer;
   Timer? _networkTimer;
   Timer? _pendingThermalThrottleTimer;
+  CameraResolutionProfile? _pendingThermalTarget;
+  DateTime? _pendingThermalAt;
   Timer? _pendingThermalRestoreTimer;
   bool _thermalThrottled = false;
   bool _thermalUserOverride = false;
@@ -254,6 +256,10 @@ class CameraStationRuntime {
       _thermalThrottled || (_temperatureC != null && _temperatureC! >= 41.0);
   bool get thermalUserOverride => _thermalUserOverride;
   bool get thermalThrottled => _thermalThrottled;
+  CameraResolutionProfile? get pendingThermalTarget => _pendingThermalTarget;
+  DateTime? get pendingThermalAt => _pendingThermalAt;
+  Duration? get pendingThermalIn =>
+      _pendingThermalAt?.difference(DateTime.now());
   bool get justCooledDown =>
       _thermalCooledDownSince != null &&
       DateTime.now().difference(_thermalCooledDownSince!) <
@@ -356,6 +362,8 @@ class CameraStationRuntime {
       // Hủy mọi lịch trình hạ độ phân giải do nhiệt độ nếu có
       _pendingThermalThrottleTimer?.cancel();
       _pendingThermalThrottleTimer = null;
+      _pendingThermalTarget = null;
+      _pendingThermalAt = null;
       _thermalUserOverride = true;
       developer.log(
         '[LOCK] Chế độ độ phân giải đã được khóa. Tự động vô hiệu hóa hạ độ phân giải khi máy nóng.',
@@ -683,6 +691,8 @@ class CameraStationRuntime {
     _networkSignature = null;
     _pendingThermalThrottleTimer?.cancel();
     _pendingThermalThrottleTimer = null;
+    _pendingThermalTarget = null;
+    _pendingThermalAt = null;
     _pendingThermalRestoreTimer?.cancel();
     _pendingThermalRestoreTimer = null;
     _thermalThrottled = false;
@@ -1369,6 +1379,8 @@ class CameraStationRuntime {
         _thermalThrottled = false;
         _pendingThermalThrottleTimer?.cancel();
         _pendingThermalThrottleTimer = null;
+        _pendingThermalTarget = null;
+        _pendingThermalAt = null;
         _profileBeforeThermalThrottle = profile;
         developer.log(
           '[THERMAL] Khách hàng chủ động chọn ${profile.shortLabel} (${profile.fps} FPS) '
@@ -2212,6 +2224,8 @@ class CameraStationRuntime {
       if (critical) {
         _pendingThermalThrottleTimer?.cancel();
         _pendingThermalThrottleTimer = null;
+        _pendingThermalTarget = null;
+        _pendingThermalAt = null;
         _pendingThermalRestoreTimer?.cancel();
         _pendingThermalRestoreTimer = null;
         _thermalNormalSince = null;
@@ -2224,6 +2238,8 @@ class CameraStationRuntime {
       if (!hot && !_thermalThrottled) {
         _pendingThermalThrottleTimer?.cancel();
         _pendingThermalThrottleTimer = null;
+        _pendingThermalTarget = null;
+        _pendingThermalAt = null;
         _profileBeforeThermalThrottle = null;
       }
       if (_thermalCriticalSuspended) {
@@ -2479,6 +2495,9 @@ class CameraStationRuntime {
     // thermal state is handled separately and still stops capture at once.
     final delay = _delayUntilSegmentBoundary();
     final targetProfile = _selectThermalThrottledProfile(_resolutionProfile);
+    _pendingThermalTarget = targetProfile;
+    _pendingThermalAt = DateTime.now().add(delay);
+    _emitState();
     developer.log(
       '[THERMAL] Hot device; scheduling ${targetProfile.shortLabel}/${targetProfile.fps}fps '
       'at the segment boundary in ${delay.inSeconds}s',
@@ -2491,40 +2510,46 @@ class CameraStationRuntime {
   }
 
   Future<void> _applyPendingThermalThrottle() async {
-    if (_stopping ||
-        !_cameraEnabled ||
-        _thermalCriticalSuspended ||
-        _iosLifecycleSuspended ||
-        _scannerPaused ||
-        _thermalThrottled ||
-        _thermalUserOverride ||
-        _resolutionLocked ||
-        _profileSwitching) {
-      return;
-    }
-    _thermalThrottled = true;
-    _emitState();
-    final targetProfile = _selectThermalThrottledProfile(_resolutionProfile);
-    developer.log(
-      '[THERMAL] Segment boundary reached; reducing camera to '
-      '${targetProfile.shortLabel}/${targetProfile.fps}fps',
-      name: 'CameraStationRuntime',
-    );
     try {
-      await _serializeLifecycle(
-        () => _setResolutionProfileInternal(
-          targetProfile,
-          persistSelection: false,
-        ),
-      );
-    } catch (error, stackTrace) {
-      _thermalThrottled = false;
+      if (_stopping ||
+          !_cameraEnabled ||
+          _thermalCriticalSuspended ||
+          _iosLifecycleSuspended ||
+          _scannerPaused ||
+          _thermalThrottled ||
+          _thermalUserOverride ||
+          _resolutionLocked ||
+          _profileSwitching) {
+        return;
+      }
+      _thermalThrottled = true;
+      _emitState();
+      final targetProfile = _selectThermalThrottledProfile(_resolutionProfile);
       developer.log(
-        '[THERMAL] Failed to reduce camera profile',
-        error: error,
-        stackTrace: stackTrace,
+        '[THERMAL] Segment boundary reached; reducing camera to '
+        '${targetProfile.shortLabel}/${targetProfile.fps}fps',
         name: 'CameraStationRuntime',
       );
+      try {
+        await _serializeLifecycle(
+          () => _setResolutionProfileInternal(
+            targetProfile,
+            persistSelection: false,
+          ),
+        );
+      } catch (error, stackTrace) {
+        _thermalThrottled = false;
+        developer.log(
+          '[THERMAL] Failed to reduce camera profile',
+          error: error,
+          stackTrace: stackTrace,
+          name: 'CameraStationRuntime',
+        );
+      }
+    } finally {
+      _pendingThermalTarget = null;
+      _pendingThermalAt = null;
+      _emitState();
     }
   }
 
