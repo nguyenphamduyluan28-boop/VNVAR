@@ -56,6 +56,36 @@ void main() {
       );
     });
 
+    test('load plan steps down without reopening the camera', () {
+      ThermalLoadPlan plan({
+        bool hot = false,
+        bool critical = false,
+        double? headroom,
+        int fps = 60,
+      }) => thermalLoadPlan(
+        hot: hot,
+        criticalConfirmed: critical,
+        headroom: headroom,
+        profileFps: fps,
+      );
+
+      expect(plan(), thermalLoadPlanNormal);
+      expect(plan(headroom: 0.5), thermalLoadPlanNormal);
+      // Dự báo sắp nóng: chỉ làm tối màn hình.
+      expect(plan(headroom: 0.9).level, 1);
+      expect(plan(headroom: 0.9).fpsCap, isNull);
+      expect(plan(headroom: 0.9).dimScreen, isTrue);
+      // Nóng (hoặc dự báo chạm SEVERE): 60 -> 30 FPS, bitrate 80%.
+      expect(plan(hot: true).fpsCap, 30);
+      expect(plan(headroom: 0.97).level, 2);
+      expect(plan(hot: true, fps: 30).fpsCap, isNull);
+      expect(plan(hot: true).bitrateFactor, 0.8);
+      // Critical: 24 FPS, bitrate 60%.
+      expect(plan(critical: true, fps: 30).fpsCap, 24);
+      expect(plan(critical: true).bitrateFactor, 0.6);
+      expect(plan(critical: true, fps: 24).fpsCap, isNull);
+    });
+
     test('streak reset to zero returns to normal', () {
       expect(
         _escalate(degradedFor: const Duration(minutes: 10)),

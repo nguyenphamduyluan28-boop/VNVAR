@@ -1041,6 +1041,26 @@ class WebRtcService {
     await _applyExposureBias(track);
   }
 
+  /// Android: giảm FPS đầu ra tại VideoSource (bỏ bớt khung) mà không mở lại
+  /// camera, nên livestream và ghi hình không bị ngắt. null = FPS gốc.
+  Future<bool> setCaptureFpsCap(int? fps) async {
+    final track = localVideoTrack;
+    if (track == null || !Platform.isAndroid) return false;
+    try {
+      return await _platformChannel.invokeMethod<bool>('setCaptureFpsCap', {
+            'trackId': track.id,
+            'fps': fps ?? 0,
+          }) ??
+          false;
+    } catch (error) {
+      developer.log(
+        '[CAMERA] Unable to limit capture fps: $error',
+        name: 'WebRtcService',
+      );
+      return false;
+    }
+  }
+
   Future<bool> setCameraLock({required bool locked, String? trackId}) async {
     final targetTrackId = trackId ?? localVideoTrack?.id;
     if (targetTrackId == null) return false;

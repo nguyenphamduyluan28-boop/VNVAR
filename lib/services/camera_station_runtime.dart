@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:developer' as developer;
 import 'dart:io';
+import 'dart:math' as math;
 
 import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
@@ -91,6 +92,45 @@ ThermalAction thermalEscalation({
     return ThermalAction.suspend;
   }
   return ThermalAction.degrade;
+}
+
+typedef ThermalLoadPlan = ({
+  int level,
+  int? fpsCap,
+  double bitrateFactor,
+  bool dimScreen,
+});
+
+const ThermalLoadPlan thermalLoadPlanNormal = (
+  level: 0,
+  fpsCap: null,
+  bitrateFactor: 1.0,
+  dimScreen: false,
+);
+
+/// Giảm tải theo bậc mà KHÔNG mở lại camera (livestream không bị ngắt):
+/// - 1 ấm (dự báo sắp nóng): làm tối màn hình;
+/// - 2 nóng hoặc dự báo chạm SEVERE: FPS tối đa 30, bitrate 80%;
+/// - 3 critical đã xác nhận: FPS tối đa 24, bitrate 60%.
+/// [headroom] là PowerManager.getThermalHeadroom (1.0 = SEVERE), null nếu
+/// máy không hỗ trợ.
+ThermalLoadPlan thermalLoadPlan({
+  required bool hot,
+  required bool criticalConfirmed,
+  required double? headroom,
+  required int profileFps,
+}) {
+  int? capTo(int fps) => profileFps > fps ? fps : null;
+  if (criticalConfirmed) {
+    return (level: 3, fpsCap: capTo(24), bitrateFactor: 0.6, dimScreen: true);
+  }
+  if (hot || (headroom != null && headroom >= 0.95)) {
+    return (level: 2, fpsCap: capTo(30), bitrateFactor: 0.8, dimScreen: true);
+  }
+  if (headroom != null && headroom >= 0.85) {
+    return (level: 1, fpsCap: null, bitrateFactor: 1.0, dimScreen: true);
+  }
+  return thermalLoadPlanNormal;
 }
 
 /// Mức ưu tiên của một giao diện mạng khi chọn địa chỉ LAN cho Tablet:
@@ -194,6 +234,11 @@ class CameraStationRuntime {
   DateTime? _thermalCriticalDegradedSince;
   int _thermalCriticalStreak = 0;
   int _thermalEmergencyStreak = 0;
+  bool _criticalProfileSwitchFailed = false;
+  ThermalLoadPlan _thermalLoadPlan = thermalLoadPlanNormal;
+  DateTime? _thermalLoadRelaxSince;
+  String? _appliedFpsCapKey;
+  bool _charging = false;
   bool _thermalCheckRunning = false;
   DateTime? _thermalNormalSince;
   double? _temperatureC;
@@ -260,8 +305,9 @@ class CameraStationRuntime {
   static const Duration _thermalRestoreDelay = Duration(minutes: 10);
   // Sau khi dừng khẩn cấp vì nhiệt, chạy lại khi máy hết nóng đủ lâu.
   static const Duration _thermalEmergencyResumeDelay = Duration(minutes: 3);
-  // Bitrate RTSP khi đang giảm tải vì critical (encoder nóng ít hơn).
-  static const double _thermalCriticalBitrateFactor = 0.6;
+  // Chỉ nới giảm tải sau khi mức nhiệt thấp hơn liên tục chừng này (chống
+  // dao động FPS/bitrate lên xuống).
+  static const Duration _thermalLoadRelaxDelay = Duration(minutes: 2);
   static const Duration _recordingTransitionGrace = Duration(seconds: 20);
   static const Duration _recordingStallTimeout = Duration(seconds: 45);
   static const Duration _bufferedVideoHardStallTimeout = Duration(minutes: 2);
@@ -310,6 +356,10 @@ class CameraStationRuntime {
   bool get thermalWarning =>
       _thermalThrottled || (_temperatureC != null && _temperatureC! >= 41.0);
   bool get thermalUserOverride => _thermalUserOverride;
+  /// Máy đang nóng trong lúc cắm sạc: sạc là nguồn nhiệt lớn, nên gợi ý.
+  bool get thermalChargingWhileHot => _charging && thermalWarning;
+  /// FPS đang bị giới hạn tạm thời vì nhiệt (null = không giới hạn).
+  int? get thermalFpsCap => _thermalLoadPlan.fpsCap;
   bool get thermalThrottled => _thermalThrottled;
   CameraResolutionProfile? get pendingThermalTarget => _pendingThermalTarget;
   DateTime? get pendingThermalAt => _pendingThermalAt;
@@ -769,6 +819,11 @@ class CameraStationRuntime {
     _thermalCriticalDegradedSince = null;
     _thermalCriticalStreak = 0;
     _thermalEmergencyStreak = 0;
+    _criticalProfileSwitchFailed = false;
+    _thermalLoadPlan = thermalLoadPlanNormal;
+    _thermalLoadRelaxSince = null;
+    _appliedFpsCapKey = null;
+    _charging = false;
     _thermalCheckRunning = false;
     _thermalNormalSince = null;
     _temperatureC = null;
@@ -1860,11 +1915,13 @@ class CameraStationRuntime {
   }
 
   void _emitState() {
-    _rtspPublisherService.expectedFps = _resolutionProfile.fps;
-    final rtspBitrate = _resolutionProfile.rtspBitrate;
-    _rtspPublisherService.maxBitrateBps = _thermalCriticalDegraded
-        ? (rtspBitrate * _thermalCriticalBitrateFactor).round()
-        : rtspBitrate;
+    final fpsCap = _thermalLoadPlan.fpsCap;
+    _rtspPublisherService.expectedFps = fpsCap == null
+        ? _resolutionProfile.fps
+        : math.min(fpsCap, _resolutionProfile.fps);
+    _rtspPublisherService.maxBitrateBps =
+        (_resolutionProfile.rtspBitrate * _thermalLoadPlan.bitrateFactor)
+            .round();
     if (!_stateController.isClosed) _stateController.add(null);
   }
 
@@ -2310,7 +2367,17 @@ class CameraStationRuntime {
           name: 'CameraStationRuntime',
         );
       }
+      _charging = snapshot.charging;
       if (!_thermalCriticalSuspended) {
+        await _applyThermalLoadPlan(
+          thermalLoadPlan(
+            hot: hot,
+            criticalConfirmed:
+                _thermalCriticalStreak >= thermalConfirmationReadings,
+            headroom: snapshot.headroom,
+            profileFps: _resolutionProfile.fps,
+          ),
+        );
         final degradedSince = _thermalCriticalDegradedSince;
         final action = thermalEscalation(
           criticalStreak: _thermalCriticalStreak,
@@ -2327,7 +2394,7 @@ class CameraStationRuntime {
             if (!_profileSwitching) {
               await _serializeLifecycle(_suspendForCriticalThermal);
             }
-          } else if (!_thermalCriticalDegraded) {
+          } else {
             await _degradeForCriticalThermal();
           }
           _emitState();
@@ -2368,6 +2435,9 @@ class CameraStationRuntime {
           !_thermalUserOverride &&
           !_resolutionLocked &&
           _pendingThermalThrottleTimer == null &&
+          // Đang livestream: không mở lại camera (ngắt luồng); FPS/bitrate đã
+          // được giảm tại chỗ bởi _applyThermalLoadPlan.
+          !_livePublishingActive &&
           !_profileSwitching) {
         _profileBeforeThermalThrottle = _resolutionProfile;
         _scheduleThermalThrottleAtSegmentBoundary();
@@ -2619,6 +2689,7 @@ class CameraStationRuntime {
           _thermalThrottled ||
           _thermalUserOverride ||
           _resolutionLocked ||
+          _livePublishingActive ||
           _profileSwitching) {
         return;
       }
@@ -2660,6 +2731,8 @@ class CameraStationRuntime {
       bool critical,
       bool emergency,
       bool cool,
+      double? headroom,
+      bool charging,
     })
   >
   _readThermalSnapshot() async {
@@ -2670,6 +2743,8 @@ class CameraStationRuntime {
         critical: false,
         emergency: false,
         cool: true,
+        headroom: null,
+        charging: false,
       );
     }
     final result = await _platformChannel.invokeMapMethod<String, dynamic>(
@@ -2688,7 +2763,55 @@ class CameraStationRuntime {
       emergency:
           (temperature != null && temperature >= 55.0) || level.emergency,
       cool: level.cool,
+      headroom: (result?['headroom'] as num?)?.toDouble(),
+      charging: result?['charging'] == true,
     );
+  }
+
+  /// Áp dụng bậc giảm tải: tăng ngay, chỉ nới sau [_thermalLoadRelaxDelay].
+  Future<void> _applyThermalLoadPlan(ThermalLoadPlan plan) async {
+    final now = DateTime.now();
+    if (plan.level >= _thermalLoadPlan.level) {
+      _thermalLoadRelaxSince = null;
+    } else {
+      _thermalLoadRelaxSince ??= now;
+      if (now.difference(_thermalLoadRelaxSince!) < _thermalLoadRelaxDelay) {
+        plan = _thermalLoadPlan;
+      } else {
+        _thermalLoadRelaxSince = null;
+      }
+    }
+    if (plan != _thermalLoadPlan) {
+      developer.log(
+        '[THERMAL] Load level ${_thermalLoadPlan.level} -> ${plan.level}: '
+        'fps cap ${plan.fpsCap ?? 'none'}, bitrate x${plan.bitrateFactor}',
+        name: 'CameraStationRuntime',
+      );
+      _thermalLoadPlan = plan;
+      _emitState();
+    }
+    if (plan.dimScreen && !_autoScreenDimmed && _stationDisplayAttached) {
+      _autoScreenDimmed = true;
+      _screenDimmedByThermal = true;
+      unawaited(_setScreenDimmedSafely(true));
+      _emitState();
+    }
+    await _applyThermalFpsCap(plan.fpsCap);
+  }
+
+  Future<void> _applyThermalFpsCap(int? cap) async {
+    final webRtc = _webRtcService;
+    final trackId = webRtc?.localVideoTrack?.id;
+    if (webRtc == null || trackId == null || !Platform.isAndroid) return;
+    final key = '$trackId|${cap ?? 0}';
+    if (key == _appliedFpsCapKey) return;
+    // Track mới (camera vừa mở lại) chưa bị giới hạn: không cần gọi để bỏ cap.
+    final sameTrack = _appliedFpsCapKey?.startsWith('$trackId|') ?? false;
+    if (cap == null && !sameTrack) {
+      _appliedFpsCapKey = key;
+      return;
+    }
+    if (await webRtc.setCaptureFpsCap(cap)) _appliedFpsCapKey = key;
   }
 
   void _cancelPendingThermalTimers() {
@@ -2702,27 +2825,31 @@ class CameraStationRuntime {
 
   /// Critical đã xác nhận: giảm tải ngay nhưng vẫn quay và livestream.
   /// Bỏ qua khoá độ phân giải / lựa chọn của người dùng vì đây là mức an toàn.
+  /// Gọi mỗi lần kiểm tra khi critical đã xác nhận. FPS/bitrate/màn hình đã
+  /// giảm tại chỗ; chỉ hạ độ phân giải (mở lại camera) khi KHÔNG livestream.
   Future<void> _degradeForCriticalThermal() async {
     // Đang đổi cấu hình (người dùng/lens): để lần kiểm tra 10 giây sau thử lại.
     if (_stopping || !_cameraEnabled || _profileSwitching) return;
-    _thermalCriticalDegraded = true;
-    _thermalCriticalDegradedSince = DateTime.now();
-    _thermalUserOverride = false;
-    _profileBeforeThermalThrottle ??= _resolutionProfile;
-    _thermalThrottled = true;
-    developer.log(
-      '[THERMAL] Critical state confirmed; reducing to 720p/30fps and lower '
-      'bitrate while keeping recording and livestream running',
-      name: 'CameraStationRuntime',
-    );
-    if (_stationDisplayAttached && !_autoScreenDimmed) {
-      _autoScreenDimmed = true;
-      _screenDimmedByThermal = true;
-      unawaited(_setScreenDimmedSafely(true));
+    if (!_thermalCriticalDegraded) {
+      _thermalCriticalDegraded = true;
+      _thermalCriticalDegradedSince = DateTime.now();
+      _criticalProfileSwitchFailed = false;
+      _thermalUserOverride = false;
+      _profileBeforeThermalThrottle ??= _resolutionProfile;
+      _thermalThrottled = true;
+      developer.log(
+        '[THERMAL] Critical state confirmed; reducing load while keeping '
+        'recording and livestream running',
+        name: 'CameraStationRuntime',
+      );
+      _emitState();
     }
-    _emitState();
     final safeProfile = CameraResolutionProfile.hd720.withFps(30);
-    if (_resolutionProfile == safeProfile) return;
+    if (_resolutionProfile == safeProfile ||
+        _livePublishingActive ||
+        _criticalProfileSwitchFailed) {
+      return;
+    }
     try {
       await _serializeLifecycle(
         () => _setResolutionProfileInternal(
@@ -2731,6 +2858,7 @@ class CameraStationRuntime {
         ),
       );
     } catch (error, stackTrace) {
+      _criticalProfileSwitchFailed = true;
       developer.log(
         '[THERMAL] Failed to reduce camera profile for critical state',
         error: error,

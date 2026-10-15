@@ -1925,6 +1925,7 @@ class _StationScreenState extends State<StationScreen>
                             thermalThrottled: _runtime.thermalThrottled,
                             pendingThermalTarget: _runtime.pendingThermalTarget,
                             pendingThermalIn: _runtime.pendingThermalIn,
+                            chargingWhileHot: _runtime.thermalChargingWhileHot,
                             whipLive: _runtime.isLiveStreaming,
                             onVideoStorage: _openVideoStorage,
                             onResolution: _handleResolutionPressed,
@@ -1996,6 +1997,7 @@ class _StationScreenState extends State<StationScreen>
                               targetProfile: _runtime.pendingThermalTarget,
                               pendingIn: _runtime.pendingThermalIn,
                               profile: _runtime.resolutionProfile,
+                              chargingWhileHot: _runtime.thermalChargingWhileHot,
                               onTap: _openResolutionPicker,
                               onDismiss: _runtime.dismissCooledDownNotice,
                             ),
@@ -2423,6 +2425,7 @@ class _ThermalToast extends StatelessWidget {
     this.targetProfile,
     this.pendingIn,
     this.profile,
+    this.chargingWhileHot = false,
   });
 
   final bool compact;
@@ -2437,6 +2440,7 @@ class _ThermalToast extends StatelessWidget {
   final CameraResolutionProfile? targetProfile;
   final Duration? pendingIn;
   final CameraResolutionProfile? profile;
+  final bool chargingWhileHot;
 
   @override
   Widget build(BuildContext context) {
@@ -2521,6 +2525,14 @@ class _ThermalToast extends StatelessWidget {
           '$warmPrefixEn Monitoring temperature. Tap to change.',
         );
       }
+    }
+    if (chargingWhileHot && !isCooledDown) {
+      // Sạc là nguồn nhiệt lớn nhất khi quay lâu.
+      message += appText(
+        context,
+        ' Nên rút sạc khi pin đủ, tháo ốp lưng và để máy nơi thoáng/có quạt.',
+        ' Unplug the charger when battery is enough, remove the case and keep the phone ventilated.',
+      );
     }
 
     return ConstrainedBox(
@@ -3127,6 +3139,7 @@ class _StationHeader extends StatelessWidget {
   final bool thermalThrottled;
   final CameraResolutionProfile? pendingThermalTarget;
   final Duration? pendingThermalIn;
+  final bool chargingWhileHot;
   final bool whipLive;
   final VoidCallback onVideoStorage;
   final VoidCallback? onResolution;
@@ -3150,6 +3163,7 @@ class _StationHeader extends StatelessWidget {
     this.thermalThrottled = false,
     this.pendingThermalTarget,
     this.pendingThermalIn,
+    this.chargingWhileHot = false,
     required this.whipLive,
     required this.onVideoStorage,
     required this.onResolution,
@@ -3236,6 +3250,7 @@ class _StationHeader extends StatelessWidget {
                   targetProfile: pendingThermalTarget,
                   pendingIn: pendingThermalIn,
                   profile: resolutionProfile,
+                  chargingWhileHot: chargingWhileHot,
                   onTap: onResolution ?? () {},
                   onDismiss: onDismissCooledDown,
                 ),
