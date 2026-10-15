@@ -55,3 +55,6 @@ app.*.map.json
 # Local tooling and temporary artifacts
 .android-adb/
 base/
+.claude/
+.gradle/
+**/.gradle/

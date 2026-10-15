@@ -11,6 +11,7 @@ import android.util.Log
 import org.webrtc.VideoFrame
 import org.webrtc.VideoSink
 import org.webrtc.VideoTrack
+import org.webrtc.YuvHelper
 import java.io.InputStream
 import java.io.OutputStream
 import java.net.ServerSocket
@@ -173,22 +174,11 @@ class VnvarRtspPublisher(
                         val input = encoder.getInputBuffer(index) ?: return
                         input.clear()
                         val is180 = frame.rotation == 180
-                        if (is180) {
-                            copyPlaneRotated180(i420.dataY, i420.strideY, i420.width, i420.height, input)
-                            if (encoderColorFormat == MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420SemiPlanar) {
-                                copyNv12ChromaRotated180(i420, input)
-                            } else {
-                                copyPlaneRotated180(i420.dataU, i420.strideU, (i420.width + 1) / 2, (i420.height + 1) / 2, input)
-                                copyPlaneRotated180(i420.dataV, i420.strideV, (i420.width + 1) / 2, (i420.height + 1) / 2, input)
-                            }
-                        } else {
-                            copyPlane(i420.dataY, i420.strideY, i420.width, i420.height, input)
-                            if (encoderColorFormat == MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420SemiPlanar) {
-                                copyNv12Chroma(i420, input)
-                            } else {
-                                copyPlane(i420.dataU, i420.strideU, (i420.width + 1) / 2, (i420.height + 1) / 2, input)
-                                copyPlane(i420.dataV, i420.strideV, (i420.width + 1) / 2, (i420.height + 1) / 2, input)
-                            }
+                        val nv12 = encoderColorFormat ==
+                            MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420SemiPlanar
+                        if (!writeFrameNative(i420, is180, nv12, input)) {
+                            input.clear()
+                            writeFrameKotlin(i420, is180, nv12, input)
                         }
                         val nowNanos = android.os.SystemClock.elapsedRealtimeNanos()
                         if (streamStartNanos < 0L) {
@@ -220,6 +210,121 @@ class VnvarRtspPublisher(
         val message = error.message?.takeIf { it.isNotBlank() }
             ?: error.javaClass.simpleName
         onEncoderError(message)
+    }
+
+    /** false sau lần đầu libyuv lỗi trên máy này: dùng đường Kotlin dự phòng. */
+    @Volatile
+    private var nativeYuvAvailable = true
+    private var rotateScratch: ByteBuffer? = null
+
+    /**
+     * Ghi khung I420 vào input buffer của encoder bằng libyuv (YuvHelper, có
+     * SIMD/NEON), thay cho vòng lặp Kotlin từng byte vốn tốn CPU và làm nóng
+     * máy khi livestream. Bố cục đầu ra giữ đúng như đường Kotlin: plane Y liền
+     * khít, sau đó UV xen kẽ (NV12) hoặc U rồi V (I420). Trả về false để dùng
+     * đường dự phòng.
+     */
+    private fun writeFrameNative(
+        i420: VideoFrame.I420Buffer,
+        rotate180: Boolean,
+        nv12: Boolean,
+        input: ByteBuffer,
+    ): Boolean {
+        if (!nativeYuvAvailable) return false
+        val frameWidth = i420.width
+        val frameHeight = i420.height
+        val chromaWidth = (frameWidth + 1) / 2
+        val chromaHeight = (frameHeight + 1) / 2
+        val lumaSize = frameWidth * frameHeight
+        val chromaSize = chromaWidth * chromaHeight
+        val outputSize = lumaSize + 2 * chromaSize
+        if (input.capacity() < outputSize) return false
+        return try {
+            var srcY = i420.dataY
+            var srcStrideY = i420.strideY
+            var srcU = i420.dataU
+            var srcStrideU = i420.strideU
+            var srcV = i420.dataV
+            var srcStrideV = i420.strideV
+            if (rotate180) {
+                val scratch = rotateScratch?.takeIf { it.capacity() >= outputSize }
+                    ?: ByteBuffer.allocateDirect(outputSize).also { rotateScratch = it }
+                val dstY = planeSlice(scratch, 0, lumaSize)
+                val dstU = planeSlice(scratch, lumaSize, chromaSize)
+                val dstV = planeSlice(scratch, lumaSize + chromaSize, chromaSize)
+                YuvHelper.I420Rotate(
+                    srcY, srcStrideY, srcU, srcStrideU, srcV, srcStrideV,
+                    dstY, frameWidth, dstU, chromaWidth, dstV, chromaWidth,
+                    frameWidth, frameHeight, 180,
+                )
+                srcY = dstY
+                srcStrideY = frameWidth
+                srcU = dstU
+                srcStrideU = chromaWidth
+                srcV = dstV
+                srcStrideV = chromaWidth
+            }
+            if (nv12) {
+                YuvHelper.I420ToNV12(
+                    srcY, srcStrideY, srcU, srcStrideU, srcV, srcStrideV,
+                    planeSlice(input, 0, lumaSize), frameWidth,
+                    planeSlice(input, lumaSize, 2 * chromaSize), 2 * chromaWidth,
+                    frameWidth, frameHeight,
+                )
+            } else {
+                YuvHelper.I420Copy(
+                    srcY, srcStrideY, srcU, srcStrideU, srcV, srcStrideV,
+                    planeSlice(input, 0, lumaSize), frameWidth,
+                    planeSlice(input, lumaSize, chromaSize), chromaWidth,
+                    planeSlice(input, lumaSize + chromaSize, chromaSize), chromaWidth,
+                    frameWidth, frameHeight,
+                )
+            }
+            input.position(outputSize)
+            true
+        } catch (error: Throwable) {
+            // UnsatisfiedLinkError / IllegalArgumentException trên một số bản build.
+            nativeYuvAvailable = false
+            Log.w(TAG, "libyuv conversion unavailable; using Kotlin fallback", error)
+            false
+        }
+    }
+
+    /** Vùng [offset, offset + length) của [buffer] làm buffer riêng (địa chỉ gốc mới cho JNI). */
+    private fun planeSlice(buffer: ByteBuffer, offset: Int, length: Int): ByteBuffer {
+        val view = buffer.duplicate()
+        view.clear()
+        view.position(offset)
+        view.limit(offset + length)
+        return view.slice()
+    }
+
+    /** Đường dự phòng (cũ): copy từng hàng/byte bằng Kotlin. */
+    private fun writeFrameKotlin(
+        i420: VideoFrame.I420Buffer,
+        rotate180: Boolean,
+        nv12: Boolean,
+        input: ByteBuffer,
+    ) {
+        val chromaWidth = (i420.width + 1) / 2
+        val chromaHeight = (i420.height + 1) / 2
+        if (rotate180) {
+            copyPlaneRotated180(i420.dataY, i420.strideY, i420.width, i420.height, input)
+            if (nv12) {
+                copyNv12ChromaRotated180(i420, input)
+            } else {
+                copyPlaneRotated180(i420.dataU, i420.strideU, chromaWidth, chromaHeight, input)
+                copyPlaneRotated180(i420.dataV, i420.strideV, chromaWidth, chromaHeight, input)
+            }
+        } else {
+            copyPlane(i420.dataY, i420.strideY, i420.width, i420.height, input)
+            if (nv12) {
+                copyNv12Chroma(i420, input)
+            } else {
+                copyPlane(i420.dataU, i420.strideU, chromaWidth, chromaHeight, input)
+                copyPlane(i420.dataV, i420.strideV, chromaWidth, chromaHeight, input)
+            }
+        }
     }
 
     private var uRowBuffer = ByteArray(0)

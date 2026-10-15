@@ -805,6 +805,13 @@ class _StationScreenState extends State<StationScreen>
     }
 
     try {
+      // Khởi tạo lỗi đã dừng foreground service; bật lại trước khi mở camera,
+      // nếu không Android sẽ cắt camera khi tắt màn hình mà không báo gì.
+      await CameraStationForegroundService.start(
+        cameraId: widget.identity.cameraId,
+        courtId: widget.identity.courtId,
+      );
+
       await _runtime.restart(
         cameraId: widget.identity.cameraId,
         courtId: widget.identity.courtId,
@@ -1034,8 +1041,6 @@ class _StationScreenState extends State<StationScreen>
 
       await _runtime.stop();
 
-      await StationConfigService().saveIdentity(newIdentity);
-
       await CameraStationForegroundService.start(
         cameraId: newIdentity.cameraId,
         courtId: newIdentity.courtId,
@@ -1046,6 +1051,10 @@ class _StationScreenState extends State<StationScreen>
         courtId: newIdentity.courtId,
         deviceId: newIdentity.deviceId,
       );
+
+      // Chỉ lưu sau khi sân mới chạy được: nếu khởi tạo lỗi, cấu hình đã lưu
+      // vẫn khớp với sân đang hiển thị/"Thử lại" (không gán nhầm sân).
+      await StationConfigService().saveIdentity(newIdentity);
 
       if (!mounted) {
         return;
@@ -1812,14 +1821,9 @@ class _StationScreenState extends State<StationScreen>
             // Nếu cập nhật ở đây, giá trị sẽ bị đổi thành portrait → khóa
             // sai hướng.
             if (_appResumed) {
+              // Chế độ auto chỉ cần nhớ hướng gần nhất trong bộ nhớ để khoá
+              // khi chạy nền; không ghi đè lựa chọn 'auto' đã lưu.
               _lastActiveOrientationLandscape = landscape;
-            }
-            if (_screenOrientation == 'auto' && _appResumed) {
-              unawaited(
-                StationConfigService().saveScreenOrientation(
-                  landscape ? 'landscape' : 'portrait',
-                ),
-              );
             }
           }
           // Scrim height scales with the viewport instead of being a
@@ -1925,6 +1929,7 @@ class _StationScreenState extends State<StationScreen>
                             thermalThrottled: _runtime.thermalThrottled,
                             pendingThermalTarget: _runtime.pendingThermalTarget,
                             pendingThermalIn: _runtime.pendingThermalIn,
+                            chargingWhileHot: _runtime.thermalChargingWhileHot,
                             whipLive: _runtime.isLiveStreaming,
                             onVideoStorage: _openVideoStorage,
                             onResolution: _handleResolutionPressed,
@@ -1996,6 +2001,7 @@ class _StationScreenState extends State<StationScreen>
                               targetProfile: _runtime.pendingThermalTarget,
                               pendingIn: _runtime.pendingThermalIn,
                               profile: _runtime.resolutionProfile,
+                              chargingWhileHot: _runtime.thermalChargingWhileHot,
                               onTap: _openResolutionPicker,
                               onDismiss: _runtime.dismissCooledDownNotice,
                             ),
@@ -2423,6 +2429,7 @@ class _ThermalToast extends StatelessWidget {
     this.targetProfile,
     this.pendingIn,
     this.profile,
+    this.chargingWhileHot = false,
   });
 
   final bool compact;
@@ -2437,6 +2444,7 @@ class _ThermalToast extends StatelessWidget {
   final CameraResolutionProfile? targetProfile;
   final Duration? pendingIn;
   final CameraResolutionProfile? profile;
+  final bool chargingWhileHot;
 
   @override
   Widget build(BuildContext context) {
@@ -2521,6 +2529,14 @@ class _ThermalToast extends StatelessWidget {
           '$warmPrefixEn Monitoring temperature. Tap to change.',
         );
       }
+    }
+    if (chargingWhileHot && !isCooledDown) {
+      // Sạc là nguồn nhiệt lớn nhất khi quay lâu.
+      message += appText(
+        context,
+        ' Nên rút sạc khi pin đủ, tháo ốp lưng và để máy nơi thoáng/có quạt.',
+        ' Unplug the charger when battery is enough, remove the case and keep the phone ventilated.',
+      );
     }
 
     return ConstrainedBox(
@@ -3127,6 +3143,7 @@ class _StationHeader extends StatelessWidget {
   final bool thermalThrottled;
   final CameraResolutionProfile? pendingThermalTarget;
   final Duration? pendingThermalIn;
+  final bool chargingWhileHot;
   final bool whipLive;
   final VoidCallback onVideoStorage;
   final VoidCallback? onResolution;
@@ -3150,6 +3167,7 @@ class _StationHeader extends StatelessWidget {
     this.thermalThrottled = false,
     this.pendingThermalTarget,
     this.pendingThermalIn,
+    this.chargingWhileHot = false,
     required this.whipLive,
     required this.onVideoStorage,
     required this.onResolution,
@@ -3236,6 +3254,7 @@ class _StationHeader extends StatelessWidget {
                   targetProfile: pendingThermalTarget,
                   pendingIn: pendingThermalIn,
                   profile: resolutionProfile,
+                  chargingWhileHot: chargingWhileHot,
                   onTap: onResolution ?? () {},
                   onDismiss: onDismissCooledDown,
                 ),

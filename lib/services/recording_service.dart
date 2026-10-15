@@ -175,10 +175,39 @@ List<String> fragmentCompanionPaths(String videoPath) {
 
 bool isManagedStorageFilePath(String path) {
   final normalized = path.replaceAll('\\', '/').toLowerCase();
-  return normalized.endsWith('.ts') ||
-      normalized.endsWith('.mp4') ||
+  return isAppManagedVideoPath(path) ||
       (normalized.contains('/fragments/') &&
           (normalized.endsWith('.wav') || normalized.endsWith('.json')));
+}
+
+/// Video do chính app tạo ra: đoạn ghi trong `<dd-mm-yyyy>/AUTOMODE/...`
+/// (gồm FRAGMENTS và bản dự phòng .mp4) hoặc tên file kiểu cũ của VNVAR.
+/// Người dùng có thể chọn thư mục lưu dùng chung (ví dụ DCIM), nên mọi thao
+/// tác dọn dẹp/giới hạn dung lượng chỉ được đụng tới các file này.
+bool isAppManagedVideoPath(String path) {
+  final normalized = path.replaceAll('\\', '/');
+  final lower = normalized.toLowerCase();
+  if (!lower.endsWith('.ts') && !lower.endsWith('.mp4')) return false;
+  if (RegExp(
+    r'/\d{2}-\d{2}-\d{4}/automode/',
+  ).hasMatch(lower)) {
+    return true;
+  }
+  final name = normalized.split('/').last.toUpperCase();
+  if (name.contains('_CLIP_')) return true;
+  return RegExp(
+    r'^(VNVAR_|CLIP_)?CAM[-_]?[A-Z0-9]*_\d{10,}\.(TS|MP4)$',
+  ).hasMatch(name);
+}
+
+/// File phụ trợ mồ côi được phép xoá khi dọn thư mục ngày: âm thanh/metadata
+/// tạm của app và file ẩn của hệ điều hành. Không bao giờ xoá file khác.
+bool isOrphanAuxiliaryFile(String path) {
+  final name = path.replaceAll('\\', '/').split('/').last.toLowerCase();
+  return name.startsWith('.') ||
+      name.endsWith('.wav') ||
+      name.endsWith('.json') ||
+      name.endsWith('.tmp');
 }
 
 /// Converts native/FFmpeg failures into a bounded string safe for a Flutter
@@ -452,6 +481,12 @@ class RecordingService {
 
   bool _stopping = false;
   Future<RecordedSegment?>? _stopOperation;
+  // Lần start() đang mở recorder đầu tiên; stop()/rotation phải chờ nó xong để
+  // không bỏ lại recorder native mở muộn (rò rỉ, file staging phình mãi).
+  Future<void>? _startOperation;
+  // File staging đang được chốt/chuyển sang TS. _currentPath đã trỏ sang đoạn
+  // mới nên dọn file tạm phải bỏ qua các file này để không convert hai lần.
+  final Set<String> _finalizingPaths = <String>{};
   Future<RecordedSegment?>? _rotationOperation;
   Future<void>? _expiredCleanupOperation;
   Future<void>? _storageLimitOperation;
@@ -1183,6 +1218,13 @@ class RecordingService {
     if (!await directory.exists()) {
       await directory.create(recursive: true);
     }
+    // Thư mục người dùng tự chọn không được đặt .nomedia ở gốc (sẽ ẩn ảnh của
+    // họ); thay vào đó ẩn riêng thư mục ngày của app khỏi thư viện ảnh.
+    if (_videoStorage.usesCustomRoot) {
+      await _videoStorage.hideFromGallery(
+        Directory('${root.path}${Platform.pathSeparator}$day'),
+      );
+    }
     return directory;
   }
 
@@ -1604,6 +1646,8 @@ class RecordingService {
     _recordAudio = Platform.isAndroid || (Platform.isIOS && audioAvailable);
 
     _recording = true;
+    final startCompleter = Completer<void>();
+    _startOperation = startCompleter.future;
 
     try {
       // ========================================================
@@ -1647,6 +1691,11 @@ class RecordingService {
       );
 
       rethrow;
+    } finally {
+      startCompleter.complete();
+      if (identical(_startOperation, startCompleter.future)) {
+        _startOperation = null;
+      }
     }
   }
 
@@ -1976,6 +2025,8 @@ class RecordingService {
   Future<RecordedSegment?> _performSegmentRotation({
     Future<void> Function()? onRecorderStopped,
   }) async {
+    final starting = _startOperation;
+    if (starting != null) await starting;
     if (!_recording) return null;
 
     _rotating = true;
@@ -2034,6 +2085,29 @@ class RecordingService {
 
   Future<RecordedSegment?> _finishCurrentSegment({
     Future<void> Function()? onRecorderStopped,
+  }) async {
+    // Chụp hướng của chính đoạn này trước khi onRecorderStopped mở đoạn mới
+    // (đoạn mới ghi đè _currentSegment*), nếu không đoạn cũ bị xuất theo
+    // hướng mới khi người dùng xoay/đổi camera giữa chừng.
+    final path = _currentPath;
+    final segmentFacingMode = _currentSegmentFacingMode;
+    final segmentQuarterTurns = _currentSegmentQuarterTurns;
+    if (path != null) _finalizingPaths.add(path);
+    try {
+      return await _finishSegment(
+        onRecorderStopped: onRecorderStopped,
+        segmentFacingMode: segmentFacingMode,
+        segmentQuarterTurns: segmentQuarterTurns,
+      );
+    } finally {
+      if (path != null) _finalizingPaths.remove(path);
+    }
+  }
+
+  Future<RecordedSegment?> _finishSegment({
+    Future<void> Function()? onRecorderStopped,
+    required String segmentFacingMode,
+    required int segmentQuarterTurns,
   }) async {
     final recorder = _recorder;
 
@@ -2250,8 +2324,8 @@ class RecordingService {
       startedAt,
       endedAt,
       audioPath == null ? null : File(audioPath),
-      facingMode: _currentSegmentFacingMode,
-      quarterTurns: _currentSegmentQuarterTurns,
+      facingMode: segmentFacingMode,
+      quarterTurns: segmentQuarterTurns,
     );
 
     // Lấy kích thước trước cleanup. Một RecordingService khác dùng chung thư
@@ -2508,14 +2582,21 @@ class RecordingService {
 
   Future<void> cleanupOldTempFiles({
     Duration maxAge = const Duration(hours: 24),
+    bool includeExportDownloads = true,
   }) async {
-    // Phiên QR cũ không được tồn tại qua lần khởi động tiếp theo.
-    await cleanupExportDownloads();
+    // Phiên QR cũ không được tồn tại qua lần khởi động tiếp theo. Khi station
+    // đang chạy (ví dụ mở màn Video đã lưu) thì giữ clip export tablet đang dùng.
+    if (includeExportDownloads) await cleanupExportDownloads();
     await _cleanupAbandonedRecordings(maxAge: maxAge);
     // Mở màn hình chính/khởi động server: dọn toàn bộ thư mục ngày hết hạn
     // trước khi dựng lại chỉ mục video.
     await removeExpiredData();
     final directory = await _videoRootDirectory();
+    // Giữ nguyên segment đã biết (ID có mili-giây từ lúc ghi). Dựng lại từ tên
+    // file chỉ có độ chính xác tới giây nên ID sẽ đổi và tablet mất liên kết.
+    final previousByPath = {
+      for (final segment in _segments) segment.path: segment,
+    };
     _segments.clear();
     try {
       await for (final entity in directory.list(recursive: true)) {
@@ -2582,6 +2663,7 @@ class RecordingService {
             }
             final timestamp = startedAt.millisecondsSinceEpoch;
             _segments.add(
+              previousByPath[entity.path] ??
               RecordedSegment(
                 id: '${indexedCameraId}_$timestamp',
                 cameraId: indexedCameraId,
@@ -2607,6 +2689,7 @@ class RecordingService {
           if (timestamp == null || (!isRecording && !isClip)) continue;
           final startedAt = DateTime.fromMillisecondsSinceEpoch(timestamp);
           _segments.add(
+            previousByPath[entity.path] ??
             RecordedSegment(
               id: isClip
                   ? 'CLIP_${cameraId}_$timestamp'
@@ -2669,6 +2752,7 @@ class RecordingService {
         continue;
       }
       if (activePath != null && entity.path == activePath) continue;
+      if (_finalizingPaths.contains(entity.path)) continue;
       try {
         final stat = await entity.stat();
         final fileName = entity.uri.pathSegments.last;
@@ -2679,9 +2763,19 @@ class RecordingService {
         final timestamp = int.tryParse(timestampText);
         if (fileName.startsWith(prefix) && timestamp != null && stat.size > 0) {
           final journal = File('${entity.path}.json');
+          // Hướng lúc quay được lưu trong journal; dùng lại khi khôi phục sau
+          // crash thay vì hướng hiện tại của camera.
+          String? journalFacingMode;
+          int? journalQuarterTurns;
           if (await journal.exists()) {
             try {
               final decoded = jsonDecode(await journal.readAsString());
+              if (decoded is Map<String, dynamic>) {
+                final facing = decoded['facingMode'];
+                final turns = decoded['quarterTurns'];
+                if (facing is String) journalFacingMode = facing;
+                if (turns is num) journalQuarterTurns = turns.toInt();
+              }
               if (decoded is Map<String, dynamic> &&
                   decoded['state'] == 'invalid') {
                 if (now.difference(stat.modified) >= maxAge) {
@@ -2741,6 +2835,8 @@ class RecordingService {
             startedAt,
             endedAt,
             await wav.exists() ? wav : null,
+            facingMode: journalFacingMode,
+            quarterTurns: journalQuarterTurns,
           );
           await _writeJournalState(
             journal,
@@ -3013,6 +3109,8 @@ class RecordingService {
 
         if (dirName.toLowerCase() == 'download') continue;
         if (dirName == todayName) continue;
+        // Chỉ dọn thư mục ngày do app tạo, không đụng thư mục của người dùng.
+        if (!RegExp(r'^\d{2}-\d{2}-\d{4}$').hasMatch(dirName)) continue;
 
         await _cleanDirectoryRecursively(entity);
       }
@@ -3042,6 +3140,7 @@ class RecordingService {
     // dọn các file phụ trợ mồ côi (.wav, .json, .tmp, file ẩn hệ điều hành)
     if (!hasVideo && remaining.whereType<Directory>().isEmpty) {
       for (final file in remainingFiles) {
+        if (!isOrphanAuxiliaryFile(file.path)) continue;
         if (!isFileReadActive(file.path)) {
           try {
             await file.delete();
@@ -3106,13 +3205,14 @@ class RecordingService {
     var total = 0;
     await for (final entity in root.list(recursive: true)) {
       if (entity is! File) continue;
-      final lower = entity.path.toLowerCase();
       final normalizedPath = entity.path.replaceAll('\\', '/').toLowerCase();
       if (normalizedPath.contains('/download/')) continue;
       try {
         final stat = await entity.stat();
         if (isManagedStorageFilePath(entity.path)) total += stat.size;
-        if (!lower.endsWith('.ts') && !lower.endsWith('.mp4')) continue;
+        // Chỉ xoá video do app tạo; file của người dùng trong thư mục dùng
+        // chung (DCIM...) không bao giờ bị đưa vào danh sách xoá.
+        if (!isAppManagedVideoPath(entity.path)) continue;
         final normalized = entity.path.replaceAll('\\', '/');
         final match = RegExp(
           r'/([0-9]{2}-[0-9]{2}-[0-9]{4})/',
@@ -3266,6 +3366,9 @@ class RecordingService {
       _segmentTimer?.cancel();
 
       _segmentTimer = null;
+
+      final starting = _startOperation;
+      if (starting != null) await starting;
 
       if (!_recording && _rotationOperation == null && _recorder == null) {
         return null;

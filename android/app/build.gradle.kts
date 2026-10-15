@@ -14,6 +14,11 @@ if (keystorePropertiesFile.exists()) {
     keystoreProperties.load(FileInputStream(keystorePropertiesFile))
 }
 
+// Bản release phải ký bằng keystore thật (android/key.properties). Chỉ cho phép
+// ký bằng debug key khi đặt rõ VNVAR_ALLOW_DEBUG_SIGNING=true (ví dụ CI tạo bản
+// thử nghiệm); trước đây việc này diễn ra âm thầm.
+val allowDebugReleaseSigning = System.getenv("VNVAR_ALLOW_DEBUG_SIGNING") == "true"
+
 android {
     namespace = "vn.vnvar.cameraStation"
     // flutter_webrtc 1.6.0 is compiled against Android SDK 36.
@@ -54,9 +59,34 @@ android {
             if (releaseSigningConfig?.storeFile?.exists() == true) {
                 signingConfig = releaseSigningConfig
             } else {
+                // Chỉ dùng khi VNVAR_ALLOW_DEBUG_SIGNING=true; nếu không, kiểm tra
+                // bên dưới chặn bản release trước khi build.
                 signingConfig = signingConfigs.getByName("debug")
             }
         }
+    }
+}
+
+// Kiểm tra lúc đã biết task sẽ chạy, để build debug/profile không bị ảnh hưởng.
+gradle.taskGraph.whenReady {
+    val releaseSigningReady =
+        android.signingConfigs.findByName("release")?.storeFile?.exists() == true
+    val buildsRelease = allTasks.any { task ->
+        task.project == project &&
+            task.name.endsWith("Release") &&
+            (task.name.startsWith("assemble") ||
+                task.name.startsWith("bundle") ||
+                task.name.startsWith("package"))
+    }
+    if (buildsRelease && !releaseSigningReady) {
+        if (!allowDebugReleaseSigning) {
+            throw GradleException(
+                "Missing release keystore (android/key.properties). Refusing to sign " +
+                    "the release build with the debug key. Set " +
+                    "VNVAR_ALLOW_DEBUG_SIGNING=true only for test builds.",
+            )
+        }
+        logger.warn("WARNING: release build is signed with the DEBUG key (test build only).")
     }
 }
 

@@ -160,6 +160,9 @@ class WebRtcService {
   Timer? _rtspRetryTimer;
   int _rtspRetryAttempt = 0;
   bool _rtspStarting = false;
+  // Tăng mỗi lần start/stop RTSP: lần start bị huỷ/hết giờ không được tự bật
+  // lại server sau khi đã dừng.
+  int _rtspStartGeneration = 0;
   bool _receivedFirstFrame = false;
   int _cameraLifecycleGeneration = 0;
   String? _currentFacingMode;
@@ -592,11 +595,13 @@ class WebRtcService {
           if (deviceId is String && deviceId.isNotEmpty) {
             detectedDeviceId ??= deviceId;
           }
-          if (item['id'] == 'ultraHd4k') continue;
-          final profile = CameraResolutionProfile.fromId(item['id'] as String?);
+          // Chỉ nhận cấu hình còn được hỗ trợ (720p/1080p). Bỏ qua 2K/4K trước
+          // khi gọi fromId, vì fromId chuyển chúng thành 1080p (sẽ bị trùng).
+          final id = item['id'] as String?;
+          if (!CameraResolutionProfile.isSelectableId(id)) continue;
+          final profile = CameraResolutionProfile.fromId(id);
           final maxFps = item['maxFps'];
           if (profile != null &&
-              profile.preset != CameraResolutionPreset.ultraHd4k &&
               maxFps is num &&
               maxFps.toInt() > 0) {
             final detectedFps = maxFps.toInt();
@@ -970,8 +975,9 @@ class WebRtcService {
   Future<void> _configureNaturalCameraMetering(MediaStreamTrack track) async {
     if (!Platform.isAndroid && !Platform.isIOS) return;
 
-    // Reset lock to continuous auto before allowing natural adaptation
-    unawaited(setCameraLock(locked: false, trackId: track.id));
+    // Reset lock to continuous auto before allowing natural adaptation.
+    // Await it: concurrent native applies each replace the repeating request.
+    await setCameraLock(locked: false, trackId: track.id);
 
     // flutter_webrtc 1.6.0 implements Android's setExposurePoint by replacing
     // the active Camera2 repeating request with a new, minimally configured
@@ -1040,6 +1046,26 @@ class WebRtcService {
     await _applyExposureBias(track);
   }
 
+  /// Android: giảm FPS đầu ra tại VideoSource (bỏ bớt khung) mà không mở lại
+  /// camera, nên livestream và ghi hình không bị ngắt. null = FPS gốc.
+  Future<bool> setCaptureFpsCap(int? fps) async {
+    final track = localVideoTrack;
+    if (track == null || !Platform.isAndroid) return false;
+    try {
+      return await _platformChannel.invokeMethod<bool>('setCaptureFpsCap', {
+            'trackId': track.id,
+            'fps': fps ?? 0,
+          }) ??
+          false;
+    } catch (error) {
+      developer.log(
+        '[CAMERA] Unable to limit capture fps: $error',
+        name: 'WebRtcService',
+      );
+      return false;
+    }
+  }
+
   Future<bool> setCameraLock({required bool locked, String? trackId}) async {
     final targetTrackId = trackId ?? localVideoTrack?.id;
     if (targetTrackId == null) return false;
@@ -1075,6 +1101,27 @@ class WebRtcService {
       '[CAMERA] Tap-to-meter triggered at (${targetPoint.x.toStringAsFixed(2)}, ${targetPoint.y.toStringAsFixed(2)})',
       name: 'WebRtcService',
     );
+
+    if (Platform.isAndroid) {
+      // Helper.setExposurePoint của flutter_webrtc thay repeating request bằng
+      // TEMPLATE_RECORD trần (mất EV/FPS/zoom) rồi watchdog native trả lại sau
+      // 3 giây: hình chớp sáng rồi trở lại. Đo sáng qua controller native để
+      // giữ nguyên cấu hình, chỉ đổi vùng đo sáng (AE vẫn liên tục, không khoá).
+      _isCameraLocked = false;
+      try {
+        await _platformChannel.invokeMethod<bool>('setCameraMeteringPoint', {
+          'trackId': track.id,
+          'x': targetPoint.x,
+          'y': targetPoint.y,
+        }).timeout(const Duration(seconds: 2));
+      } catch (error) {
+        developer.log(
+          '[CAMERA] Tap-to-meter unavailable: $error',
+          name: 'WebRtcService',
+        );
+      }
+      return;
+    }
 
     // Luôn duy trì Continuous Auto Exposure, không khoá cứng thông số
     await setCameraLock(locked: false, trackId: track.id);
@@ -1170,6 +1217,7 @@ class WebRtcService {
       _rtspStarting = false;
       return;
     }
+    final startGeneration = ++_rtspStartGeneration;
     try {
       _rtspRunning = false;
       _rtspAudio = false;
@@ -1192,13 +1240,23 @@ class WebRtcService {
           'fps': _resolutionProfile.fps,
           'remoteAudio': _rtspTabletAudio,
         },
-      );
+      // Native có thể không trả lời (ví dụ iOS bị dừng trước khi server sẵn
+      // sàng); không để _rtspStarting kẹt true mãi.
+      ).timeout(const Duration(seconds: 15));
       _rtspAudio = result?['audio'] == true;
       developer.log(
         '[RTSP] Server opened; waiting for H.264 encoder readiness.',
         name: 'WebRtcService',
       );
     } catch (error, stackTrace) {
+      if (startGeneration != _rtspStartGeneration) {
+        // RTSP đã được dừng trong lúc đang khởi động: không bật lại.
+        developer.log(
+          '[RTSP] Start superseded by stop: $error',
+          name: 'WebRtcService',
+        );
+        return;
+      }
       // Keep the logical server state so transient encoder/network failures
       // can be retried without requiring the tablet to reconnect manually.
       _rtspServerStarted = true;
@@ -1219,6 +1277,7 @@ class WebRtcService {
 
   Future<void> _stopRtsp() async {
     if (!Platform.isAndroid && !Platform.isIOS) return;
+    _rtspStartGeneration++;
     if (!_rtspServerStarted) return;
     _rtspRetryTimer?.cancel();
     _rtspRetryTimer = null;
@@ -1458,6 +1517,14 @@ class WebRtcService {
   Future<void> _bindRendererAndWaitForFirstFrame(MediaStream stream) async {
     _receivedFirstFrame = false;
     _firstFrameFailureTimer?.cancel();
+    // Lần mở camera chồng lên: kết thúc lần chờ trước bằng lỗi thay vì bỏ rơi
+    // nó (timer của nó vừa bị huỷ nên nó sẽ chờ mãi, kẹt cả hàng đợi lifecycle).
+    final previous = _firstFrameCompleter;
+    if (previous != null && !previous.isCompleted) {
+      previous.completeError(
+        StateError('Camera stream changed before its first frame.'),
+      );
+    }
     final completer = Completer<void>();
     _firstFrameCompleter = completer;
     localRenderer.srcObject = stream;

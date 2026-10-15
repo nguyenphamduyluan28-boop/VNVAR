@@ -53,6 +53,21 @@ int effectiveWebRtcPeerLimit(String thermalState) {
   }
 }
 
+/// Trạng thái runtime mà /start không được tự gắn recorder: camera đang được
+/// đổi cấu hình, khôi phục hoặc tạm dừng (track hiện tại sắp bị huỷ). Runtime
+/// sẽ tự gọi ensureRecording() khi camera mở lại.
+bool captureStateBlocksRecorderStart(String? captureState) {
+  const blocking = {
+    'profile_switching',
+    'recovering',
+    'lifecycle_suspended',
+    'lifecycle_resuming',
+    'thermal_suspended',
+    'scanner_paused',
+  };
+  return blocking.contains(captureState);
+}
+
 class CameraServer {
   // ============================================================
   // SERVER
@@ -681,6 +696,19 @@ class CameraServer {
         'error': 'Not Found',
         'path': path,
       });
+    } on RequestBodyTimeoutException catch (error) {
+      developer.log(
+        'CameraServer request body timed out: $error',
+        name: 'CameraServer',
+      );
+      try {
+        await _sendJson(request.response, HttpStatus.requestTimeout, {
+          'error': 'Request body timeout',
+          'retryable': true,
+        });
+      } catch (_) {
+        // The client may already be gone.
+      }
     } on PayloadTooLargeException catch (error, stackTrace) {
       developer.log(
         'CameraServer rejected oversized request body',
@@ -954,6 +982,25 @@ class CameraServer {
 
   Future<void> _startRecording(HttpRequest request) async {
     final alreadyRunning = recordingService.recording;
+    final captureState = captureStateProvider?.call();
+    if (!alreadyRunning && captureStateBlocksRecorderStart(captureState)) {
+      // Runtime đang đổi cấu hình/khôi phục/tạm dừng camera: gắn recorder lúc
+      // này sẽ bám vào track sắp bị huỷ. Chỉ ghi nhận yêu cầu; runtime tự gọi
+      // ensureRecording() khi camera sẵn sàng.
+      _stoppedByRequest = false;
+      await _sendJson(request.response, HttpStatus.ok, {
+        'success': true,
+        'courtId': courtId,
+        'cameraId': cameraId,
+        'deviceId': deviceId,
+        'status': 'STARTING',
+        'recording': false,
+        'deferred': true,
+        'captureState': captureState,
+        'alreadyRunning': false,
+      });
+      return;
+    }
     if (!alreadyRunning) {
       await resumeRecordingByRequest();
     } else {
@@ -1667,6 +1714,9 @@ class CameraServer {
       });
       return;
     }
+    // Đọc xong body TRƯỚC khi vào hàng đợi tuần tự: một tablet gửi body chậm
+    // không được chặn lượt kết nối của các tablet khác.
+    final body = await _readJson(request);
     _pendingWebRtcOffers++;
     final previous = _webRtcOfferTail;
     final turn = Completer<void>();
@@ -1677,7 +1727,6 @@ class CameraServer {
       } catch (_) {
         // A failed older offer must not poison the next handover.
       }
-      final body = await _readJson(request);
 
       final sdp = body['sdp'] as String?;
 
@@ -1850,11 +1899,18 @@ class CameraServer {
     }
 
     final decoder = BoundedJsonBodyDecoder(maximumBytes: maximumJsonBodyBytes);
-    await for (final chunk in request) {
-      decoder.add(chunk);
+    try {
+      await request
+          .forEach(decoder.add)
+          .timeout(requestBodyTimeout);
+    } on TimeoutException {
+      throw const RequestBodyTimeoutException(requestBodyTimeout);
     }
     return decoder.decode();
   }
+
+  /// Thời gian tối đa để nhận xong body JSON của một request.
+  static const Duration requestBodyTimeout = Duration(seconds: 10);
 
   // ============================================================
   // NOT FOUND

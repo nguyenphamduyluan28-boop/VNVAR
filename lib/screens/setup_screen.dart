@@ -82,10 +82,12 @@ class _SetupScreenState extends State<SetupScreen> {
           ];
     SystemChrome.setPreferredOrientations(orientations);
     if (Platform.isAndroid) {
-      const MethodChannel('vn.vnvar.cameraStation/channel')
+      // Kênh native thật của app (MainActivity); tên cũ không được đăng ký.
+      const MethodChannel('vnvar/camera_station_service')
           .invokeMethod('setScreenOrientation', {
-        'mode': widget.isLandscape ? 'landscape' : 'portrait',
-      });
+            'mode': widget.isLandscape ? 'landscape' : 'portrait',
+          })
+          .catchError((Object _) => null);
     }
   }
 

@@ -27,7 +27,10 @@ class _SavedVideosScreenState extends State<SavedVideosScreen> {
 
   Future<void> _refresh() async {
     if (mounted) setState(() => _loading = true);
-    await widget.recordingService.cleanupOldTempFiles();
+    // Station có thể đang chạy: không xoá clip export tablet đang dùng.
+    await widget.recordingService.cleanupOldTempFiles(
+      includeExportDownloads: false,
+    );
     final videos = widget.recordingService.segments;
     final bytes = await widget.recordingService.storageSizeBytes();
     if (!mounted) return;

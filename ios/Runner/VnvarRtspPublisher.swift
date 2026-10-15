@@ -13,6 +13,8 @@ final class VnvarRtspPublisher: NSObject, RTCVideoRenderer {
   private let encoder: VnvarH264Encoder
   private let stateQueue = DispatchQueue(label: "vnvar.rtsp.publisher.state")
   private let frameQueue = DispatchQueue(label: "vnvar.rtsp.publisher.frames")
+  private let stateQueueKey = DispatchSpecificKey<Void>()
+  private let frameQueueKey = DispatchSpecificKey<Void>()
   private var running = false
   private var formatReady = false
   private var framePending = false
@@ -46,6 +48,8 @@ final class VnvarRtspPublisher: NSObject, RTCVideoRenderer {
     maximumBitrate = max(250_000, bitrate)
     requestedFps = max(1, fps)
     super.init()
+    stateQueue.setSpecific(key: stateQueueKey, value: ())
+    frameQueue.setSpecific(key: frameQueueKey, value: ())
 
     encoder.onFormat = { [weak self] sps, pps in
       guard let self = self else { return }
@@ -114,8 +118,13 @@ final class VnvarRtspPublisher: NSObject, RTCVideoRenderer {
     handleAudio(pcm, sampleRate: 48_000, channels: 1, bitsPerSample: 16)
   }
 
+  /// Có client RTSP đang nhận tiếng: chỉ khi đó mới cần đọc PCM từ file ghi âm.
+  var needsNativeAudio: Bool {
+    nativeAudioAvailable && server.hasPlayingAudioClients
+  }
+
   func start() throws {
-    let shouldStart = stateQueue.sync { () -> Bool in
+    let shouldStart = onStateQueue { () -> Bool in
       guard !running else { return false }
       running = true
       return true
@@ -124,14 +133,14 @@ final class VnvarRtspPublisher: NSObject, RTCVideoRenderer {
     do {
       try server.start()
     } catch {
-      stateQueue.sync { running = false }
+      onStateQueue { running = false }
       throw error
     }
     track.add(self)
   }
 
   func stop() {
-    let wasRunning = stateQueue.sync { () -> Bool in
+    let wasRunning = onStateQueue { () -> Bool in
       let value = running
       running = false
       formatReady = false
@@ -139,9 +148,22 @@ final class VnvarRtspPublisher: NSObject, RTCVideoRenderer {
     }
     if wasRunning { track.remove(self) }
     audioSink?.close()
-    frameQueue.sync {}
+    // Chờ các khung đang xử lý xong. Nếu stop() chạy ngay trên frameQueue thì
+    // không thể tự chờ chính mình (sẽ treo cứng): bỏ qua bước này.
+    if DispatchQueue.getSpecific(key: frameQueueKey) == nil {
+      frameQueue.sync {}
+    }
     encoder.stop()
     server.stop()
+  }
+
+  /// stateQueue.sync an toàn: chạy thẳng nếu đang ở trên stateQueue (tránh
+  /// deadlock), giống VnvarRtspServer.stop().
+  private func onStateQueue<T>(_ work: () -> T) -> T {
+    if DispatchQueue.getSpecific(key: stateQueueKey) != nil {
+      return work()
+    }
+    return stateQueue.sync(execute: work)
   }
 
   func setSize(_ size: CGSize) {}
@@ -235,18 +257,27 @@ final class VnvarRtspPublisher: NSObject, RTCVideoRenderer {
       let sampleCount = pcm.count / MemoryLayout<Int16>.size
       let frameCount = sampleCount / channels
       guard frameCount > 0 else { return }
-      var networkPcm = Data(capacity: frameCount * 2)
-      pcm.withUnsafeBytes { raw in
-        let samples = raw.bindMemory(to: Int16.self)
-        for frame in 0..<frameCount {
-          var sum = 0
-          for channel in 0..<channels {
-            sum += Int(samples[frame * channels + channel])
+      // Ghi thẳng vào bộ đệm cấp sẵn (big-endian cho RTP L16) thay vì append
+      // từng byte vào Data.
+      var networkPcm = Data(count: frameCount * MemoryLayout<UInt16>.size)
+      networkPcm.withUnsafeMutableBytes { output in
+        let destination = output.bindMemory(to: UInt16.self)
+        pcm.withUnsafeBytes { raw in
+          let samples = raw.bindMemory(to: Int16.self)
+          if channels == 1 {
+            for frame in 0..<frameCount {
+              destination[frame] = UInt16(bitPattern: samples[frame]).bigEndian
+            }
+          } else {
+            for frame in 0..<frameCount {
+              var sum = 0
+              for channel in 0..<channels {
+                sum += Int(samples[frame * channels + channel])
+              }
+              let mono = Int16(clamping: sum / channels)
+              destination[frame] = UInt16(bitPattern: mono).bigEndian
+            }
           }
-          let mono = Int16(clamping: sum / channels)
-          let value = UInt16(bitPattern: mono)
-          networkPcm.append(UInt8((value >> 8) & 0xFF))
-          networkPcm.append(UInt8(value & 0xFF))
         }
       }
       self.server.sendAudio(pcm: networkPcm, timestamp: timestamp)

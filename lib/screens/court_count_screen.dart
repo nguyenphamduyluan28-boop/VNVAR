@@ -30,8 +30,10 @@ class _CourtCountScreenState extends State<CourtCountScreen> {
       DeviceOrientation.portraitDown,
     ]);
     if (Platform.isAndroid) {
-      const MethodChannel('vn.vnvar.cameraStation/channel')
-          .invokeMethod('setScreenOrientation', {'mode': 'portrait'});
+      // Kênh native thật của app (MainActivity); tên cũ không được đăng ký.
+      const MethodChannel('vnvar/camera_station_service')
+          .invokeMethod('setScreenOrientation', {'mode': 'portrait'})
+          .catchError((Object _) => null);
     }
     _loadExisting();
   }

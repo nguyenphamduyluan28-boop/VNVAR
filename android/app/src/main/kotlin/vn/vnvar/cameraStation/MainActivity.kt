@@ -261,6 +261,41 @@ class MainActivity : FlutterActivity() {
                     }
                 }
 
+                "setCameraMeteringPoint" -> {
+                    val trackId = call.argument<String>("trackId")
+                    val x = call.argument<Double>("x")
+                    val y = call.argument<Double>("y")
+                    if (trackId.isNullOrBlank() || x == null || y == null) {
+                        result.error("INVALID_ARGS", "trackId, x and y are required", null)
+                    } else {
+                        CameraExposureController.setMeteringPoint(trackId, x, y) { response ->
+                            runOnUiThread { result.success(response["applied"] == true) }
+                        }
+                    }
+                }
+
+                "setStableExposure" -> {
+                    val trackId = call.argument<String>("trackId")
+                    val enabled = call.argument<Boolean>("enabled") ?: true
+                    if (trackId.isNullOrBlank()) {
+                        result.error("INVALID_TRACK", "trackId is required", null)
+                    } else {
+                        CameraExposureController.setStableExposure(trackId, enabled) { response ->
+                            runOnUiThread { result.success(response["applied"] == true) }
+                        }
+                    }
+                }
+
+                "setCaptureFpsCap" -> {
+                    val trackId = call.argument<String>("trackId")
+                    val fps = call.argument<Int>("fps")
+                    if (trackId.isNullOrBlank()) {
+                        result.error("INVALID_TRACK", "trackId is required", null)
+                    } else {
+                        result.success(CameraExposureController.setCaptureFpsCap(trackId, fps))
+                    }
+                }
+
                 "startRtsp" -> {
                     val trackId = call.argument<String>("trackId")
                     val port = call.argument<Int>("port") ?: 8554
@@ -438,9 +473,19 @@ class MainActivity : FlutterActivity() {
                     val battery = registerReceiver(null, android.content.IntentFilter(Intent.ACTION_BATTERY_CHANGED))
                     val tenths = battery?.getIntExtra("temperature", Int.MIN_VALUE) ?: Int.MIN_VALUE
                     val power = getSystemService(PowerManager::class.java)
+                    // Dự báo nhiệt 30 giây tới (Android 11+): 1.0 = chạm mức SEVERE.
+                    // NaN khi máy không hỗ trợ / gọi quá dày.
+                    val headroom = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                        try {
+                            power?.getThermalHeadroom(30)?.toDouble()?.takeIf { !it.isNaN() }
+                        } catch (_: Throwable) { null }
+                    } else null
+                    val plugged = battery?.getIntExtra(android.os.BatteryManager.EXTRA_PLUGGED, 0) ?: 0
                     result.success(mapOf(
                         "temperatureC" to if (tenths == Int.MIN_VALUE) null else tenths / 10.0,
                         "thermalStatus" to if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) power?.currentThermalStatus else 0,
+                        "headroom" to headroom,
+                        "charging" to (plugged != 0),
                     ))
                 }
 
@@ -804,8 +849,7 @@ class MainActivity : FlutterActivity() {
         val targets = listOf(
             Triple("hd720", 1280, 720),
             Triple("fullHd1080", 1920, 1080),
-            Triple("qhd2k", 2560, 1440),
-            Triple("ultraHd4k", 3840, 2160),
+            // 2K/4K đã bỏ khỏi trạm camera (nóng máy, không nét hơn ở cùng bitrate).
         )
         return targets.mapNotNull { (id, width, height) ->
             val size = sizes.firstOrNull { it.width == width && it.height == height }

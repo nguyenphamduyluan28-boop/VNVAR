@@ -20,6 +20,8 @@
         android:label="SportO Cam"
         android:requestLegacyExternalStorage="true"
         android:hasFragileUserData="true"
+        android:allowBackup="false"
+        android:dataExtractionRules="@xml/data_extraction_rules"
         android:usesCleartextTraffic="true"
         android:icon="@mipmap/ic_launcher">
 

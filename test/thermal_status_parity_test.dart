@@ -19,5 +19,12 @@ void main() {
       expect(classifyPlatformThermalStatus(1, isIos: false).cool, isTrue);
       expect(classifyPlatformThermalStatus(2, isIos: false).cool, isFalse);
     });
+
+    test('only Android EMERGENCY and above is an emergency', () {
+      expect(classifyPlatformThermalStatus(4, isIos: false).emergency, isFalse);
+      expect(classifyPlatformThermalStatus(5, isIos: false).emergency, isTrue);
+      expect(classifyPlatformThermalStatus(6, isIos: false).emergency, isTrue);
+      expect(classifyPlatformThermalStatus(5, isIos: true).emergency, isFalse);
+    });
   });
 }

@@ -6,10 +6,23 @@ import UIKit
 @main
 @objc class AppDelegate: FlutterAppDelegate, FlutterImplicitEngineDelegate {
   private var stationChannel: FlutterMethodChannel?
-  private var rtspPublisher: VnvarRtspPublisher?
+  private var rtspPublisher: VnvarRtspPublisher? {
+    didSet {
+      audioPublisherLock.lock()
+      audioPublisher = rtspPublisher
+      audioPublisherLock.unlock()
+    }
+  }
+  // Bản sao có khoá của rtspPublisher cho luồng nền đọc PCM: rtspPublisher chỉ
+  // được gán trên main thread, đọc trực tiếp từ timer nền là data race.
+  private let audioPublisherLock = NSLock()
+  private var audioPublisher: VnvarRtspPublisher?
   private let cellularUplink = VnvarCellularUplink()
   private let audioSegmentRecorder = VnvarAudioSegmentRecorder()
   private var rtspGeneration: UInt64 = 0
+  // Trả kết quả "đã huỷ" cho lần startRtsp đang chờ khi stopRtsp chạy trước lúc
+  // server sẵn sàng; nếu không FlutterResult không bao giờ được gọi.
+  private var pendingRtspStartCancel: (() -> Void)?
   private var finalizationTask: UIBackgroundTaskIdentifier = .invalid
   private var brightnessBeforeDimming: CGFloat?
 
@@ -71,7 +84,11 @@ import UIKit
     )
     self.stationChannel = stationChannel
     audioSegmentRecorder.onPcm = { [weak self] pcm in
-      self?.rtspPublisher?.sendNativePcm(pcm)
+      self?.currentAudioPublisher()?.sendNativePcm(pcm)
+    }
+    // Chỉ đọc PCM từ file ghi âm khi có client RTSP đang nhận tiếng.
+    audioSegmentRecorder.isPcmNeeded = { [weak self] in
+      self?.currentAudioPublisher()?.needsNativeAudio ?? false
     }
     stationChannel.setMethodCallHandler { [weak self] call, result in
       guard let self = self else {
@@ -363,6 +380,17 @@ import UIKit
     publisher.setRemoteAudioEnabled(remoteAudio)
     let generation = rtspGeneration
     var startResultSent = false
+    pendingRtspStartCancel = {
+      guard !startResultSent else { return }
+      startResultSent = true
+      result(
+        FlutterError(
+          code: "RTSP_START_CANCELLED",
+          message: "RTSP start was cancelled before the server became ready.",
+          details: nil
+        )
+      )
+    }
     publisher.onEncoderConfigured = { [weak self] in
       guard let self = self, self.rtspGeneration == generation else { return }
       self.stationChannel?.invokeMethod(
@@ -434,8 +462,18 @@ import UIKit
 
   private func stopRtsp() {
     rtspGeneration &+= 1
+    let cancelPendingStart = pendingRtspStartCancel
+    pendingRtspStartCancel = nil
     rtspPublisher?.stop()
     rtspPublisher = nil
+    cancelPendingStart?()
+  }
+
+  /// An toàn khi gọi từ luồng nền (timer đọc PCM).
+  private func currentAudioPublisher() -> VnvarRtspPublisher? {
+    audioPublisherLock.lock()
+    defer { audioPublisherLock.unlock() }
+    return audioPublisher
   }
 
   private func requestMicrophonePermission(_ result: @escaping FlutterResult) {

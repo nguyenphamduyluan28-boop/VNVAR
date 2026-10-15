@@ -23,12 +23,21 @@ jobs:
         uses: subosito/flutter-action@v2
         with:
           channel: 'stable'
+          # Ghim phiên bản để bản build CI giống máy phát triển.
+          flutter-version: '3.44.0'
           cache: true
 
       - name: Install dependencies
         run: flutter pub get
 
+      - name: Run tests
+        run: flutter test
+
       - name: Build APK Release
+        # CI chưa có keystore: cho phép rõ ràng bản thử nghiệm ký debug key.
+        # Khi thêm keystore qua secrets thì bỏ biến này.
+        env:
+          VNVAR_ALLOW_DEBUG_SIGNING: 'true'
         run: flutter build apk --release
 
       - name: Upload Android APK
@@ -48,6 +57,7 @@ jobs:
         uses: subosito/flutter-action@v2
         with:
           channel: 'stable'
+          flutter-version: '3.44.0'
           cache: true
 
       - name: Install dependencies

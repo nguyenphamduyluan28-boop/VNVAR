@@ -22,6 +22,9 @@ private enum VnvarAudioSegmentError: LocalizedError {
 /// RecordingService muxes the sidecar as AAC when finalizing the video.
 final class VnvarAudioSegmentRecorder {
   var onPcm: ((Data) -> Void)?
+  /// Có ai cần PCM lúc này không (ví dụ client RTSP đang nhận tiếng). Gọi trên
+  /// luồng nền của timer. nil = luôn đọc khi có onPcm (hành vi cũ).
+  var isPcmNeeded: (() -> Bool)?
   private var recorder: AVAudioRecorder?
   private var path: String?
   private var pcmTimer: DispatchSourceTimer?
@@ -87,26 +90,60 @@ final class VnvarAudioSegmentRecorder {
     let generation = pcmGeneration
     let timer = DispatchSource.makeTimerSource(queue: DispatchQueue.global(qos: .userInitiated))
     timer.schedule(deadline: .now() + .milliseconds(100), repeating: .milliseconds(40))
+    // Một FileHandle cho cả segment thay vì mở/đóng file 25 lần mỗi giây. Chỉ
+    // được dùng trong event/cancel handler của timer, vốn chạy tuần tự.
+    var fileHandle: FileHandle?
+    var readErrorLogged = false
     timer.setEventHandler { [weak self] in
-      guard let self = self, self.pcmGeneration == generation,
-            let handle = try? FileHandle(forReadingFrom: URL(fileURLWithPath: path)) else { return }
-      defer { handle.closeFile() }
-      if self.pcmOffset == 0 {
-        handle.seek(toFileOffset: 0)
-        let header = handle.readData(ofLength: 4_096)
-        guard let range = header.range(of: Data("data".utf8)) else { return }
-        self.pcmOffset = UInt64(range.upperBound + 4)
+      guard let self = self, self.pcmGeneration == generation else { return }
+      if fileHandle == nil {
+        fileHandle = try? FileHandle(forReadingFrom: URL(fileURLWithPath: path))
       }
-      handle.seek(toFileOffset: self.pcmOffset)
-      // Đọc toàn bộ phần đã ghi (tối đa 1 giây). AVAudioRecorder ghi theo từng
-      // đợt; đọc cố định 100 ms mỗi nhịp khiến luồng RTSP bị khoảng lặng khi
-      // đợt ghi đến muộn và không bao giờ đuổi kịp phần tồn sau đó.
-      let data = handle.readData(ofLength: 96_000)
-      guard !data.isEmpty else { return }
-      let aligned = data.count - (data.count % 2)
-      guard aligned > 0 else { return }
-      self.pcmOffset += UInt64(aligned)
-      self.onPcm?(Data(data.prefix(aligned)))
+      guard let handle = fileHandle else { return }
+      // Dùng API FileHandle ném lỗi Swift (iOS 13.4+). API cũ (seek(toFileOffset:),
+      // readData, seekToEndOfFile, closeFile) ném NSException khi lỗi I/O, Swift
+      // không bắt được và app sẽ văng giữa lúc đang quay.
+      do {
+        if self.pcmOffset == 0 {
+          try handle.seek(toOffset: 0)
+          let header = try handle.read(upToCount: 4_096) ?? Data()
+          guard let range = header.range(of: Data("data".utf8)) else { return }
+          self.pcmOffset = UInt64(range.upperBound + 4)
+        }
+        guard self.isPcmNeeded?() ?? (self.onPcm != nil) else {
+          // Không ai nghe: không đọc/copy dữ liệu, chỉ nhảy tới cuối phần đã ghi
+          // để khi có người nghe không phát lại tiếng cũ.
+          let end = try handle.seekToEnd()
+          if end > self.pcmOffset {
+            self.pcmOffset = end - (end - self.pcmOffset) % 2
+          }
+          return
+        }
+        try handle.seek(toOffset: self.pcmOffset)
+        // Đọc toàn bộ phần đã ghi (tối đa 1 giây). AVAudioRecorder ghi theo từng
+        // đợt; đọc cố định 100 ms mỗi nhịp khiến luồng RTSP bị khoảng lặng khi
+        // đợt ghi đến muộn và không bao giờ đuổi kịp phần tồn sau đó.
+        guard let data = try handle.read(upToCount: 96_000), !data.isEmpty else {
+          return
+        }
+        let aligned = data.count - (data.count % 2)
+        guard aligned > 0 else { return }
+        self.pcmOffset += UInt64(aligned)
+        self.onPcm?(Data(data.prefix(aligned)))
+      } catch {
+        // Lỗi I/O: đóng file, nhịp sau mở lại. Chỉ ghi log lần đầu để không
+        // lặp 25 lần/giây. Ghi âm (AVAudioRecorder) không bị ảnh hưởng.
+        if !readErrorLogged {
+          readErrorLogged = true
+          NSLog("[VNVAR-AUDIO] PCM tail read failed: %@", String(describing: error))
+        }
+        try? handle.close()
+        fileHandle = nil
+      }
+    }
+    timer.setCancelHandler {
+      try? fileHandle?.close()
+      fileHandle = nil
     }
     pcmTimer = timer
     timer.resume()

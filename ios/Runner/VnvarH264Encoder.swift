@@ -15,6 +15,8 @@ final class VnvarH264Encoder {
   var onError: ((String) -> Void)?
 
   private let queue = DispatchQueue(label: "vnvar.rtsp.h264.encoder")
+  private let queueKey = DispatchSpecificKey<Void>()
+  // Bảo vệ encodeQueued, pendingCompletion, pendingFrameToken, nextFrameToken.
   private let admissionLock = NSLock()
   private let maximumBitrate: Int
   private var currentBitrate: Int
@@ -26,11 +28,20 @@ final class VnvarH264Encoder {
   private var lastParameterSets: (sps: Data, pps: Data)?
   private var encodeQueued = false
   private var pendingCompletion: (() -> Void)?
+  // Mã của khung đang nằm trong VideoToolbox (0 = chưa có). Truyền qua
+  // sourceFrameRefcon để nhận ra callback muộn của phiên đã bị huỷ.
+  private var pendingFrameToken: UInt = 0
+  private var nextFrameToken: UInt = 0
+
+  /// Khung chờ VideoToolbox lâu hơn chừng này coi như mất callback: nhả khung
+  /// và tạo lại phiên, thay vì để RTSP đứng hình vĩnh viễn.
+  private static let stallTimeout: TimeInterval = 1.0
 
   init(bitrate: Int, fps: Int) {
     maximumBitrate = max(250_000, bitrate)
     currentBitrate = max(250_000, bitrate)
     self.fps = max(1, min(fps, 60))
+    queue.setSpecific(key: queueKey, value: ())
   }
 
   func encode(
@@ -46,20 +57,29 @@ final class VnvarH264Encoder {
     }
     encodeQueued = true
     pendingCompletion = completion
+    nextFrameToken &+= 1
+    if nextFrameToken == 0 { nextFrameToken = 1 }
+    let token = nextFrameToken
+    pendingFrameToken = token
     admissionLock.unlock()
+    // Publisher cũng chỉ cho một khung chạy cùng lúc, nên khi callback bị mất sẽ
+    // không có khung mới nào tới để phát hiện: tự hẹn giờ kiểm tra từng khung.
+    queue.asyncAfter(deadline: .now() + Self.stallTimeout) { [weak self] in
+      self?.recoverIfStalled(token: token)
+    }
     queue.async { [weak self] in
       guard let self = self else {
         completion()
         return
       }
       guard !self.stopped else {
-        self.finishPendingFrame()
+        self.finishPendingFrame(token: token)
         return
       }
       do {
         try self.ensureSession(for: pixelBuffer)
         guard let session = self.session else {
-          self.finishPendingFrame()
+          self.finishPendingFrame(token: token)
           return
         }
         let timestamp = CMTime(value: timestampNs, timescale: 1_000_000_000)
@@ -74,14 +94,20 @@ final class VnvarH264Encoder {
           presentationTimeStamp: timestamp,
           duration: CMTime(value: 1, timescale: CMTimeScale(self.fps)),
           frameProperties: options,
-          sourceFrameRefcon: nil,
+          sourceFrameRefcon: UnsafeMutableRawPointer(bitPattern: token),
           infoFlagsOut: nil
         )
         guard status == noErr else {
           throw EncoderError.operation("encode", status)
         }
+      } catch EncoderError.operation(_, let status) where Self.isSessionLost(status) {
+        // iOS huỷ phiên phần cứng (ví dụ khi app ra nền): tạo lại ở khung sau
+        // thay vì lỗi mãi với cùng một phiên hỏng.
+        NSLog("[VNVAR-RTSP] VideoToolbox session lost (%d); recreating", status)
+        self.resetSession()
+        self.finishPendingFrame(token: token)
       } catch {
-        self.finishPendingFrame()
+        self.finishPendingFrame(token: token)
         self.report(error)
       }
     }
@@ -114,17 +140,54 @@ final class VnvarH264Encoder {
   }
 
   func stop() {
-    queue.sync {
-      stopped = true
-      if let session = session {
-        VTCompressionSessionCompleteFrames(session, untilPresentationTimeStamp: .invalid)
-        VTCompressionSessionInvalidate(session)
-      }
-      session = nil
-      dimensions = nil
-      lastParameterSets = nil
-      finishPendingFrame()
+    // Gọi từ chính hàng đợi encoder thì queue.sync sẽ treo cứng: chạy thẳng.
+    if DispatchQueue.getSpecific(key: queueKey) != nil {
+      stopLocked()
+    } else {
+      queue.sync { stopLocked() }
     }
+  }
+
+  private func stopLocked() {
+    stopped = true
+    if let session = session {
+      VTCompressionSessionCompleteFrames(session, untilPresentationTimeStamp: .invalid)
+      VTCompressionSessionInvalidate(session)
+    }
+    session = nil
+    dimensions = nil
+    lastParameterSets = nil
+    finishPendingFrame()
+  }
+
+  /// Chạy trên `queue`. Huỷ phiên hiện tại để khung kế tiếp tạo phiên mới.
+  private func resetSession() {
+    if let session = session {
+      VTCompressionSessionInvalidate(session)
+    }
+    session = nil
+    dimensions = nil
+    lastParameterSets = nil
+    forceNextKeyFrame = true
+  }
+
+  /// Chạy trên `queue` sau `stallTimeout` kể từ khi khung [token] vào encoder.
+  private func recoverIfStalled(token: UInt) {
+    admissionLock.lock()
+    let stalled = encodeQueued && pendingFrameToken == token
+    admissionLock.unlock()
+    guard stalled, !stopped else { return }
+    NSLog(
+      "[VNVAR-RTSP] VideoToolbox returned no frame within %.1fs; recreating encoder session",
+      Self.stallTimeout
+    )
+    resetSession()
+    finishPendingFrame(token: token)
+  }
+
+  private static func isSessionLost(_ status: OSStatus) -> Bool {
+    Int(status) == Int(kVTInvalidSessionErr) ||
+      Int(status) == Int(kVTVideoEncoderMalfunctionErr)
   }
 
   private func ensureSession(for pixelBuffer: CVPixelBuffer) throws {
@@ -231,8 +294,19 @@ final class VnvarH264Encoder {
     return status == noErr
   }
 
-  fileprivate func handle(status: OSStatus, sampleBuffer: CMSampleBuffer?) {
-    defer { finishPendingFrame() }
+  fileprivate func handle(status: OSStatus, sampleBuffer: CMSampleBuffer?, token: UInt) {
+    admissionLock.lock()
+    let isCurrentFrame = encodeQueued && pendingFrameToken == token
+    admissionLock.unlock()
+    // Callback muộn của khung đã được watchdog nhả / phiên đã huỷ: bỏ qua để
+    // không nhả nhầm khung mới và không gửi lại dữ liệu cũ.
+    guard isCurrentFrame else { return }
+    defer { finishPendingFrame(token: token) }
+    if Self.isSessionLost(status) {
+      NSLog("[VNVAR-RTSP] VideoToolbox session lost in callback (%d); recreating", status)
+      queue.async { [weak self] in self?.resetSession() }
+      return
+    }
     guard status == noErr,
           let sampleBuffer = sampleBuffer,
           CMSampleBufferDataIsReady(sampleBuffer) else {
@@ -273,8 +347,14 @@ final class VnvarH264Encoder {
     onAccessUnit?(nals, timestamp, isKeyFrame)
   }
 
-  private func finishPendingFrame() {
+  /// Nhả khung đang chờ. Có [token] thì chỉ nhả khi đúng khung đó vẫn đang chờ
+  /// (tránh watchdog/callback muộn nhả nhầm khung mới).
+  private func finishPendingFrame(token: UInt? = nil) {
     admissionLock.lock()
+    if let token = token, !encodeQueued || pendingFrameToken != token {
+      admissionLock.unlock()
+      return
+    }
     encodeQueued = false
     let completion = pendingCompletion
     pendingCompletion = nil
@@ -369,7 +449,7 @@ final class VnvarH264Encoder {
 
 private let vnvarH264OutputCallback: VTCompressionOutputCallback = {
   refcon,
-  _,
+  sourceFrameRefcon,
   status,
   _,
   sampleBuffer in
@@ -377,5 +457,9 @@ private let vnvarH264OutputCallback: VTCompressionOutputCallback = {
   let encoder = Unmanaged<VnvarH264Encoder>
     .fromOpaque(refcon)
     .takeUnretainedValue()
-  encoder.handle(status: status, sampleBuffer: sampleBuffer)
+  encoder.handle(
+    status: status,
+    sampleBuffer: sampleBuffer,
+    token: UInt(bitPattern: sourceFrameRefcon)
+  )
 }

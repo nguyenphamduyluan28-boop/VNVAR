@@ -63,6 +63,37 @@ ParsedStreamUrl parseStreamUrl(String raw) {
   );
 }
 
+/// Đích được phép tự phát ngay sau khi quét QR: nền tảng phổ biến, máy chủ
+/// đối tác và máy chủ trong mạng nội bộ (MediaMTX tại sân). Đích lạ phải được
+/// người dùng xác nhận, tránh QR lạ âm thầm phát camera + mic ra ngoài.
+bool isTrustedAutoStartDestination(String url) {
+  final host = Uri.tryParse(url.trim())?.host.toLowerCase() ?? '';
+  if (host.isEmpty) return false;
+  bool under(String domain) => host == domain || host.endsWith('.$domain');
+  const trustedDomains = [
+    'youtube.com',
+    'facebook.com',
+    'fbcdn.net',
+    'tiktok.com',
+    'tiktokv.com',
+    'tiktokcdn.com',
+    'aqvision.net',
+  ];
+  if (trustedDomains.any(under)) return true;
+  if (RegExp(r'(^|\.)tiktokcdn-[a-z]+\.com$').hasMatch(host)) return true;
+  if (host == 'localhost' || host.endsWith('.local')) return true;
+  final ipv4 = RegExp(
+    r'^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$',
+  ).firstMatch(host);
+  if (ipv4 == null) return false;
+  final a = int.parse(ipv4.group(1)!);
+  final b = int.parse(ipv4.group(2)!);
+  return a == 10 ||
+      a == 127 ||
+      (a == 192 && b == 168) ||
+      (a == 172 && b >= 16 && b <= 31);
+}
+
 String buildStreamUrl(String server, String key) {
   final s = server.trim().replaceAll(RegExp(r'/+$'), '');
   final k = key.trim().replaceAll(RegExp(r'^/+'), '');

@@ -11,6 +11,16 @@ class PayloadTooLargeException implements Exception {
   String toString() => 'Request body exceeds $maximumBytes bytes';
 }
 
+/// Raised when a client sends its request body too slowly.
+class RequestBodyTimeoutException implements Exception {
+  final Duration timeout;
+
+  const RequestBodyTimeoutException(this.timeout);
+
+  @override
+  String toString() => 'Request body not received within ${timeout.inSeconds}s';
+}
+
 /// Incrementally collects and decodes one bounded JSON object.
 class BoundedJsonBodyDecoder {
   final int maximumBytes;

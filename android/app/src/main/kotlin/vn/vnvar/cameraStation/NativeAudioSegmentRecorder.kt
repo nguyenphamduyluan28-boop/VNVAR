@@ -151,7 +151,8 @@ class NativeAudioSegmentRecorder(private val context: Context) {
                 )
             } catch (_: Exception) {}
             val buffer = ByteArray(chunkBytes)
-            while (isAudioRecordRunning.get()) {
+            var keepReading = true
+            while (keepReading && isAudioRecordRunning.get()) {
                 val count = activeRecorder.read(buffer, 0, buffer.size)
                 when {
                     count > 0 -> {
@@ -165,13 +166,61 @@ class NativeAudioSegmentRecorder(private val context: Context) {
                         } catch (_: Exception) {}
                         lastProgressElapsedMs.set(android.os.SystemClock.elapsedRealtime())
                     }
-                    count == AudioRecord.ERROR_INVALID_OPERATION ||
-                        count == AudioRecord.ERROR_BAD_VALUE -> {
-                        isAudioRecordRunning.set(false)
+                    count < 0 -> {
+                        // Mọi lỗi đọc (kể cả ERROR_DEAD_OBJECT khi hệ thống thu
+                        // hồi mic): mở lại mic thay vì dừng âm thầm. Trước đây
+                        // mã -6 không được xử lý nên vòng lặp quay liên tục ăn CPU.
+                        keepReading = false
+                        recoverAfterReadError(activeRecorder, count)
+                    }
+                    else -> {
+                        // read() trả 0: nhường CPU, không quay vòng rỗng.
+                        try { Thread.sleep(2) } catch (_: InterruptedException) {
+                            keepReading = false
+                        }
                     }
                 }
             }
         }, "VNVAR-NativeAudio").also { it.start() }
+    }
+
+    /** Chạy trên luồng thu đã lỗi: đóng AudioRecord hỏng rồi mở lại (giãn dần). */
+    private fun recoverAfterReadError(failed: AudioRecord, code: Int) {
+        android.util.Log.w(LOG_TAG, "AudioRecord read error $code; reopening microphone")
+        synchronized(this) {
+            // stop()/start() khác đã thay recorder: luồng này chỉ việc kết thúc.
+            if (audioRecord !== failed) return
+            isAudioRecordRunning.set(false)
+            try { failed.stop() } catch (_: Exception) {}
+            try { failed.release() } catch (_: Exception) {}
+            audioRecord = null
+            worker = null
+        }
+        for (attempt in 1..MIC_RECOVERY_ATTEMPTS) {
+            try {
+                Thread.sleep(minOf(250L * attempt, 2_000L))
+            } catch (_: InterruptedException) {
+                return
+            }
+            synchronized(this) {
+                if (audioRecord != null) return
+                // Không còn ai cần mic (đã stop ghi và stop phát): thôi mở lại.
+                if (!recordingFileActive.get() && !streamingActive.get()) return
+                try {
+                    ensureAudioRecordStartedLocked()
+                    android.util.Log.i(LOG_TAG, "Microphone reopened after error $code")
+                    return
+                } catch (error: Exception) {
+                    android.util.Log.w(LOG_TAG, "Microphone reopen attempt $attempt failed", error)
+                }
+            }
+        }
+        android.util.Log.e(LOG_TAG, "Microphone could not be reopened after error $code")
+    }
+
+    private companion object {
+        const val LOG_TAG = "VNVAR-NativeAudio"
+        const val MIC_RECOVERY_ATTEMPTS = 8
     }
 
     private fun stopAudioRecordInternalLocked() {

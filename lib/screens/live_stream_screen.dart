@@ -438,6 +438,7 @@ class _LiveStreamScreenState extends State<LiveStreamScreen> {
     _actionInFlight = true;
     bool shouldAutoStart = false;
     bool isWhip = false;
+    String? destination;
     try {
       await widget.runtime.pauseCameraForScanner();
       if (!mounted) return;
@@ -445,6 +446,9 @@ class _LiveStreamScreenState extends State<LiveStreamScreen> {
       if (result != null && mounted) {
         isWhip = result.protocol == 'whip';
         shouldAutoStart = result.autoStart;
+        destination = isWhip
+            ? result.streamUrl
+            : mergeStreamUrlWithKey(result.streamUrl, result.token);
         setState(() {
           if (isWhip) {
             _whipUrlController.text = result.streamUrl;
@@ -472,6 +476,16 @@ class _LiveStreamScreenState extends State<LiveStreamScreen> {
       if (mounted) setState(() {});
     }
 
+    // Tự phát ngay với nền tảng quen thuộc/máy chủ nội bộ như trước; máy chủ lạ
+    // phải được xác nhận để QR lạ không âm thầm phát camera + mic ra ngoài.
+    final target = destination;
+    if (shouldAutoStart &&
+        mounted &&
+        target != null &&
+        !isTrustedAutoStartDestination(target)) {
+      shouldAutoStart = await _confirmUnknownDestination(target);
+    }
+
     if (shouldAutoStart && mounted) {
       if (isWhip) {
         await _handleStartWhip();
@@ -479,6 +493,39 @@ class _LiveStreamScreenState extends State<LiveStreamScreen> {
         await _handleStartLive();
       }
     }
+  }
+
+  Future<bool> _confirmUnknownDestination(String url) async {
+    final host = Uri.tryParse(url.trim())?.host ?? '';
+    final shown = host.isEmpty ? url : host;
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: Text(
+          appText(dialogContext, 'Phát tới máy chủ lạ?', 'Stream to an unknown server?'),
+        ),
+        content: Text(
+          appText(
+            dialogContext,
+            'Mã QR yêu cầu phát camera và micro tới "$shown". '
+                'Chỉ tiếp tục nếu bạn tin tưởng máy chủ này.',
+            'The QR code asks to stream the camera and microphone to "$shown". '
+                'Continue only if you trust this server.',
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(dialogContext, false),
+            child: Text(appText(dialogContext, 'Hủy', 'Cancel')),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(dialogContext, true),
+            child: Text(appText(dialogContext, 'Phát', 'Stream')),
+          ),
+        ],
+      ),
+    );
+    return confirmed == true;
   }
 
   void _showToast(String message, {bool isError = false}) {

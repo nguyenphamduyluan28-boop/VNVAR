@@ -32,6 +32,9 @@ class VideoStorageService {
   }
 
   String? get selectedPath => _selectedPath;
+
+  /// Thư mục lưu do người dùng tự chọn (có thể là thư mục dùng chung).
+  bool get usesCustomRoot => _selectedPath != null;
   bool get supportsFolderPicker => _supportsFolderPicker;
 
   Future<void> load() async {
@@ -115,16 +118,12 @@ class VideoStorageService {
     final directory = Directory(rootPath);
     try {
       if (!await directory.exists()) await directory.create(recursive: true);
-      // Đảm bảo luôn có file .nomedia trong thư mục gốc VNVAR để thư viện ảnh Android (Gallery)
-      // không quét và không hiển thị hàng loạt clip camera vào Bộ sưu tập cá nhân
-      final nomediaFile = File('${directory.path}${Platform.pathSeparator}.nomedia');
-      if (!await nomediaFile.exists()) {
-        try {
-          await nomediaFile.create();
-        } catch (_) {}
-      }
-      if (Platform.isAndroid && _noMediaEnsuredPaths.add(directory.path)) {
-        unawaited(ensureNoMedia(directory.path));
+      // Thư mục gốc riêng của app: đặt .nomedia để thư viện ảnh Android
+      // (Gallery) không hiển thị hàng loạt clip camera. Thư mục người dùng tự
+      // chọn (có thể là DCIM) thì KHÔNG đặt ở gốc vì sẽ ẩn cả ảnh của họ; khi
+      // đó RecordingService ẩn riêng từng thư mục ngày (hideFromGallery).
+      if (selectedPath == null) {
+        await hideFromGallery(directory);
       }
       await directory.list().take(1).drain();
       return directory;
@@ -207,6 +206,17 @@ class VideoStorageService {
         '[STORAGE] scanMediaFile failed: $error',
         name: 'VideoStorageService',
       );
+    }
+  }
+
+  /// Đặt .nomedia trong [directory] (một lần mỗi đường dẫn) để Gallery bỏ qua.
+  Future<void> hideFromGallery(Directory directory) async {
+    final nomediaFile = File('${directory.path}${Platform.pathSeparator}.nomedia');
+    try {
+      if (!await nomediaFile.exists()) await nomediaFile.create(recursive: true);
+    } catch (_) {}
+    if (Platform.isAndroid && _noMediaEnsuredPaths.add(directory.path)) {
+      unawaited(ensureNoMedia(directory.path));
     }
   }
 

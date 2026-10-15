@@ -39,14 +39,20 @@ CellularTunnelEndpoint? cellularTunnelEndpoint(String targetUrl) {
   final uri = Uri.parse(targetUrl.trim());
   final scheme = uri.scheme.toLowerCase();
   final pathAndQuery = '${uri.path}${uri.hasQuery ? '?${uri.query}' : ''}';
+  // Giữ user:pass của URL gốc: server có xác thực sẽ từ chối luồng đi 4G nếu
+  // địa chỉ relay cục bộ làm mất thông tin này.
+  final credentials = uri.userInfo.isEmpty ? '' : '${uri.userInfo}@';
   if (scheme == 'rtsp') {
-    return (url: 'rtsp://127.0.0.1:$localPort$pathAndQuery', args: const []);
+    return (
+      url: 'rtsp://${credentials}127.0.0.1:$localPort$pathAndQuery',
+      args: const [],
+    );
   }
   final segments = uri.pathSegments.where((part) => part.isNotEmpty).toList();
   final app = segments.isEmpty ? '' : segments.first;
   final authority = uri.hasPort ? '${uri.host}:${uri.port}' : uri.host;
   return (
-    url: 'rtmp://127.0.0.1:$localPort$pathAndQuery',
+    url: 'rtmp://${credentials}127.0.0.1:$localPort$pathAndQuery',
     args: ['-rtmp_tcurl', '$scheme://$authority/$app'],
   );
 }

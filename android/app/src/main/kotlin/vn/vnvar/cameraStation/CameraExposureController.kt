@@ -7,7 +7,9 @@ import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CameraDevice
 import android.hardware.camera2.CameraManager
 import android.hardware.camera2.CaptureRequest
+import android.hardware.camera2.CaptureResult
 import android.hardware.camera2.TotalCaptureResult
+import android.hardware.camera2.params.MeteringRectangle
 import android.graphics.Rect
 import android.graphics.SurfaceTexture
 import android.os.Build
@@ -23,6 +25,14 @@ import org.webrtc.Camera1Capturer
 import org.webrtc.Camera2Capturer
 import org.webrtc.CameraEnumerationAndroid
 import org.webrtc.CameraVideoCapturer
+import org.webrtc.VideoFrame
+import org.webrtc.VideoSink
+import org.webrtc.VideoTrack
+import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicBoolean
+import kotlin.math.abs
+import kotlin.math.max
+import kotlin.math.min
 import kotlin.math.roundToInt
 
 /** Applies a conservative exposure bias to flutter_webrtc's active camera. */
@@ -31,6 +41,13 @@ object CameraExposureController {
     private val lifecycleHandler = Handler(Looper.getMainLooper())
     private const val WATCHDOG_INTERVAL_MS = 1_500L
     private const val CAPTURE_HEARTBEAT_TIMEOUT_MS = 3_000L
+    private const val METERING_REGION_FRACTION = 0.3
+    /** AE/AF phải ổn định liên tục chừng này trước khi tự khoá. */
+    private const val STABLE_LOCK_AFTER_MS = 2_000L
+    /** Độ sáng khung hình lệch khỏi lúc khoá quá ngưỡng này... */
+    private const val RELOCK_LUMA_DRIFT = 0.35
+    /** ...liên tục chừng này (ánh sáng thật sự đổi, không phải người đi ngang) thì đo lại. */
+    private const val RELOCK_AFTER_MS = 5_000L
 
     @Volatile
     private var activeTrackId: String? = null
@@ -45,6 +62,33 @@ object CameraExposureController {
     private var lastCaptureHeartbeatMs = 0L
     @Volatile
     private var requestGeneration = 0
+    /** Điểm đo sáng do người dùng chạm (toạ độ chuẩn hoá trên preview); null = vùng giữa. */
+    @Volatile
+    private var activeMeteringPoint: Pair<Double, Double>? = null
+    /** Cấu hình của repeating request đang chạy, để bỏ qua các lần áp dụng trùng lặp. */
+    @Volatile
+    private var lastAppliedKey: String? = null
+
+    // Chế độ "ổn định": sau khi AE/AF hội tụ, khoá phơi sáng, cân bằng trắng và
+    // lấy nét để hình không "thở" sáng/tối hay mờ khi người chơi đi qua. Chỉ mở
+    // khoá đo lại khi độ sáng cả khung hình đổi lâu (bật/tắt đèn, mây che).
+    @Volatile
+    private var stableExposureEnabled = true
+    @Volatile
+    private var autoLocked = false
+    @Volatile
+    private var lockPending = false
+    @Volatile
+    private var lockedFocusDistance: Float? = null
+    @Volatile
+    private var convergedSinceMs = 0L
+    @Volatile
+    private var lumaRefAtLock: Double? = null
+    @Volatile
+    private var lumaDriftSinceMs = 0L
+    private val lumaMeter = LumaMeter { trackId, luma ->
+        lifecycleHandler.post { onLuma(trackId, luma) }
+    }
 
     private val captureWatchdog = object : Runnable {
         override fun run() {
@@ -61,6 +105,7 @@ object CameraExposureController {
                 // apply() restarts the watchdog from a single fresh schedule.
                 return
             }
+            if (!lumaMeter.isAttachedTo(trackId)) lumaMeter.attach(trackId)
             lifecycleHandler.postDelayed(this, WATCHDOG_INTERVAL_MS)
         }
     }
@@ -69,6 +114,8 @@ object CameraExposureController {
         if (activeTrackId != trackId) {
             requestGeneration++
             lastCaptureHeartbeatMs = 0L
+            releaseAutoLock()
+            lumaMeter.attach(trackId)
         }
         activeTrackId = trackId
         activeTargetEv = targetEv
@@ -100,9 +147,11 @@ object CameraExposureController {
 
     fun reapplyAfterLifecycleChange(reason: String) {
         val trackId = activeTrackId ?: return
-        // Force the session-bound watchdog to verify the first capture request
-        // after a foreground transition. No fixed retry window is required.
-        lastCaptureHeartbeatMs = 0L
+        // Không ép thay repeating request khi request của app vẫn đang chạy:
+        // mỗi lần thay request (tắt màn hình, kéo thanh thông báo) có thể làm
+        // AE/AF hội tụ lại và gây chớp sáng trên livestream. apply() tự bỏ qua
+        // khi cấu hình không đổi và heartbeat còn tươi; nếu session đã bị dựng
+        // lại thì heartbeat cũ và request được áp dụng lại ngay.
         lifecycleHandler.post {
             apply(trackId, activeTargetEv) { response ->
                 if (response["applied"] == true) {
@@ -120,12 +169,134 @@ object CameraExposureController {
         activeTrackId = null
         activeCamera2 = false
         activeCameraLock = false
+        activeMeteringPoint = null
+        lastAppliedKey = null
+        releaseAutoLock()
+        lumaMeter.detach()
         lastCaptureHeartbeatMs = 0L
         requestGeneration++
         lifecycleHandler.removeCallbacks(captureWatchdog)
     }
 
+    /** Bật/tắt tự khoá phơi sáng sau khi hội tụ (mặc định bật). */
+    fun setStableExposure(trackId: String, enabled: Boolean, callback: (Map<String, Any>) -> Unit) {
+        stableExposureEnabled = enabled
+        releaseAutoLock()
+        apply(trackId, activeTargetEv, callback)
+    }
+
+    /**
+     * Giảm FPS đầu ra ngay tại VideoSource (bỏ bớt khung) mà không mở lại camera,
+     * nên livestream/ghi hình không bị ngắt. [fps] null/<=0 trả về FPS gốc.
+     */
+    fun setCaptureFpsCap(trackId: String, fps: Int?): Boolean {
+        return try {
+            val plugin = FlutterWebRTCPlugin.sharedSingleton ?: return false
+            val handler = readField(plugin, "methodCallHandler")
+            val getUserMedia = readField(handler, "getUserMediaImpl") as GetUserMediaImpl
+            val info = getUserMedia.getCapturerInfo(trackId) ?: return false
+            val source = info.videoSource ?: return false
+            if (info.width <= 0 || info.height <= 0 || info.fps <= 0) return false
+            val target = if (fps == null || fps <= 0) info.fps else min(fps, info.fps)
+            source.adaptOutputFormat(info.width, info.height, target)
+            Log.i(TAG, "Capture output limited to $target fps (camera ${info.fps} fps)")
+            true
+        } catch (error: Throwable) {
+            Log.w(TAG, "Cannot limit capture fps", error)
+            false
+        }
+    }
+
+    private fun releaseAutoLock() {
+        autoLocked = false
+        lockPending = false
+        lockedFocusDistance = null
+        convergedSinceMs = 0L
+        lumaRefAtLock = null
+        lumaDriftSinceMs = 0L
+    }
+
+    /** Gọi trên camera thread với mỗi kết quả của request hiện tại. */
+    private fun observeConvergence(trackId: String, generation: Int, result: TotalCaptureResult) {
+        if (!stableExposureEnabled || autoLocked || activeCameraLock || lockPending) return
+        // Không có bộ đo sáng thì không thể phát hiện ánh sáng đổi: giữ AE tự động.
+        if (!lumaMeter.isAttachedTo(trackId)) return
+        val ae = result.get(CaptureResult.CONTROL_AE_STATE) ?: return
+        val af = result.get(CaptureResult.CONTROL_AF_STATE)
+        val aeSettled = ae == CaptureResult.CONTROL_AE_STATE_CONVERGED ||
+            ae == CaptureResult.CONTROL_AE_STATE_FLASH_REQUIRED
+        val afSettled = af == null ||
+            af == CaptureResult.CONTROL_AF_STATE_INACTIVE ||
+            af == CaptureResult.CONTROL_AF_STATE_PASSIVE_FOCUSED ||
+            af == CaptureResult.CONTROL_AF_STATE_FOCUSED_LOCKED
+        val now = SystemClock.elapsedRealtime()
+        if (!aeSettled || !afSettled) {
+            convergedSinceMs = 0L
+            return
+        }
+        if (convergedSinceMs == 0L) {
+            convergedSinceMs = now
+            return
+        }
+        if (now - convergedSinceMs < STABLE_LOCK_AFTER_MS) return
+        lockPending = true
+        val focusDistance = result.get(CaptureResult.LENS_FOCUS_DISTANCE)
+        lifecycleHandler.post {
+            lockPending = false
+            if (activeTrackId != trackId || requestGeneration != generation ||
+                autoLocked || activeCameraLock || !stableExposureEnabled
+            ) return@post
+            autoLocked = true
+            lockedFocusDistance = focusDistance
+            lumaRefAtLock = lumaMeter.current
+            lumaDriftSinceMs = 0L
+            Log.i(TAG, "Exposure settled; locking AE/AWB" +
+                if (focusDistance != null) " and focus ($focusDistance dpt)" else "")
+            apply(trackId, activeTargetEv) {}
+        }
+    }
+
+    /** Main thread: độ sáng trung bình khung hình (0..255, đã làm mượt). */
+    private fun onLuma(trackId: String, luma: Double) {
+        if (activeTrackId != trackId || !autoLocked) {
+            lumaDriftSinceMs = 0L
+            return
+        }
+        val reference = lumaRefAtLock
+        if (reference == null) {
+            lumaRefAtLock = luma
+            return
+        }
+        val drift = abs(luma - reference) / max(reference, 24.0)
+        val now = SystemClock.elapsedRealtime()
+        if (drift < RELOCK_LUMA_DRIFT) {
+            lumaDriftSinceMs = 0L
+            return
+        }
+        if (lumaDriftSinceMs == 0L) {
+            lumaDriftSinceMs = now
+            return
+        }
+        if (now - lumaDriftSinceMs < RELOCK_AFTER_MS) return
+        Log.i(TAG, "Scene brightness changed (${reference.roundToInt()} -> ${luma.roundToInt()}); re-metering")
+        releaseAutoLock()
+        apply(trackId, activeTargetEv) {}
+    }
+
+    /**
+     * Đo sáng theo điểm chạm mà vẫn giữ nguyên toàn bộ cấu hình request của app
+     * (EV, FPS, zoom, NR/EIS). Thay cho Helper.setExposurePoint của flutter_webrtc,
+     * vốn thay request bằng TEMPLATE_RECORD trần (sáng/zoom nhảy rồi watchdog trả lại).
+     */
+    fun setMeteringPoint(trackId: String, x: Double, y: Double, callback: (Map<String, Any>) -> Unit) {
+        activeMeteringPoint = Pair(x.coerceIn(0.0, 1.0), y.coerceIn(0.0, 1.0))
+        activeCameraLock = false
+        releaseAutoLock()
+        apply(trackId, activeTargetEv, callback)
+    }
+
     fun setLock(trackId: String, locked: Boolean, callback: (Map<String, Any>) -> Unit) {
+        if (activeCameraLock != locked) releaseAutoLock()
         activeCameraLock = locked
         apply(trackId, activeTargetEv) { res ->
             callback(mapOf(
@@ -308,7 +479,10 @@ object CameraExposureController {
     }
 
     fun setZoom(trackId: String, zoom: Double, callback: (Map<String, Any>) -> Unit) {
-        activeZoom = zoom.coerceIn(0.3, 5.0)
+        val newZoom = zoom.coerceIn(0.3, 5.0)
+        // Đổi khung hình: đo sáng/lấy nét lại rồi tự khoá lại.
+        if (abs(newZoom - activeZoom) > 0.01) releaseAutoLock()
+        activeZoom = newZoom
         apply(trackId, activeTargetEv) { response -> callback(response + ("zoom" to activeZoom)) }
     }
 
@@ -355,8 +529,11 @@ object CameraExposureController {
                     } catch (_: Throwable) {}
                     activeZoom = 1.0
                     activeCameraLock = false
+                    activeMeteringPoint = null
+                    lastAppliedKey = null
                     lastCaptureHeartbeatMs = 0L
                     lifecycleHandler.post {
+                        releaseAutoLock()
                         callback(true, null)
                     }
                 }
@@ -430,6 +607,24 @@ object CameraExposureController {
                 compensationRange.upper,
             )
         } else 0
+        val appliedKey = listOf(
+            trackId,
+            System.identityHashCode(captureSession),
+            compensation,
+            activeCameraLock,
+            autoLocked,
+            lockedFocusDistance,
+            activeZoom,
+            activeMeteringPoint,
+            activeRotationDegrees,
+        ).joinToString("|")
+        if (appliedKey == lastAppliedKey &&
+            SystemClock.elapsedRealtime() - lastCaptureHeartbeatMs < CAPTURE_HEARTBEAT_TIMEOUT_MS
+        ) {
+            // Request đang chạy đã đúng cấu hình: thay lại chỉ làm AE hội tụ lại.
+            callback(result(true, compensation, compensation * compensationStep))
+            return
+        }
         val generation = ++requestGeneration
         cameraThread.post {
             if (activeTrackId != trackId || requestGeneration != generation) {
@@ -451,16 +646,26 @@ object CameraExposureController {
                             captureFormat.framerate.max / fpsUnitFactor,
                         ),
                     )
+                    val locked = activeCameraLock || autoLocked
                     val aeLockAvailable = characteristics.get(CameraCharacteristics.CONTROL_AE_LOCK_AVAILABLE) == true
                     if (aeLockAvailable) {
-                        set(CaptureRequest.CONTROL_AE_LOCK, activeCameraLock)
+                        set(CaptureRequest.CONTROL_AE_LOCK, locked)
                     }
                     val awbLockAvailable = characteristics.get(CameraCharacteristics.CONTROL_AWB_LOCK_AVAILABLE) == true
                     if (awbLockAvailable) {
-                        set(CaptureRequest.CONTROL_AWB_LOCK, activeCameraLock)
+                        set(CaptureRequest.CONTROL_AWB_LOCK, locked)
                     }
                     val afModes = characteristics.get(CameraCharacteristics.CONTROL_AF_AVAILABLE_MODES)
-                    if (activeCameraLock) {
+                    val focusDistance = lockedFocusDistance
+                    val manualFocus = (characteristics.get(
+                        CameraCharacteristics.LENS_INFO_MINIMUM_FOCUS_DISTANCE,
+                    ) ?: 0f) > 0f && afModes?.contains(CaptureRequest.CONTROL_AF_MODE_OFF) == true
+                    if (autoLocked && focusDistance != null && manualFocus) {
+                        // Giữ ống kính đúng tiêu cự đã hội tụ: không "săn nét" khi
+                        // người chơi đi gần/xa (máy đặt cố định trên chân).
+                        set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_OFF)
+                        set(CaptureRequest.LENS_FOCUS_DISTANCE, focusDistance)
+                    } else if (activeCameraLock) {
                         if (afModes?.contains(CaptureRequest.CONTROL_AF_MODE_AUTO) == true) {
                             set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_AUTO)
                         } else if (afModes?.contains(CaptureRequest.CONTROL_AF_MODE_OFF) == true) {
@@ -476,9 +681,21 @@ object CameraExposureController {
                         }
                     }
                     set(CaptureRequest.CONTROL_AWB_MODE, CaptureRequest.CONTROL_AWB_MODE_AUTO)
+                    // Đèn sân 50 Hz + FPS cố định: bật chống nhấp nháy để AE không
+                    // dao động sáng/tối theo tần số lưới điện.
+                    setFirstSupportedMode(
+                        this,
+                        CaptureRequest.CONTROL_AE_ANTIBANDING_MODE,
+                        characteristics.get(CameraCharacteristics.CONTROL_AE_AVAILABLE_ANTIBANDING_MODES),
+                        CaptureRequest.CONTROL_AE_ANTIBANDING_MODE_AUTO,
+                    )
                     // Zoom: ưu tiên CONTROL_ZOOM_RATIO (Android 11+) cho phép
                     // giá trị < 1.0 (ultra-wide). Fallback SCALER_CROP_REGION
                     // cho Android cũ hơn.
+                    // Toạ độ vùng đo sáng: với CONTROL_ZOOM_RATIO là active array
+                    // sau zoom; với crop zoom kiểu cũ phải nằm trong vùng crop.
+                    val activeArray = characteristics.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE)
+                    var meteringBounds: Rect? = activeArray?.let { Rect(0, 0, it.width(), it.height()) }
                     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
                         val zoomRange = characteristics.get(
                             CameraCharacteristics.CONTROL_ZOOM_RATIO_RANGE
@@ -491,10 +708,24 @@ object CameraExposureController {
                             set(CaptureRequest.CONTROL_ZOOM_RATIO, zoom.toFloat())
                             activeZoom = zoom
                         } else {
-                            applyLegacyCropZoom(this, characteristics)
+                            applyLegacyCropZoom(this, characteristics)?.let { meteringBounds = it }
                         }
                     } else {
-                        applyLegacyCropZoom(this, characteristics)
+                        applyLegacyCropZoom(this, characteristics)?.let { meteringBounds = it }
+                    }
+                    val maxAeRegions = characteristics.get(CameraCharacteristics.CONTROL_MAX_REGIONS_AE) ?: 0
+                    val bounds = meteringBounds
+                    // Chưa chạm: giữ đo sáng mặc định của HAL (toàn khung hình, ổn định nhất).
+                    val point = activeMeteringPoint
+                    if (point != null && maxAeRegions > 0 && bounds != null &&
+                        bounds.width() > 0 && bounds.height() > 0
+                    ) {
+                        val mirror = characteristics.get(CameraCharacteristics.LENS_FACING) ==
+                            CameraCharacteristics.LENS_FACING_FRONT
+                        set(
+                            CaptureRequest.CONTROL_AE_REGIONS,
+                            arrayOf(meteringRectFor(point.first, point.second, activeRotationDegrees, mirror, bounds)),
+                        )
                     }
                     setFirstSupportedMode(
                         this,
@@ -528,14 +759,17 @@ object CameraExposureController {
                         ) {
                             if (activeTrackId == trackId && requestGeneration == generation) {
                                 lastCaptureHeartbeatMs = SystemClock.elapsedRealtime()
+                                observeConvergence(trackId, generation, result)
                             }
                         }
                     },
                     cameraThread,
                 )
                 lastCaptureHeartbeatMs = SystemClock.elapsedRealtime()
+                lastAppliedKey = appliedKey
                 callback(result(true, compensation, compensation * compensationStep))
             } catch (error: Throwable) {
+                lastAppliedKey = null
                 Log.w(TAG, "Cannot apply Camera2 exposure boost", error)
                 callback(result(false, reason = error.javaClass.simpleName))
             }
@@ -573,6 +807,24 @@ object CameraExposureController {
                 parameters.focusMode = Camera.Parameters.FOCUS_MODE_CONTINUOUS_VIDEO
             }
         }
+        val point = activeMeteringPoint
+        if (point != null && parameters.maxNumMeteringAreas > 0) {
+            try {
+                val area = meteringRectFor(
+                    point.first,
+                    point.second,
+                    activeRotationDegrees,
+                    false,
+                    Rect(0, 0, 2000, 2000),
+                )
+                parameters.meteringAreas = listOf(
+                    Camera.Area(
+                        Rect(area.x - 1000, area.y - 1000, area.x + area.width - 1000, area.y + area.height - 1000),
+                        1000,
+                    ),
+                )
+            } catch (_: Throwable) {}
+        }
         if (parameters.isZoomSupported) {
             val target = (activeZoom * 100).roundToInt()
             val index = parameters.zoomRatios.indices.minByOrNull { kotlin.math.abs(parameters.zoomRatios[it] - target) } ?: 0
@@ -609,11 +861,11 @@ object CameraExposureController {
         }
     }
 
-    /** Legacy zoom bằng SCALER_CROP_REGION – chỉ hỗ trợ zoom >= 1.0. */
+    /** Legacy zoom bằng SCALER_CROP_REGION – chỉ hỗ trợ zoom >= 1.0. Trả về vùng crop đã đặt. */
     private fun applyLegacyCropZoom(
         request: CaptureRequest.Builder,
         characteristics: CameraCharacteristics,
-    ) {
+    ): Rect? {
         val sensor = characteristics.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE)
         val maxZoom = characteristics.get(
             CameraCharacteristics.SCALER_AVAILABLE_MAX_DIGITAL_ZOOM
@@ -624,12 +876,43 @@ object CameraExposureController {
             val height = (sensor.height() / zoom).roundToInt()
             val left = sensor.centerX() - width / 2
             val top = sensor.centerY() - height / 2
-            request.set(
-                CaptureRequest.SCALER_CROP_REGION,
-                Rect(left, top, left + width, top + height),
-            )
+            val crop = Rect(left, top, left + width, top + height)
+            request.set(CaptureRequest.SCALER_CROP_REGION, crop)
             activeZoom = zoom
+            return crop
         }
+        return null
+    }
+
+    /**
+     * Chuyển điểm chạm trên preview (0..1, khung đã xoay [rotationDegrees] theo
+     * chiều kim đồng hồ so với sensor) thành vùng đo sáng ~30% khung hình trong
+     * [bounds]. Vùng lớn (thay vì spot 10% của flutter_webrtc) giúp AE không giật
+     * khi người chơi/đèn đi ngang điểm đo.
+     */
+    internal fun meteringRectFor(
+        x: Double,
+        y: Double,
+        rotationDegrees: Int,
+        mirror: Boolean,
+        bounds: Rect,
+    ): MeteringRectangle {
+        var px = x.coerceIn(0.0, 1.0)
+        val py = y.coerceIn(0.0, 1.0)
+        if (mirror) px = 1.0 - px
+        val (sx, sy) = when (((rotationDegrees % 360) + 360) % 360) {
+            90 -> Pair(py, 1.0 - px)
+            180 -> Pair(1.0 - px, 1.0 - py)
+            270 -> Pair(1.0 - py, px)
+            else -> Pair(px, py)
+        }
+        val width = (bounds.width() * METERING_REGION_FRACTION).roundToInt().coerceIn(1, bounds.width())
+        val height = (bounds.height() * METERING_REGION_FRACTION).roundToInt().coerceIn(1, bounds.height())
+        val centerX = bounds.left + (sx * bounds.width()).roundToInt()
+        val centerY = bounds.top + (sy * bounds.height()).roundToInt()
+        val left = (centerX - width / 2).coerceIn(bounds.left, bounds.right - width)
+        val top = (centerY - height / 2).coerceIn(bounds.top, bounds.bottom - height)
+        return MeteringRectangle(left, top, width, height, MeteringRectangle.METERING_WEIGHT_MAX)
     }
 
     @Volatile
@@ -671,5 +954,97 @@ object CameraExposureController {
         put("compensation", compensation)
         put("appliedEv", appliedEv)
         if (reason != null) put("reason", reason)
+    }
+}
+
+/**
+ * Đo độ sáng trung bình khung hình 2 lần/giây trên ảnh thu nhỏ 32x18 (rất nhẹ),
+ * xử lý ngoài thread camera của WebRTC.
+ */
+private class LumaMeter(private val onLuma: (String, Double) -> Unit) : VideoSink {
+    private val executor = Executors.newSingleThreadExecutor()
+    private val busy = AtomicBoolean(false)
+    @Volatile private var lastSampleMs = 0L
+    @Volatile private var track: VideoTrack? = null
+    @Volatile private var trackId: String? = null
+    @Volatile var current: Double? = null
+        private set
+
+    fun attach(id: String) {
+        detach()
+        val videoTrack = try {
+            FlutterWebRTCPlugin.sharedSingleton?.getTrackForId(id, null) as? VideoTrack
+        } catch (_: Throwable) { null } ?: return
+        try {
+            videoTrack.addSink(this)
+            track = videoTrack
+            trackId = id
+        } catch (error: Throwable) {
+            Log.w("CameraExposure", "Cannot attach brightness meter", error)
+        }
+    }
+
+    fun isAttachedTo(id: String): Boolean = trackId == id && track != null
+
+    fun detach() {
+        val previous = track
+        track = null
+        trackId = null
+        current = null
+        if (previous != null) {
+            try { previous.removeSink(this) } catch (_: Throwable) {}
+        }
+    }
+
+    override fun onFrame(frame: VideoFrame) {
+        val id = trackId ?: return
+        val now = SystemClock.elapsedRealtime()
+        if (now - lastSampleMs < 500L || !busy.compareAndSet(false, true)) return
+        lastSampleMs = now
+        frame.retain()
+        try {
+            executor.execute {
+                try {
+                    sample(id, frame)
+                } catch (_: Throwable) {
+                } finally {
+                    frame.release()
+                    busy.set(false)
+                }
+            }
+        } catch (_: Throwable) {
+            frame.release()
+            busy.set(false)
+        }
+    }
+
+    private fun sample(id: String, frame: VideoFrame) {
+        val buffer = frame.buffer
+        if (buffer.width <= 0 || buffer.height <= 0) return
+        val scaled = buffer.cropAndScale(0, 0, buffer.width, buffer.height, 32, 18)
+        try {
+            val i420 = scaled.toI420() ?: return
+            try {
+                val plane = i420.dataY
+                val stride = i420.strideY
+                var sum = 0L
+                for (row in 0 until i420.height) {
+                    val base = row * stride
+                    for (col in 0 until i420.width) {
+                        sum += plane.get(base + col).toInt() and 0xFF
+                    }
+                }
+                val average = sum.toDouble() / (i420.width * i420.height)
+                val previous = current
+                val smoothed = if (previous == null) average else previous * 0.6 + average * 0.4
+                if (trackId != id) return
+                current = smoothed
+                onLuma(id, smoothed)
+            } finally {
+                i420.release()
+            }
+        } finally {
+            scaled.release()
+        }
     }
 }

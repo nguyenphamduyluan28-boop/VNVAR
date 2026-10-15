@@ -46,7 +46,16 @@ class CameraResolutionProfile {
     bitrate: 10000000,
   );
 
-  static const values = [hd720, fullHd1080, qhd2k];
+  /// Các cấu hình được phép chọn. 2K và 4K đã bỏ: cùng bitrate ghi hình nên
+  /// không nét hơn 1080p với cảnh chuyển động nhanh, nhưng làm máy nóng hơn
+  /// nhiều. Enum vẫn giữ để đọc cấu hình cũ và các nhánh iOS.
+  static const values = [hd720, fullHd1080];
+
+  /// Id đã từng lưu nhưng không còn hỗ trợ; tự chuyển về 1080p.
+  static const retiredIds = {'qhd2k', 'ultraHd4k'};
+
+  static bool isSelectableId(String? id) =>
+      values.any((profile) => profile.id == id);
 
   String get id => preset.name;
   String get shortLabel => switch (preset) {
@@ -75,11 +84,21 @@ class CameraResolutionProfile {
     CameraResolutionPreset.ultraHd4k => 8000000,
   };
 
+  /// Bitrate chuẩn (30 FPS) của preset. withFps luôn tính từ mức này để gọi
+  /// nhiều lần (60 → 30 → 60) không bị nhân dồn hoặc giữ nhầm mức 60 FPS.
+  int get baseBitrate => switch (preset) {
+    CameraResolutionPreset.hd720 => hd720.bitrate,
+    CameraResolutionPreset.fullHd1080 => fullHd1080.bitrate,
+    CameraResolutionPreset.qhd2k => qhd2k.bitrate,
+    CameraResolutionPreset.ultraHd4k => ultraHd4k.bitrate,
+  };
+
   CameraResolutionProfile withFps(int supportedFps) {
     final clampedFps = supportedFps.clamp(1, 60);
+    final base = baseBitrate;
     final adjustedBitrate = clampedFps >= 50
-        ? (bitrate * 1.25).toInt()
-        : (clampedFps <= 15 ? (bitrate * 0.6).toInt() : bitrate);
+        ? (base * 1.25).toInt()
+        : (clampedFps <= 15 ? (base * 0.6).toInt() : base);
     return CameraResolutionProfile(
       preset: preset,
       width: width,
@@ -90,8 +109,8 @@ class CameraResolutionProfile {
   }
 
   static CameraResolutionProfile? fromId(String? id) {
-    // Tự động chuyển đổi nếu máy từng lưu profile 4K trước đó về 1080p an toàn
-    if (id == 'ultraHd4k') {
+    // Máy từng lưu 2K/4K: tự chuyển về 1080p an toàn.
+    if (retiredIds.contains(id)) {
       return fullHd1080;
     }
     for (final profile in values) {

@@ -42,7 +42,15 @@ class WhipPublisherService {
   String? _currentError;
   int _retryAttempt = 0;
   Timer? _reconnectTimer;
+  Timer? _iceTimer;
   Timer? _durationTimer;
+  // Mỗi ý định phát mới (start/stop/restart) tăng số này. Lần publish cũ còn
+  // đang chạy sẽ tự huỷ kết nối/phiên của nó thay vì chạy chồng và rò rỉ.
+  int _publishGeneration = 0;
+  Future<void>? _publishInFlight;
+
+  /// Thời gian chờ ICE kết nối sau khi server trả Answer SDP.
+  static const Duration iceConnectTimeout = Duration(seconds: 15);
   Duration _liveDuration = Duration.zero;
   bool _intentionalStop = false;
 
@@ -118,6 +126,9 @@ class WhipPublisherService {
     String? bearerToken,
   }) async {
     _intentionalStop = false;
+    _publishGeneration++;
+    _reconnectTimer?.cancel();
+    _reconnectTimer = null;
     _endpointUrl = endpointUrl.trim();
     _bearerToken = bearerToken?.trim();
     _webRtcService = webRtcService;
@@ -134,7 +145,44 @@ class WhipPublisherService {
     await _executePublish();
   }
 
-  Future<void> _executePublish() async {
+  /// Chạy tuần tự: mỗi lần publish chờ lần trước kết thúc, nên không bao giờ có
+  /// hai PeerConnection/hai phiên WHIP cùng lúc.
+  Future<void> _executePublish() {
+    final generation = _publishGeneration;
+    final previous = _publishInFlight ?? Future<void>.value();
+    final run = previous
+        .catchError((_) {})
+        .then((_) => _executePublishOnce(generation));
+    _publishInFlight = run;
+    return run.whenComplete(() {
+      if (identical(_publishInFlight, run)) _publishInFlight = null;
+    });
+  }
+
+  bool _isStale(int generation) =>
+      _intentionalStop || generation != _publishGeneration;
+
+  /// Lần publish đã bị thay thế/dừng: đóng PeerConnection và xoá phiên của
+  /// riêng nó (chủ hiện tại của trạng thái là lần publish mới hoặc stop()).
+  Future<void> _abandonAttempt(
+    RTCPeerConnection? pc,
+    String? sessionUrl,
+  ) async {
+    if (pc != null) {
+      if (identical(_peerConnection, pc)) _peerConnection = null;
+      try {
+        await pc.close();
+        await pc.dispose();
+      } catch (_) {}
+    }
+    if (sessionUrl != null) {
+      if (_sessionResourceUrl == sessionUrl) _sessionResourceUrl = null;
+      unawaited(_deleteSession(sessionUrl, _bearerToken));
+    }
+  }
+
+  Future<void> _executePublishOnce(int generation) async {
+    if (_isStale(generation)) return;
     final webRtc = _webRtcService;
     final stream = webRtc?.localStream;
 
@@ -146,10 +194,18 @@ class WhipPublisherService {
     }
 
     await _cleanupConnection();
+    if (_isStale(generation)) return;
     HttpClient? client;
+    RTCPeerConnection? attemptPc;
+    String? attemptSession;
 
     try {
       final pc = await createPeerConnection(_rtcConfiguration);
+      attemptPc = pc;
+      if (_isStale(generation)) {
+        await _abandonAttempt(pc, null);
+        return;
+      }
       _peerConnection = pc;
 
       // 1. Add video track from active local camera
@@ -255,7 +311,12 @@ class WhipPublisherService {
         // Extract session URL for teardown
         final location = response.headers.value(HttpHeaders.locationHeader);
         if (location != null && location.isNotEmpty) {
-          _sessionResourceUrl = uri.resolve(location).toString();
+          attemptSession = uri.resolve(location).toString();
+          _sessionResourceUrl = attemptSession;
+        }
+        if (_isStale(generation)) {
+          await _abandonAttempt(pc, attemptSession);
+          return;
         }
 
         final answerSdp = await response
@@ -269,12 +330,28 @@ class WhipPublisherService {
         await pc.setRemoteDescription(
           RTCSessionDescription(answerSdp, 'answer'),
         );
+        if (_isStale(generation)) {
+          await _abandonAttempt(pc, attemptSession);
+          return;
+        }
 
-        _retryAttempt = 0;
+        // Chỉ báo "publishing" khi ICE thực sự kết nối (onConnectionState).
+        // Báo sớm ở đây làm bộ đếm thử lại luôn về 0: lỗi ICE sẽ thử lại mỗi
+        // 2 giây mãi mãi.
         _currentError = null;
-        _setState(WhipPublishState.publishing);
+        _iceTimer?.cancel();
+        _iceTimer = Timer(iceConnectTimeout, () {
+          if (!identical(_peerConnection, pc) ||
+              _intentionalStop ||
+              _state == WhipPublishState.publishing) {
+            return;
+          }
+          _scheduleReconnect(
+            'Không thiết lập được kết nối media (ICE) tới server WHIP.',
+          );
+        });
         developer.log(
-          '[WHIP] Successfully published stream to $_endpointUrl',
+          '[WHIP] Answer accepted from $_endpointUrl; waiting for ICE',
           name: 'WhipPublisherService',
         );
       } else {
@@ -288,6 +365,10 @@ class WhipPublisherService {
         );
       }
     } catch (e, stackTrace) {
+      if (_isStale(generation)) {
+        await _abandonAttempt(attemptPc, attemptSession);
+        return;
+      }
       final formattedError = _formatErrorMessage(e);
       _currentError = formattedError;
       developer.log(
@@ -387,44 +468,17 @@ class WhipPublisherService {
   /// Stops publishing and gracefully tears down the remote session.
   Future<void> stopPublish() async {
     _intentionalStop = true;
+    _publishGeneration++;
     _reconnectTimer?.cancel();
     _reconnectTimer = null;
+    _iceTimer?.cancel();
+    _iceTimer = null;
     _retryAttempt = 0;
 
     // Gracefully send HTTP DELETE to session resource URL (RFC 9450)
-    if (_sessionResourceUrl != null) {
-      try {
-        final client = HttpClient();
-        client.connectionTimeout = const Duration(seconds: 4);
-        try {
-          final request = await client.deleteUrl(
-            Uri.parse(_sessionResourceUrl!),
-          );
-          if (_bearerToken != null && _bearerToken!.isNotEmpty) {
-            request.headers.set(
-              HttpHeaders.authorizationHeader,
-              'Bearer $_bearerToken',
-            );
-          }
-          final response = await request.close().timeout(
-            const Duration(seconds: 6),
-          );
-          await response.drain<void>().timeout(const Duration(seconds: 6));
-          developer.log(
-            '[WHIP] Session deleted: ${response.statusCode}',
-            name: 'WhipPublisherService',
-          );
-        } finally {
-          client.close();
-        }
-      } catch (e) {
-        developer.log(
-          '[WHIP] Session delete error (non-fatal): $e',
-          name: 'WhipPublisherService',
-        );
-      }
-      _sessionResourceUrl = null;
-    }
+    final session = _sessionResourceUrl;
+    _sessionResourceUrl = null;
+    if (session != null) await _deleteSession(session, _bearerToken);
 
     await _cleanupConnection();
     _setState(WhipPublishState.idle);
@@ -437,6 +491,7 @@ class WhipPublisherService {
       '[WHIP] Preparing for camera reconfiguration (pausing WHIP)...',
       name: 'WhipPublisherService',
     );
+    _publishGeneration++;
     _reconnectTimer?.cancel();
     _reconnectTimer = null;
     _setState(WhipPublishState.connecting);
@@ -453,6 +508,7 @@ class WhipPublisherService {
       name: 'WhipPublisherService',
     );
     _intentionalStop = false;
+    _publishGeneration++;
     _reconnectTimer?.cancel();
     _reconnectTimer = null;
     _retryAttempt = 0;
@@ -463,7 +519,48 @@ class WhipPublisherService {
     await _executePublish();
   }
 
+  /// Gửi HTTP DELETE tới phiên WHIP (RFC 9450). Lỗi không ảnh hưởng luồng.
+  Future<void> _deleteSession(String sessionUrl, String? bearerToken) async {
+    try {
+      final client = HttpClient();
+      client.connectionTimeout = const Duration(seconds: 4);
+      try {
+        final request = await client.deleteUrl(Uri.parse(sessionUrl));
+        if (bearerToken != null && bearerToken.isNotEmpty) {
+          request.headers.set(
+            HttpHeaders.authorizationHeader,
+            'Bearer $bearerToken',
+          );
+        }
+        final response = await request.close().timeout(
+          const Duration(seconds: 6),
+        );
+        await response.drain<void>().timeout(const Duration(seconds: 6));
+        developer.log(
+          '[WHIP] Session deleted: ${response.statusCode}',
+          name: 'WhipPublisherService',
+        );
+      } finally {
+        client.close();
+      }
+    } catch (e) {
+      developer.log(
+        '[WHIP] Session delete error (non-fatal): $e',
+        name: 'WhipPublisherService',
+      );
+    }
+  }
+
   Future<void> _cleanupConnection() async {
+    _iceTimer?.cancel();
+    _iceTimer = null;
+    // Kết nối lại: xoá phiên cũ trên server (không chờ) để server không giữ
+    // "publisher" ma và từ chối lần phát mới.
+    final staleSession = _sessionResourceUrl;
+    _sessionResourceUrl = null;
+    if (staleSession != null) {
+      unawaited(_deleteSession(staleSession, _bearerToken));
+    }
     if (_peerConnection != null) {
       try {
         await _peerConnection!.close();

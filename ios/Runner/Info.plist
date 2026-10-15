@@ -8,6 +8,9 @@
 	<key>NSMicrophoneUsageDescription</key>
 	<string>VNVAR sử dụng microphone để ghi âm cùng video.</string>
 
+	<key>NSPhotoLibraryUsageDescription</key>
+	<string>VNVAR cần chọn ảnh mã QR trong thư viện để cấu hình livestream.</string>
+
 	<key>NSLocalNetworkUsageDescription</key>
 	<string>VNVAR sử dụng mạng nội bộ để nhận lệnh điều khiển từ tablet.</string>
 

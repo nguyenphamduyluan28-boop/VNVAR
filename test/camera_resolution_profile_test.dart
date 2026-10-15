@@ -50,12 +50,41 @@ void main() {
 
   test('persists and restores the selected resolution preset', () async {
     final config = StationConfigService();
-    await config.saveResolutionProfile(CameraResolutionProfile.qhd2k);
+    await config.saveResolutionProfile(CameraResolutionProfile.hd720);
 
     final restored = await config.loadResolutionProfile();
 
-    expect(restored?.preset, CameraResolutionPreset.qhd2k);
+    expect(restored?.preset, CameraResolutionPreset.hd720);
     expect(restored?.fps, 30);
+  });
+
+  test('only 720p and 1080p are selectable; 2K and 4K are retired', () {
+    expect(CameraResolutionProfile.values, [
+      CameraResolutionProfile.hd720,
+      CameraResolutionProfile.fullHd1080,
+    ]);
+    expect(CameraResolutionProfile.isSelectableId('hd720'), isTrue);
+    expect(CameraResolutionProfile.isSelectableId('fullHd1080'), isTrue);
+    expect(CameraResolutionProfile.isSelectableId('qhd2k'), isFalse);
+    expect(CameraResolutionProfile.isSelectableId('ultraHd4k'), isFalse);
+  });
+
+  test('a saved 2K or 4K selection migrates to 1080p keeping its FPS', () async {
+    final config = StationConfigService();
+    await config.saveResolutionProfile(
+      CameraResolutionProfile.qhd2k.withFps(60),
+    );
+
+    final restored = await config.loadResolutionProfile();
+
+    expect(restored?.preset, CameraResolutionPreset.fullHd1080);
+    expect(restored?.fps, 60);
+
+    await config.saveResolutionProfile(CameraResolutionProfile.ultraHd4k);
+    expect(
+      (await config.loadResolutionProfile())?.preset,
+      CameraResolutionPreset.fullHd1080,
+    );
   });
 
   test('persists and restores the selected resolution with custom FPS', () async {

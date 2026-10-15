@@ -149,5 +149,66 @@ void main() {
 
     expect(await todayDir.exists(), isTrue);
   });
+
+  test('never touches user folders inside a shared storage root', () async {
+    final reference = DateTime(2026, 8, 25, 12);
+    final screenshots = Directory(
+      '${sandbox.path}${Platform.pathSeparator}Screenshots',
+    );
+    await screenshots.create(recursive: true);
+    final photo = File('${screenshots.path}${Platform.pathSeparator}a.png');
+    final note = File('${screenshots.path}${Platform.pathSeparator}b.json');
+    await photo.writeAsBytes([1]);
+    await note.writeAsString('{}');
+
+    await recording.cleanupEmptyStorageDirectories(referenceTime: reference);
+
+    expect(await photo.exists(), isTrue);
+    expect(await note.exists(), isTrue);
+  });
+
+  test('keeps non-auxiliary files inside an app day folder', () async {
+    final reference = DateTime(2026, 8, 25, 12);
+    final pastDay = Directory(
+      '${sandbox.path}${Platform.pathSeparator}24-08-2026',
+    );
+    await pastDay.create(recursive: true);
+    final photo = File('${pastDay.path}${Platform.pathSeparator}photo.jpg');
+    final orphan = File('${pastDay.path}${Platform.pathSeparator}x.json');
+    await photo.writeAsBytes([1]);
+    await orphan.writeAsString('{}');
+
+    await recording.cleanupEmptyStorageDirectories(referenceTime: reference);
+
+    expect(await photo.exists(), isTrue);
+    expect(await orphan.exists(), isFalse);
+  });
+
+  test('a custom storage root does not get a root .nomedia', () async {
+    await recording.getStoragePath();
+
+    expect(
+      await File('${sandbox.path}${Platform.pathSeparator}.nomedia').exists(),
+      isFalse,
+    );
+  });
+
+  test('only app-made videos count as managed storage', () {
+    expect(
+      isAppManagedVideoPath('/DCIM/24-08-2026/AUTOMODE/10-00-00_10-03-00.ts'),
+      isTrue,
+    );
+    expect(
+      isAppManagedVideoPath('/DCIM/24-08-2026/AUTOMODE/CAM2/FRAGMENTS/F.mp4'),
+      isTrue,
+    );
+    expect(isAppManagedVideoPath('/VNVAR/VNVAR_CAM-01_1756000000000.ts'), isTrue);
+    expect(isAppManagedVideoPath('/VNVAR/CLIP_CAM1_1756000000000.mp4'), isTrue);
+    expect(isAppManagedVideoPath('/DCIM/Camera/VID_20260824_100000.mp4'), isFalse);
+    expect(isAppManagedVideoPath('/DCIM/holiday.mp4'), isFalse);
+    expect(isManagedStorageFilePath('/DCIM/holiday.mp4'), isFalse);
+    expect(isOrphanAuxiliaryFile('/x/24-08-2026/a.wav'), isTrue);
+    expect(isOrphanAuxiliaryFile('/x/24-08-2026/photo.jpg'), isFalse);
+  });
 }
 

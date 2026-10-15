@@ -120,17 +120,60 @@ class LiveBitrateController {
 /// 4G/5G cũng không giúp được.
 bool isRouteRelatedRelayFailure(String? output) {
   if (output == null || output.isEmpty) return true;
+  final text = ffmpegDiagnosticText(output);
   const serverRejections = [
-    '401',
     'Unauthorized',
-    '403',
     'Forbidden',
-    '404',
     'Not Found',
     'Stream not found',
     'NetStream.Publish.BadName',
   ];
-  return !serverRejections.any(output.contains);
+  return ffmpegServerRejectionCode(text) == null &&
+      !serverRejections.any(text.contains);
+}
+
+/// Che stream key/mật khẩu trước khi ghi log: chỉ giữ scheme, máy chủ và tên
+/// app (ví dụ "rtmp://a.rtmp.youtube.com/live2/abcd…").
+String maskStreamUrlForLog(String? url) {
+  if (url == null || url.isEmpty) return '';
+  final uri = Uri.tryParse(url.trim());
+  if (uri == null || uri.host.isEmpty) return '***';
+  final segments = uri.pathSegments.where((part) => part.isNotEmpty).toList();
+  final authority = uri.hasPort ? '${uri.host}:${uri.port}' : uri.host;
+  final app = segments.isEmpty ? '' : '/${segments.first}';
+  final secret = segments.length > 1 ? segments.sublist(1).join('/') : '';
+  final hint = secret.isEmpty
+      ? ''
+      : '/${secret.substring(0, secret.length < 4 ? secret.length : 4)}…';
+  return '${uri.scheme}://$authority$app$hint';
+}
+
+/// Bỏ các dòng tiến trình/thống kê của FFmpeg ("frame= 4010 ... size= 14012kB
+/// time=... bitrate=..."). Các số trong đó từng bị khớp nhầm thành mã 401/404,
+/// khiến mọi lần rớt mạng sau vài phút live bị báo "Sai Stream Key" và không
+/// chuyển sang 4G.
+String ffmpegDiagnosticText(String output) {
+  return output
+      .split(RegExp(r'[\r\n]+'))
+      .where((line) {
+        final trimmed = line.trim();
+        if (trimmed.startsWith('frame=') || trimmed.startsWith('size=')) {
+          return false;
+        }
+        return !(trimmed.contains('time=') && trimmed.contains('bitrate='));
+      })
+      .join('\n');
+}
+
+/// Mã HTTP/RTMP 401/403/404 chỉ khi xuất hiện đúng ngữ cảnh lỗi máy chủ.
+int? ffmpegServerRejectionCode(String text) {
+  final match = RegExp(
+    r'(?:\b(?:error|returned|status|code|http)\b[^\n\d]{0,12}\b(40[134])\b)'
+    r'|(?:\b(40[134])\s+(?:Unauthorized|Forbidden|Not Found)\b)',
+    caseSensitive: false,
+  ).firstMatch(text);
+  final code = match?.group(1) ?? match?.group(2);
+  return code == null ? null : int.parse(code);
 }
 
 class RtspPublisherService {
@@ -419,7 +462,7 @@ class RtspPublisherService {
     ];
 
     developer.log(
-      '[RTSP_PUSH] Starting FFmpeg push to $_targetUrl',
+      '[RTSP_PUSH] Starting FFmpeg push to ${maskStreamUrlForLog(_targetUrl)}',
       name: 'RtspPublisherService',
     );
 
@@ -477,7 +520,7 @@ class RtspPublisherService {
               _currentError = null;
               _setState(RtspPublishState.publishing);
               developer.log(
-                '[RTSP_PUSH] Stream is now LIVE on $_targetUrl '
+                '[RTSP_PUSH] Stream is now LIVE on ${maskStreamUrlForLog(_targetUrl)} '
                 '(${_cellularActive ? '4G/5G fallback' : 'default network'})',
                 name: 'RtspPublisherService',
               );
@@ -581,10 +624,12 @@ class RtspPublisherService {
     if (output.contains('Connection refused')) {
       return 'Không thể kết nối (Connection refused). Vui lòng kiểm tra IP/Domain và cổng 18554.';
     }
-    if (output.contains('401') || output.contains('Unauthorized')) {
+    final diagnostic = ffmpegDiagnosticText(output);
+    final rejection = ffmpegServerRejectionCode(diagnostic);
+    if (rejection == 401 || diagnostic.contains('Unauthorized')) {
       return 'Server từ chối (401 Unauthorized). Stream Key không chính xác.';
     }
-    if (output.contains('404') || output.contains('Not Found')) {
+    if (rejection == 404 || diagnostic.contains('Not Found')) {
       return 'Server không tìm thấy luồng (404 Not Found). Kiểm tra App Name hoặc Stream Name.';
     }
     if (output.contains('Immediate exit requested')) {
