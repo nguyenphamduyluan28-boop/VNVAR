@@ -8,6 +8,7 @@ import android.hardware.camera2.CameraDevice
 import android.hardware.camera2.CameraManager
 import android.hardware.camera2.CaptureRequest
 import android.hardware.camera2.TotalCaptureResult
+import android.hardware.camera2.params.MeteringRectangle
 import android.graphics.Rect
 import android.graphics.SurfaceTexture
 import android.os.Build
@@ -31,6 +32,7 @@ object CameraExposureController {
     private val lifecycleHandler = Handler(Looper.getMainLooper())
     private const val WATCHDOG_INTERVAL_MS = 1_500L
     private const val CAPTURE_HEARTBEAT_TIMEOUT_MS = 3_000L
+    private const val METERING_REGION_FRACTION = 0.3
 
     @Volatile
     private var activeTrackId: String? = null
@@ -45,6 +47,12 @@ object CameraExposureController {
     private var lastCaptureHeartbeatMs = 0L
     @Volatile
     private var requestGeneration = 0
+    /** Điểm đo sáng do người dùng chạm (toạ độ chuẩn hoá trên preview); null = vùng giữa. */
+    @Volatile
+    private var activeMeteringPoint: Pair<Double, Double>? = null
+    /** Cấu hình của repeating request đang chạy, để bỏ qua các lần áp dụng trùng lặp. */
+    @Volatile
+    private var lastAppliedKey: String? = null
 
     private val captureWatchdog = object : Runnable {
         override fun run() {
@@ -100,9 +108,11 @@ object CameraExposureController {
 
     fun reapplyAfterLifecycleChange(reason: String) {
         val trackId = activeTrackId ?: return
-        // Force the session-bound watchdog to verify the first capture request
-        // after a foreground transition. No fixed retry window is required.
-        lastCaptureHeartbeatMs = 0L
+        // Không ép thay repeating request khi request của app vẫn đang chạy:
+        // mỗi lần thay request (tắt màn hình, kéo thanh thông báo) có thể làm
+        // AE/AF hội tụ lại và gây chớp sáng trên livestream. apply() tự bỏ qua
+        // khi cấu hình không đổi và heartbeat còn tươi; nếu session đã bị dựng
+        // lại thì heartbeat cũ và request được áp dụng lại ngay.
         lifecycleHandler.post {
             apply(trackId, activeTargetEv) { response ->
                 if (response["applied"] == true) {
@@ -120,9 +130,22 @@ object CameraExposureController {
         activeTrackId = null
         activeCamera2 = false
         activeCameraLock = false
+        activeMeteringPoint = null
+        lastAppliedKey = null
         lastCaptureHeartbeatMs = 0L
         requestGeneration++
         lifecycleHandler.removeCallbacks(captureWatchdog)
+    }
+
+    /**
+     * Đo sáng theo điểm chạm mà vẫn giữ nguyên toàn bộ cấu hình request của app
+     * (EV, FPS, zoom, NR/EIS). Thay cho Helper.setExposurePoint của flutter_webrtc,
+     * vốn thay request bằng TEMPLATE_RECORD trần (sáng/zoom nhảy rồi watchdog trả lại).
+     */
+    fun setMeteringPoint(trackId: String, x: Double, y: Double, callback: (Map<String, Any>) -> Unit) {
+        activeMeteringPoint = Pair(x.coerceIn(0.0, 1.0), y.coerceIn(0.0, 1.0))
+        activeCameraLock = false
+        apply(trackId, activeTargetEv, callback)
     }
 
     fun setLock(trackId: String, locked: Boolean, callback: (Map<String, Any>) -> Unit) {
@@ -355,6 +378,8 @@ object CameraExposureController {
                     } catch (_: Throwable) {}
                     activeZoom = 1.0
                     activeCameraLock = false
+                    activeMeteringPoint = null
+                    lastAppliedKey = null
                     lastCaptureHeartbeatMs = 0L
                     lifecycleHandler.post {
                         callback(true, null)
@@ -430,6 +455,22 @@ object CameraExposureController {
                 compensationRange.upper,
             )
         } else 0
+        val appliedKey = listOf(
+            trackId,
+            System.identityHashCode(captureSession),
+            compensation,
+            activeCameraLock,
+            activeZoom,
+            activeMeteringPoint,
+            activeRotationDegrees,
+        ).joinToString("|")
+        if (appliedKey == lastAppliedKey &&
+            SystemClock.elapsedRealtime() - lastCaptureHeartbeatMs < CAPTURE_HEARTBEAT_TIMEOUT_MS
+        ) {
+            // Request đang chạy đã đúng cấu hình: thay lại chỉ làm AE hội tụ lại.
+            callback(result(true, compensation, compensation * compensationStep))
+            return
+        }
         val generation = ++requestGeneration
         cameraThread.post {
             if (activeTrackId != trackId || requestGeneration != generation) {
@@ -476,9 +517,21 @@ object CameraExposureController {
                         }
                     }
                     set(CaptureRequest.CONTROL_AWB_MODE, CaptureRequest.CONTROL_AWB_MODE_AUTO)
+                    // Đèn sân 50 Hz + FPS cố định: bật chống nhấp nháy để AE không
+                    // dao động sáng/tối theo tần số lưới điện.
+                    setFirstSupportedMode(
+                        this,
+                        CaptureRequest.CONTROL_AE_ANTIBANDING_MODE,
+                        characteristics.get(CameraCharacteristics.CONTROL_AE_AVAILABLE_ANTIBANDING_MODES),
+                        CaptureRequest.CONTROL_AE_ANTIBANDING_MODE_AUTO,
+                    )
                     // Zoom: ưu tiên CONTROL_ZOOM_RATIO (Android 11+) cho phép
                     // giá trị < 1.0 (ultra-wide). Fallback SCALER_CROP_REGION
                     // cho Android cũ hơn.
+                    // Toạ độ vùng đo sáng: với CONTROL_ZOOM_RATIO là active array
+                    // sau zoom; với crop zoom kiểu cũ phải nằm trong vùng crop.
+                    val activeArray = characteristics.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE)
+                    var meteringBounds: Rect? = activeArray?.let { Rect(0, 0, it.width(), it.height()) }
                     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
                         val zoomRange = characteristics.get(
                             CameraCharacteristics.CONTROL_ZOOM_RATIO_RANGE
@@ -491,10 +544,24 @@ object CameraExposureController {
                             set(CaptureRequest.CONTROL_ZOOM_RATIO, zoom.toFloat())
                             activeZoom = zoom
                         } else {
-                            applyLegacyCropZoom(this, characteristics)
+                            applyLegacyCropZoom(this, characteristics)?.let { meteringBounds = it }
                         }
                     } else {
-                        applyLegacyCropZoom(this, characteristics)
+                        applyLegacyCropZoom(this, characteristics)?.let { meteringBounds = it }
+                    }
+                    val maxAeRegions = characteristics.get(CameraCharacteristics.CONTROL_MAX_REGIONS_AE) ?: 0
+                    val bounds = meteringBounds
+                    // Chưa chạm: giữ đo sáng mặc định của HAL (toàn khung hình, ổn định nhất).
+                    val point = activeMeteringPoint
+                    if (point != null && maxAeRegions > 0 && bounds != null &&
+                        bounds.width() > 0 && bounds.height() > 0
+                    ) {
+                        val mirror = characteristics.get(CameraCharacteristics.LENS_FACING) ==
+                            CameraCharacteristics.LENS_FACING_FRONT
+                        set(
+                            CaptureRequest.CONTROL_AE_REGIONS,
+                            arrayOf(meteringRectFor(point.first, point.second, activeRotationDegrees, mirror, bounds)),
+                        )
                     }
                     setFirstSupportedMode(
                         this,
@@ -534,8 +601,10 @@ object CameraExposureController {
                     cameraThread,
                 )
                 lastCaptureHeartbeatMs = SystemClock.elapsedRealtime()
+                lastAppliedKey = appliedKey
                 callback(result(true, compensation, compensation * compensationStep))
             } catch (error: Throwable) {
+                lastAppliedKey = null
                 Log.w(TAG, "Cannot apply Camera2 exposure boost", error)
                 callback(result(false, reason = error.javaClass.simpleName))
             }
@@ -573,6 +642,24 @@ object CameraExposureController {
                 parameters.focusMode = Camera.Parameters.FOCUS_MODE_CONTINUOUS_VIDEO
             }
         }
+        val point = activeMeteringPoint
+        if (point != null && parameters.maxNumMeteringAreas > 0) {
+            try {
+                val area = meteringRectFor(
+                    point.first,
+                    point.second,
+                    activeRotationDegrees,
+                    false,
+                    Rect(0, 0, 2000, 2000),
+                )
+                parameters.meteringAreas = listOf(
+                    Camera.Area(
+                        Rect(area.x - 1000, area.y - 1000, area.x + area.width - 1000, area.y + area.height - 1000),
+                        1000,
+                    ),
+                )
+            } catch (_: Throwable) {}
+        }
         if (parameters.isZoomSupported) {
             val target = (activeZoom * 100).roundToInt()
             val index = parameters.zoomRatios.indices.minByOrNull { kotlin.math.abs(parameters.zoomRatios[it] - target) } ?: 0
@@ -609,11 +696,11 @@ object CameraExposureController {
         }
     }
 
-    /** Legacy zoom bằng SCALER_CROP_REGION – chỉ hỗ trợ zoom >= 1.0. */
+    /** Legacy zoom bằng SCALER_CROP_REGION – chỉ hỗ trợ zoom >= 1.0. Trả về vùng crop đã đặt. */
     private fun applyLegacyCropZoom(
         request: CaptureRequest.Builder,
         characteristics: CameraCharacteristics,
-    ) {
+    ): Rect? {
         val sensor = characteristics.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE)
         val maxZoom = characteristics.get(
             CameraCharacteristics.SCALER_AVAILABLE_MAX_DIGITAL_ZOOM
@@ -624,12 +711,43 @@ object CameraExposureController {
             val height = (sensor.height() / zoom).roundToInt()
             val left = sensor.centerX() - width / 2
             val top = sensor.centerY() - height / 2
-            request.set(
-                CaptureRequest.SCALER_CROP_REGION,
-                Rect(left, top, left + width, top + height),
-            )
+            val crop = Rect(left, top, left + width, top + height)
+            request.set(CaptureRequest.SCALER_CROP_REGION, crop)
             activeZoom = zoom
+            return crop
         }
+        return null
+    }
+
+    /**
+     * Chuyển điểm chạm trên preview (0..1, khung đã xoay [rotationDegrees] theo
+     * chiều kim đồng hồ so với sensor) thành vùng đo sáng ~30% khung hình trong
+     * [bounds]. Vùng lớn (thay vì spot 10% của flutter_webrtc) giúp AE không giật
+     * khi người chơi/đèn đi ngang điểm đo.
+     */
+    internal fun meteringRectFor(
+        x: Double,
+        y: Double,
+        rotationDegrees: Int,
+        mirror: Boolean,
+        bounds: Rect,
+    ): MeteringRectangle {
+        var px = x.coerceIn(0.0, 1.0)
+        val py = y.coerceIn(0.0, 1.0)
+        if (mirror) px = 1.0 - px
+        val (sx, sy) = when (((rotationDegrees % 360) + 360) % 360) {
+            90 -> Pair(py, 1.0 - px)
+            180 -> Pair(1.0 - px, 1.0 - py)
+            270 -> Pair(1.0 - py, px)
+            else -> Pair(px, py)
+        }
+        val width = (bounds.width() * METERING_REGION_FRACTION).roundToInt().coerceIn(1, bounds.width())
+        val height = (bounds.height() * METERING_REGION_FRACTION).roundToInt().coerceIn(1, bounds.height())
+        val centerX = bounds.left + (sx * bounds.width()).roundToInt()
+        val centerY = bounds.top + (sy * bounds.height()).roundToInt()
+        val left = (centerX - width / 2).coerceIn(bounds.left, bounds.right - width)
+        val top = (centerY - height / 2).coerceIn(bounds.top, bounds.bottom - height)
+        return MeteringRectangle(left, top, width, height, MeteringRectangle.METERING_WEIGHT_MAX)
     }
 
     @Volatile

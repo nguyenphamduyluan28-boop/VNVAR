@@ -261,6 +261,19 @@ class MainActivity : FlutterActivity() {
                     }
                 }
 
+                "setCameraMeteringPoint" -> {
+                    val trackId = call.argument<String>("trackId")
+                    val x = call.argument<Double>("x")
+                    val y = call.argument<Double>("y")
+                    if (trackId.isNullOrBlank() || x == null || y == null) {
+                        result.error("INVALID_ARGS", "trackId, x and y are required", null)
+                    } else {
+                        CameraExposureController.setMeteringPoint(trackId, x, y) { response ->
+                            runOnUiThread { result.success(response["applied"] == true) }
+                        }
+                    }
+                }
+
                 "startRtsp" -> {
                     val trackId = call.argument<String>("trackId")
                     val port = call.argument<Int>("port") ?: 8554

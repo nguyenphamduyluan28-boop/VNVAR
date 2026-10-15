@@ -970,8 +970,9 @@ class WebRtcService {
   Future<void> _configureNaturalCameraMetering(MediaStreamTrack track) async {
     if (!Platform.isAndroid && !Platform.isIOS) return;
 
-    // Reset lock to continuous auto before allowing natural adaptation
-    unawaited(setCameraLock(locked: false, trackId: track.id));
+    // Reset lock to continuous auto before allowing natural adaptation.
+    // Await it: concurrent native applies each replace the repeating request.
+    await setCameraLock(locked: false, trackId: track.id);
 
     // flutter_webrtc 1.6.0 implements Android's setExposurePoint by replacing
     // the active Camera2 repeating request with a new, minimally configured
@@ -1075,6 +1076,27 @@ class WebRtcService {
       '[CAMERA] Tap-to-meter triggered at (${targetPoint.x.toStringAsFixed(2)}, ${targetPoint.y.toStringAsFixed(2)})',
       name: 'WebRtcService',
     );
+
+    if (Platform.isAndroid) {
+      // Helper.setExposurePoint của flutter_webrtc thay repeating request bằng
+      // TEMPLATE_RECORD trần (mất EV/FPS/zoom) rồi watchdog native trả lại sau
+      // 3 giây: hình chớp sáng rồi trở lại. Đo sáng qua controller native để
+      // giữ nguyên cấu hình, chỉ đổi vùng đo sáng (AE vẫn liên tục, không khoá).
+      _isCameraLocked = false;
+      try {
+        await _platformChannel.invokeMethod<bool>('setCameraMeteringPoint', {
+          'trackId': track.id,
+          'x': targetPoint.x,
+          'y': targetPoint.y,
+        }).timeout(const Duration(seconds: 2));
+      } catch (error) {
+        developer.log(
+          '[CAMERA] Tap-to-meter unavailable: $error',
+          name: 'WebRtcService',
+        );
+      }
+      return;
+    }
 
     // Luôn duy trì Continuous Auto Exposure, không khoá cứng thông số
     await setCameraLock(locked: false, trackId: track.id);
