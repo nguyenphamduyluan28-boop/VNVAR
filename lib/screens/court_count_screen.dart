@@ -39,7 +39,15 @@ class _CourtCountScreenState extends State<CourtCountScreen> {
   }
 
   Future<void> _loadExisting() async {
-    final prefs = await SharedPreferences.getInstance();
+    final SharedPreferences prefs;
+    try {
+      prefs = await SharedPreferences.getInstance();
+    } catch (error) {
+      debugPrint('[COURT_COUNT] Unable to load config: $error');
+      return;
+    }
+    // Màn hình đã đóng trong lúc đọc: controller đã dispose.
+    if (!mounted) return;
     final count = prefs.getInt('courtCount');
     _countController.text = count == null ? '' : '$count';
     _venueNameController.text = prefs.getString('venueName') ?? '';

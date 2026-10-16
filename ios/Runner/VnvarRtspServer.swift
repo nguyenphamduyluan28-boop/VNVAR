@@ -42,6 +42,13 @@ final class VnvarRtspServer {
   // (loopback) luôn nhận tiếng.
   private var remoteAudioEnabled = false
   private let maximumClients = 4
+  // Relay livestream cục bộ (FFmpeg qua 127.0.0.1) có hạn mức riêng: client
+  // mạng LAN treo không được chiếm hết chỗ khiến livestream không mở lại được.
+  private let maximumLoopbackClients = 2
+  // Client chưa PLAY (hoặc đang PAUSE) mà im lặng quá lâu thường là kết nối
+  // half-open (tablet mất Wi-Fi): thu hồi để không giữ chỗ mãi.
+  private let idleSessionTimeout: TimeInterval = 60
+  private var idleReaper: DispatchSourceTimer?
 
   init(port: Int) {
     self.port = port
@@ -80,7 +87,32 @@ final class VnvarRtspServer {
       // short window where a connection can be cancelled before it is started.
       self?.accept(connection)
     }
+    // Tạo timer trước khi listener chạy: nếu listener lỗi ngay, stopLocked()
+    // (chạy trên queue) chắc chắn thấy và huỷ được nó.
+    startIdleReaper()
     listener.start(queue: queue)
+  }
+
+  private func startIdleReaper() {
+    idleReaper?.cancel()
+    let timer = DispatchSource.makeTimerSource(queue: queue)
+    timer.schedule(deadline: .now() + 10, repeating: 10)
+    timer.setEventHandler { [weak self] in self?.reapIdleSessions() }
+    idleReaper = timer
+    timer.resume()
+  }
+
+  /// Chạy trên `queue`. Đóng các phiên không phát (chưa PLAY/đang PAUSE) đã im
+  /// lặng quá `idleSessionTimeout`.
+  private func reapIdleSessions() {
+    let now = ProcessInfo.processInfo.systemUptime
+    let idle = sessions.values.filter {
+      !$0.playing && now - $0.lastActivityUptime > idleSessionTimeout
+    }
+    for session in idle {
+      NSLog("[VNVAR-RTSP] Closing idle RTSP session")
+      close(session)
+    }
   }
 
   func stop() {
@@ -170,8 +202,21 @@ final class VnvarRtspServer {
   }
 
   private func accept(_ connection: NWConnection) {
-    guard sessions.count < maximumClients else {
-      NSLog("[VNVAR-RTSP] Rejecting client: limit %d reached", maximumClients)
+    let loopback = ClientSession.isLoopbackEndpoint(connection.endpoint)
+    func countFull() -> Bool {
+      let sameKind = sessions.values.filter { $0.isLoopback == loopback }.count
+      return sameKind >= (loopback ? maximumLoopbackClients : maximumClients)
+    }
+    if countFull() {
+      // Thử thu hồi phiên treo trước khi từ chối client mới.
+      reapIdleSessions()
+    }
+    guard !countFull() else {
+      if loopback {
+        NSLog("[VNVAR-RTSP] Rejecting loopback client: limit reached")
+      } else {
+        NSLog("[VNVAR-RTSP] Rejecting network client: limit reached")
+      }
       connection.cancel()
       return
     }
@@ -203,6 +248,7 @@ final class VnvarRtspServer {
       guard let self = self, let session = session else { return }
       self.queue.async {
         if let data = data, !data.isEmpty {
+          session.lastActivityUptime = ProcessInfo.processInfo.systemUptime
           session.input.append(data)
           guard session.input.count <= ClientSession.maximumInputBytes else {
             self.close(session)
@@ -427,6 +473,8 @@ final class VnvarRtspServer {
   }
 
   private func stopLocked() {
+    idleReaper?.cancel()
+    idleReaper = nil
     listener?.cancel()
     listener = nil
     sessions.values.forEach { session in
@@ -456,6 +504,7 @@ final class VnvarRtspServer {
     var videoSequence = UInt16.random(in: UInt16.min...UInt16.max)
     var audioSequence = UInt16.random(in: UInt16.min...UInt16.max)
     var pendingSends = 0
+    var lastActivityUptime = ProcessInfo.processInfo.systemUptime
     // A new client, or one whose network queue overflowed, must start again at
     // an IDR frame. Sending dependent P-frames after dropping an access unit
     // produces green/yellow macroblocks until the next keyframe.
@@ -485,7 +534,7 @@ final class VnvarRtspServer {
       sendStallTimeout = loopback ? 10 : 2
     }
 
-    private static func isLoopbackEndpoint(_ endpoint: NWEndpoint) -> Bool {
+    fileprivate static func isLoopbackEndpoint(_ endpoint: NWEndpoint) -> Bool {
       guard case let .hostPort(host, _) = endpoint else { return false }
       switch host {
       case let .ipv4(address):

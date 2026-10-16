@@ -107,6 +107,9 @@ class CameraServer {
   // ============================================================
 
   bool recording = false;
+  // stop() đang chạy: không nhận request mới, không mở recorder mới, không
+  // bind lại discovery (tránh recorder/socket mồ côi khi đang huỷ server).
+  bool _stopping = false;
   Future<void>? _ensureRecordingOperation;
   Future<void> _recordingRequestTail = Future<void>.value();
   bool _iosLifecycleSuspended = false;
@@ -146,6 +149,7 @@ class CameraServer {
     if (_server != null) {
       return;
     }
+    _stopping = false;
 
     final HttpServer server;
     try {
@@ -208,7 +212,44 @@ class CameraServer {
   // ============================================================
 
   Future<void> stop({Future<void> Function()? onRecorderStopped}) async {
+    // Đóng cổng HTTP TRƯỚC: request đến trong lúc recorder/WebRTC đang được
+    // huỷ không được mở recorder mới trên track sắp chết.
+    _stopping = true;
+    final server = _server;
+    _server = null;
+    // Ngừng nhận kết nối mới nhưng để request đang xử lý (CheckVAR, /stop...)
+    // kịp trả lời; request mới trên kết nối keep-alive bị trả 503 (_stopping).
+    if (server != null) {
+      unawaited(
+        server.close().catchError((Object error) {
+          developer.log('HTTP server close error: $error', name: 'CameraServer');
+        }),
+      );
+    }
+
     await _discovery.stop();
+
+    // Chờ request ghi hình đã được nhận (start/stop/CheckVAR) chạy xong.
+    try {
+      await _recordingRequestTail.timeout(const Duration(seconds: 15));
+    } catch (_) {}
+    final ensuring = _ensureRecordingOperation;
+    if (ensuring != null) {
+      try {
+        await ensuring.timeout(const Duration(seconds: 15));
+      } catch (_) {}
+    }
+    // Đóng hẳn mọi kết nối còn lại (tải video dở...) trước khi huỷ recorder.
+    try {
+      await server?.close(force: true);
+    } catch (error, stackTrace) {
+      developer.log(
+        'HTTP server close error',
+        error: error,
+        stackTrace: stackTrace,
+        name: 'CameraServer',
+      );
+    }
 
     try {
       await recordingService.dispose(onRecorderStopped: onRecorderStopped);
@@ -232,10 +273,6 @@ class CameraServer {
       );
     }
 
-    await _server?.close(force: true);
-
-    _server = null;
-
     recording = false;
 
     developer.log('Camera Server stopped', name: 'CameraServer');
@@ -245,11 +282,16 @@ class CameraServer {
   /// camera or RecordingService. HTTP is bound to anyIPv4 and automatically
   /// becomes reachable when a Wi-Fi interface receives an address.
   Future<void> reconnectNetworkServices() async {
-    if (_server == null) {
+    bool stopped() => _server == null || _stopping;
+    if (stopped()) {
       throw StateError('Camera Server is not running.');
     }
     await webRtcService.reconnectNetworkTransports();
+    // stop() có thể chạy trong lúc chờ: không bind lại discovery cho một
+    // server đã dừng (socket mồ côi trả cameraId/courtId cũ cho tablet).
+    if (stopped()) return;
     await _discovery.stop();
+    if (stopped()) return;
     await _discovery.startTcpDiscovery(
       courtId: courtId,
       cameraId: cameraId,
@@ -257,6 +299,10 @@ class CameraServer {
       port: apiPort,
       status: recordingService.recording ? 'RECORDING' : 'READY',
     );
+    if (stopped()) {
+      await _discovery.stop();
+      return;
+    }
     developer.log(
       'Network services rebound without restarting capture',
       name: 'CameraServer',
@@ -422,6 +468,13 @@ class CameraServer {
     developer.log('$method $path', name: 'CameraServer');
 
     try {
+      if (_stopping) {
+        await _sendJson(request.response, HttpStatus.serviceUnavailable, {
+          'error': 'Camera station is stopping',
+          'retryable': true,
+        });
+        return;
+      }
       if (!await _admitRequest(request, path: path, method: method)) return;
 
       if ((path == '/' || path == '/viewer') && method == 'GET') {
@@ -922,7 +975,7 @@ class CameraServer {
   }
 
   Future<void> ensureRecording() async {
-    if (_stoppedByRequest) return;
+    if (_stoppedByRequest || _stopping) return;
     if (recordingService.recording) {
       recording = true;
       _discovery.updateStatus('RECORDING');
@@ -945,8 +998,28 @@ class CameraServer {
   }
 
   Future<void> _autoStartRecording(HttpRequest request) async {
+    final captureState = captureStateProvider?.call();
+    if (!recordingService.recording &&
+        captureStateBlocksRecorderStart(captureState)) {
+      // Giống /start: runtime đang đổi cấu hình/khôi phục camera. Chỉ ghi nhận
+      // yêu cầu; runtime tự gọi ensureRecording() khi camera sẵn sàng.
+      _stoppedByRequest = false;
+      await _sendJson(request.response, HttpStatus.ok, {
+        'success': true,
+        'cameraId': cameraId,
+        'recording': false,
+        'deferred': true,
+        'captureState': captureState,
+        'alreadyRunning': false,
+      });
+      return;
+    }
     if (recordingService.recording) {
       recording = true;
+      // Giống /start: tablet muốn ghi nên xoá cờ "đã dừng theo yêu cầu" còn
+      // sót lại (ví dụ /stop trước đó bị lỗi), để lần đổi profile/khôi phục
+      // sau vẫn tự mở lại recorder.
+      _stoppedByRequest = false;
 
       _discovery.updateStatus('RECORDING');
 

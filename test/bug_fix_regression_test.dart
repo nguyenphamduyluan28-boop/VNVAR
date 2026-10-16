@@ -2,8 +2,10 @@ import 'package:camera_station/models/camera_resolution_profile.dart';
 import 'package:camera_station/services/camera_server.dart';
 import 'package:camera_station/services/camera_station_runtime.dart';
 import 'package:camera_station/services/cellular_uplink_service.dart';
+import 'package:camera_station/services/recording_service.dart';
 import 'package:camera_station/services/rtsp_publisher_service.dart';
 import 'package:camera_station/utils/stream_url_parser.dart';
+import 'package:camera_station/widgets/qr_stream_scanner_dialog.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 void main() {
@@ -110,6 +112,35 @@ void main() {
       expect(sixty.withFps(30).bitrate, 8000000);
       expect(sixty.withFps(60).bitrate, 10000000);
     });
+  });
+
+  test('source-change rotation is a no-op when not recording', () async {
+    final recording = RecordingService(cameraId: 'CAM-01');
+    var called = false;
+    final segment = await recording.rotateSegmentForSourceChange(
+      onRecorderStopped: () async => called = true,
+    );
+    // Runtime dựa vào điều này để đổi camera trực tiếp khi không có đoạn nào.
+    expect(segment, isNull);
+    expect(called, isFalse);
+  });
+
+  test('FFmpeg error lines shown on screen hide the stream key', () {
+    expect(
+      maskStreamUrlsInText(
+        'rtmp://a.rtmp.youtube.com/live2/abcd-1234-efgh: I/O error',
+      ),
+      'rtmp://a.rtmp.youtube.com/live2/abcd…: I/O error',
+    );
+    expect(maskStreamUrlsInText('Connection timed out'), 'Connection timed out');
+  });
+
+  test('QR shorthand only applies to "name?key=value", not full URLs', () {
+    expect(
+      QrStreamParseResult.parse('court1_cam?key=pk_1')?.streamUrl,
+      'rtmp://media.aqvision.net:11935/live/court1_cam?key=pk_1',
+    );
+    expect(QrStreamParseResult.parse('https://example.com/x?key=1'), isNull);
   });
 
   test('4G relay keeps URL credentials', () {

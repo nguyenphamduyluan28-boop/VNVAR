@@ -520,6 +520,14 @@ class RecordingService {
   bool isFileReadActive(String path) =>
       (_activeFileReaders[_leaseKey(path)] ?? 0) > 0;
 
+  /// Có file nào nằm trong [directoryPath] đang được HTTP đọc hay không.
+  bool _hasActiveReadUnder(String directoryPath) {
+    if (_activeFileReaders.isEmpty) return false;
+    var prefix = _leaseKey(directoryPath);
+    if (!prefix.endsWith('/')) prefix = '$prefix/';
+    return _activeFileReaders.keys.any((key) => key.startsWith(prefix));
+  }
+
   // ============================================================
   // COMPLETED SEGMENTS
   // ============================================================
@@ -859,7 +867,10 @@ class RecordingService {
       _exportSegments[clip.fileName] = clip;
       return clip;
     } catch (_) {
-      if (output != null && await output.exists()) await output.delete();
+      // Dọn file dở dang nhưng không được che mất lỗi gốc (FFmpeg/trim).
+      try {
+        if (output != null && await output.exists()) await output.delete();
+      } catch (_) {}
       rethrow;
     } finally {
       final list = concatList;
@@ -1070,6 +1081,16 @@ class RecordingService {
     return _videoStorage.rootDirectory();
   }
 
+  /// Thư mục chính + thư mục dự phòng từng được dùng khi thư mục chính lỗi.
+  Future<List<Directory>> _allVideoRoots() async {
+    final primary = await _videoRootDirectory();
+    final secondary = await _videoStorage.secondaryRoots(primary);
+    return [primary, ...secondary];
+  }
+
+  /// Đang phải ghi vào thư mục dự phòng vì thư mục lưu đã chọn bị lỗi.
+  bool get storageFallbackActive => _videoStorage.fallbackActive;
+
   Future<String> getStoragePath() async {
     return (await _videoRootDirectory()).path;
   }
@@ -1090,9 +1111,9 @@ class RecordingService {
   }
 
   Future<void> _removeExpiredDataInternal({DateTime? referenceTime}) async {
-    final Directory root;
+    final List<Directory> roots;
     try {
-      root = await _videoRootDirectory();
+      roots = await _allVideoRoots();
     } catch (e) {
       developer.log(
         '[RECORDING] Cannot get video root directory: $e',
@@ -1104,6 +1125,7 @@ class RecordingService {
     final today = DateTime(now.year, now.month, now.day);
     final cutoff = today.subtract(Duration(days: storageDays - 1));
 
+    for (final root in roots) {
     try {
       await for (final entity in root.list()) {
         if (entity is! Directory) continue;
@@ -1125,6 +1147,15 @@ class RecordingService {
             directoryDate.month == month &&
             directoryDate.year == year;
         if (!isValidDate || !directoryDate.isBefore(cutoff)) continue;
+        // Tablet đang tải một file trong thư mục này: để lần dọn sau xoá,
+        // không cắt ngang lượt tải.
+        if (_hasActiveReadUnder(entity.path)) {
+          developer.log(
+            '[STORAGE] Skip expired directory with active download: ${entity.path}',
+            name: 'RecordingService',
+          );
+          continue;
+        }
 
         try {
           final normalizedDirectory = entity.path.replaceAll('\\', '/');
@@ -1141,10 +1172,14 @@ class RecordingService {
             await _deepDeleteDirectory(entity);
           }
 
+          // Chỉ bỏ khỏi chỉ mục những file đã thực sự bị xoá; file xoá lỗi vẫn
+          // còn trên đĩa và vẫn tải/xoá được ở lần sau.
           _segments.removeWhere((segment) {
             final normalizedPath = segment.path.replaceAll('\\', '/');
-            return normalizedPath == normalizedDirectory ||
+            final inside =
+                normalizedPath == normalizedDirectory ||
                 normalizedPath.startsWith('$normalizedDirectory/');
+            return inside && !File(segment.path).existsSync();
           });
           _notifyVideoChanges();
           developer.log(
@@ -1167,6 +1202,7 @@ class RecordingService {
         stackTrace: stackTrace,
         name: 'RecordingService',
       );
+    }
     }
     await cleanupEmptyStorageDirectories(referenceTime: now);
   }
@@ -1660,9 +1696,13 @@ class RecordingService {
       // AUTO ROTATE BY THE CONFIGURED DURATION
       // ========================================================
 
-      _segmentTimer = Timer(_segmentDuration, () {
-        _rotateSegment();
-      });
+      _segmentTimer?.cancel();
+      _segmentTimer = null;
+      if (_recording && !_stopping) {
+        _segmentTimer = Timer(_segmentDuration, () {
+          _rotateSegment();
+        });
+      }
 
       developer.log(
         'Recording started. '
@@ -1828,10 +1868,13 @@ class RecordingService {
           );
           return;
         }
-        if (Platform.isIOS) {
+        if (Platform.isIOS || _rotating) {
           // Calls, route changes and another audio app can temporarily own the
           // iOS audio session. Keep the court video instead of tearing down the
           // complete capture pipeline; the next segment retries microphone.
+          // Android: lần mở mic đầu tiên vẫn bắt buộc (báo lỗi cho người vận
+          // hành), nhưng khi chuyển segment giữa phiên mà mic bị app khác giữ
+          // tạm thời thì ghi tiếp không tiếng thay vì dừng hẳn việc ghi sân.
           try {
             final partialAudio = File(audioPath);
             if (await partialAudio.exists()) await partialAudio.delete();
@@ -1997,6 +2040,26 @@ class RecordingService {
       throw StateError('Không có file đang quay để chốt Check VAR.');
     }
     return segment;
+  }
+
+  /// Chốt đoạn hiện tại và mở đoạn mới quanh một lần đổi nguồn tại chỗ (ví dụ
+  /// đổi camera iOS mà không mở lại track), để mỗi đoạn chỉ có một hướng
+  /// camera. [onRecorderStopped] chạy giữa hai đoạn.
+  Future<RecordedSegment?> rotateSegmentForSourceChange({
+    required Future<void> Function() onRecorderStopped,
+  }) async {
+    // Đang có lần chuyển segment khác (hết 3 phút/Check VAR): nếu nhập vào
+    // lần đó thì việc đổi nguồn xảy ra GIỮA đoạn mới (đoạn có 2 hướng camera).
+    // Chờ nó xong rồi tự cắt một ranh giới riêng cho lần đổi nguồn này.
+    var current = _rotationOperation;
+    while (current != null) {
+      try {
+        await current;
+      } catch (_) {}
+      if (identical(_rotationOperation, current)) break;
+      current = _rotationOperation;
+    }
+    return _requestSegmentRotation(onRecorderStopped: onRecorderStopped);
   }
 
   Future<RecordedSegment?> _requestSegmentRotation({
@@ -2364,7 +2427,18 @@ class RecordingService {
 
     _segments.add(segment);
     _notifyVideoChanges();
-    await enforceStorageLimit();
+    // Quét/dọn dung lượng chạy nền: Check VAR và việc mở đoạn kế tiếp không
+    // phải chờ duyệt toàn bộ thư mục lưu (có thể vài giây với 20 GB).
+    unawaited(
+      enforceStorageLimit().catchError((Object error, StackTrace stackTrace) {
+        developer.log(
+          'Background storage limit enforcement failed',
+          error: error,
+          stackTrace: stackTrace,
+          name: 'RecordingService',
+        );
+      }),
+    );
 
     try {
       await _writeJournalState(journal, 'completed', finalPath: file.path);
@@ -2553,11 +2627,22 @@ class RecordingService {
       return false;
     }
 
+    // Tablet đang tải file này: không xoá giữa chừng.
+    if (isFileReadActive(segment.path)) return false;
+
     try {
       final file = File(segment.path);
 
       if (await file.exists()) {
         await file.delete();
+      }
+
+      // Xoá cả file đi kèm (âm thanh/metadata của các mảnh ghi) nếu có.
+      for (final companion in fragmentCompanionPaths(segment.path)) {
+        try {
+          final extra = File(companion);
+          if (await extra.exists()) await extra.delete();
+        } catch (_) {}
       }
 
       _segments.removeWhere((item) => item.id == segmentId);
@@ -2591,13 +2676,16 @@ class RecordingService {
     // Mở màn hình chính/khởi động server: dọn toàn bộ thư mục ngày hết hạn
     // trước khi dựng lại chỉ mục video.
     await removeExpiredData();
-    final directory = await _videoRootDirectory();
+    final roots = await _allVideoRoots();
     // Giữ nguyên segment đã biết (ID có mili-giây từ lúc ghi). Dựng lại từ tên
     // file chỉ có độ chính xác tới giây nên ID sẽ đổi và tablet mất liên kết.
     final previousByPath = {
       for (final segment in _segments) segment.path: segment,
     };
-    _segments.clear();
+    // Dựng chỉ mục mới vào danh sách riêng rồi mới thay một lần: trong lúc
+    // duyệt thư mục (có thể vài giây) tablet vẫn tìm/trim/tải được video cũ.
+    final rebuilt = <RecordedSegment>[];
+    for (final directory in roots) {
     try {
       await for (final entity in directory.list(recursive: true)) {
         if (entity is! File) {
@@ -2662,7 +2750,7 @@ class RecordingService {
               startedAt = startedAt.subtract(const Duration(days: 1));
             }
             final timestamp = startedAt.millisecondsSinceEpoch;
-            _segments.add(
+            rebuilt.add(
               previousByPath[entity.path] ??
               RecordedSegment(
                 id: '${indexedCameraId}_$timestamp',
@@ -2688,7 +2776,7 @@ class RecordingService {
           final isRecording = isNewName || fileName.startsWith('${cameraId}_');
           if (timestamp == null || (!isRecording && !isClip)) continue;
           final startedAt = DateTime.fromMillisecondsSinceEpoch(timestamp);
-          _segments.add(
+          rebuilt.add(
             previousByPath[entity.path] ??
             RecordedSegment(
               id: isClip
@@ -2720,7 +2808,27 @@ class RecordingService {
         name: 'RecordingService',
       );
     }
+    }
 
+    // Giữ các đoạn vừa ghi xong trong lúc đang duyệt (chưa có trong lần quét).
+    // Đoạn đã có trong chỉ mục hiện tại thì giữ nguyên object (ID chính xác
+    // tới mili-giây, trạng thái downloaded) thay vì bản dựng lại từ tên file.
+    final currentByPath = {
+      for (final segment in _segments) segment.path: segment,
+    };
+    final merged = [
+      for (final segment in rebuilt) currentByPath[segment.path] ?? segment,
+    ];
+    final rebuiltPaths = {for (final segment in rebuilt) segment.path};
+    for (final segment in _segments) {
+      if (!previousByPath.containsKey(segment.path) &&
+          !rebuiltPaths.contains(segment.path)) {
+        merged.add(segment);
+      }
+    }
+    _segments
+      ..clear()
+      ..addAll(merged);
     _segments.sort((a, b) => a.startedAt.compareTo(b.startedAt));
     _notifyVideoChanges();
     await enforceStorageLimit();
@@ -3200,9 +3308,10 @@ class RecordingService {
             const Duration(minutes: 1)) {
       return;
     }
-    final root = await _videoRootDirectory();
+    final roots = await _allVideoRoots();
     final files = <({File file, FileStat stat, String day})>[];
     var total = 0;
+    for (final root in roots) {
     await for (final entity in root.list(recursive: true)) {
       if (entity is! File) continue;
       final normalizedPath = entity.path.replaceAll('\\', '/').toLowerCase();
@@ -3219,6 +3328,7 @@ class RecordingService {
         ).firstMatch(normalized);
         files.add((file: entity, stat: stat, day: match?.group(1) ?? ''));
       } catch (_) {}
+    }
     }
 
     DateTime? dayValue(String value) {
@@ -3363,12 +3473,14 @@ class RecordingService {
       // STOP TIMER FIRST
       // ========================================================
 
+      // Chờ start() đang chạy xong rồi mới huỷ timer: start() có thể vừa tạo
+      // timer mới, huỷ trước thì timer đó sống sót và cắt sớm lần ghi sau.
+      final starting = _startOperation;
+      if (starting != null) await starting;
+
       _segmentTimer?.cancel();
 
       _segmentTimer = null;
-
-      final starting = _startOperation;
-      if (starting != null) await starting;
 
       if (!_recording && _rotationOperation == null && _recorder == null) {
         return null;

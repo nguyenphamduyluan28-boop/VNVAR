@@ -726,6 +726,29 @@ class _StationScreenState extends State<StationScreen>
   // INITIALIZE
   // ============================================================
 
+  /// Camera đã chạy: lỗi bật foreground service không được biến thành màn
+  /// hình lỗi (camera/server vẫn chạy phía sau). Chỉ cảnh báo người vận hành.
+  Future<void> _startForegroundServiceAfterCamera() async {
+    try {
+      await CameraStationForegroundService.start(
+        cameraId: widget.identity.cameraId,
+        courtId: widget.identity.courtId,
+      );
+    } catch (error) {
+      debugPrint('[STATION] Không thể bật foreground service: $error');
+      if (!mounted) return;
+      _showStationToast(
+        appText(
+          context,
+          'Không bật được chế độ chạy nền. Giữ màn hình mở để camera không bị ngắt.',
+          'Background mode unavailable. Keep the screen on so the camera is not cut off.',
+        ),
+        isError: true,
+        duration: const Duration(seconds: 5),
+      );
+    }
+  }
+
   Future<void> _initialize() async {
     if (mounted) {
       setState(() {
@@ -741,11 +764,6 @@ class _StationScreenState extends State<StationScreen>
         '${widget.identity.cameraId}',
       );
 
-      await CameraStationForegroundService.start(
-        cameraId: widget.identity.cameraId,
-        courtId: widget.identity.courtId,
-      );
-
       if (!mounted) {
         await _shutdownStation();
         return;
@@ -756,6 +774,12 @@ class _StationScreenState extends State<StationScreen>
         cameraId: widget.identity.cameraId,
         deviceId: widget.identity.deviceId,
       );
+
+      // Android 14+: foreground service loại camera|microphone chỉ được khởi
+      // động khi app ĐÃ có quyền camera/mic. Lần chạy đầu tiên các quyền này
+      // được xin trong lúc mở camera ở trên, nên service phải bật sau đó
+      // (lúc này app vẫn đang ở foreground nên camera không bị gián đoạn).
+      await _startForegroundServiceAfterCamera();
 
       unawaited(_runtime.setCameraQuarterTurns(_cameraQuarterTurns));
 
@@ -805,18 +829,15 @@ class _StationScreenState extends State<StationScreen>
     }
 
     try {
-      // Khởi tạo lỗi đã dừng foreground service; bật lại trước khi mở camera,
-      // nếu không Android sẽ cắt camera khi tắt màn hình mà không báo gì.
-      await CameraStationForegroundService.start(
-        cameraId: widget.identity.cameraId,
-        courtId: widget.identity.courtId,
-      );
-
       await _runtime.restart(
         cameraId: widget.identity.cameraId,
         courtId: widget.identity.courtId,
         deviceId: widget.identity.deviceId,
       );
+
+      // Khởi tạo lỗi đã dừng foreground service; bật lại ngay khi camera đã
+      // mở (đã có quyền), nếu không Android sẽ cắt camera khi tắt màn hình.
+      await _startForegroundServiceAfterCamera();
 
       if (!mounted) {
         return;
@@ -1217,7 +1238,20 @@ class _StationScreenState extends State<StationScreen>
                                     'Đã mở khóa chế độ phân giải. Camera sẽ tự động điều chỉnh khi máy nóng.',
                                     'Resolution mode unlocked. Camera will automatically adjust when hot.',
                                   );
-                            await _runtime.setResolutionLocked(nextLock);
+                            try {
+                              await _runtime.setResolutionLocked(nextLock);
+                            } catch (error) {
+                              if (!mounted) return;
+                              _showStationToast(
+                                appText(
+                                  this.context,
+                                  'Không đổi được chế độ khóa: ${userFacingError(error)}',
+                                  'Unable to change lock mode: ${userFacingError(error)}',
+                                ),
+                                isError: true,
+                              );
+                              return;
+                            }
                             if (!sheetContext.mounted) return;
                             setSheetState(() {});
                             if (mounted) {
@@ -2174,7 +2208,19 @@ class _StationScreenState extends State<StationScreen>
                             onQuickSelectZoom: _quickSelectZoom,
                             exposureEv: _runtime.exposureBiasEv,
                             onExposureChanged: (ev) async {
-                              await _runtime.setExposureBias(ev);
+                              try {
+                                await _runtime.setExposureBias(ev);
+                              } catch (error) {
+                                if (!mounted) return;
+                                _showStationToast(
+                                  appText(
+                                    this.context,
+                                    'Không chỉnh được độ sáng: ${userFacingError(error)}',
+                                    'Unable to adjust exposure: ${userFacingError(error)}',
+                                  ),
+                                  isError: true,
+                                );
+                              }
                               if (mounted) setState(() {});
                             },
                           ),

@@ -730,6 +730,13 @@ class WebRtcService {
 
     _localStream = null;
     _cameraInitialized = false;
+    // Timer theo dõi track của stream cũ không còn ý nghĩa với stream mới.
+    _muteFailureTimer?.cancel();
+    _muteFailureTimer = null;
+    _endedFailureTimer?.cancel();
+    _endedFailureTimer = null;
+    _audioFailureTimer?.cancel();
+    _audioFailureTimer = null;
 
     if (oldStream != null) {
       try {
@@ -837,6 +844,13 @@ class WebRtcService {
 
     try {
       await firstFrame;
+    } on StateError {
+      // Một lần mở camera mới đã thay thế lần này (hoặc camera đã bị dispose):
+      // lần mới chịu trách nhiệm camera. Kết thúc lặng lẽ như các kiểm tra
+      // thế hệ khác trong hàm, thay vì đẩy lỗi lên runtime (có thể khiến
+      // runtime khôi phục và đóng mất camera vừa mở).
+      if (cameraGeneration != _cameraLifecycleGeneration) return;
+      rethrow;
     } on TimeoutException {
       if (_localStream == stream) {
         localRenderer.srcObject = null;
@@ -861,7 +875,13 @@ class WebRtcService {
         };
         track.onMute = () {
           _audioFailureTimer?.cancel();
+          final observedGeneration = cameraGeneration;
           _audioFailureTimer = Timer(const Duration(seconds: 8), () {
+            // Track của lần mở camera cũ: không báo lỗi cho camera mới.
+            if (observedGeneration != _cameraLifecycleGeneration ||
+                _localStream != stream) {
+              return;
+            }
             onCameraFailure?.call('ios_audio_track_muted');
           });
         };
@@ -892,7 +912,13 @@ class WebRtcService {
     videoTrack.onMute = () {
       developer.log('[CAMERA] Video track muted', name: 'WebRtcService');
       _muteFailureTimer?.cancel();
+      final observedGeneration = cameraGeneration;
       _muteFailureTimer = Timer(const Duration(seconds: 8), () {
+        // Track của lần mở camera cũ: không kích hoạt khôi phục thừa.
+        if (observedGeneration != _cameraLifecycleGeneration ||
+            _localStream != stream) {
+          return;
+        }
         onCameraFailure?.call('video_track_muted');
       });
     };
@@ -1228,6 +1254,9 @@ class WebRtcService {
         _rtspReadyCompleter = Completer<void>();
       }
       _rtspRetryTimer?.cancel();
+      // Phải gán null: _scheduleRtspRetry bỏ qua khi timer khác null, nên timer
+      // đã huỷ nhưng còn tham chiếu khiến RTSP không bao giờ tự thử lại.
+      _rtspRetryTimer = null;
       final result = await _platformChannel.invokeMethod<Map<Object?, Object?>>(
         'startRtsp',
         {

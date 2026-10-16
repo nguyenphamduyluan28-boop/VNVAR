@@ -1,4 +1,5 @@
 import 'dart:io';
+import 'dart:math';
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -35,18 +36,37 @@ class VnvarCameraStationApp extends StatefulWidget {
   State<VnvarCameraStationApp> createState() => _VnvarCameraStationAppState();
 }
 
+/// deviceId tạm khi không đọc/tạo được cấu hình: mỗi máy một mã ngẫu nhiên để
+/// nhiều máy cùng lỗi không trùng nhau khi tablet dò tìm.
+String _fallbackDeviceId() {
+  final random = Random.secure();
+  final suffix = List.generate(
+    6,
+    (_) => random.nextInt(16).toRadixString(16),
+  ).join().toUpperCase();
+  return 'PHONE-$suffix';
+}
+
 class _VnvarCameraStationAppState extends State<VnvarCameraStationApp> {
   late StationIdentity _identity;
   _StartupStep _step = _StartupStep.splash;
+  final GlobalKey<NavigatorState> _navigatorKey = GlobalKey<NavigatorState>();
+  bool _exitDialogOpen = false;
 
   @override
   void initState() {
     super.initState();
-    _identity = widget.savedIdentity ??
-        const StationIdentity(
+    final saved = widget.savedIdentity;
+    if (saved == null) {
+      debugPrint(
+        '[BOOT] Dùng cấu hình tạm (chưa lưu). Hãy mở Cài đặt để chọn sân/camera.',
+      );
+    }
+    _identity = saved ??
+        StationIdentity(
           courtId: 'COURT-01',
           cameraId: 'CAM-01',
-          deviceId: 'PHONE-000000',
+          deviceId: _fallbackDeviceId(),
           cameraName: 'Camera 01',
           cameraPosition: '',
         );
@@ -64,8 +84,43 @@ class _VnvarCameraStationAppState extends State<VnvarCameraStationApp> {
 
   Future<void> _handleSystemBack(bool didPop) async {
     if (didPop || !mounted) return;
-    if (_step == _StartupStep.station && Platform.isAndroid) {
-      SystemNavigator.pop();
+    if (_step != _StartupStep.station || !Platform.isAndroid) return;
+    // Chạm nhầm Back khi đang ghi sẽ huỷ engine Flutter và cắt ngang segment:
+    // luôn hỏi lại trước khi thoát.
+    final dialogContext = _navigatorKey.currentContext;
+    if (dialogContext == null || _exitDialogOpen) return;
+    _exitDialogOpen = true;
+    bool? confirmed;
+    try {
+      confirmed = await showDialog<bool>(
+        context: dialogContext,
+        builder: (context) => AlertDialog(
+          title: Text(appText(context, 'Thoát Camera Station?', 'Exit Camera Station?')),
+          content: Text(
+            appText(
+              context,
+              'Camera sẽ ngừng ghi hình và ngừng phát cho Tablet.',
+              'The camera will stop recording and streaming to tablets.',
+            ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(context, false),
+              child: Text(appText(context, 'Ở LẠI', 'STAY')),
+            ),
+            FilledButton(
+              style: FilledButton.styleFrom(backgroundColor: Colors.redAccent),
+              onPressed: () => Navigator.pop(context, true),
+              child: Text(appText(context, 'THOÁT', 'EXIT')),
+            ),
+          ],
+        ),
+      );
+    } finally {
+      _exitDialogOpen = false;
+    }
+    if (confirmed == true && mounted) {
+      await SystemNavigator.pop();
     }
   }
 
@@ -86,6 +141,7 @@ class _VnvarCameraStationAppState extends State<VnvarCameraStationApp> {
     return AppLanguageScope(
       service: AppLanguageService.instance,
       child: MaterialApp(
+        navigatorKey: _navigatorKey,
         title: 'VNVAR Camera Station',
         debugShowCheckedModeBanner: false,
         theme: ThemeData(

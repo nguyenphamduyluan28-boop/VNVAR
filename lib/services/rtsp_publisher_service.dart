@@ -148,6 +148,26 @@ String maskStreamUrlForLog(String? url) {
   return '${uri.scheme}://$authority$app$hint';
 }
 
+/// Che mọi URL phát (rtmp/rtsp/srt/http) xuất hiện trong một dòng văn bản.
+String maskStreamUrlsInText(String text) {
+  return text.replaceAllMapped(
+    RegExp(
+      '\\b(?:rtmps?|rtsps?|srt|https?)://[^\\s\'"]+',
+      caseSensitive: false,
+    ),
+    (match) {
+      var url = match.group(0)!;
+      // Bỏ dấu ":" cuối mà FFmpeg nối sau URL ("<url>: I/O error").
+      var suffix = '';
+      while (url.endsWith(':') || url.endsWith(',') || url.endsWith('.')) {
+        suffix = url[url.length - 1] + suffix;
+        url = url.substring(0, url.length - 1);
+      }
+      return '${maskStreamUrlForLog(url)}$suffix';
+    },
+  );
+}
+
 /// Bỏ các dòng tiến trình/thống kê của FFmpeg ("frame= 4010 ... size= 14012kB
 /// time=... bitrate=..."). Các số trong đó từng bị khớp nhầm thành mã 401/404,
 /// khiến mọi lần rớt mạng sau vài phút live bị báo "Sai Stream Key" và không
@@ -378,7 +398,15 @@ class RtspPublisherService {
       final localPort = endpoint == null
           ? null
           : await CellularUplinkService.openTunnel(endpoint);
-      if (!isCurrent()) return;
+      if (!isCurrent()) {
+        // Phiên đã bị thay thế/dừng trong lúc mở tunnel. Nếu không còn phiên
+        // nào cần 4G (đã stop hoặc phiên mới không dùng tunnel) thì đóng nó,
+        // tránh tunnel mồ côi giữ mạng di động.
+        if (localPort != null && (_intentionalStop || !_preferCellular)) {
+          unawaited(CellularUplinkService.closeTunnel());
+        }
+        return;
+      }
       if (localPort != null) {
         final relay = buildCellularRelayTarget(outputUrl, localPort);
         outputUrl = relay.url;
@@ -642,7 +670,9 @@ class RtspPublisherService {
         .where((l) => l.isNotEmpty && !l.startsWith('ffmpeg version'))
         .toList();
     if (lines.isNotEmpty) {
-      return lines.last;
+      // Dòng lỗi FFmpeg thường có dạng "rtmp://host/app/<stream key>: I/O
+      // error" và được hiện trên màn hình: che key/mật khẩu trước.
+      return maskStreamUrlsInText(lines.last);
     }
     return 'Lỗi truyền luồng RTSP.';
   }
@@ -863,7 +893,19 @@ class RtspPublisherService {
     _routeProbeTimer?.cancel();
     _reconnectTimer?.cancel();
     _stopDurationTimer();
-    _cancelActiveSession();
+    unawaited(
+      _cancelActiveSession().catchError((Object error) {
+        developer.log(
+          '[RTSP_PUSH] Cancel session during dispose failed: $error',
+          name: 'RtspPublisherService',
+        );
+      }),
+    );
+    if (_cellularActive || _preferCellular) {
+      _cellularActive = false;
+      _preferCellular = false;
+      unawaited(CellularUplinkService.closeTunnel());
+    }
     _stateController.close();
   }
 }

@@ -1408,7 +1408,19 @@ class _LiveStreamScreenState extends State<LiveStreamScreen> {
             contentPadding: EdgeInsets.zero,
             value: widget.runtime.rtspTabletAudio,
             onChanged: (value) async {
-              await widget.runtime.setRtspTabletAudio(value);
+              try {
+                await widget.runtime.setRtspTabletAudio(value);
+              } catch (error) {
+                if (!mounted) return;
+                _showToast(
+                  appText(
+                    context,
+                    'Không đổi được âm thanh cho Tablet: $error',
+                    'Unable to change tablet audio: $error',
+                  ),
+                  isError: true,
+                );
+              }
               if (mounted) setState(() {});
             },
             title: Text(

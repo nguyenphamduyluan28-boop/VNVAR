@@ -12,6 +12,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 /// guarded here so callers never invoke an unavailable MethodChannel on iOS.
 class VideoStorageService {
   static const _storagePathKey = 'camera_video_storage_path';
+  static const _fallbackPathKey = 'camera_video_fallback_path';
   static const MethodChannel _androidChannel = MethodChannel(
     'vnvar/camera_station_service',
   );
@@ -19,6 +20,11 @@ class VideoStorageService {
   String? _selectedPath;
   String? _androidPublicPath;
   bool _supportsFolderPicker = Platform.isAndroid;
+  // Thư mục dự phòng (Documents/VNVAR) đã từng được dùng khi thư mục chính
+  // tạm lỗi. Được nhớ lại để video ghi vào đó vẫn được index, dọn và giới hạn
+  // dung lượng sau khi thư mục chính hoạt động lại.
+  String? _fallbackPath;
+  bool _fallbackActive = false;
   final Set<String> _noMediaEnsuredPaths = <String>{};
 
   /// Thư mục công khai cũ `Movies/VNVAR` (trước khi chuyển sang thư mục riêng
@@ -36,6 +42,9 @@ class VideoStorageService {
   /// Thư mục lưu do người dùng tự chọn (có thể là thư mục dùng chung).
   bool get usesCustomRoot => _selectedPath != null;
   bool get supportsFolderPicker => _supportsFolderPicker;
+
+  /// Lần lấy thư mục gần nhất phải dùng thư mục dự phòng vì thư mục chính lỗi.
+  bool get fallbackActive => _fallbackActive;
 
   Future<void> load() async {
     if (Platform.isAndroid) {
@@ -77,6 +86,10 @@ class VideoStorageService {
       }
     }
     final prefs = await SharedPreferences.getInstance();
+    final savedFallback = prefs.getString(_fallbackPathKey)?.trim();
+    _fallbackPath = savedFallback == null || savedFallback.isEmpty
+        ? null
+        : savedFallback;
     final savedPath = prefs.getString(_storagePathKey)?.trim();
     if (savedPath == null ||
         savedPath.isEmpty ||
@@ -126,6 +139,7 @@ class VideoStorageService {
         await hideFromGallery(directory);
       }
       await directory.list().take(1).drain();
+      _fallbackActive = false;
       return directory;
     } catch (error, stackTrace) {
       developer.log(
@@ -138,8 +152,47 @@ class VideoStorageService {
       final fallbackDir =
           Directory('${defaultRoot.path}${Platform.pathSeparator}VNVAR');
       if (!await fallbackDir.exists()) await fallbackDir.create(recursive: true);
+      _fallbackActive = true;
+      await _rememberFallback(fallbackDir.absolute.path);
       return fallbackDir;
     }
+  }
+
+  Future<void> _rememberFallback(String path) async {
+    if (_fallbackPath == path) return;
+    _fallbackPath = path;
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setString(_fallbackPathKey, path);
+    } catch (_) {}
+  }
+
+  static String _normalizeRoot(String path) => path
+      .replaceAll('\\', '/')
+      .replaceAll(RegExp(r'/+$'), '')
+      .toLowerCase();
+
+  /// Các thư mục gốc phụ còn chứa video của app (thư mục dự phòng đã dùng khi
+  /// thư mục chính lỗi), khác với [primary]. Video trong đó vẫn phải được
+  /// index, dọn theo ngày và tính vào giới hạn dung lượng.
+  Future<List<Directory>> secondaryRoots(Directory primary) async {
+    final path = _fallbackPath;
+    if (path == null) return const [];
+    if (_normalizeRoot(Directory(path).absolute.path) ==
+        _normalizeRoot(primary.absolute.path)) {
+      return const [];
+    }
+    final directory = Directory(path);
+    try {
+      if (await directory.exists()) return [directory];
+    } catch (_) {}
+    // Thư mục dự phòng không còn: quên nó đi.
+    _fallbackPath = null;
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.remove(_fallbackPathKey);
+    } catch (_) {}
+    return const [];
   }
 
   Future<void> setStoragePath(String? path) async {

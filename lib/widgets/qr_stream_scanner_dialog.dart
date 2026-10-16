@@ -84,8 +84,10 @@ class QrStreamParseResult {
       );
     }
 
-    // 4. Dạng rút gọn: "cam1?key=pk_..."
-    if (text.contains('?key=')) {
+    // 4. Dạng rút gọn: "cam1?key=pk_..." (chỉ tên luồng + key, không phải URL
+    // đầy đủ; nếu không "https://x/y?key=1" sẽ bị ghép thành URL rtmp sai).
+    if (!text.contains('://') &&
+        RegExp(r'^[\w.-]+\?key=[\w.-]+$').hasMatch(text)) {
       final formattedUrl = 'rtmp://media.aqvision.net:11935/live/$text';
       return QrStreamParseResult(
         streamUrl: formattedUrl,
@@ -184,7 +186,8 @@ class _QrStreamScannerDialogState extends State<QrStreamScannerDialog> {
         imageQuality: 100,
       );
 
-      if (file == null || !mounted) {
+      if (!mounted) return;
+      if (file == null) {
         setState(() => _isProcessingImage = false);
         return;
       }
@@ -255,8 +258,25 @@ class _QrStreamScannerDialogState extends State<QrStreamScannerDialog> {
     }
   }
 
-  void _toggleTorch() async {
-    await _controller.toggleTorch();
+  Future<void> _toggleTorch() async {
+    try {
+      await _controller.toggleTorch();
+    } catch (error) {
+      // Máy không có đèn flash/camera đang bận: giữ nguyên trạng thái nút.
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+            AppLanguageService.instance.isEnglish
+                ? 'Flashlight is not available.'
+                : 'Không bật được đèn flash.',
+          ),
+          behavior: SnackBarBehavior.floating,
+        ),
+      );
+      return;
+    }
+    if (!mounted) return;
     setState(() => _torchOn = !_torchOn);
   }
 

@@ -501,11 +501,32 @@ class CameraStationRuntime {
       // Nếu máy đang bị thermal throttled trước đó, khôi phục lại profile trước khi throttle
       if (_thermalThrottled && _profileBeforeThermalThrottle != null) {
         final restoreProfile = _profileBeforeThermalThrottle!;
-        _thermalThrottled = false;
-        _profileBeforeThermalThrottle = null;
+        // Chỉ xoá cờ hạ nhiệt khi đã khôi phục được profile; nếu lỗi thì giữ
+        // nguyên để lần sau (mở khoá/khoá lại, hồi nhiệt) còn thử khôi phục.
         unawaited(
           _serializeLifecycle(
-            () => _setResolutionProfileInternal(restoreProfile, persistSelection: false),
+            () => _setResolutionProfileInternal(
+              restoreProfile,
+              persistSelection: false,
+            ),
+          ).then<void>(
+            (_) {
+              if (identical(_profileBeforeThermalThrottle, restoreProfile) &&
+                  _resolutionProfile == restoreProfile) {
+                _thermalThrottled = false;
+                _profileBeforeThermalThrottle = null;
+              }
+              _emitState();
+            },
+            onError: (Object error, StackTrace stackTrace) {
+              developer.log(
+                '[LOCK] Unable to restore the pre-thermal resolution profile',
+                error: error,
+                stackTrace: stackTrace,
+                name: 'CameraStationRuntime',
+              );
+              _emitState();
+            },
           ),
         );
       }
@@ -1389,13 +1410,12 @@ class CameraStationRuntime {
         );
         if (!recreateCapture) {
           // flutter_webrtc switches the capturer behind the existing
-          // MediaStreamTrack. Recorder, WebRTC peers and RTSP can therefore
-          // keep consuming that same track without cutting a segment. Waiting
-          // for a checkpoint here made the UI spin until FFmpeg had finished
-          // remuxing, especially after several consecutive lens switches.
+          // MediaStreamTrack, so WebRTC peers and RTSP keep the same track.
+          // The recording is cut at the switch so each segment has a single
+          // camera orientation; only the hand-off is awaited, FFmpeg remuxes
+          // the previous segment in the background (no UI spinner).
           try {
-            await webRtc.switchCamera();
-            recording.setFacingMode(webRtc.currentFacingMode);
+            await _switchIosLensInPlace(webRtc, recording);
             if (!recording.recording) await server.ensureRecording();
           } catch (error, stackTrace) {
             // Some iOS devices report a successful native lens handoff before
@@ -1515,6 +1535,62 @@ class CameraStationRuntime {
       _profileSwitching = false;
       _emitState();
     }
+  }
+
+  /// Đổi camera iOS tại chỗ đúng ranh giới segment: đoạn cũ giữ hướng camera
+  /// cũ, đoạn mới bắt đầu sau khi đổi. Chỉ chờ tới lúc đổi xong, không chờ
+  /// FFmpeg đóng gói đoạn cũ.
+  Future<void> _switchIosLensInPlace(
+    WebRtcService webRtc,
+    RecordingService recording,
+  ) async {
+    var switched = false;
+    Future<void> doSwitch() async {
+      await webRtc.switchCamera();
+      recording.setFacingMode(webRtc.currentFacingMode);
+      switched = true;
+    }
+
+    if (!recording.recording) {
+      await doSwitch();
+      return;
+    }
+    final handedOff = Completer<void>();
+    unawaited(
+      recording
+          .rotateSegmentForSourceChange(
+            onRecorderStopped: () async {
+              try {
+                await doSwitch();
+                if (!handedOff.isCompleted) handedOff.complete();
+              } catch (error, stackTrace) {
+                if (!handedOff.isCompleted) {
+                  handedOff.completeError(error, stackTrace);
+                }
+                rethrow;
+              }
+            },
+          )
+          .then<void>(
+            (_) {
+              // Không có đoạn nào để cắt (recorder chưa mở): đổi trực tiếp.
+              if (!handedOff.isCompleted) handedOff.complete();
+            },
+            onError: (Object error, StackTrace stackTrace) {
+              if (!handedOff.isCompleted) {
+                handedOff.completeError(error, stackTrace);
+              }
+              developer.log(
+                '[CAMERA] Segment cut around iOS lens switch failed',
+                error: error,
+                stackTrace: stackTrace,
+                name: 'CameraStationRuntime',
+              );
+            },
+          ),
+    );
+    await handedOff.future;
+    if (!switched) await doSwitch();
   }
 
   Future<void> setResolutionProfile(

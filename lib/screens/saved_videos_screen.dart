@@ -27,18 +27,43 @@ class _SavedVideosScreenState extends State<SavedVideosScreen> {
 
   Future<void> _refresh() async {
     if (mounted) setState(() => _loading = true);
-    // Station có thể đang chạy: không xoá clip export tablet đang dùng.
-    await widget.recordingService.cleanupOldTempFiles(
-      includeExportDownloads: false,
-    );
-    final videos = widget.recordingService.segments;
-    final bytes = await widget.recordingService.storageSizeBytes();
+    var videos = _videos;
+    var bytes = _totalBytes;
+    Object? failure;
+    try {
+      // Station có thể đang chạy: không xoá clip export tablet đang dùng.
+      await widget.recordingService.cleanupOldTempFiles(
+        includeExportDownloads: false,
+      );
+      videos = widget.recordingService.segments;
+      bytes = await widget.recordingService.storageSizeBytes();
+    } catch (error) {
+      // Vẫn hiện danh sách đang có thay vì quay vòng mãi.
+      failure = error;
+      videos = widget.recordingService.segments;
+    }
     if (!mounted) return;
     setState(() {
       _videos = videos;
       _totalBytes = bytes;
       _loading = false;
     });
+    if (failure != null) {
+      _showMessage(
+        appText(
+          context,
+          'Không tải lại được danh sách video: $failure',
+          'Unable to refresh videos: $failure',
+        ),
+      );
+    }
+  }
+
+  void _showMessage(String message) {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context)
+      ..hideCurrentSnackBar()
+      ..showSnackBar(SnackBar(content: Text(message)));
   }
 
   Future<void> _delete(RecordedSegment video) async {
@@ -67,7 +92,17 @@ class _SavedVideosScreenState extends State<SavedVideosScreen> {
       ),
     );
     if (accepted != true) return;
-    await widget.recordingService.deleteSegment(video.id);
+    final deleted = await widget.recordingService.deleteSegment(video.id);
+    if (!mounted) return;
+    if (!deleted) {
+      _showMessage(
+        appText(
+          context,
+          'Không xoá được ${video.fileName} (file đang được tải hoặc bị khoá).',
+          'Could not delete ${video.fileName} (in use or locked).',
+        ),
+      );
+    }
     await _refresh();
   }
 

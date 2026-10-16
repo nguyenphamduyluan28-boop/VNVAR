@@ -4,6 +4,7 @@ import 'dart:developer' as developer;
 import 'dart:io';
 
 import 'package:flutter_webrtc/flutter_webrtc.dart';
+import 'rtsp_publisher_service.dart' show maskStreamUrlForLog;
 import 'webrtc_service.dart';
 
 enum WhipPublishState { idle, connecting, publishing, reconnecting, error }
@@ -43,6 +44,7 @@ class WhipPublisherService {
   int _retryAttempt = 0;
   Timer? _reconnectTimer;
   Timer? _iceTimer;
+  Timer? _disconnectTimer;
   Timer? _durationTimer;
   // Mỗi ý định phát mới (start/stop/restart) tăng số này. Lần publish cũ còn
   // đang chạy sẽ tự huỷ kết nối/phiên của nó thay vì chạy chồng và rò rỉ.
@@ -51,6 +53,9 @@ class WhipPublisherService {
 
   /// Thời gian chờ ICE kết nối sau khi server trả Answer SDP.
   static const Duration iceConnectTimeout = Duration(seconds: 15);
+
+  /// "disconnected" của WebRTC thường tự hồi phục; chỉ kết nối lại nếu kéo dài.
+  static const Duration disconnectGrace = Duration(seconds: 5);
   Duration _liveDuration = Duration.zero;
   bool _intentionalStop = false;
 
@@ -240,14 +245,26 @@ class WhipPublisherService {
         if (!identical(_peerConnection, pc)) return;
         if (connectionState ==
             RTCPeerConnectionState.RTCPeerConnectionStateConnected) {
+          _disconnectTimer?.cancel();
+          _disconnectTimer = null;
           _retryAttempt = 0;
           _reconnectTimer?.cancel();
           _currentError = null;
           _setState(WhipPublishState.publishing);
         } else if (connectionState ==
-                RTCPeerConnectionState.RTCPeerConnectionStateFailed ||
-            connectionState ==
-                RTCPeerConnectionState.RTCPeerConnectionStateDisconnected) {
+            RTCPeerConnectionState.RTCPeerConnectionStateDisconnected) {
+          // Mạng chập chờn: chờ một chút để ICE tự hồi phục thay vì phá phiên.
+          _disconnectTimer?.cancel();
+          _disconnectTimer = Timer(disconnectGrace, () {
+            _disconnectTimer = null;
+            if (identical(_peerConnection, pc) && !_intentionalStop) {
+              _scheduleReconnect('Mất kết nối mạng tới Server');
+            }
+          });
+        } else if (connectionState ==
+            RTCPeerConnectionState.RTCPeerConnectionStateFailed) {
+          _disconnectTimer?.cancel();
+          _disconnectTimer = null;
           if (!_intentionalStop) {
             _scheduleReconnect('Mất kết nối mạng tới Server');
           }
@@ -287,7 +304,7 @@ class WhipPublisherService {
 
       final uri = Uri.parse(_endpointUrl!);
       developer.log(
-        '[WHIP] Connecting to WHIP endpoint: $uri',
+        '[WHIP] Connecting to WHIP endpoint: ${maskStreamUrlForLog(uri.toString())}',
         name: 'WhipPublisherService',
       );
       final request = await httpClient.postUrl(uri);
@@ -351,7 +368,8 @@ class WhipPublisherService {
           );
         });
         developer.log(
-          '[WHIP] Answer accepted from $_endpointUrl; waiting for ICE',
+          '[WHIP] Answer accepted from ${maskStreamUrlForLog(_endpointUrl)}; '
+          'waiting for ICE',
           name: 'WhipPublisherService',
         );
       } else {
@@ -420,6 +438,12 @@ class WhipPublisherService {
 
   void _scheduleReconnect(String reason) {
     if (_intentionalStop) return;
+    // Đã có một lần thử lại đang chờ (ví dụ hết giờ ICE rồi tới sự kiện Failed):
+    // không tăng bộ đếm lần nữa, tránh backoff tăng gấp đôi.
+    if (_reconnectTimer?.isActive ?? false) {
+      _currentError = reason;
+      return;
+    }
 
     _currentError = reason;
     // Hết các lần thử nhanh thì vẫn thử tiếp thưa hơn cho tới khi có mạng.
@@ -473,6 +497,8 @@ class WhipPublisherService {
     _reconnectTimer = null;
     _iceTimer?.cancel();
     _iceTimer = null;
+    _disconnectTimer?.cancel();
+    _disconnectTimer = null;
     _retryAttempt = 0;
 
     // Gracefully send HTTP DELETE to session resource URL (RFC 9450)
@@ -554,12 +580,18 @@ class WhipPublisherService {
   Future<void> _cleanupConnection() async {
     _iceTimer?.cancel();
     _iceTimer = null;
-    // Kết nối lại: xoá phiên cũ trên server (không chờ) để server không giữ
-    // "publisher" ma và từ chối lần phát mới.
+    _disconnectTimer?.cancel();
+    _disconnectTimer = null;
+    // Kết nối lại: xoá phiên cũ trên server TRƯỚC khi POST phiên mới, để server
+    // (MediaMTX) không còn giữ "publisher" cũ và từ chối lần phát mới. Giới
+    // hạn thời gian chờ để mạng hỏng không làm chậm việc kết nối lại.
     final staleSession = _sessionResourceUrl;
     _sessionResourceUrl = null;
     if (staleSession != null) {
-      unawaited(_deleteSession(staleSession, _bearerToken));
+      await _deleteSession(staleSession, _bearerToken).timeout(
+        const Duration(seconds: 3),
+        onTimeout: () {},
+      );
     }
     if (_peerConnection != null) {
       try {

@@ -169,7 +169,10 @@ class _VideoStorageScreenState extends State<VideoStorageScreen> {
       );
       if (accepted != true) return;
       await widget.recordingService.setStoragePath(path);
-      await widget.recordingService.cleanupOldTempFiles();
+      // Giữ clip export tablet đang dùng (chúng vẫn nằm ở thư mục cũ).
+      await widget.recordingService.cleanupOldTempFiles(
+        includeExportDownloads: false,
+      );
       await _refresh();
     } catch (error) {
       if (!mounted) return;

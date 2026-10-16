@@ -92,15 +92,26 @@ class _SetupScreenState extends State<SetupScreen> {
   }
 
   Future<void> _loadConfig() async {
-    final prefs = await SharedPreferences.getInstance();
-    if (prefs.containsKey('venueName')) await prefs.remove('venueName');
-    if (prefs.containsKey('venueMapAddress')) await prefs.remove('venueMapAddress');
-    final port = await _config.loadApiPort();
-    _apiPortController.text = port.toString();
-    if (mounted) {
-      setState(() {
-        _loadingConfig = false;
-      });
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      if (prefs.containsKey('venueName')) await prefs.remove('venueName');
+      if (prefs.containsKey('venueMapAddress')) {
+        await prefs.remove('venueMapAddress');
+      }
+      final port = await _config.loadApiPort();
+      // Màn hình đã đóng: controller đã dispose, không được gán nữa.
+      if (!mounted) return;
+      _apiPortController.text = port.toString();
+    } catch (error) {
+      // Không đọc được cấu hình: vẫn mở form (giữ giá trị mặc định) thay vì
+      // quay vòng mãi.
+      debugPrint('[SETUP] Unable to load config: $error');
+    } finally {
+      if (mounted) {
+        setState(() {
+          _loadingConfig = false;
+        });
+      }
     }
   }
 
