@@ -473,6 +473,16 @@ class RecordingService {
   bool _recording = false;
   Future<RecordedSegment>? _trimOperation;
 
+  /// Số yêu cầu cắt clip tối đa được xếp hàng (kể cả cái đang chạy).
+  static const int maxPendingTrims = 4;
+
+  // Các yêu cầu cắt clip chạy lần lượt (FFmpeg cắt từng clip một) thay vì
+  // trả lỗi 409 khi đang bận. Yêu cầu trùng hệt (Tablet gửi lại khi chờ lâu)
+  // dùng chung kết quả với yêu cầu đang chạy.
+  final Map<String, Future<RecordedSegment>> _pendingTrims =
+      <String, Future<RecordedSegment>>{};
+  Future<void> _trimQueueTail = Future<void>.value();
+
   bool _rotating = false;
   bool _lowStorageWarning = false;
   DateTime? _lowStorageWarningSince;
@@ -559,14 +569,13 @@ class RecordingService {
   RecordedSegment? precedingSegmentOf(RecordedSegment segment) =>
       selectPrecedingSegment(_segments, segment);
 
-  /// Chờ thao tác cắt clip đang chạy (nếu có) xong.
+  /// Chờ mọi thao tác cắt clip đang chạy/xếp hàng xong.
   Future<void> waitForTrimIdle() async {
-    final current = _trimOperation;
-    if (current == null) return;
-    try {
-      await current;
-    } catch (_) {
-      // Lỗi của thao tác trước đã được trả về cho caller của nó.
+    // Hàng đợi có thể được nối thêm trong lúc chờ: chờ tới khi đứng yên.
+    while (true) {
+      final tail = _trimQueueTail;
+      await tail;
+      if (identical(tail, _trimQueueTail)) return;
     }
   }
 
@@ -581,25 +590,66 @@ class RecordingService {
     int? minimumOutputDurationMs,
     String? precedingSegmentId,
   }) {
-    if (_trimOperation != null || _exportCleanupOperation != null) {
+    final key = [
+      segmentId,
+      startMs,
+      endMs,
+      streamCopy,
+      minimumOutputDurationMs,
+      precedingSegmentId,
+    ].join('|');
+    final duplicate = _pendingTrims[key];
+    if (duplicate != null) return duplicate;
+    if (_pendingTrims.length >= maxPendingTrims) {
       return Future<RecordedSegment>.error(
         const TrimInProgressException(
-          'Camera Station đang xử lý một video khác.',
+          'Camera Station đang xử lý nhiều video; vui lòng thử lại sau ít phút.',
         ),
       );
     }
-    final operation = _trimSegmentInternal(
-      segmentId: segmentId,
-      startMs: startMs,
-      endMs: endMs,
-      streamCopy: streamCopy,
-      minimumOutputDurationMs: minimumOutputDurationMs,
-      precedingSegmentId: precedingSegmentId,
+    final previous = _trimQueueTail;
+    final operation = () async {
+      await previous;
+      // Không cắt trong lúc đang dọn thư mục tải về: clip mới có thể bị xoá.
+      while (true) {
+        final cleanup = _exportCleanupOperation;
+        if (cleanup == null) break;
+        try {
+          await cleanup;
+        } catch (_) {
+          // Lỗi dọn dẹp đã được trả cho caller của nó.
+        }
+      }
+      final run = _trimSegmentInternal(
+        segmentId: segmentId,
+        startMs: startMs,
+        endMs: endMs,
+        streamCopy: streamCopy,
+        minimumOutputDurationMs: minimumOutputDurationMs,
+        precedingSegmentId: precedingSegmentId,
+      );
+      _trimOperation = run;
+      try {
+        return await run;
+      } finally {
+        if (identical(_trimOperation, run)) _trimOperation = null;
+      }
+    }();
+    _pendingTrims[key] = operation;
+    final settled = operation.then<void>((_) {}, onError: (Object _) {});
+    _trimQueueTail = settled;
+    unawaited(
+      settled.whenComplete(() {
+        if (identical(_pendingTrims[key], operation)) _pendingTrims.remove(key);
+      }),
     );
-    _trimOperation = operation;
-    return operation.whenComplete(() {
-      if (identical(_trimOperation, operation)) _trimOperation = null;
-    });
+    if (_pendingTrims.length > 1) {
+      developer.log(
+        '[TRIM] Queued trim request (${_pendingTrims.length} pending)',
+        name: 'RecordingService',
+      );
+    }
+    return operation;
   }
 
   Future<RecordedSegment> _trimSegmentInternal({

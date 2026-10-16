@@ -6,10 +6,13 @@ import 'dart:io';
 import 'package:flutter/foundation.dart';
 import 'package:flutter_webrtc/flutter_webrtc.dart';
 
+import '../models/scoreboard_state.dart';
 import 'bounded_json_body.dart';
 import 'discovery_service.dart';
 import 'recording_service.dart';
 import 'request_rate_limiter.dart';
+import 'scoreboard_service.dart';
+import 'scoreboard_web_pages.dart';
 import 'webrtc_service.dart';
 
 String normalizeCheckVarRequestId(String? value, DateTime receivedAt) {
@@ -68,6 +71,75 @@ bool captureStateBlocksRecorderStart(String? captureState) {
   return blocking.contains(captureState);
 }
 
+/// Request cũ (đặc tả đầu tiên) gửi thẳng tỉ số dạng phẳng, không có
+/// trường "action": chuyển thành lệnh ghi đè "setScore".
+bool isLegacyScoreboardBody(Map<String, dynamic> body) {
+  if (body.containsKey('action')) return false;
+  const keys = [
+    'scoreA',
+    'scoreB',
+    'setsA',
+    'setsB',
+    'gamesA',
+    'gamesB',
+    'teamA',
+    'teamB',
+    'serving',
+    'matchFinished',
+  ];
+  return keys.any(body.containsKey);
+}
+
+/// Một kết nối Server-Sent Events của bảng tỉ số. Mọi lần ghi được xếp hàng
+/// (HttpResponse không cho ghi khi đang flush).
+class _ScoreboardStream {
+  _ScoreboardStream(this.response);
+
+  final HttpResponse response;
+  final Completer<void> done = Completer<void>();
+  Future<void> _tail = Future<void>.value();
+  StreamSubscription<Map<String, dynamic>>? subscription;
+  Timer? heartbeat;
+  bool closed = false;
+  int _pending = 0;
+
+  /// Client không đọc (mất Wi-Fi, OBS treo) mà hàng chờ vượt mức này thì
+  /// đóng kết nối thay vì giữ dữ liệu trong RAM; client sẽ tự kết nối lại.
+  static const int maximumPendingChunks = 20;
+
+  void send(String chunk) {
+    if (closed) return;
+    _pending += 1;
+    if (_pending > maximumPendingChunks) {
+      close();
+      return;
+    }
+    _tail = _tail
+        .then((_) async {
+          if (closed) return;
+          response.write(chunk);
+          await response.flush();
+        })
+        .whenComplete(() {
+          _pending -= 1;
+        })
+        .catchError((Object _) {
+          close();
+        });
+  }
+
+  void close() {
+    if (closed) return;
+    closed = true;
+    heartbeat?.cancel();
+    heartbeat = null;
+    subscription?.cancel();
+    subscription = null;
+    _tail = _tail.then((_) => response.close()).catchError((Object _) {});
+    if (!done.isCompleted) done.complete();
+  }
+}
+
 class CameraServer {
   // ============================================================
   // SERVER
@@ -101,6 +173,12 @@ class CameraServer {
   final Map<String, dynamic> Function()? captureMetricsProvider;
 
   final DiscoveryService _discovery = DiscoveryService();
+
+  /// Bảng tỉ số/overlay nội bộ (dùng chung toàn app, sống qua các lần
+  /// khởi động lại server).
+  final ScoreboardService scoreboard;
+  final Set<_ScoreboardStream> _scoreStreams = <_ScoreboardStream>{};
+  static const int maximumScoreboardStreams = 32;
 
   // ============================================================
   // STATE
@@ -139,7 +217,9 @@ class CameraServer {
     this.thermalStateProvider,
     this.temperatureProvider,
     this.captureMetricsProvider,
-  }) : assert(apiPort > 0 && apiPort <= 65535);
+    ScoreboardService? scoreboardService,
+  }) : scoreboard = scoreboardService ?? ScoreboardService.instance,
+       assert(apiPort > 0 && apiPort <= 65535);
 
   // ============================================================
   // START SERVER
@@ -150,6 +230,8 @@ class CameraServer {
       return;
     }
     _stopping = false;
+    // Trạng thái bảng tỉ số phải sẵn sàng trước khi nhận request đầu tiên.
+    await scoreboard.load();
 
     final HttpServer server;
     try {
@@ -217,6 +299,13 @@ class CameraServer {
     _stopping = true;
     final server = _server;
     _server = null;
+    // Đóng các luồng SSE của bảng tỉ số (overlay sẽ tự kết nối lại khi server
+    // chạy lại) và ghi trạng thái xuống máy.
+    for (final stream in _scoreStreams.toList()) {
+      stream.close();
+    }
+    _scoreStreams.clear();
+    unawaited(scoreboard.flush());
     // Ngừng nhận kết nối mới nhưng để request đang xử lý (CheckVAR, /stop...)
     // kịp trả lời; request mới trên kết nối keep-alive bị trả 503 (_stopping).
     if (server != null) {
@@ -476,6 +565,12 @@ class CameraServer {
         return;
       }
       if (!await _admitRequest(request, path: path, method: method)) return;
+
+      // ========================================================
+      // BẢNG TỈ SỐ / OVERLAY NỘI BỘ
+      // ========================================================
+
+      if (await _handleScoreboardRequest(request, path, method)) return;
 
       if ((path == '/' || path == '/viewer') && method == 'GET') {
         await _viewerPage(request);
@@ -805,7 +900,14 @@ class CameraServer {
     var bucket = 'general';
     var maximum = 240;
     var window = const Duration(minutes: 1);
-    if (path == '/webrtc/offer') {
+    if (path.startsWith('/api/score') ||
+        path == '/control' ||
+        path == '/overlay') {
+      // Trọng tài bấm liên tục + nhiều overlay/preview: hạn mức riêng, không
+      // dùng chung hạn mức "control" (30 lệnh/phút) của API ghi hình.
+      bucket = 'scoreboard';
+      maximum = 600;
+    } else if (path == '/webrtc/offer') {
       bucket = 'webrtc-offer';
       maximum = 30;
       window = const Duration(minutes: 1);
@@ -1959,6 +2061,260 @@ class CameraServer {
       fallbackAddress:
           request.connectionInfo?.remoteAddress.address ?? 'unknown',
     );
+  }
+
+  // ============================================================
+  // SCOREBOARD
+  // ============================================================
+
+  Future<bool> _handleScoreboardRequest(
+    HttpRequest request,
+    String path,
+    String method,
+  ) async {
+    if (method == 'GET' && path == '/control') {
+      await _sendHtml(request.response, scoreboardControlPageHtml);
+      return true;
+    }
+    if (method == 'GET' && path == '/overlay') {
+      await _sendHtml(request.response, scoreboardOverlayPageHtml);
+      return true;
+    }
+    if (!path.startsWith('/api/score')) return false;
+
+    if (method == 'GET' && path == '/api/score') {
+      await _sendJson(request.response, HttpStatus.ok, scoreboard.snapshot());
+      return true;
+    }
+    if (method == 'GET' && path == '/api/score/events') {
+      await _scoreboardEvents(request);
+      return true;
+    }
+    if (method == 'POST' && path == '/api/score') {
+      await _scoreboardAction(request);
+      return true;
+    }
+    if (method == 'POST' && path == '/api/score/logo') {
+      await _scoreboardLogoUpload(request);
+      return true;
+    }
+    if (method == 'GET' && path.startsWith('/api/score/logo/')) {
+      await _scoreboardLogo(request, path.substring('/api/score/logo/'.length));
+      return true;
+    }
+    await _sendJson(request.response, HttpStatus.notFound, {
+      'ok': false,
+      'error': 'not_found',
+      'path': path,
+    });
+    return true;
+  }
+
+  bool _scoreboardKeyOk(HttpRequest request) {
+    final candidate =
+        request.headers.value('x-score-key') ?? request.uri.queryParameters['k'];
+    return scoreboard.verifyKey(candidate);
+  }
+
+  Future<void> _sendScoreboardError(
+    HttpResponse response,
+    int statusCode,
+    String code,
+    String message,
+  ) {
+    return _sendJson(response, statusCode, {
+      'ok': false,
+      'error': code,
+      'message': message,
+    });
+  }
+
+  Future<void> _sendHtml(HttpResponse response, String html) async {
+    response.statusCode = HttpStatus.ok;
+    response.headers.contentType = ContentType.html;
+    response.headers.set(HttpHeaders.cacheControlHeader, 'no-store');
+    response.write(html);
+    await response.close();
+  }
+
+  Future<void> _scoreboardAction(HttpRequest request) async {
+    if (!_scoreboardKeyOk(request)) {
+      await _sendScoreboardError(
+        request.response,
+        HttpStatus.unauthorized,
+        'invalid_key',
+        'Mã điều khiển không đúng. Quét lại mã QR trên app Camera Station.',
+      );
+      return;
+    }
+    final Map<String, dynamic> body;
+    try {
+      body = await _readJson(request);
+    } on FormatException {
+      await _sendScoreboardError(
+        request.response,
+        HttpStatus.badRequest,
+        'invalid_json',
+        'Nội dung gửi lên không phải JSON hợp lệ.',
+      );
+      return;
+    }
+    final action = isLegacyScoreboardBody(body)
+        ? <String, dynamic>{...body, 'action': 'setScore'}
+        : body;
+    try {
+      final state = scoreboard.apply(action);
+      await _sendJson(request.response, HttpStatus.ok, {
+        'ok': true,
+        'state': state,
+      });
+    } on ScoreboardException catch (error) {
+      await _sendScoreboardError(
+        request.response,
+        error.statusCode,
+        error.code,
+        error.message,
+      );
+    }
+  }
+
+  Future<void> _scoreboardLogoUpload(HttpRequest request) async {
+    if (!_scoreboardKeyOk(request)) {
+      await _sendScoreboardError(
+        request.response,
+        HttpStatus.unauthorized,
+        'invalid_key',
+        'Mã điều khiển không đúng.',
+      );
+      return;
+    }
+    const maximum = ScoreboardService.maximumLogoBytes;
+    if (request.contentLength > maximum) {
+      await _sendScoreboardError(
+        request.response,
+        HttpStatus.requestEntityTooLarge,
+        'logo_too_large',
+        'Logo phải nhỏ hơn 512 KB.',
+      );
+      return;
+    }
+    final bytes = <int>[];
+    var tooLarge = false;
+    try {
+      await request
+          .forEach((chunk) {
+            if (tooLarge) return;
+            if (bytes.length + chunk.length > maximum) {
+              tooLarge = true;
+              return;
+            }
+            bytes.addAll(chunk);
+          })
+          .timeout(requestBodyTimeout);
+    } on TimeoutException {
+      throw const RequestBodyTimeoutException(requestBodyTimeout);
+    }
+    if (tooLarge) {
+      await _sendScoreboardError(
+        request.response,
+        HttpStatus.requestEntityTooLarge,
+        'logo_too_large',
+        'Logo phải nhỏ hơn 512 KB.',
+      );
+      return;
+    }
+    final team = (request.uri.queryParameters['team'] ?? '').toUpperCase();
+    try {
+      final state = await scoreboard.saveLogo(team, bytes);
+      await _sendJson(request.response, HttpStatus.ok, {
+        'ok': true,
+        'state': state,
+      });
+    } on ScoreboardException catch (error) {
+      await _sendScoreboardError(
+        request.response,
+        error.statusCode,
+        error.code,
+        error.message,
+      );
+    }
+  }
+
+  Future<void> _scoreboardLogo(HttpRequest request, String rawId) async {
+    String id;
+    try {
+      id = Uri.decodeComponent(rawId);
+    } catch (_) {
+      id = '';
+    }
+    final file = isValidScoreboardLogoId(id)
+        ? await scoreboard.logoFile(id)
+        : null;
+    if (file == null) {
+      await _sendScoreboardError(
+        request.response,
+        HttpStatus.notFound,
+        'logo_not_found',
+        'Không tìm thấy logo.',
+      );
+      return;
+    }
+    final response = request.response;
+    response.statusCode = HttpStatus.ok;
+    response.headers.contentType = ContentType.parse(
+      scoreboardContentTypeForLogo(id),
+    );
+    // Mỗi lần tải logo mới có id mới nên được phép cache lâu.
+    response.headers.set(HttpHeaders.cacheControlHeader, 'public, max-age=86400');
+    await response.addStream(file.openRead());
+    await response.close();
+  }
+
+  Future<void> _scoreboardEvents(HttpRequest request) async {
+    if (_scoreStreams.length >= maximumScoreboardStreams) {
+      request.response.headers.set(HttpHeaders.retryAfterHeader, '5');
+      await _sendScoreboardError(
+        request.response,
+        HttpStatus.serviceUnavailable,
+        'too_many_streams',
+        'Quá nhiều màn hình đang kết nối bảng tỉ số.',
+      );
+      return;
+    }
+    final response = request.response;
+    response.bufferOutput = false;
+    response.statusCode = HttpStatus.ok;
+    response.headers.set(
+      HttpHeaders.contentTypeHeader,
+      'text/event-stream; charset=utf-8',
+    );
+    response.headers.set(HttpHeaders.cacheControlHeader, 'no-cache, no-transform');
+    response.headers.set('X-Accel-Buffering', 'no');
+
+    final stream = _ScoreboardStream(response);
+    _scoreStreams.add(stream);
+    String event(String name, Object data) =>
+        'event: $name\ndata: ${jsonEncode(data)}\n\n';
+
+    stream.send('retry: 2000\n\n');
+    stream.send(event('state', scoreboard.snapshot()));
+    stream.subscription = scoreboard.changes.listen(
+      (json) => stream.send(event('state', json)),
+    );
+    // Heartbeat có tên để client biết kết nối còn sống (comment SSE không
+    // kích hoạt sự kiện ở trình duyệt).
+    stream.heartbeat = Timer.periodic(
+      const Duration(seconds: 15),
+      (_) => stream.send('event: ping\ndata: {}\n\n'),
+    );
+    unawaited(
+      response.done.then<void>(
+        (_) => stream.close(),
+        onError: (Object _) => stream.close(),
+      ),
+    );
+    await stream.done.future;
+    _scoreStreams.remove(stream);
   }
 
   // ============================================================

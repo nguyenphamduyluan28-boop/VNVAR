@@ -45,9 +45,25 @@ object CameraExposureController {
     /** AE/AF phải ổn định liên tục chừng này trước khi tự khoá. */
     private const val STABLE_LOCK_AFTER_MS = 2_000L
     /** Độ sáng khung hình lệch khỏi lúc khoá quá ngưỡng này... */
-    private const val RELOCK_LUMA_DRIFT = 0.35
+    private const val RELOCK_LUMA_DRIFT = 0.20
     /** ...liên tục chừng này (ánh sáng thật sự đổi, không phải người đi ngang) thì đo lại. */
     private const val RELOCK_AFTER_MS = 5_000L
+    /**
+     * Hình đang khoá mà quá sáng/quá tối rõ rệt (độ sáng trung bình 0..255) thì
+     * đo lại sớm hơn, kể cả khi độ lệch tương đối chưa tới [RELOCK_LUMA_DRIFT]
+     * (ví dụ khung đã gần trắng nên không còn "chỗ" để lệch thêm).
+     */
+    private const val OVEREXPOSED_LUMA = 195.0
+    private const val UNDEREXPOSED_LUMA = 35.0
+    private const val EXTREME_MIN_DRIFT = 0.10
+    private const val EXTREME_RELOCK_AFTER_MS = 3_000L
+    /**
+     * Khoá lâu (ánh sáng đổi chậm: nắng lên/xuống) thì kiểm tra định kỳ; CHỈ đo
+     * lại khi hình đã lệch rõ ([PERIODIC_MIN_DRIFT]). Hình còn đúng thì giữ khoá,
+     * không đụng tới camera (không chớp khi đang livestream/Check VAR).
+     */
+    private const val PERIODIC_REMETER_MS = 10 * 60 * 1_000L
+    private const val PERIODIC_MIN_DRIFT = 0.10
 
     @Volatile
     private var activeTrackId: String? = null
@@ -86,6 +102,13 @@ object CameraExposureController {
     private var lumaRefAtLock: Double? = null
     @Volatile
     private var lumaDriftSinceMs = 0L
+    @Volatile
+    private var lockedAtMs = 0L
+    /** Capture session của request đang chạy / lúc khoá phơi sáng. */
+    @Volatile
+    private var currentSessionHash = 0
+    @Volatile
+    private var lockedSessionHash: Int? = null
     private val lumaMeter = LumaMeter { trackId, luma ->
         lifecycleHandler.post { onLuma(trackId, luma) }
     }
@@ -207,13 +230,19 @@ object CameraExposureController {
         }
     }
 
-    private fun releaseAutoLock() {
+    /**
+     * Mở khoá phơi sáng để AE đo lại. [keepFocus]: giữ ống kính ở tiêu cự đã
+     * khoá (chỉ đo lại độ sáng, không "săn nét" lại).
+     */
+    private fun releaseAutoLock(keepFocus: Boolean = false) {
         autoLocked = false
         lockPending = false
-        lockedFocusDistance = null
+        if (!keepFocus) lockedFocusDistance = null
         convergedSinceMs = 0L
         lumaRefAtLock = null
         lumaDriftSinceMs = 0L
+        lockedAtMs = 0L
+        lockedSessionHash = null
     }
 
     /** Gọi trên camera thread với mỗi kết quả của request hiện tại. */
@@ -250,6 +279,8 @@ object CameraExposureController {
             lockedFocusDistance = focusDistance
             lumaRefAtLock = lumaMeter.current
             lumaDriftSinceMs = 0L
+            lockedAtMs = SystemClock.elapsedRealtime()
+            lockedSessionHash = currentSessionHash
             Log.i(TAG, "Exposure settled; locking AE/AWB" +
                 if (focusDistance != null) " and focus ($focusDistance dpt)" else "")
             apply(trackId, activeTargetEv) {}
@@ -269,7 +300,20 @@ object CameraExposureController {
         }
         val drift = abs(luma - reference) / max(reference, 24.0)
         val now = SystemClock.elapsedRealtime()
-        if (drift < RELOCK_LUMA_DRIFT) {
+        if (lockedAtMs > 0L && now - lockedAtMs >= PERIODIC_REMETER_MS) {
+            if (drift < PERIODIC_MIN_DRIFT) {
+                // Hình vẫn đúng sáng: giữ nguyên, hẹn kiểm tra lần sau.
+                lockedAtMs = now
+            } else {
+                Log.i(TAG, "Periodic re-meter after ${(now - lockedAtMs) / 60_000} min locked")
+                releaseAutoLock(keepFocus = true)
+                apply(trackId, activeTargetEv) {}
+                return
+            }
+        }
+        val extreme = (luma >= OVEREXPOSED_LUMA || luma <= UNDEREXPOSED_LUMA) &&
+            drift >= EXTREME_MIN_DRIFT
+        if (drift < RELOCK_LUMA_DRIFT && !extreme) {
             lumaDriftSinceMs = 0L
             return
         }
@@ -277,9 +321,11 @@ object CameraExposureController {
             lumaDriftSinceMs = now
             return
         }
-        if (now - lumaDriftSinceMs < RELOCK_AFTER_MS) return
+        val waitMs = if (extreme) EXTREME_RELOCK_AFTER_MS else RELOCK_AFTER_MS
+        if (now - lumaDriftSinceMs < waitMs) return
         Log.i(TAG, "Scene brightness changed (${reference.roundToInt()} -> ${luma.roundToInt()}); re-metering")
-        releaseAutoLock()
+        // Tiêu cự không đổi khi chỉ ánh sáng đổi: giữ nét, chỉ đo lại độ sáng.
+        releaseAutoLock(keepFocus = true)
         apply(trackId, activeTargetEv) {}
     }
 
@@ -593,6 +639,16 @@ object CameraExposureController {
             "captureFormat",
         ) as CameraEnumerationAndroid.CaptureFormat
         val fpsUnitFactor = readField(session, "fpsUnitFactor") as Int
+        val sessionHash = System.identityHashCode(captureSession)
+        currentSessionHash = sessionHash
+        val lockedOn = lockedSessionHash
+        if (autoLocked && lockedOn != null && lockedOn != sessionHash) {
+            // Camera vừa dựng lại phiên chụp (lỗi camera, hệ thống, đổi định
+            // dạng...): khoá phơi sáng cũ sẽ "đóng băng" mức sáng lúc phiên mới
+            // vừa mở (thường quá sáng/tối). Đo lại trước, hội tụ xong mới khoá.
+            Log.i(TAG, "Capture session rebuilt while exposure locked; re-metering")
+            releaseAutoLock(keepFocus = true)
+        }
         val cameraManager = readField(capturer, "cameraManager") as CameraManager
         val characteristics = cameraManager.getCameraCharacteristics(cameraDevice.id)
         val compensationRange = characteristics.get(
@@ -609,7 +665,7 @@ object CameraExposureController {
         } else 0
         val appliedKey = listOf(
             trackId,
-            System.identityHashCode(captureSession),
+            sessionHash,
             compensation,
             activeCameraLock,
             autoLocked,
@@ -660,7 +716,9 @@ object CameraExposureController {
                     val manualFocus = (characteristics.get(
                         CameraCharacteristics.LENS_INFO_MINIMUM_FOCUS_DISTANCE,
                     ) ?: 0f) > 0f && afModes?.contains(CaptureRequest.CONTROL_AF_MODE_OFF) == true
-                    if (autoLocked && focusDistance != null && manualFocus) {
+                    // Giữ tiêu cự cả khi đang đo lại độ sáng (lockedFocusDistance
+                    // còn giữ sau releaseAutoLock(keepFocus = true)).
+                    if (focusDistance != null && manualFocus && !activeCameraLock) {
                         // Giữ ống kính đúng tiêu cự đã hội tụ: không "săn nét" khi
                         // người chơi đi gần/xa (máy đặt cố định trên chân).
                         set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_OFF)

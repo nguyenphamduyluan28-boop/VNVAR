@@ -56,5 +56,6 @@ app.*.map.json
 .android-adb/
 base/
 .claude/
+Claude outputs/
 .gradle/
 **/.gradle/

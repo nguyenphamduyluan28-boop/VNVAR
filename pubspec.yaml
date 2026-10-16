@@ -20,6 +20,8 @@ dependencies:
   wakelock_plus: ^1.2.8
   mobile_scanner: ^7.4.2
   image_picker: ^1.2.4
+  # Mã QR mở trang điều khiển bảng tỉ số (Hub bảng tỉ số).
+  qr_flutter: ^4.1.0
 
 
 # Bản flutter_webrtc 1.6.0 có vá bitrate và profile H.264 của trình ghi video

@@ -1,4 +1,6 @@
 import 'dart:async';
+import 'dart:io';
+
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
@@ -7,6 +9,7 @@ import '../services/camera_station_runtime.dart';
 import '../services/station_config_service.dart';
 import '../services/whip_publisher_service.dart';
 import '../services/rtsp_publisher_service.dart';
+import '../services/scoreboard_service.dart';
 import '../utils/stream_url_parser.dart';
 import '../widgets/qr_stream_scanner_dialog.dart';
 
@@ -1226,8 +1229,82 @@ class _LiveStreamScreenState extends State<LiveStreamScreen> {
               ),
             ],
           ),
+          const SizedBox(height: 12),
+          Row(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [
+              Icon(
+                Icons.scoreboard_rounded,
+                size: 16,
+                color: !isWhip && _rtspService.overlayActive
+                    ? Colors.amberAccent
+                    : Colors.white38,
+              ),
+              const SizedBox(width: 6),
+              Flexible(
+                child: Text(
+                  _scoreboardStatus(isWhip),
+                  textAlign: TextAlign.center,
+                  style: const TextStyle(color: Colors.white70, fontSize: 12),
+                ),
+              ),
+            ],
+          ),
         ],
       ),
+    );
+  }
+
+  /// Trạng thái in bảng tỉ số vào video livestream.
+  String _scoreboardStatus(bool isWhip) {
+    if (isWhip) {
+      return appText(
+        context,
+        'Phát WHIP không in được bảng tỉ số (dùng RTMP/RTSP hoặc OBS).',
+        'WHIP cannot show the scoreboard (use RTMP/RTSP or OBS).',
+      );
+    }
+    if (!Platform.isAndroid) {
+      return appText(
+        context,
+        'iPhone chưa hỗ trợ in bảng tỉ số vào livestream (dùng OBS).',
+        'iPhone cannot burn the scoreboard into the livestream yet (use OBS).',
+      );
+    }
+    if (_rtspService.overlayIssue != null) {
+      return appText(
+        context,
+        'Máy này không in được bảng tỉ số vào livestream; đang phát không có bảng tỉ số.',
+        'This phone cannot burn the scoreboard into the livestream; streaming without it.',
+      );
+    }
+    final overlay = ScoreboardService.instance.snapshot()['overlay'];
+    if (_rtspService.overlayActive) {
+      if (overlay is Map && overlay['visible'] == false) {
+        return appText(
+          context,
+          'Overlay đang ẩn (bật lại trên trang điều khiển → Overlay)',
+          'Overlay is hidden (show it again on the control page → Overlay)',
+        );
+      }
+      return appText(
+        context,
+        'Bảng tỉ số đang hiện trên livestream',
+        'Scoreboard is shown on the livestream',
+      );
+    }
+    final enabled = overlay is Map && overlay['burnIn'] != false;
+    if (enabled) {
+      return appText(
+        context,
+        'Đang chuẩn bị bảng tỉ số cho livestream…',
+        'Preparing the scoreboard for the livestream…',
+      );
+    }
+    return appText(
+      context,
+      'Bảng tỉ số đang tắt trên livestream (bật trên trang điều khiển → Overlay)',
+      'Scoreboard is off on the livestream (turn it on on the control page → Overlay)',
     );
   }
 

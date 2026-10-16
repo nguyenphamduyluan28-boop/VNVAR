@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:io';
 import 'dart:developer' as developer;
 import 'package:ffmpeg_kit_flutter_new_video/ffmpeg_kit.dart';
 import 'package:ffmpeg_kit_flutter_new_video/ffmpeg_session.dart';
@@ -7,6 +8,7 @@ import 'package:ffmpeg_kit_flutter_new_video/statistics.dart';
 
 import 'audio_cleanup.dart';
 import 'cellular_uplink_service.dart';
+import 'scoreboard_burn_in.dart';
 
 enum RtspPublishState {
   idle,
@@ -148,6 +150,79 @@ String maskStreamUrlForLog(String? url) {
   return '${uri.scheme}://$authority$app$hint';
 }
 
+/// Lỗi kết thúc phiên do phần mã hoá lại/chồng bảng tỉ số (không phải lỗi
+/// mạng hay server): khi đó phát tiếp không có bảng tỉ số.
+bool isLivestreamOverlayFailure(String? output) {
+  if (output == null || output.isEmpty) return false;
+  const markers = [
+    'Error while opening encoder',
+    'Error initializing output stream',
+    'Error initializing complex filters',
+    'Error reinitializing filters',
+    'Error configuring filter',
+    'Unknown encoder',
+  ];
+  for (final raw in output.split(RegExp(r'[\r\n]+'))) {
+    final line = raw.trim();
+    // Dòng cấu hình FFmpeg ("--enable-mediacodec") không phải lỗi.
+    if (line.startsWith('configuration:')) continue;
+    if (markers.any(line.contains)) return true;
+    final lower = line.toLowerCase();
+    final mentionsOverlayPart =
+        lower.contains('mediacodec') || lower.contains('scoreboard_burnin');
+    if (mentionsOverlayPart &&
+        (lower.contains('error') ||
+            lower.contains('fail') ||
+            lower.contains('no such file') ||
+            lower.contains('invalid data'))) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/// Lỗi khi mở/giải mã bằng MediaCodec (hoặc codec/bộ lọc nói chung) trước
+/// khi phiên kịp phát: thử lại bằng giải mã CPU.
+bool isHardwareDecodeFailure(String? output) {
+  if (output == null || output.isEmpty) return false;
+  if (isLivestreamOverlayFailure(output)) return true;
+  for (final raw in output.split(RegExp(r'[\r\n]+'))) {
+    final line = raw.trim();
+    if (line.startsWith('configuration:')) continue;
+    final lower = line.toLowerCase();
+    if (line.contains('Unknown decoder') ||
+        line.contains('Error while opening decoder') ||
+        (lower.contains('mediacodec') &&
+            (lower.contains('decod') || lower.contains('error')))) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/// FFmpeg không vẽ được chữ chạy (thiếu bộ lọc drawtext, không mở được font
+/// hay file chữ).
+bool isLivestreamTickerFailure(String? output) {
+  if (output == null || output.isEmpty) return false;
+  for (final raw in output.split(RegExp(r'[\r\n]+'))) {
+    final line = raw.trim();
+    if (line.startsWith('configuration:')) continue;
+    final lower = line.toLowerCase();
+    if (!lower.contains('drawtext')) continue;
+    if (lower.contains('no such filter') ||
+        lower.contains('error') ||
+        lower.contains('fail') ||
+        lower.contains('could not') ||
+        lower.contains('cannot') ||
+        lower.contains('unable') ||
+        lower.contains('no such file') ||
+        lower.contains('invalid')) {
+      return true;
+    }
+  }
+  return false;
+}
+
 /// Che mọi URL phát (rtmp/rtsp/srt/http) xuất hiện trong một dòng văn bản.
 String maskStreamUrlsInText(String text) {
   return text.replaceAllMapped(
@@ -233,6 +308,46 @@ class RtspPublisherService {
   /// Máy đang có Wi-Fi/Ethernet (runtime cung cấp). Dùng để biết khi nào nên
   /// thử quay lại mạng mặc định sau khi đã chuyển sang 4G/5G dự phòng.
   bool Function()? hasWifiNetwork;
+
+  /// Chuẩn bị ảnh bảng tỉ số để in vào video livestream (runtime cung cấp).
+  /// Trả về null khi không in (tắt, không hỗ trợ, chưa có kích thước).
+  /// [scrollingTicker]: cho FFmpeg vẽ chữ chạy (false sau khi máy báo lỗi).
+  Future<LivestreamOverlay?> Function(
+    String localRtspUrl, {
+    required bool scrollingTicker,
+  })?
+  prepareOverlay;
+
+  /// Dừng cập nhật ảnh bảng tỉ số khi không còn phiên nào dùng.
+  void Function()? releaseOverlay;
+
+  bool _overlayActive = false;
+  bool _overlayUnavailable = false;
+  // FFmpeg trên máy không vẽ được chữ chạy (thiếu drawtext/font): dùng chữ
+  // đứng yên trong ảnh cho tới khi tắt app.
+  bool _tickerScrollUnavailable = false;
+
+  // In bảng tỉ số: giải mã hình bằng chip phần cứng (MediaCodec) thay vì CPU
+  // để máy mát hơn. Máy không hỗ trợ / lỗi thì tắt cho tới khi tắt app và
+  // giải mã bằng CPU như trước.
+  bool _hwDecodeUnavailable = false;
+  int _hwDecodeEarlyFailures = 0;
+  String? _overlayIssue;
+
+  /// Phiên hiện tại đang in bảng tỉ số vào video.
+  bool get overlayActive => _overlayActive;
+
+  /// Lý do không in được bảng tỉ số (máy không mã hoá lại được video...).
+  String? get overlayIssue => _overlayIssue;
+
+  /// Cho phép thử in bảng tỉ số lại ở phiên sau (người dùng vừa bật lại).
+  void clearOverlayFailure() {
+    _overlayUnavailable = false;
+    _overlayIssue = null;
+    // Lần phát mới: thử lại giải mã phần cứng (lỗi cũ có thể do mạng/tạm thời).
+    _hwDecodeUnavailable = false;
+    _hwDecodeEarlyFailures = 0;
+  }
 
   // Đường truyền livestream: luôn thử mạng mặc định trước (Wi-Fi khi có, 4G/5G
   // khi không có Wi-Fi). Thất bại liên tiếp [routeFailuresBeforeSwitch] lần thì
@@ -347,6 +462,7 @@ class RtspPublisherService {
     String? localRtspUrl,
   }) async {
     _intentionalStop = false;
+    clearOverlayFailure();
     _targetUrl = targetUrl.trim();
     _localRtspUrl = (localRtspUrl?.trim().isNotEmpty ?? false)
         ? localRtspUrl!.trim()
@@ -417,15 +533,52 @@ class RtspPublisherService {
     if (wasCellular && !_cellularActive) {
       unawaited(CellularUplinkService.closeTunnel());
     }
+    // Bảng tỉ số in vào video: cần mã hoá lại hình (thay vì copy nguyên luồng).
+    LivestreamOverlay? overlay;
+    final prepare = prepareOverlay;
+    if (prepare != null && !_overlayUnavailable) {
+      try {
+        overlay = await prepare(
+          _localRtspUrl!,
+          scrollingTicker: !_tickerScrollUnavailable,
+        );
+      } catch (error) {
+        developer.log(
+          '[RTSP_PUSH] Scoreboard overlay unavailable: $error',
+          name: 'RtspPublisherService',
+        );
+        overlay = null;
+      }
+      if (!isCurrent()) {
+        // Người dùng đã dừng phát trong lúc chuẩn bị: không để ảnh tiếp tục
+        // được vẽ lại khi không còn phiên nào dùng.
+        if (overlay != null && _intentionalStop) releaseOverlay?.call();
+        return;
+      }
+    }
+    if (overlay == null) releaseOverlay?.call();
+    _overlayActive = overlay != null;
+    final usedOverlay = overlay != null;
+    final usedTicker = overlay?.ticker != null;
+    final usedHwDecode =
+        overlay != null && Platform.isAndroid && !_hwDecodeUnavailable;
+    DateTime? outputStartedAt;
+    var sawOutput = false;
     // Build optimized realtime low-latency stream arguments
     final args = <String>[
       '-nostdin',
       '-thread_queue_size',
       '4096',
       '-fflags',
-      '+genpts+nobuffer+discardcorrupt',
-      '-flags',
-      'low_delay',
+      // "nobuffer" làm bộ lọc chồng ảnh không nhận được thông số luồng và
+      // treo (đã thử trên FFmpeg 6): chỉ dùng khi copy nguyên luồng.
+      overlay != null
+          ? '+genpts+discardcorrupt'
+          : '+genpts+nobuffer+discardcorrupt',
+      // low_delay tắt giải mã đa luồng: chỉ dùng khi copy nguyên luồng. Khi in
+      // bảng tỉ số, máy phải giải mã lại hình nên cần đủ luồng CPU để theo
+      // kịp thời gian thực (không thì FFmpeg tụt tốc độ và luồng bị ngắt).
+      if (overlay == null) ...['-flags', 'low_delay'],
       '-correct_ts_overflow',
       '1',
       '-rtsp_transport',
@@ -435,12 +588,22 @@ class RtspPublisherService {
       // Timeout I/O với RTSP cục bộ (micro giây): không treo nếu nguồn ngừng.
       '-timeout',
       '10000000',
+      if (usedHwDecode) ...['-c:v', 'h264_mediacodec'],
       '-i',
       _localRtspUrl!,
-      '-map',
-      '0:v:0',
-      '-c:v',
-      'copy',
+      if (overlay != null) ...[
+        ...livestreamOverlayInputArgs(overlay.imagePath),
+        ...livestreamOverlayVideoArgs(
+          bitrateBps: _bitrate.targetBps,
+          fps: _expectedFps,
+          ticker: overlay.ticker,
+        ),
+      ] else ...[
+        '-map',
+        '0:v:0',
+        '-c:v',
+        'copy',
+      ],
       // Chèn SPS/PPS vào mỗi Keyframe để server Sporto và decoder người xem
       // cập nhật độ phân giải mới mượt mà, không bị nghẽn buffer hay lỗi phân giải.
       '-bsf:v',
@@ -521,6 +684,79 @@ class RtspPublisherService {
           // kết nối lại, nếu không trạng thái kẹt ở "LIVE" mà không còn phiên.
           final output = await completedSession.getOutput();
           if (!isCurrent()) return;
+          // Giải mã phần cứng lỗi ngay khi mở, hoặc phiên chết sớm 2 lần liên
+          // tiếp sau khi đã phát: chuyển sang giải mã CPU (vẫn in bảng tỉ số).
+          final startedAt = outputStartedAt;
+          final diedEarly = startedAt != null &&
+              DateTime.now().difference(startedAt) <
+                  const Duration(seconds: 60);
+          if (usedHwDecode &&
+              !isSuccess &&
+              !(usedTicker && !sawOutput && isLivestreamTickerFailure(output))) {
+            if (!sawOutput) {
+              // Chỉ đổ lỗi cho giải mã phần cứng khi FFmpeg báo lỗi
+              // codec/bộ lọc (không phải lỗi mạng tới server).
+              if (isHardwareDecodeFailure(output)) _hwDecodeUnavailable = true;
+            } else if (diedEarly &&
+                !isRouteRelatedRelayFailure(output) &&
+                isHardwareDecodeFailure(output)) {
+              _hwDecodeEarlyFailures++;
+              if (_hwDecodeEarlyFailures >= 2) _hwDecodeUnavailable = true;
+            } else {
+              _hwDecodeEarlyFailures = 0;
+            }
+            if (_hwDecodeUnavailable && !sawOutput) {
+              developer.log(
+                '[RTSP_PUSH] Hardware decoding unavailable; retrying with CPU decoding',
+                name: 'RtspPublisherService',
+              );
+              _currentSession = null;
+              _reconnectTimer?.cancel();
+              _reconnectTimer = Timer(const Duration(milliseconds: 300), () {
+                if (!_intentionalStop) _executePublish();
+              });
+              return;
+            }
+          }
+          if (usedTicker &&
+              !sawOutput &&
+              !isSuccess &&
+              isLivestreamTickerFailure(output)) {
+            // Không vẽ được chữ chạy: vẫn in bảng tỉ số, chữ chạy đứng yên.
+            _tickerScrollUnavailable = true;
+            developer.log(
+              '[RTSP_PUSH] Scrolling ticker unavailable; using a static ticker',
+              name: 'RtspPublisherService',
+            );
+            _currentSession = null;
+            _reconnectTimer?.cancel();
+            _reconnectTimer = Timer(const Duration(milliseconds: 300), () {
+              if (!_intentionalStop) _executePublish();
+            });
+            return;
+          }
+          if (usedOverlay &&
+              !sawOutput &&
+              !isSuccess &&
+              isLivestreamOverlayFailure(output)) {
+            // Máy không mã hoá lại được video (encoder/bộ lọc): phát tiếp
+            // không có bảng tỉ số thay vì làm hỏng cả livestream.
+            _overlayUnavailable = true;
+            _overlayActive = false;
+            _overlayIssue =
+                'Máy này không in được bảng tỉ số vào livestream; đang phát không có bảng tỉ số.';
+            releaseOverlay?.call();
+            developer.log(
+              '[RTSP_PUSH] Overlay encoding failed; retrying without scoreboard',
+              name: 'RtspPublisherService',
+            );
+            _currentSession = null;
+            _reconnectTimer?.cancel();
+            _reconnectTimer = Timer(const Duration(milliseconds: 300), () {
+              if (!_intentionalStop) _executePublish();
+            });
+            return;
+          }
           final failureReason = isSuccess
               ? 'Nguồn camera cục bộ đã đóng; đang kết nối lại.'
               : _extractFailureReason(output);
@@ -538,6 +774,10 @@ class RtspPublisherService {
           if (!isCurrent()) return;
           final message = log.getMessage();
           // Detect active streaming
+          if (message.contains('frame=') || message.contains('bitrate=')) {
+            if (!sawOutput) outputStartedAt = DateTime.now();
+            sawOutput = true;
+          }
           if (message.contains('Output #0') ||
               message.contains('frame=') ||
               message.contains('bitrate=')) {
@@ -569,6 +809,8 @@ class RtspPublisherService {
               now: DateTime.now(),
             );
             if (next != null) {
+              // Khi in bảng tỉ số, bitrate mới áp dụng từ phiên kết nối sau;
+              // không tự khởi động lại phiên (làm livestream bị ngắt).
               developer.log(
                 '[RTSP_PUSH] Upload speed ${_currentSpeed.toStringAsFixed(2)}x, '
                 'FPS ${_currentFps.toStringAsFixed(1)}; bitrate -> ${next ~/ 1000} kbps',
@@ -812,6 +1054,8 @@ class RtspPublisherService {
     _reconnectTimer = null;
     _retryAttempt = 0;
     await _cancelActiveSession();
+    _overlayActive = false;
+    releaseOverlay?.call();
     _preferCellular = false;
     _routeFailures = 0;
     if (_cellularActive) {
@@ -893,6 +1137,8 @@ class RtspPublisherService {
     _routeProbeTimer?.cancel();
     _reconnectTimer?.cancel();
     _stopDurationTimer();
+    _overlayActive = false;
+    releaseOverlay?.call();
     unawaited(
       _cancelActiveSession().catchError((Object error) {
         developer.log(
