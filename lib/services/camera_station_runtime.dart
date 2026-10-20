@@ -17,6 +17,7 @@ import 'rtsp_publisher_service.dart';
 import 'scoreboard_burn_in.dart';
 import 'scoreboard_service.dart';
 import 'station_display_service.dart';
+import 'station_errors.dart';
 
 bool shouldRecreateIosCameraForLensSwitch(
   CameraResolutionProfile previous,
@@ -214,6 +215,178 @@ bool shouldRunPeriodicStorageEnforcement({
   return now.difference(lastRun) >= interval;
 }
 
+/// Tìm cấu hình thiết bị hỗ trợ khớp [profile]: đúng preset + FPS, nếu không
+/// có thì cùng preset với FPS giới hạn theo khả năng. null = không hỗ trợ.
+CameraResolutionProfile? resolveSupportedResolutionProfile(
+  List<CameraResolutionProfile> supported,
+  CameraResolutionProfile profile,
+) {
+  for (final candidate in supported) {
+    if (candidate.preset == profile.preset && candidate.fps == profile.fps) {
+      return candidate;
+    }
+  }
+  for (final candidate in supported) {
+    if (candidate.preset == profile.preset) {
+      return candidate.withFps(profile.fps.clamp(1, candidate.fps));
+    }
+  }
+  return null;
+}
+
+/// Tải xử lý tương đối của một cấu hình (điểm ảnh × FPS) để so sánh nặng/nhẹ.
+int resolutionProfileLoad(CameraResolutionProfile profile) =>
+    profile.width * profile.height * profile.fps;
+
+/// Lý do không được mở/mở lại camera lúc này (null = được phép).
+/// - Dừng khẩn cấp vì nhiệt: chỉ thermal monitor mới được mở lại camera.
+/// - iOS đang ở nền: AVCaptureSession đã được giải phóng.
+/// - Máy quét QR đang giữ camera ([scannerActive]).
+@visibleForTesting
+StationErrorCode? cameraOpenBlockReason({
+  required bool thermalSuspended,
+  required bool iosSuspended,
+  required bool scannerActive,
+}) {
+  if (thermalSuspended) return StationErrorCode.thermalSuspended;
+  if (iosSuspended) return StationErrorCode.iosSuspended;
+  if (scannerActive) return StationErrorCode.scannerActive;
+  return null;
+}
+
+/// Thời gian chờ trước lần nối lại dịch vụ mạng kế tiếp sau [failures] lần
+/// thất bại liên tiếp: 5 s, 15 s, rồi 60 s.
+@visibleForTesting
+Duration networkReconnectRetryDelay(int failures) {
+  if (failures <= 1) return const Duration(seconds: 5);
+  if (failures == 2) return const Duration(seconds: 15);
+  return const Duration(seconds: 60);
+}
+
+/// Có nối lại dịch vụ mạng (đóng mọi peer WebRTC, bind lại discovery) không.
+/// Chỉ khi IP LAN thật sự đổi, hoặc lần nối lại trước THẤT BẠI và đã hết thời
+/// gian chờ. Lỗi đọc trạng thái mạng thoáng qua không phải lý do nối lại.
+@visibleForTesting
+bool shouldReconnectNetworkServices({
+  required bool firstObservation,
+  required String? previousAddress,
+  required String? address,
+  required bool lastReconnectFailed,
+  required DateTime? retryNotBefore,
+  required DateTime now,
+}) {
+  if (firstObservation || address == null) return false;
+  if (address != previousAddress) return true;
+  if (!lastReconnectFailed) return false;
+  return retryNotBefore == null || !now.isBefore(retryNotBefore);
+}
+
+/// Thời gian chờ trước lần tự khởi tạo lại thứ [attempt] (0 = lần đầu):
+/// 5 s, 15 s, 30 s, rồi giữ 60 s.
+@visibleForTesting
+Duration initRetryDelay(int attempt) {
+  const delays = [
+    Duration(seconds: 5),
+    Duration(seconds: 15),
+    Duration(seconds: 30),
+  ];
+  if (attempt < 0) return delays.first;
+  if (attempt < delays.length) return delays[attempt];
+  return const Duration(seconds: 60);
+}
+
+/// Lỗi khởi tạo có nên tự thử lại không. Thiếu quyền camera/micro thì không:
+/// người dùng phải cấp quyền trong cài đặt.
+@visibleForTesting
+bool isRetryableInitError(Object error) => !isPermissionDeniedError(error);
+
+/// Việc cần làm khi một yêu cầu khởi tạo tới lượt trong hàng đợi vòng đời.
+@visibleForTesting
+enum InitializeEntryAction { skip, initialize, stopThenInitialize }
+
+/// Quyết định cho một yêu cầu khởi tạo. Chỉ bỏ qua khi runtime đã khởi tạo
+/// xong toàn bộ ([initCompleted]: server, camera và các monitor) cho đúng
+/// camera/sân/thiết bị đó. Server đang chạy nhưng khởi tạo chưa xong (lần
+/// trước quá hạn giữa chừng) thì dọn runtime dở dang rồi khởi tạo lại.
+@visibleForTesting
+InitializeEntryAction initializeEntryAction({
+  required bool restart,
+  required bool serverRunning,
+  required bool initCompleted,
+  required bool sameIdentity,
+}) {
+  if (restart) return InitializeEntryAction.stopThenInitialize;
+  if (serverRunning && initCompleted && sameIdentity) {
+    return InitializeEntryAction.skip;
+  }
+  if (serverRunning && !initCompleted) {
+    return InitializeEntryAction.stopThenInitialize;
+  }
+  return InitializeEntryAction.initialize;
+}
+
+/// Số lần đọc không-critical liên tiếp cần để thoát trạng thái critical đã
+/// giảm tải (chống dao động khi cảm biến đọc nhiễu một lần).
+@visibleForTesting
+bool shouldExitCriticalDegrade({
+  required bool degraded,
+  required int nonCriticalStreak,
+}) => degraded && nonCriticalStreak >= thermalConfirmationReadings;
+
+/// Recovery có được (tiếp tục) thử mở lại camera không. Kiểm tra trước MỖI
+/// lần thử và trước khi mở camera: dừng khẩn cấp vì nhiệt (đã dừng hoặc yêu
+/// cầu dừng đang chờ trong hàng đợi), nền iOS, máy quét QR, runtime đang dừng,
+/// camera bị tắt hoặc lượt recovery đã bị thay thế ([superseded]) thì không.
+@visibleForTesting
+bool cameraRecoveryMayProceed({
+  required bool stopping,
+  required bool cameraEnabled,
+  required bool superseded,
+  required bool thermalSuspended,
+  required bool thermalSuspendPending,
+  required bool iosSuspended,
+  required bool scannerActive,
+}) {
+  if (stopping || !cameraEnabled || superseded || thermalSuspendPending) {
+    return false;
+  }
+  return cameraOpenBlockReason(
+        thermalSuspended: thermalSuspended,
+        iosSuspended: iosSuspended,
+        scannerActive: scannerActive,
+      ) ==
+      null;
+}
+
+/// Đủ mát để bắt đầu/tiếp tục đếm thời gian ổn định trước khi khôi phục chất
+/// lượng đã hạ vì nhiệt chưa. Hệ điều hành báo mát ([cool]: Android ≤ LIGHT,
+/// iOS ≤ fair) hoặc Android báo MODERATE kéo dài nhưng nhiệt độ pin đo được
+/// ≤ [maxTemperatureC] đều được; mức nóng ([hot]: SEVERE trở lên) thì không.
+/// Nhiệt độ đo được trên [maxTemperatureC] luôn chặn (chống dao động).
+@visibleForTesting
+bool thermalRestoreCoolEnough({
+  required bool hot,
+  required bool cool,
+  required double? temperatureC,
+  required double maxTemperatureC,
+}) {
+  if (hot) return false;
+  if (temperatureC != null && temperatureC > maxTemperatureC) return false;
+  // MODERATE (không "cool") chỉ được tính khi có nhiệt độ pin để xác nhận.
+  return cool || temperatureC != null;
+}
+
+/// Thao tác vòng đời đã quá hạn (hàng đợi đã giao cho thao tác khác) hoặc đã
+/// bị thay thế: dừng giữa chừng, không mở camera / đổi trạng thái nữa.
+class _StaleLifecycleOperation implements Exception {
+  const _StaleLifecycleOperation(this.label);
+
+  final String label;
+
+  @override
+  String toString() => 'Stale lifecycle operation: $label';
+}
+
 String? selectPrivateLanIpv4(Iterable<String> addresses) {
   for (final address in addresses) {
     final parts = address.split('.');
@@ -230,6 +403,30 @@ String? selectPrivateLanIpv4(Iterable<String> addresses) {
   }
   return null;
 }
+
+typedef _ThermalSnapshot = ({
+  double? temperatureC,
+  bool hot,
+  bool critical,
+  bool emergency,
+  bool cool,
+  double? headroom,
+  bool charging,
+});
+
+/// Không đọc được nhiệt độ: coi như không biết, máy không nóng.
+const _ThermalSnapshot _unknownThermalSnapshot = (
+  temperatureC: null,
+  hot: false,
+  critical: false,
+  emergency: false,
+  cool: true,
+  headroom: null,
+  charging: false,
+);
+
+/// Lens/zoom của camera sau để mở lại đúng góc quay.
+typedef _LensState = ({bool isUltraWide, double zoom, String? deviceId});
 
 class CameraStationRuntime {
   CameraStationRuntime._();
@@ -323,6 +520,54 @@ class CameraStationRuntime {
     CameraResolutionProfile.hd720,
   ];
   int _generation = 0;
+  // Phiên giám sát: tăng mỗi lần dừng runtime. Kết quả của một lần kiểm tra
+  // network/thermal/health/dọn bộ nhớ thuộc phiên cũ (còn đang chờ I/O khi
+  // runtime dừng/khởi tạo lại) bị bỏ qua và không được reset cờ của phiên mới.
+  int _monitorSession = 0;
+  bool _storageCleanupRunning = false;
+  // Lỗi đọc trạng thái mạng (thoáng qua) tách khỏi lỗi khôi phục dịch vụ mạng
+  // ([_networkError]): chỉ lỗi khôi phục mới khiến runtime nối lại lần nữa.
+  String? _networkReadError;
+  int _networkReconnectFailures = 0;
+  DateTime? _networkReconnectRetryAt;
+  // Tự khởi tạo lại khi khởi tạo lỗi (trừ lỗi thiếu quyền).
+  Timer? _initRetryTimer;
+  DateTime? _nextInitRetryAt;
+  Object? _lastInitError;
+  int _initRetryAttempt = 0;
+  // Tăng mỗi lần huỷ lịch tự khởi tạo lại (stop/khởi tạo thủ công): lần khởi
+  // tạo đang chạy dở mà lỗi sau đó không được tự lên lịch thử lại nữa.
+  int _initRetryEpoch = 0;
+  // Phiên khởi tạo: tăng mỗi lần _runInitialize/stop. Lần khởi tạo cũ (bị
+  // thay thế hoặc quá hạn vẫn chạy nền) không được dọn runtime, ghi
+  // lastInitError hay lên lịch thử lại thay cho phiên hiện tại.
+  int _initSession = 0;
+  // Chỉ true khi lần khởi tạo hoàn tất toàn bộ (server, camera và các
+  // monitor health/thermal/network đã bật). Lần khởi tạo quá hạn sau khi
+  // server đã chạy để lại server.running == true nhưng cờ này vẫn false, nên
+  // initialize() không coi runtime dở dang đó là đã sẵn sàng.
+  bool _initCompleted = false;
+  // Tăng mỗi khi một thao tác vòng đời quá hạn và hàng đợi được giải phóng:
+  // thao tác treo (vẫn chạy nền) so sánh với giá trị lúc nó bắt đầu để dừng
+  // sớm thay vì mở camera song song với thao tác kế tiếp.
+  int _lifecycleEpoch = 0;
+  // Thermal monitor chỉ đặt yêu cầu vào hàng đợi vòng đời rồi trả về; các cờ
+  // này chống xếp trùng yêu cầu khi lần kiểm tra 10 giây sau tới.
+  bool _thermalSuspendQueued = false;
+  bool _thermalResumeQueued = false;
+  bool _thermalDegradeQueued = false;
+  int _thermalNonCriticalStreak = 0;
+  // Lens/zoom lúc dừng khẩn cấp vì nhiệt, để mở lại đúng góc quay khi nguội.
+  _LensState? _thermalSavedLens;
+
+  /// Thời gian tối đa mặc định của một thao tác trong hàng đợi vòng đời.
+  static const Duration _lifecycleOperationTimeout = Duration(seconds: 45);
+  static const Duration _initializeOperationTimeout = Duration(minutes: 2);
+  static const Duration _stopOperationTimeout = Duration(seconds: 90);
+  static const Duration _reconfigureOperationTimeout = Duration(seconds: 90);
+  static const Duration _iosSuspendOperationTimeout = Duration(seconds: 60);
+  // Recovery chờ giữa các lần thử (tổng ~82 giây) ngay trong hàng đợi.
+  static const Duration _recoveryOperationTimeout = Duration(minutes: 5);
 
   static const List<Duration> _recoveryDelays = [
     Duration(seconds: 2),
@@ -336,8 +581,9 @@ class CameraStationRuntime {
   static const Duration _thermalRestoreDelay = Duration(minutes: 10);
 
   /// Chỉ tự khôi phục chất lượng khi pin đã xuống mức này (°C) và hệ điều
-  /// hành báo mát. Trước đây chỉ cần dưới ngưỡng nóng (45°C) nên máy dao động
-  /// quanh ngưỡng bị hạ ↔ khôi phục liên tục; mỗi lần là một lần mở lại camera
+  /// hành báo mát (Android MODERATE vẫn được nếu pin đo được ≤ mức này, xem
+  /// [thermalRestoreCoolEnough]). Trước đây chỉ cần dưới ngưỡng nóng (45°C)
+  /// nên máy dao động quanh ngưỡng bị hạ ↔ khôi phục liên tục; mỗi lần là một lần mở lại camera
   /// (Tablet/RTSP mất hình vài giây).
   static const double _thermalRestoreMaxC = 40.0;
 
@@ -367,8 +613,9 @@ class CameraStationRuntime {
   final WhipPublisherService _whipPublisherService = WhipPublisherService();
   final RtspPublisherService _rtspPublisherService = RtspPublisherService();
 
-  /// Ảnh bảng tỉ số in vào livestream RTMP/RTSP (chỉ Android: FFmpeg trên iOS
-  /// không có bộ mã hoá H.264).
+  /// Ảnh bảng tỉ số in vào livestream RTMP/RTSP (Android: FFmpeg mã hoá lại
+  /// bằng MediaCodec; iOS: native chồng ảnh lên luồng RTSP overlay riêng,
+  /// FFmpeg chỉ copy — gói FFmpeg iOS không có VideoToolbox/libx264).
   final ScoreboardBurnIn _scoreboardBurnIn = ScoreboardBurnIn();
   StreamSubscription<Map<String, dynamic>>? _scoreboardSubscription;
   bool? _lastBurnInSetting;
@@ -476,7 +723,30 @@ class CameraStationRuntime {
   bool get lifecycleResuming => _iosResumeQueued;
   bool get networkRecovering => _networkRecovering;
   String? get lanAddress => _lanAddress;
-  String? get networkError => _networkError;
+  String? get networkError => _networkError ?? _networkReadError;
+
+  /// Lần nối lại dịch vụ mạng gần nhất thất bại: thời điểm runtime tự thử lại
+  /// (null nếu không có lịch thử lại).
+  DateTime? get networkReconnectRetryAt => _networkReconnectRetryAt;
+
+  /// Khởi tạo lỗi và runtime đã lên lịch tự khởi tạo lại lúc này (null nếu
+  /// không có lịch: chưa lỗi, đã dừng, hoặc lỗi thiếu quyền).
+  DateTime? get nextInitRetryAt => _nextInitRetryAt;
+
+  /// Lỗi của lần khởi tạo gần nhất (null nếu lần gần nhất thành công). Lỗi
+  /// thiếu quyền là [StationException] mã [StationErrorCode.permissionDenied].
+  Object? get lastInitError => _lastInitError;
+
+  /// Khởi tạo lỗi vì thiếu quyền camera/micro (không tự thử lại).
+  bool get initPermissionDenied {
+    final error = _lastInitError;
+    return error is StationException && error.isPermissionDenied;
+  }
+
+  /// Cấu hình người dùng muốn, sẽ được khôi phục khi máy nguội (null nếu
+  /// không bị hạ vì nhiệt).
+  CameraResolutionProfile? get thermalTargetProfile =>
+      _thermalThrottled ? _profileBeforeThermalThrottle : null;
   String get captureState {
     if (_thermalCriticalSuspended) return 'thermal_suspended';
     if (_recordingService?.storageSuspended == true) {
@@ -518,7 +788,9 @@ class CameraStationRuntime {
     String localRtspUrl, {
     required bool scrollingTicker,
   }) async {
-    if (!Platform.isAndroid) return null;
+    // Android: FFmpeg mã hoá lại (MediaCodec). iOS: native tạo luồng overlay
+    // (RtspPublisherService gọi startOverlayRtsp với ảnh này).
+    if (!Platform.isAndroid && !Platform.isIOS) return null;
     final enabled = await _scoreboardBurnIn.enabled();
     _lastBurnInSetting = enabled;
     if (!enabled) return null;
@@ -538,7 +810,11 @@ class CameraStationRuntime {
     final burnIn = overlay is Map && overlay['burnIn'] != false;
     final previous = _lastBurnInSetting;
     _lastBurnInSetting = burnIn;
-    if (previous == null || previous == burnIn || !Platform.isAndroid) return;
+    if (previous == null ||
+        previous == burnIn ||
+        (!Platform.isAndroid && !Platform.isIOS)) {
+      return;
+    }
     if (!_rtspPublisherService.wantsPublishing) return;
     if (burnIn) _rtspPublisherService.clearOverlayFailure();
     unawaited(_rtspPublisherService.restartIfPublishing());
@@ -561,8 +837,15 @@ class CameraStationRuntime {
         '[LOCK] Chế độ độ phân giải đã được khóa. Tự động vô hiệu hóa hạ độ phân giải khi máy nóng.',
         name: 'CameraStationRuntime',
       );
-      // Nếu máy đang bị thermal throttled trước đó, khôi phục lại profile trước khi throttle
-      if (_thermalThrottled && _profileBeforeThermalThrottle != null) {
+      // Nếu máy đang bị thermal throttled trước đó, khôi phục lại profile trước khi throttle.
+      // Đang critical (đã giảm tải hoặc dừng khẩn cấp) thì KHÔNG mở camera ở
+      // cấu hình cao (lần kiểm tra nhiệt kế tiếp sẽ lại hạ = mở lại camera 2
+      // lần): profile mục tiêu được giữ và khôi phục khi máy nguội.
+      if (_thermalThrottled &&
+          _profileBeforeThermalThrottle != null &&
+          !_thermalCriticalDegraded &&
+          !_thermalCriticalSuspended &&
+          _cameraOpenBlockedError() == null) {
         final restoreProfile = _profileBeforeThermalThrottle!;
         // Chỉ xoá cờ hạ nhiệt khi đã khôi phục được profile; nếu lỗi thì giữ
         // nguyên để lần sau (mở khoá/khoá lại, hồi nhiệt) còn thử khôi phục.
@@ -572,6 +855,9 @@ class CameraStationRuntime {
               restoreProfile,
               persistSelection: false,
             ),
+            timeout: _reconfigureOperationTimeout,
+            label: 'lock_restore',
+            recoverOnTimeout: true,
           ).then<void>(
             (_) {
               if (identical(_profileBeforeThermalThrottle, restoreProfile) &&
@@ -619,33 +905,239 @@ class CameraStationRuntime {
     required String courtId,
     required String deviceId,
   }) {
+    // Khởi tạo thủ công thay thế mọi lịch tự khởi tạo lại đang chờ.
+    _cancelInitRetry(resetAttempts: true);
     _interruptRecovery();
-    return _serializeLifecycle(() async {
-      if (ready &&
-          _cameraId == cameraId &&
-          _courtId == courtId &&
-          _deviceId == deviceId) {
-        return;
+    return _runInitialize(
+      cameraId: cameraId,
+      courtId: courtId,
+      deviceId: deviceId,
+      restart: false,
+    );
+  }
+
+  /// Chạy khởi tạo trong hàng đợi vòng đời. Lỗi thiếu quyền được phân loại
+  /// thành [StationException] ([StationErrorCode.permissionDenied]) và không
+  /// tự thử lại; các lỗi khác được tự thử lại với backoff [initRetryDelay].
+  Future<void> _runInitialize({
+    required String cameraId,
+    required String courtId,
+    required String deviceId,
+    required bool restart,
+  }) async {
+    final retryEpoch = _initRetryEpoch;
+    final session = ++_initSession;
+    try {
+      await _serializeLifecycle(() async {
+        // Đã bị thay thế (stop/khởi tạo mới) trong lúc chờ hàng đợi.
+        if (session != _initSession) {
+          developer.log(
+            '[SERVICE] Initialization superseded while queued; skipping '
+            '(runtime not marked as initialized)',
+            name: 'CameraStationRuntime',
+          );
+          return;
+        }
+        final action = initializeEntryAction(
+          restart: restart,
+          serverRunning: ready,
+          initCompleted: _initCompleted,
+          sameIdentity:
+              _cameraId == cameraId &&
+              _courtId == courtId &&
+              _deviceId == deviceId,
+        );
+        if (action == InitializeEntryAction.skip) return;
+        if (action == InitializeEntryAction.stopThenInitialize) {
+          if (!restart) {
+            developer.log(
+              '[SERVICE] Server is running but the previous initialization '
+              'did not complete; cleaning up before initializing again',
+              name: 'CameraStationRuntime',
+            );
+          }
+          await _stopInternal();
+        }
+        await _initializeInternal(
+          cameraId: cameraId,
+          courtId: courtId,
+          deviceId: deviceId,
+          session: session,
+        );
+      }, timeout: _initializeOperationTimeout, label: 'initialize');
+    } catch (error, stackTrace) {
+      if (session != _initSession) {
+        // Lần khởi tạo cũ đã bị thay thế: không ghi đè lỗi/lịch thử lại của
+        // phiên hiện tại.
+        Error.throwWithStackTrace(error, stackTrace);
       }
-      await _initializeInternal(
-        cameraId: cameraId,
-        courtId: courtId,
-        deviceId: deviceId,
+      final classified = isPermissionDeniedError(error)
+          ? (error is StationException
+                ? error
+                : StationException.fromCode(
+                    StationErrorCode.permissionDenied,
+                    cause: error,
+                  ))
+          : error;
+      _lastInitError = classified;
+      // Đã dừng hoặc đã có lần khởi tạo thủ công mới trong lúc chờ: không tự
+      // lên lịch thử lại cho lần khởi tạo cũ này.
+      if (retryEpoch == _initRetryEpoch) {
+        if (isRetryableInitError(classified)) {
+          _scheduleInitRetry(
+            cameraId: cameraId,
+            courtId: courtId,
+            deviceId: deviceId,
+          );
+        } else {
+          _cancelInitRetry(resetAttempts: true);
+          developer.log(
+            '[SERVICE] Initialization failed because camera/microphone '
+            'permission is missing; not retrying automatically',
+            name: 'CameraStationRuntime',
+          );
+        }
+      }
+      _emitState();
+      Error.throwWithStackTrace(classified, stackTrace);
+    }
+    if (retryEpoch == _initRetryEpoch && session == _initSession) {
+      _lastInitError = null;
+      _cancelInitRetry(resetAttempts: true);
+    }
+    _emitState();
+  }
+
+  void _scheduleInitRetry({
+    required String cameraId,
+    required String courtId,
+    required String deviceId,
+  }) {
+    _initRetryTimer?.cancel();
+    final delay = initRetryDelay(_initRetryAttempt);
+    _initRetryAttempt++;
+    _nextInitRetryAt = DateTime.now().add(delay);
+    developer.log(
+      '[SERVICE] Scheduling automatic initialization retry '
+      '#$_initRetryAttempt in ${delay.inSeconds}s',
+      name: 'CameraStationRuntime',
+    );
+    _initRetryTimer = Timer(delay, () {
+      _initRetryTimer = null;
+      _nextInitRetryAt = null;
+      _emitState();
+      // Lỗi đã được ghi vào lastInitError và tự lên lịch lần kế tiếp.
+      // restart: lần trước có thể đã quá hạn và dừng giữa chừng (server đã
+      // chạy nhưng chưa có camera/monitor): dọn sạch rồi khởi tạo lại thay vì
+      // coi runtime dở dang là đã sẵn sàng.
+      unawaited(
+        _runInitialize(
+          cameraId: cameraId,
+          courtId: courtId,
+          deviceId: deviceId,
+          restart: true,
+        ).catchError((Object _) {}),
       );
     });
   }
 
-  Future<T> _serializeLifecycle<T>(Future<T> Function() operation) {
+  void _cancelInitRetry({required bool resetAttempts}) {
+    _initRetryEpoch++;
+    _initRetryTimer?.cancel();
+    _initRetryTimer = null;
+    _nextInitRetryAt = null;
+    if (resetAttempts) _initRetryAttempt = 0;
+  }
+
+  /// Chạy [operation] tuần tự sau các thao tác vòng đời trước đó.
+  ///
+  /// Mỗi thao tác có thời gian tối đa [timeout]: quá hạn thì hàng đợi được
+  /// giải phóng (thao tác treo vẫn chạy nền nhưng kết quả bị bỏ qua), người
+  /// gọi nhận [StationException] ([StationErrorCode.operationTimeout]); nếu
+  /// [recoverOnTimeout] thì lên lịch khôi phục camera.
+  Future<T> _serializeLifecycle<T>(
+    Future<T> Function() operation, {
+    Duration timeout = _lifecycleOperationTimeout,
+    String label = 'operation',
+    bool recoverOnTimeout = false,
+  }) {
     final completer = Completer<T>();
     final previous = _lifecycleTail;
     _lifecycleTail = previous.catchError((Object _) {}).then((_) async {
+      var timedOut = false;
+      final pending = Future<T>.sync(operation);
       try {
-        completer.complete(await operation());
+        completer.complete(
+          await pending.timeout(
+            timeout,
+            onTimeout: () {
+              timedOut = true;
+              throw TimeoutException(
+                'Lifecycle $label exceeded ${timeout.inSeconds}s',
+                timeout,
+              );
+            },
+          ),
+        );
       } catch (error, stackTrace) {
-        completer.completeError(error, stackTrace);
+        if (!timedOut) {
+          completer.completeError(error, stackTrace);
+          return;
+        }
+        // Thao tác treo vẫn chạy nền: đổi epoch để nó dừng ở mốc kiểm tra kế
+        // tiếp (không mở camera song song với thao tác sau).
+        _lifecycleEpoch++;
+        developer.log(
+          '[LIFECYCLE] "$label" exceeded ${timeout.inSeconds}s; releasing the '
+          'lifecycle queue and ignoring its late result',
+          error: error,
+          stackTrace: stackTrace,
+          name: 'CameraStationRuntime',
+        );
+        unawaited(
+          pending.then<void>(
+            (_) {},
+            onError: (Object lateError, StackTrace lateStackTrace) {
+              developer.log(
+                '[LIFECYCLE] Timed-out "$label" failed later',
+                error: lateError,
+                stackTrace: lateStackTrace,
+                name: 'CameraStationRuntime',
+              );
+            },
+          ),
+        );
+        completer.completeError(
+          StationException.fromCode(
+            StationErrorCode.operationTimeout,
+            cause: error,
+          ),
+          stackTrace,
+        );
+        if (recoverOnTimeout) _recoverAfterLifecycleTimeout(label);
       }
     });
     return completer.future;
+  }
+
+  /// Một thao tác mở/đổi camera bị treo: camera có thể đang ở trạng thái dở
+  /// dang. Bỏ cờ đổi cấu hình (finally của thao tác treo chưa chạy) và giao
+  /// cho recovery mở lại camera.
+  void _recoverAfterLifecycleTimeout(String label) {
+    // Thao tác treo không còn được tự bỏ cờ (finally của nó bỏ qua khi đã
+    // quá hạn): luôn bỏ cờ đổi cấu hình, kể cả khi không khôi phục.
+    _profileSwitching = false;
+    // Thao tác đổi lens treo vẫn được giữ trong _lensSwitchOperation cho tới
+    // khi Future của nó hoàn tất (microtask sau): bỏ ngay để recovery không
+    // bị coi là "đang đổi cấu hình".
+    _lensSwitchOperation = null;
+    if (_stopping || !_cameraEnabled) {
+      _emitState();
+      return;
+    }
+    _generation++;
+    _emitState();
+    _scheduleRecovery('lifecycle_timeout_$label');
   }
 
   void _interruptRecovery() {
@@ -656,11 +1148,67 @@ class CameraStationRuntime {
     _recoveryCancellation = Completer<void>();
   }
 
+  /// Ném [_StaleLifecycleOperation] nếu thao tác bắt đầu ở [epoch] đã quá hạn
+  /// (hàng đợi vòng đời đã giao cho thao tác khác).
+  void _throwIfLifecycleStale(int epoch, String label) {
+    if (epoch != _lifecycleEpoch) throw _StaleLifecycleOperation(label);
+  }
+
+  /// Bật/tắt giữ màn hình sáng. Lỗi wakelock chỉ được ghi log, không được làm
+  /// hỏng thao tác mở/đóng camera.
+  Future<void> _setWakelockSafely(bool enabled) async {
+    try {
+      if (enabled) {
+        await WakelockPlus.enable();
+      } else {
+        await WakelockPlus.disable();
+      }
+    } catch (error, stackTrace) {
+      developer.log(
+        '[SERVICE] Unable to ${enabled ? 'enable' : 'disable'} wakelock',
+        error: error,
+        stackTrace: stackTrace,
+        name: 'CameraStationRuntime',
+      );
+    }
+  }
+
   Future<void> _initializeInternal({
     required String cameraId,
     required String courtId,
     required String deviceId,
+    required int session,
   }) async {
+    final epoch = _lifecycleEpoch;
+    // Lần khởi tạo này đã quá hạn (hàng đợi giải phóng) hoặc bị thay thế
+    // (stop/khởi tạo mới): dừng sớm, không mở camera/server nữa. Nếu vẫn đang
+    // giữ hàng đợi thì dọn phần đã khởi tạo dở để thao tác kế tiếp bắt đầu
+    // từ trạng thái sạch; đã quá hạn thì không đụng tới runtime của lần sau.
+    Future<bool> abortIfStale(String step) async {
+      if (session == _initSession && epoch == _lifecycleEpoch) return false;
+      final timedOut = epoch != _lifecycleEpoch;
+      developer.log(
+        '[SERVICE] Initialization ${timedOut ? 'timed out' : 'superseded'} '
+        'before "$step"; aborting without marking the runtime as '
+        'initialized${timedOut ? ' (cleanup left to the current owner)' : ''}',
+        name: 'CameraStationRuntime',
+      );
+      if (epoch == _lifecycleEpoch) {
+        try {
+          await _stopInternal();
+        } catch (error, stackTrace) {
+          developer.log(
+            '[SERVICE] Cleanup after superseded initialization failed',
+            error: error,
+            stackTrace: stackTrace,
+            name: 'CameraStationRuntime',
+          );
+        }
+      }
+      return true;
+    }
+
+    _initCompleted = false;
     _stopping = false;
     _cameraEnabled = true;
     _iosLifecycleSuspended = false;
@@ -675,6 +1223,7 @@ class CameraStationRuntime {
       _cameraEnabled = true;
     }
     await _setIosStationActive(true);
+    if (await abortIfStale('setup')) return;
 
     developer.log(
       '[SERVICE] Initializing runtime: $cameraId / $courtId',
@@ -697,6 +1246,12 @@ class CameraStationRuntime {
         await _webRtcService?.waitForRtspReady() ?? false;
     _rtspPublisherService.prepareOverlay = _prepareLivestreamOverlay;
     _rtspPublisherService.releaseOverlay = _scoreboardBurnIn.stop;
+    // iOS: track camera cho luồng overlay native (cùng track với startRtsp)
+    // và báo native nạp lại ảnh mỗi khi bảng tỉ số được vẽ lại.
+    _rtspPublisherService.videoTrackId = () =>
+        _webRtcService?.localVideoTrack?.id;
+    _scoreboardBurnIn.onImageWritten =
+        _rtspPublisherService.handleOverlayImageWritten;
     _scoreboardSubscription ??= ScoreboardService.instance.changes.listen(
       _handleScoreboardChange,
     );
@@ -731,7 +1286,21 @@ class CameraStationRuntime {
         _supportedResolutionProfiles,
         savedProfile,
       );
-      final preflightThermal = await _readThermalSnapshot();
+      // Lỗi đọc nhiệt độ không được làm hỏng khởi động: coi như không biết
+      // nhiệt độ, thermal monitor sẽ đọc lại sau 10 giây.
+      _ThermalSnapshot preflightThermal;
+      try {
+        preflightThermal = await _readThermalSnapshot();
+      } catch (error, stackTrace) {
+        developer.log(
+          '[THERMAL] Preflight thermal read failed; starting normally',
+          error: error,
+          stackTrace: stackTrace,
+          name: 'CameraStationRuntime',
+        );
+        preflightThermal = _unknownThermalSnapshot;
+      }
+      if (await abortIfStale('thermal preflight')) return;
       _temperatureC = preflightThermal.temperatureC;
       // Chỉ mức khẩn cấp mới giữ camera dừng; critical thì khởi động ở cấu
       // hình nhẹ (720p30) để vẫn quay và livestream.
@@ -752,6 +1321,9 @@ class CameraStationRuntime {
       }
       if (criticalThermal) {
         _thermalCriticalSuspended = true;
+        // Lens/zoom đã lưu để khi nguội camera mở lại đúng góc quay (không
+        // rơi về camera chính 1x).
+        _thermalSavedLens = await _loadSavedLensState();
         developer.log(
           '[THERMAL] Emergency state detected before camera startup; capture remains paused',
           name: 'CameraStationRuntime',
@@ -761,51 +1333,17 @@ class CameraStationRuntime {
       if (!criticalThermal) {
         // Nếu đã có saved lens state (ultra-wide), pre-set preferred device ID
         // để initializeCamera mở đúng lens ngay từ đầu.
-        final savedLens = await StationConfigService().loadCameraLensState();
-        if (savedLens.isUltraWide && savedLens.deviceId != null) {
-          webRtc.setPreferredCameraDevice('environment', savedLens.deviceId);
-          developer.log(
-            '[CAMERA] Pre-setting saved ultra-wide device=${savedLens.deviceId} before startup',
-            name: 'CameraStationRuntime',
-          );
-        }
+        final savedLens = await _loadSavedLensState();
+        if (await abortIfStale('camera open')) return;
+        _preselectLens(webRtc, savedLens, facingMode: 'environment');
         await webRtc.initializeCamera(facingMode: 'environment');
+        if (await abortIfStale('microphone')) return;
         // Camera Station always requests microphone audio. A denied permission
         // intentionally falls back to video-only recording.
         await webRtc.ensureMicrophoneEnabled();
         // Restore lens state và zoom HOÀN TẤT trước khi bắt đầu recording
         // để camera pipeline ổn định, không làm gián đoạn AVAssetWriter/MediaRecorder.
-        if (savedLens.isUltraWide) {
-          try {
-            if (!webRtc.isCurrentUltraWide) {
-              await webRtc.switchToLensMode('ultra_wide');
-            }
-            final targetZoom = webRtc.ultraWideZoomRatio;
-            await webRtc.setCameraZoom(targetZoom);
-            developer.log(
-              '[CAMERA] Restored startup ultra-wide lens ($targetZoom)',
-              name: 'CameraStationRuntime',
-            );
-          } catch (e) {
-            developer.log(
-              '[CAMERA] Startup ultra-wide restore failed: $e',
-              name: 'CameraStationRuntime',
-            );
-          }
-        } else if (savedLens.zoom > 1.05) {
-          try {
-            await webRtc.setCameraZoom(savedLens.zoom);
-            developer.log(
-              '[CAMERA] Restored startup zoom (${savedLens.zoom})',
-              name: 'CameraStationRuntime',
-            );
-          } catch (e) {
-            developer.log(
-              '[CAMERA] Startup zoom restore failed: $e',
-              name: 'CameraStationRuntime',
-            );
-          }
-        }
+        await _restoreLensState(webRtc, savedLens, context: 'startup');
       }
 
       final savedQuarterTurns =
@@ -815,6 +1353,7 @@ class CameraStationRuntime {
       recording.setFacingMode(webRtc.currentFacingMode);
 
       final apiPort = await StationConfigService().loadApiPort();
+      if (await abortIfStale('server start')) return;
       final server = CameraServer(
         courtId: courtId,
         cameraId: cameraId,
@@ -831,9 +1370,11 @@ class CameraStationRuntime {
       _cameraServer = server;
 
       await server.start();
+      if (await abortIfStale('recording start')) return;
       if (!criticalThermal) {
         try {
           await _waitForIosCaptureWarmup();
+          if (await abortIfStale('recording start')) return;
           await server.ensureRecording();
         } catch (error, stackTrace) {
           developer.log(
@@ -844,14 +1385,28 @@ class CameraStationRuntime {
           );
         }
       }
+      if (await abortIfStale('monitors')) return;
       _startHealthMonitor();
       _startThermalMonitor();
       _startNetworkMonitor();
+      // Mốc kiểm tra cuối cùng đã qua và các monitor đã bật: runtime đã khởi
+      // tạo xong (đặt đồng bộ ngay sau khi bật monitor, không có await xen giữa).
+      _initCompleted = true;
 
       // Giữ màn hình luôn sáng khi camera đang hoạt động.
       // Trên iOS, điều này đảm bảo app luôn ở foreground và camera
       // không bị hệ điều hành dừng khi màn hình tắt.
-      await WakelockPlus.enable();
+      // Lỗi wakelock không được làm hỏng khởi động (camera/server đã chạy).
+      try {
+        await WakelockPlus.enable();
+      } catch (error, stackTrace) {
+        developer.log(
+          '[SERVICE] Unable to enable wakelock',
+          error: error,
+          stackTrace: stackTrace,
+          name: 'CameraStationRuntime',
+        );
+      }
       await _setIosStationActive(true);
 
       developer.log(
@@ -869,7 +1424,9 @@ class CameraStationRuntime {
         stackTrace: stackTrace,
         name: 'CameraStationRuntime',
       );
-      await _stopInternal();
+      // Lần khởi tạo đã quá hạn rồi mới lỗi: hàng đợi đã thuộc về thao tác
+      // khác (có thể là runtime mới), không được dọn runtime.
+      if (epoch == _lifecycleEpoch) await _stopInternal();
       rethrow;
     }
   }
@@ -879,22 +1436,29 @@ class CameraStationRuntime {
     required String courtId,
     required String deviceId,
   }) {
+    _cancelInitRetry(resetAttempts: true);
     _interruptRecovery();
-    return _serializeLifecycle(() async {
-      await _stopInternal();
-      await _initializeInternal(
-        cameraId: cameraId,
-        courtId: courtId,
-        deviceId: deviceId,
-      );
-    });
+    return _runInitialize(
+      cameraId: cameraId,
+      courtId: courtId,
+      deviceId: deviceId,
+      restart: true,
+    );
   }
 
   Future<void> stop({Future<void> Function()? onRecorderStopped}) {
     _stopping = true;
+    // Dừng chủ động: không tự khởi tạo lại nữa.
+    _cancelInitRetry(resetAttempts: true);
+    // Lần khởi tạo đang chạy/đang chờ trở thành phiên cũ: dừng sớm, không ghi
+    // lỗi hay lên lịch thử lại.
+    _initSession++;
+    _lastInitError = null;
     _interruptRecovery();
     return _serializeLifecycle(
       () => _stopInternal(onRecorderStopped: onRecorderStopped),
+      timeout: _stopOperationTimeout,
+      label: 'stop',
     );
   }
 
@@ -902,6 +1466,10 @@ class CameraStationRuntime {
     Future<void> Function()? onRecorderStopped,
   }) async {
     _stopping = true;
+    _initCompleted = false;
+    // Kiểm tra network/thermal/health của phiên cũ có thể vẫn đang chờ I/O:
+    // đổi phiên để kết quả của chúng bị bỏ qua.
+    _monitorSession++;
     _healthTimer?.cancel();
     _healthTimer = null;
     _thermalTimer?.cancel();
@@ -914,6 +1482,9 @@ class CameraStationRuntime {
     _networkRecovering = false;
     _lanAddress = null;
     _networkError = null;
+    _networkReadError = null;
+    _networkReconnectFailures = 0;
+    _networkReconnectRetryAt = null;
     _networkSignature = null;
     _pendingThermalThrottleTimer?.cancel();
     _pendingThermalThrottleTimer = null;
@@ -927,6 +1498,11 @@ class CameraStationRuntime {
     _thermalCriticalDegradedSince = null;
     _thermalCriticalStreak = 0;
     _thermalEmergencyStreak = 0;
+    _thermalNonCriticalStreak = 0;
+    _thermalSuspendQueued = false;
+    _thermalResumeQueued = false;
+    _thermalDegradeQueued = false;
+    _thermalSavedLens = null;
     _criticalProfileSwitchFailed = false;
     _thermalLoadPlan = thermalLoadPlanNormal;
     _thermalLoadRelaxSince = null;
@@ -947,6 +1523,7 @@ class CameraStationRuntime {
     _profileBeforeThermalThrottle = null;
     _storageCleanupTimer?.cancel();
     _storageCleanupTimer = null;
+    _storageCleanupRunning = false;
     _healthCheckRunning = false;
     _iosActualFps = null;
     _iosRequestedFps = null;
@@ -1013,7 +1590,12 @@ class CameraStationRuntime {
 
   Future<void> setCameraEnabled(bool enabled) {
     _interruptRecovery();
-    return _serializeLifecycle(() => _setCameraEnabledInternal(enabled));
+    return _serializeLifecycle(
+      () => _setCameraEnabledInternal(enabled),
+      timeout: _reconfigureOperationTimeout,
+      label: 'camera_enable',
+      recoverOnTimeout: enabled,
+    );
   }
 
   Future<void> suspendForIosBackground() {
@@ -1031,6 +1613,8 @@ class CameraStationRuntime {
     _emitState();
     return _serializeLifecycle(
       () => _suspendForIosBackgroundInternal(lifecycleGeneration),
+      timeout: _iosSuspendOperationTimeout,
+      label: 'ios_suspend',
     );
   }
 
@@ -1094,7 +1678,7 @@ class CameraStationRuntime {
           } finally {
             await webRtc.disposeCamera().timeout(_iosTransportDisposeTimeout);
           }
-          await WakelockPlus.disable();
+          await _setWakelockSafely(false);
           await _setIosStationActive(false);
           _resetRecordingProgressWatchdog();
           _emitState();
@@ -1157,6 +1741,11 @@ class CameraStationRuntime {
           () => _resumeFromIosBackgroundInternal(lifecycleGeneration).timeout(
             _iosForegroundResumeTimeout,
             onTimeout: () {
+              // Thao tác treo vẫn chạy nền trong khi hàng đợi được giải phóng
+              // và recovery được lên lịch: đổi epoch để nó dừng ở mốc kiểm tra
+              // kế tiếp thay vì mở/đóng camera song song (như quá hạn của
+              // _serializeLifecycle).
+              _lifecycleEpoch++;
               throw TimeoutException(
                 'iOS camera resume exceeded '
                 '${_iosForegroundResumeTimeout.inSeconds} seconds.',
@@ -1196,12 +1785,19 @@ class CameraStationRuntime {
     final webRtc = _webRtcService;
     final server = _cameraServer;
     if (webRtc == null || server == null) return;
-    if (_thermalCriticalSuspended) {
-      await WakelockPlus.enable();
+    // Quá hạn (recovery đã được giao) thì dừng ở mốc kiểm tra kế tiếp: không
+    // mở/đóng camera hay đổi cờ nền iOS nữa.
+    final epoch = _lifecycleEpoch;
+    if (_thermalCriticalSuspended || _scannerPaused) {
+      // Dừng khẩn cấp vì nhiệt: thermal monitor tự mở lại camera khi nguội.
+      // Máy quét QR đang giữ camera: chỉ bỏ cờ nền iOS, để
+      // resumeCameraAfterScanner mở lại camera (tránh tranh camera).
+      await _setWakelockSafely(true);
       await _setIosStationActive(true);
+      if (epoch != _lifecycleEpoch) return;
       if (!_iosAppInForeground ||
           lifecycleGeneration != _iosLifecycleGeneration) {
-        await WakelockPlus.disable();
+        await _setWakelockSafely(false);
         await _setIosStationActive(false);
         return;
       }
@@ -1211,8 +1807,18 @@ class CameraStationRuntime {
     }
     try {
       final currentFacing = webRtc.currentFacingMode;
+      final lens = _currentLensState(webRtc);
+      _preselectLens(webRtc, lens, facingMode: currentFacing);
       await webRtc.initializeCamera(facingMode: currentFacing);
+      _throwIfLifecycleStale(epoch, 'ios_resume');
       _recordingService?.setFacingMode(currentFacing);
+      if (!_iosAppInForeground ||
+          lifecycleGeneration != _iosLifecycleGeneration) {
+        await webRtc.disposeCamera();
+        return;
+      }
+      await _restoreLensState(webRtc, lens, context: 'iOS foreground');
+      _throwIfLifecycleStale(epoch, 'ios_resume');
       if (!_iosAppInForeground ||
           lifecycleGeneration != _iosLifecycleGeneration) {
         await webRtc.disposeCamera();
@@ -1220,25 +1826,28 @@ class CameraStationRuntime {
       }
       await webRtc.ensureMicrophoneEnabled();
       await _waitForIosCaptureWarmup();
+      _throwIfLifecycleStale(epoch, 'ios_resume');
       if (!_iosAppInForeground ||
           lifecycleGeneration != _iosLifecycleGeneration) {
         await webRtc.disposeCamera();
         return;
       }
       await server.ensureRecording();
+      _throwIfLifecycleStale(epoch, 'ios_resume');
       if (!_iosAppInForeground ||
           lifecycleGeneration != _iosLifecycleGeneration) {
         await _recordingService?.stop();
         await webRtc.disposeCamera();
         return;
       }
-      await WakelockPlus.enable();
+      await _setWakelockSafely(true);
       await _setIosStationActive(true);
+      _throwIfLifecycleStale(epoch, 'ios_resume');
       if (!_iosAppInForeground ||
           lifecycleGeneration != _iosLifecycleGeneration) {
         await _recordingService?.stop();
         await webRtc.disposeCamera();
-        await WakelockPlus.disable();
+        await _setWakelockSafely(false);
         await _setIosStationActive(false);
         return;
       }
@@ -1250,6 +1859,17 @@ class CameraStationRuntime {
         name: 'CameraStationRuntime',
       );
     } catch (error, stackTrace) {
+      // Đã quá hạn: lần quá hạn đã lên lịch recovery, không lên lịch trùng
+      // hay đổi cờ nền iOS của thao tác sau.
+      if (error is _StaleLifecycleOperation || epoch != _lifecycleEpoch) {
+        developer.log(
+          '[LIFECYCLE] Timed-out iOS capture resume stopped',
+          error: error,
+          stackTrace: stackTrace,
+          name: 'CameraStationRuntime',
+        );
+        return;
+      }
       developer.log(
         '[LIFECYCLE] Unable to resume iOS capture; scheduling recovery',
         error: error,
@@ -1272,7 +1892,26 @@ class CameraStationRuntime {
     final recording = _recordingService;
     final server = _cameraServer;
     if (webRtc == null || recording == null || server == null) {
-      throw StateError('Camera Station chưa khởi tạo xong.');
+      throw StationException.fromCode(StationErrorCode.notInitialized);
+    }
+    if (enabled) {
+      if (_thermalCriticalSuspended) {
+        // Đang dừng khẩn cấp vì nhiệt: KHÔNG mở camera. Ghi nhận ý định bật để
+        // thermal monitor (chỉ chạy khi camera bật) tự mở lại khi máy nguội,
+        // rồi báo cho người dùng biết camera chưa mở.
+        _cameraEnabled = true;
+        _thermalNormalSince = null;
+        _emitState();
+        throw StationException.fromCode(StationErrorCode.thermalSuspended);
+      }
+      if (_iosLifecycleSuspended && _iosAppInForeground) {
+        // Cờ nền iOS còn sót (camera bị tắt khi app ở nền nên lần trở lại
+        // foreground đã bỏ qua): app đang ở foreground nên được mở camera.
+        _iosLifecycleSuspended = false;
+        server.resumeAfterIosBackground();
+      }
+      final blocked = _cameraOpenBlockedError();
+      if (blocked != null) throw blocked;
     }
 
     _cameraEnabled = enabled;
@@ -1316,20 +1955,26 @@ class CameraStationRuntime {
         await webRtc.disposeCamera();
       }
 
-      await WakelockPlus.disable();
+      await _setWakelockSafely(false);
       await _setIosStationActive(false);
       developer.log('[CAMERA] Disabled by user', name: 'CameraStationRuntime');
       _emitState();
       return;
     }
 
+    final epoch = _lifecycleEpoch;
     try {
       final currentFacing = webRtc.currentFacingMode;
+      final lens = _currentLensState(webRtc);
+      _preselectLens(webRtc, lens, facingMode: currentFacing);
       await webRtc.initializeCamera(facingMode: currentFacing);
+      _throwIfLifecycleStale(epoch, 'camera_enable');
       recording.setFacingMode(currentFacing);
+      await _restoreLensState(webRtc, lens, context: 'camera enable');
       await _waitForIosCaptureWarmup();
+      _throwIfLifecycleStale(epoch, 'camera_enable');
       await server.ensureRecording();
-      await WakelockPlus.enable();
+      await _setWakelockSafely(true);
       await _setIosStationActive(true);
 
       if (_wasRtspBeforeCameraDisable) {
@@ -1342,9 +1987,22 @@ class CameraStationRuntime {
       }
 
       developer.log('[CAMERA] Enabled by user', name: 'CameraStationRuntime');
-    } catch (_) {
+    } catch (error) {
+      // Đã quá hạn: recovery của lần quá hạn đang lo camera, không tắt cờ
+      // camera hay đóng camera của thao tác sau.
+      if (error is _StaleLifecycleOperation || epoch != _lifecycleEpoch) {
+        rethrow;
+      }
       _cameraEnabled = false;
-      await webRtc.disposeCamera();
+      // Lỗi dọn camera không được che lỗi mở camera gốc.
+      try {
+        await webRtc.disposeCamera();
+      } catch (disposeError) {
+        developer.log(
+          '[CAMERA] Unable to release camera after failed enable: $disposeError',
+          name: 'CameraStationRuntime',
+        );
+      }
       rethrow;
     } finally {
       _emitState();
@@ -1355,7 +2013,12 @@ class CameraStationRuntime {
     final current = _lensSwitchOperation;
     if (current != null) return current;
     _interruptRecovery();
-    final operation = _serializeLifecycle(_switchCameraInternal);
+    final operation = _serializeLifecycle(
+      _switchCameraInternal,
+      timeout: _reconfigureOperationTimeout,
+      label: 'camera_switch',
+      recoverOnTimeout: true,
+    );
     _lensSwitchOperation = operation;
     return operation.whenComplete(() {
       if (identical(_lensSwitchOperation, operation)) {
@@ -1369,9 +2032,15 @@ class CameraStationRuntime {
     if (current != null) return current;
     _interruptRecovery();
     final operation = _serializeLifecycle(() async {
-      if (!_cameraEnabled) throw StateError('Camera đang tắt.');
+      if (!_cameraEnabled) {
+        throw StationException.fromCode(StationErrorCode.cameraDisabled);
+      }
+      final blocked = _cameraOpenBlockedError();
+      if (blocked != null) throw blocked;
       final webRtc = _webRtcService;
-      if (webRtc == null) throw StateError('Camera chưa sẵn sàng.');
+      if (webRtc == null) {
+        throw StationException.fromCode(StationErrorCode.cameraNotReady);
+      }
       await webRtc.switchToLensMode(mode);
       // Persist lens state để restore khi đổi resolution hoặc restart app
       final isUltraWide = webRtc.isCurrentUltraWide;
@@ -1382,7 +2051,7 @@ class CameraStationRuntime {
         deviceId: isUltraWide ? webRtc.ultraWideCamera?.id : webRtc.mainBackCamera?.id,
       ));
       _emitState();
-    });
+    }, timeout: _reconfigureOperationTimeout, label: 'lens_switch');
     _lensSwitchOperation = operation;
     return operation.whenComplete(() {
       if (identical(_lensSwitchOperation, operation)) {
@@ -1413,17 +2082,22 @@ class CameraStationRuntime {
   }
 
   Future<void> _switchCameraInternal() async {
+    // Quá hạn (hàng đợi đã giao cho recovery/thao tác khác) thì dừng ở mốc
+    // kiểm tra kế tiếp: không mở/đóng camera, không rollback.
+    final epoch = _lifecycleEpoch;
     if (!_cameraEnabled) {
-      throw StateError('Camera đang tắt.');
+      throw StationException.fromCode(StationErrorCode.cameraDisabled);
     }
     if (_profileSwitching) {
-      throw StateError('Camera đang thay đổi cấu hình.');
+      throw StationException.fromCode(StationErrorCode.cameraBusy);
     }
+    final blocked = _cameraOpenBlockedError();
+    if (blocked != null) throw blocked;
     final webRtc = _webRtcService;
     final recording = _recordingService;
     final server = _cameraServer;
     if (webRtc == null || recording == null || server == null) {
-      throw StateError('Camera Station chưa khởi tạo xong.');
+      throw StationException.fromCode(StationErrorCode.notInitialized);
     }
 
     final wasRtspPublishing = _rtspPublisherService.isLive;
@@ -1443,7 +2117,11 @@ class CameraStationRuntime {
     // Android recreates the capture stream, so it still needs a verified
     // target profile before stopping the current recorder.
     if (targetProfiles.isEmpty && !Platform.isIOS) {
-      throw StateError('Thiết bị không có camera $targetFacing khả dụng.');
+      throw StationException(
+        StationErrorCode.noCameraAvailable,
+        messageVi: 'Thiết bị không có camera $targetFacing khả dụng.',
+        messageEn: 'No $targetFacing camera is available on this device.',
+      );
     }
 
     final previousProfile = _resolutionProfile;
@@ -1469,6 +2147,9 @@ class CameraStationRuntime {
     if (wasWhipPublishing) {
       await _whipPublisherService.prepareForReconfiguration();
     }
+    // Quá hạn trước khi đặt cờ: _recoverAfterLifecycleTimeout đã bỏ cờ, không
+    // được đặt lại (finally bên dưới sẽ không bỏ cờ của thao tác quá hạn).
+    _throwIfLifecycleStale(epoch, 'camera_switch');
     _profileSwitching = true;
     _generation++;
     _emitState();
@@ -1486,8 +2167,14 @@ class CameraStationRuntime {
           // the previous segment in the background (no UI spinner).
           try {
             await _switchIosLensInPlace(webRtc, recording);
+            _throwIfLifecycleStale(epoch, 'camera_switch');
             if (!recording.recording) await server.ensureRecording();
+            _throwIfLifecycleStale(epoch, 'camera_switch');
           } catch (error, stackTrace) {
+            if (error is _StaleLifecycleOperation ||
+                epoch != _lifecycleEpoch) {
+              rethrow;
+            }
             // Some iOS devices report a successful native lens handoff before
             // the new AVCaptureSession produces its first frame. Reopen the
             // requested facing explicitly so one tap is sufficient instead
@@ -1499,32 +2186,43 @@ class CameraStationRuntime {
               name: 'CameraStationRuntime',
             );
             await recording.stop();
+            _throwIfLifecycleStale(epoch, 'camera_switch');
             // Giữ kết nối WebRTC của Tablet, chỉ dispose camera để switch track
             await webRtc.disposeCamera();
+            _throwIfLifecycleStale(epoch, 'camera_switch');
             webRtc.setResolutionProfile(selectedProfile);
             await webRtc.initializeCamera(facingMode: targetFacing);
+            _throwIfLifecycleStale(epoch, 'camera_switch');
             recording.setFacingMode(targetFacing);
             await _waitForIosCaptureWarmup(profile: selectedProfile);
+            _throwIfLifecycleStale(epoch, 'camera_switch');
             await server.ensureRecording();
+            _throwIfLifecycleStale(epoch, 'camera_switch');
           }
         } else {
           // Helper.switchCamera keeps the constraints of the previous lens.
           // Recreate capture when the target lens needs a lower profile (for
           // example a 4K rear camera switching to a 1080p front camera).
           await recording.stop();
+          _throwIfLifecycleStale(epoch, 'camera_switch');
           // Giữ kết nối WebRTC của Tablet
           await webRtc.disposeCamera();
+          _throwIfLifecycleStale(epoch, 'camera_switch');
           webRtc.setResolutionProfile(selectedProfile);
           await webRtc.initializeCamera(facingMode: targetFacing);
+          _throwIfLifecycleStale(epoch, 'camera_switch');
           recording.setFacingMode(targetFacing);
           await _waitForIosCaptureWarmup(profile: selectedProfile);
+          _throwIfLifecycleStale(epoch, 'camera_switch');
           await server.ensureRecording();
+          _throwIfLifecycleStale(epoch, 'camera_switch');
         }
         if (targetProfiles.isEmpty) {
           final refreshed = await webRtc.getSupportedResolutionProfiles(
             facingMode: targetFacing,
             fallbackWhenUnavailable: false,
           );
+          _throwIfLifecycleStale(epoch, 'camera_switch');
           targetProfiles = refreshed.isEmpty
               ? <CameraResolutionProfile>[selectedProfile]
               : refreshed;
@@ -1550,12 +2248,16 @@ class CameraStationRuntime {
         return;
       }
       await recording.stop();
+      _throwIfLifecycleStale(epoch, 'camera_switch');
       // Giữ kết nối WebRTC của Tablet
       await webRtc.disposeCamera();
+      _throwIfLifecycleStale(epoch, 'camera_switch');
       webRtc.setResolutionProfile(selectedProfile);
       await webRtc.initializeCamera(facingMode: targetFacing);
+      _throwIfLifecycleStale(epoch, 'camera_switch');
       recording.setFacingMode(targetFacing);
       await server.ensureRecording();
+      _throwIfLifecycleStale(epoch, 'camera_switch');
 
       _supportedResolutionProfiles = targetProfiles;
       _resolutionProfile = selectedProfile;
@@ -1573,7 +2275,14 @@ class CameraStationRuntime {
         '${selectedProfile.shortLabel} ${selectedProfile.fps} FPS',
         name: 'CameraStationRuntime',
       );
-    } catch (_) {
+    } catch (error) {
+      if (error is _StaleLifecycleOperation || epoch != _lifecycleEpoch) {
+        developer.log(
+          '[CAMERA] Timed-out lens switch stopped without rollback',
+          name: 'CameraStationRuntime',
+        );
+        rethrow;
+      }
       _supportedResolutionProfiles = previousProfiles;
       _resolutionProfile = previousProfile;
       webRtc.setResolutionProfile(previousProfile);
@@ -1583,16 +2292,26 @@ class CameraStationRuntime {
         // recorder before disposing the track, otherwise its state remains
         // `recording` while no camera frames can reach it.
         await recording.stop();
+        _throwIfLifecycleStale(epoch, 'camera_switch_rollback');
         await webRtc.disposeCamera();
+        _throwIfLifecycleStale(epoch, 'camera_switch_rollback');
         await webRtc.initializeCamera(facingMode: previousFacing);
+        _throwIfLifecycleStale(epoch, 'camera_switch_rollback');
         recording.setFacingMode(previousFacing);
         await _waitForIosCaptureWarmup(profile: previousProfile);
+        _throwIfLifecycleStale(epoch, 'camera_switch_rollback');
         await server.ensureRecording();
+        // Quá hạn trong lúc mở lại ghi hình: không bật lại publisher thay cho
+        // thao tác sau (nó tự quyết định phát lại).
+        _throwIfLifecycleStale(epoch, 'camera_switch_rollback');
         if (wasRtspPublishing || wasWhipPublishing) _resumeLivePublishers();
       } catch (rollbackError, stackTrace) {
         // Không còn camera để tráo track: đóng peer để Tablet tự kết nối lại
-        // thay vì giữ một kết nối "connected" đứng hình.
-        await _releasePeersAfterFailedCameraRestore(webRtc);
+        // thay vì giữ một kết nối "connected" đứng hình. Rollback dừng vì quá
+        // hạn thì không đóng kết nối của thao tác sau.
+        if (rollbackError is! _StaleLifecycleOperation) {
+          await _releasePeersAfterFailedCameraRestore(webRtc);
+        }
         developer.log(
           '[CAMERA] Lens switch rollback failed',
           error: rollbackError,
@@ -1602,7 +2321,9 @@ class CameraStationRuntime {
       }
       rethrow;
     } finally {
-      _profileSwitching = false;
+      // Quá hạn thì _recoverAfterLifecycleTimeout đã bỏ cờ; không bỏ cờ của
+      // thao tác đổi cấu hình mới hơn.
+      if (epoch == _lifecycleEpoch) _profileSwitching = false;
       _emitState();
     }
   }
@@ -1668,9 +2389,63 @@ class CameraStationRuntime {
     bool ignoreLock = false,
     bool userInitiated = true,
   }) {
+    // Kiểm tra hợp lệ TRƯỚC khi đụng tới trạng thái nhiệt: lựa chọn bị từ
+    // chối không được xoá cờ hạ nhiệt hay profile mục tiêu.
     if (_resolutionLocked && !ignoreLock) {
       return Future<void>.error(
-        StateError('Chế độ phân giải đang bị khóa.'),
+        StationException.fromCode(StationErrorCode.resolutionLocked),
+      );
+    }
+    if (resolveSupportedResolutionProfile(
+          _supportedResolutionProfiles,
+          profile,
+        ) ==
+        null) {
+      return Future<void>.error(_unsupportedProfileError(profile));
+    }
+    final blocked = _cameraOpenBlockedError();
+    if (blocked != null) return Future<void>.error(blocked);
+    if (!_cameraEnabled) {
+      return Future<void>.error(
+        StationException.fromCode(StationErrorCode.cameraDisabled),
+      );
+    }
+    if (userInitiated && _thermalCriticalDegraded) {
+      // Máy đang critical (đã giảm tải): ghi nhận lựa chọn làm profile mục
+      // tiêu để khôi phục khi máy nguội, nhưng KHÔNG mở camera ở cấu hình
+      // nặng hơn (lần kiểm tra nhiệt kế tiếp sẽ lại hạ = mở lại camera 2 lần).
+      _profileBeforeThermalThrottle = profile;
+      _thermalThrottled = true;
+      _thermalCooledDownSince = null;
+      _thermalAutoRestoreBlocked = false;
+      _lastThermalRestoreAt = null;
+      if (resolutionProfileLoad(profile) >
+          resolutionProfileLoad(_resolutionProfile)) {
+        developer.log(
+          '[THERMAL] Máy đang critical; ghi nhận ${profile.shortLabel} '
+          '(${profile.fps} FPS) để khôi phục khi máy nguội',
+          name: 'CameraStationRuntime',
+        );
+        unawaited(
+          StationConfigService().saveResolutionProfile(profile).catchError((
+            Object error,
+          ) {
+            developer.log(
+              '[THERMAL] Unable to save deferred resolution profile: $error',
+              name: 'CameraStationRuntime',
+            );
+          }),
+        );
+        _emitState();
+        return Future<void>.value();
+      }
+      // Cấu hình nhẹ hơn cấu hình hiện tại: áp dụng ngay (giảm tải thêm).
+      _interruptRecovery();
+      return _serializeLifecycle(
+        () => _setResolutionProfileInternal(profile),
+        timeout: _reconfigureOperationTimeout,
+        label: 'resolution',
+        recoverOnTimeout: true,
       );
     }
     // Khách hàng có toàn quyền lựa chọn độ phân giải theo ý muốn.
@@ -1699,7 +2474,30 @@ class CameraStationRuntime {
       _lastThermalRestoreAt = null;
     }
     _interruptRecovery();
-    return _serializeLifecycle(() => _setResolutionProfileInternal(profile));
+    return _serializeLifecycle(
+      () => _setResolutionProfileInternal(profile),
+      timeout: _reconfigureOperationTimeout,
+      label: 'resolution',
+      recoverOnTimeout: true,
+    );
+  }
+
+  StationException _unsupportedProfileError(CameraResolutionProfile profile) {
+    return StationException(
+      StationErrorCode.resolutionUnsupported,
+      messageVi: 'Thiết bị không hỗ trợ ${profile.shortLabel}.',
+      messageEn: 'This device does not support ${profile.shortLabel}.',
+    );
+  }
+
+  /// Lỗi nếu lúc này không được mở/mở lại camera (null = được phép).
+  StationException? _cameraOpenBlockedError() {
+    final code = cameraOpenBlockReason(
+      thermalSuspended: _thermalCriticalSuspended,
+      iosSuspended: _iosLifecycleSuspended,
+      scannerActive: _scannerPaused,
+    );
+    return code == null ? null : StationException.fromCode(code);
   }
 
   Future<void> _setResolutionProfileInternal(
@@ -1709,39 +2507,31 @@ class CameraStationRuntime {
     if (_profileSwitching || profile == _resolutionProfile) {
       return;
     }
-    CameraResolutionProfile? selected;
-    for (final supported in _supportedResolutionProfiles) {
-      if (supported.preset == profile.preset && supported.fps == profile.fps) {
-        selected = supported;
-        break;
-      }
-    }
+    // Kiểm tra trước khi đụng tới camera/trạng thái: dừng khẩn cấp vì nhiệt,
+    // iOS ở nền hoặc máy quét QR đang giữ camera thì không được mở camera.
+    final blocked = _cameraOpenBlockedError();
+    if (blocked != null) throw blocked;
+    var selected = resolveSupportedResolutionProfile(
+      _supportedResolutionProfiles,
+      profile,
+    );
     if (selected == null) {
-      for (final supported in _supportedResolutionProfiles) {
-        if (supported.preset == profile.preset) {
-          selected = supported.withFps(profile.fps.clamp(1, supported.fps));
-          break;
-        }
-      }
-    }
-    if (selected == null) {
-      throw ArgumentError('Thiết bị không hỗ trợ ${profile.shortLabel}.');
+      throw _unsupportedProfileError(profile);
     }
     final webRtc = _webRtcService;
     final recording = _recordingService;
     final server = _cameraServer;
-    if (!_cameraEnabled ||
-        webRtc == null ||
-        recording == null ||
-        server == null) {
-      throw StateError('Camera chưa sẵn sàng.');
+    if (!_cameraEnabled) {
+      throw StationException.fromCode(StationErrorCode.cameraDisabled);
+    }
+    if (webRtc == null || recording == null || server == null) {
+      throw StationException.fromCode(StationErrorCode.cameraNotReady);
     }
 
-    final wasUltraWide = webRtc.isCurrentUltraWide;
-    final previousZoom = webRtc.cameraZoom;
+    final lens = _currentLensState(webRtc);
     // Camera góc rộng (Ultra-Wide) phần cứng trên iPhone chỉ hỗ trợ tối đa 30 FPS.
     // Giới hạn ở 30 FPS để tránh ngoại lệ phần cứng AVFoundation làm thoát app.
-    if (wasUltraWide && Platform.isIOS && selected.fps > 30) {
+    if (lens.isUltraWide && Platform.isIOS && selected.fps > 30) {
       selected = selected.withFps(30);
       developer.log(
         '[CAMERA] Capping iOS ultra-wide to 30 FPS to prevent hardware exception',
@@ -1761,6 +2551,9 @@ class CameraStationRuntime {
     }
     _profileSwitching = true;
     _generation++;
+    // Quá hạn (hàng đợi đã giao cho recovery/thao tác khác) thì dừng ở mốc
+    // kiểm tra kế tiếp: không mở camera, không rollback.
+    final epoch = _lifecycleEpoch;
     _emitState();
     try {
       await recording.stop();
@@ -1771,71 +2564,32 @@ class CameraStationRuntime {
         // trước khi tạo session mới ở độ phân giải cao hơn, tránh xung đột phần cứng.
         await Future<void>.delayed(const Duration(milliseconds: 500));
       }
+      _throwIfLifecycleStale(epoch, 'resolution');
 
       // Nếu đang ở ultra-wide mode, ghi nhớ preferred device ID để
       // initializeCamera mở đúng lens ngay từ đầu (không cần switch sau init).
-      if (wasUltraWide && currentFacing == 'environment') {
-        final uwCamera = webRtc.ultraWideCamera;
-        if (uwCamera != null) {
-          webRtc.setPreferredCameraDevice('environment', uwCamera.id);
-          developer.log(
-            '[CAMERA] Pre-setting ultra-wide preferred device=${uwCamera.id} before resolution change',
-            name: 'CameraStationRuntime',
-          );
-        }
-      }
+      _preselectLens(webRtc, lens, facingMode: currentFacing, profile: selected);
 
       webRtc.setResolutionProfile(selected);
       await webRtc.initializeCamera(facingMode: currentFacing);
+      _throwIfLifecycleStale(epoch, 'resolution');
       recording.setFacingMode(currentFacing);
 
       // Khôi phục lại góc quay / zoom TRƯỚC KHI bắt đầu ghi hình.
       // Cấu hình hoàn tất phần cứng camera để pipeline video ổn định,
       // tránh làm gián đoạn AVAssetWriter / MediaRecorder dẫn đến crash app.
-      if (wasUltraWide && currentFacing == 'environment') {
-        try {
-          final targetRatio = webRtc.ultraWideZoomRatio;
-          await webRtc.setCameraZoom(targetRatio);
-          // Persist lens state để restore sau app restart
-          unawaited(StationConfigService().saveCameraLensState(
-            isUltraWide: true,
-            zoom: targetRatio,
-            deviceId: webRtc.ultraWideCamera?.id,
-          ));
-          developer.log(
-            '[CAMERA] Restored ultra-wide zoom ($targetRatio) before recording start',
-            name: 'CameraStationRuntime',
-          );
-        } catch (e) {
-          developer.log(
-            '[CAMERA] Restore ultra-wide zoom failed: $e',
-            name: 'CameraStationRuntime',
-          );
-        }
-      } else if (previousZoom > 1.05 && currentFacing == 'environment') {
-        try {
-          await webRtc.setCameraZoom(previousZoom);
-          unawaited(StationConfigService().saveCameraLensState(
-            isUltraWide: false,
-            zoom: previousZoom,
-          ));
-          developer.log(
-            '[CAMERA] Restored zoom ($previousZoom) before recording start',
-            name: 'CameraStationRuntime',
-          );
-        } catch (e) {
-          developer.log(
-            '[CAMERA] Restore zoom failed: $e',
-            name: 'CameraStationRuntime',
-          );
-        }
-      } else {
-        // Reset về 1x, clear persisted lens state
-        unawaited(StationConfigService().clearCameraLensState());
-      }
+      await _restoreLensState(
+        webRtc,
+        lens,
+        context: 'resolution change',
+        profile: selected,
+        persist: true,
+      );
 
       await _waitForIosCaptureWarmup(profile: selected);
+      _throwIfLifecycleStale(epoch, 'resolution');
       await server.ensureRecording();
+      _throwIfLifecycleStale(epoch, 'resolution');
       _resolutionProfile = selected;
 
       if (persistSelection) {
@@ -1862,35 +2616,37 @@ class CameraStationRuntime {
         '${selected.fps} FPS ($currentFacing)',
         name: 'CameraStationRuntime',
       );
-    } catch (_) {
+    } catch (error) {
+      if (error is _StaleLifecycleOperation || epoch != _lifecycleEpoch) {
+        developer.log(
+          '[CAMERA] Timed-out resolution change stopped without rollback',
+          name: 'CameraStationRuntime',
+        );
+        rethrow;
+      }
       webRtc.setResolutionProfile(previous);
       try {
         await webRtc.disposeCamera();
         if (Platform.isIOS) {
           await Future<void>.delayed(const Duration(milliseconds: 500));
         }
+        _throwIfLifecycleStale(epoch, 'resolution_rollback');
+        _preselectLens(
+          webRtc,
+          lens,
+          facingMode: currentFacing,
+          profile: previous,
+        );
         await webRtc.initializeCamera(facingMode: currentFacing);
         recording.setFacingMode(currentFacing);
-        if (wasUltraWide && currentFacing == 'environment') {
-          try {
-            await webRtc.setCameraZoom(webRtc.ultraWideZoomRatio);
-          } catch (error) {
-            developer.log(
-              '[CAMERA] Unable to restore ultra-wide zoom after rollback: $error',
-              name: 'CameraStationRuntime',
-            );
-          }
-        } else if (previousZoom > 1.05 && currentFacing == 'environment') {
-          try {
-            await webRtc.setCameraZoom(previousZoom);
-          } catch (error) {
-            developer.log(
-              '[CAMERA] Unable to restore zoom after rollback: $error',
-              name: 'CameraStationRuntime',
-            );
-          }
-        }
+        await _restoreLensState(
+          webRtc,
+          lens,
+          context: 'resolution rollback',
+          profile: previous,
+        );
         await _waitForIosCaptureWarmup(profile: previous);
+        _throwIfLifecycleStale(epoch, 'resolution_rollback');
         await server.ensureRecording();
         if (wasRtspPublishing) {
           unawaited(_rtspPublisherService.restartIfPublishing());
@@ -1899,7 +2655,10 @@ class CameraStationRuntime {
           unawaited(_whipPublisherService.restartIfPublishing());
         }
       } catch (rollbackError, stackTrace) {
-        await _releasePeersAfterFailedCameraRestore(webRtc);
+        // Rollback dừng vì quá hạn: không đóng kết nối của thao tác sau.
+        if (rollbackError is! _StaleLifecycleOperation) {
+          await _releasePeersAfterFailedCameraRestore(webRtc);
+        }
         developer.log(
           '[CAMERA] Resolution rollback failed',
           error: rollbackError,
@@ -1909,7 +2668,9 @@ class CameraStationRuntime {
       }
       rethrow;
     } finally {
-      _profileSwitching = false;
+      // Quá hạn thì _recoverAfterLifecycleTimeout đã bỏ cờ; không bỏ cờ của
+      // thao tác đổi cấu hình mới hơn.
+      if (epoch == _lifecycleEpoch) _profileSwitching = false;
       _emitState();
     }
   }
@@ -1925,15 +2686,139 @@ class CameraStationRuntime {
     }
   }
 
-  bool _scannerSavedUltraWide = false;
-  double _scannerSavedZoom = 1.0;
+  /// Lens/zoom đang dùng (giá trị vẫn giữ sau disposeCamera), để mở lại đúng
+  /// góc quay sau khi camera bị đóng.
+  _LensState _currentLensState(WebRtcService webRtc) {
+    final ultraWide = webRtc.isCurrentUltraWide;
+    return (
+      isUltraWide: ultraWide,
+      zoom: webRtc.cameraZoom,
+      deviceId: ultraWide ? webRtc.ultraWideCamera?.id : null,
+    );
+  }
+
+  /// Lens/zoom đã lưu (đổi lens, zoom, đổi độ phân giải). Lỗi đọc → null.
+  Future<_LensState?> _loadSavedLensState() async {
+    try {
+      return await StationConfigService().loadCameraLensState();
+    } catch (error) {
+      developer.log(
+        '[CAMERA] Unable to load saved lens state: $error',
+        name: 'CameraStationRuntime',
+      );
+      return null;
+    }
+  }
+
+  /// Camera góc rộng (Ultra-Wide) phần cứng trên iPhone chỉ hỗ trợ tối đa
+  /// 30 FPS: không tự mở ultra-wide ở cấu hình cao hơn.
+  bool _ultraWideAllowedFor(CameraResolutionProfile profile) =>
+      !Platform.isIOS || profile.fps <= 30;
+
+  /// Trước initializeCamera: chọn sẵn thiết bị ultra-wide để camera mở đúng
+  /// lens ngay từ đầu (không cần đổi lens sau khi mở).
+  void _preselectLens(
+    WebRtcService webRtc,
+    _LensState? lens, {
+    required String facingMode,
+    CameraResolutionProfile? profile,
+  }) {
+    if (lens == null || !lens.isUltraWide || facingMode != 'environment') {
+      return;
+    }
+    if (!_ultraWideAllowedFor(profile ?? _resolutionProfile)) return;
+    final deviceId = lens.deviceId ?? webRtc.ultraWideCamera?.id;
+    if (deviceId == null) return;
+    webRtc.setPreferredCameraDevice('environment', deviceId);
+    developer.log(
+      '[CAMERA] Pre-setting ultra-wide device=$deviceId before opening camera',
+      name: 'CameraStationRuntime',
+    );
+  }
+
+  /// Khôi phục lens (ultra-wide) và zoom ngay sau khi camera vừa được mở lại,
+  /// TRƯỚC khi bắt đầu ghi để pipeline video ổn định. Dùng chung cho mọi
+  /// đường mở lại camera (khởi động, đổi độ phân giải, máy quét QR, recovery,
+  /// hồi nhiệt, iOS trở lại foreground). Lỗi chỉ ghi log, không chặn ghi hình.
+  /// [persist]: lưu lại trạng thái lens (đổi độ phân giải do người dùng chọn).
+  Future<void> _restoreLensState(
+    WebRtcService webRtc,
+    _LensState? lens, {
+    required String context,
+    CameraResolutionProfile? profile,
+    bool persist = false,
+  }) async {
+    if (lens == null) return;
+    if (webRtc.currentFacingMode != 'environment') {
+      if (persist) unawaited(StationConfigService().clearCameraLensState());
+      return;
+    }
+    if (lens.isUltraWide && _ultraWideAllowedFor(profile ?? _resolutionProfile)) {
+      try {
+        if (!webRtc.isCurrentUltraWide) {
+          await webRtc.switchToLensMode('ultra_wide');
+        }
+        final targetRatio = webRtc.ultraWideZoomRatio;
+        await webRtc.setCameraZoom(targetRatio);
+        if (persist) {
+          unawaited(
+            StationConfigService().saveCameraLensState(
+              isUltraWide: true,
+              zoom: targetRatio,
+              deviceId: webRtc.ultraWideCamera?.id,
+            ),
+          );
+        }
+        developer.log(
+          '[CAMERA] Restored ultra-wide lens ($targetRatio) after $context',
+          name: 'CameraStationRuntime',
+        );
+      } catch (error) {
+        developer.log(
+          '[CAMERA] Unable to restore ultra-wide lens after $context: $error',
+          name: 'CameraStationRuntime',
+        );
+      }
+    } else if (lens.zoom > 1.05) {
+      try {
+        await webRtc.setCameraZoom(lens.zoom);
+        if (persist) {
+          unawaited(
+            StationConfigService().saveCameraLensState(
+              isUltraWide: false,
+              zoom: lens.zoom,
+            ),
+          );
+        }
+        developer.log(
+          '[CAMERA] Restored zoom (${lens.zoom}) after $context',
+          name: 'CameraStationRuntime',
+        );
+      } catch (error) {
+        developer.log(
+          '[CAMERA] Unable to restore zoom after $context: $error',
+          name: 'CameraStationRuntime',
+        );
+      }
+    } else if (persist) {
+      // Reset về 1x, clear persisted lens state
+      unawaited(StationConfigService().clearCameraLensState());
+    }
+  }
+
+  _LensState? _scannerSavedLens;
   String _scannerSavedFacing = 'environment';
 
   /// Tạm thời giải phóng camera phần cứng để các tính năng quét QR bên ngoài
   /// (MobileScanner / CameraX) có thể sử dụng mà không xung đột tài nguyên độc quyền.
   Future<void> pauseCameraForScanner() {
     _interruptRecovery();
-    return _serializeLifecycle(_pauseCameraForScannerInternal);
+    return _serializeLifecycle(
+      _pauseCameraForScannerInternal,
+      // Dừng ghi (chốt segment cuối bằng FFmpeg) như stop(): cùng hạn 90 giây.
+      timeout: _stopOperationTimeout,
+      label: 'scanner_pause',
+    );
   }
 
   Future<void> _pauseCameraForScannerInternal() async {
@@ -1949,8 +2834,7 @@ class CameraStationRuntime {
     _resetRecordingProgressWatchdog();
     _emitState();
     try {
-      _scannerSavedUltraWide = webRtc.isCurrentUltraWide;
-      _scannerSavedZoom = webRtc.cameraZoom;
+      _scannerSavedLens = _currentLensState(webRtc);
       _scannerSavedFacing = webRtc.currentFacingMode;
 
       await _pauseLivePublishers();
@@ -1971,7 +2855,11 @@ class CameraStationRuntime {
   /// Khôi phục camera của trạm sau khi quét mã QR hoàn tất.
   Future<void> resumeCameraAfterScanner() {
     _interruptRecovery();
-    return _serializeLifecycle(_resumeCameraAfterScannerInternal);
+    return _serializeLifecycle(
+      _resumeCameraAfterScannerInternal,
+      label: 'scanner_resume',
+      recoverOnTimeout: true,
+    );
   }
 
   Future<void> _resumeCameraAfterScannerInternal() async {
@@ -1994,37 +2882,23 @@ class CameraStationRuntime {
       '[RUNTIME] Resuming station camera after QR scanner...',
       name: 'CameraStationRuntime',
     );
+    final epoch = _lifecycleEpoch;
     try {
+      final lens = _scannerSavedLens;
+      _preselectLens(webRtc, lens, facingMode: _scannerSavedFacing);
       await webRtc.initializeCamera(facingMode: _scannerSavedFacing);
+      _throwIfLifecycleStale(epoch, 'scanner_resume');
       recording?.setFacingMode(_scannerSavedFacing);
-
-      if (_scannerSavedUltraWide && _scannerSavedFacing == 'environment') {
-        try {
-          if (!webRtc.isCurrentUltraWide) {
-            await webRtc.switchToLensMode('ultra_wide');
-          }
-          final targetRatio = webRtc.ultraWideZoomRatio;
-          await webRtc.setCameraZoom(targetRatio);
-        } catch (error) {
-          developer.log(
-            '[CAMERA] Unable to restore ultra-wide lens after QR scan: $error',
-            name: 'CameraStationRuntime',
-          );
-        }
-      } else if (_scannerSavedZoom > 1.05 && _scannerSavedFacing == 'environment') {
-        try {
-          await webRtc.setCameraZoom(_scannerSavedZoom);
-        } catch (error) {
-          developer.log(
-            '[CAMERA] Unable to restore zoom after QR scan: $error',
-            name: 'CameraStationRuntime',
-          );
-        }
-      }
+      await _restoreLensState(webRtc, lens, context: 'QR scan');
 
       await _waitForIosCaptureWarmup(profile: _resolutionProfile);
+      _throwIfLifecycleStale(epoch, 'scanner_resume');
       if (server != null) {
         await server.ensureRecording();
+        // iOS có thể đã trở lại foreground trong lúc máy quét giữ camera.
+        if (Platform.isIOS && _iosAppInForeground) {
+          server.resumeAfterIosBackground();
+        }
       }
       _resumeLivePublishers();
     } catch (e) {
@@ -2032,8 +2906,11 @@ class CameraStationRuntime {
         '[RUNTIME] Error resuming camera after scanner: $e',
         name: 'CameraStationRuntime',
       );
-      // Giao lại cho cơ chế recovery thay vì để camera tắt vĩnh viễn.
-      _scheduleRecovery('scanner_resume_failed');
+      // Giao lại cho cơ chế recovery thay vì để camera tắt vĩnh viễn. Đã quá
+      // hạn thì recovery đã được lên lịch lúc quá hạn.
+      if (e is! _StaleLifecycleOperation && epoch == _lifecycleEpoch) {
+        _scheduleRecovery('scanner_resume_failed');
+      }
     }
     _emitState();
   }
@@ -2134,7 +3011,7 @@ class CameraStationRuntime {
 
   /// Phát hiện chuyển đổi Wi-Fi ↔ 4G/5G, mất hoặc có lại mạng và báo cho
   /// luồng livestream để nối lại ngay.
-  Future<void> _observeNetworkPaths() async {
+  Future<void> _observeNetworkPaths(int session) async {
     final Set<String> current;
     try {
       final interfaces = await NetworkInterface.list(
@@ -2150,6 +3027,8 @@ class CameraStationRuntime {
     } catch (_) {
       return;
     }
+    // Runtime đã dừng/khởi tạo lại trong lúc chờ: bỏ kết quả cũ.
+    if (session != _monitorSession) return;
     final previous = _networkSignature;
     _networkSignature = current;
     if (previous == null) return;
@@ -2163,7 +3042,9 @@ class CameraStationRuntime {
     _rtspPublisherService.handleNetworkChange(
       interfaceLost: activeRouteLost(lost, current),
     );
-    _whipPublisherService.handleNetworkChange();
+    _whipPublisherService.handleNetworkChange(
+      interfaceLost: activeRouteLost(lost, current),
+    );
   }
 
   Future<String?> _readLanAddress() async {
@@ -2188,12 +3069,31 @@ class CameraStationRuntime {
 
   Future<void> _checkNetworkState() async {
     if (_networkCheckRunning || _stopping) return;
+    final session = _monitorSession;
     _networkCheckRunning = true;
     try {
-      await _observeNetworkPaths();
-      final address = await _readLanAddress();
+      final String? address;
+      try {
+        await _observeNetworkPaths(session);
+        address = await _readLanAddress();
+      } catch (error, stackTrace) {
+        if (session != _monitorSession) return;
+        // Lỗi ĐỌC trạng thái mạng (thường thoáng qua): chỉ báo cho UI, không
+        // nối lại dịch vụ (nối lại = đóng mọi peer WebRTC của Tablet).
+        _networkReadError = error.toString();
+        developer.log(
+          '[NETWORK] Cannot inspect LAN state',
+          error: error,
+          stackTrace: stackTrace,
+          name: 'CameraStationRuntime',
+        );
+        _emitState();
+        return;
+      }
+      if (session != _monitorSession || _stopping) return;
+      final hadReadError = _networkReadError != null;
+      _networkReadError = null;
       final previous = _lanAddress;
-      final hadRecoveryError = _networkError != null;
       final firstObservation = !_networkObservationInitialized;
       _networkObservationInitialized = true;
 
@@ -2204,32 +3104,35 @@ class CameraStationRuntime {
       // disconnecting every tablet peer even though Wi-Fi never changed.
       if (address == null && previous != null) {
         _missingNetworkObservations++;
-        _networkError = null;
-        if (_missingNetworkObservations < 2) return;
+        if (_missingNetworkObservations < 2) {
+          if (hadReadError) _emitState();
+          return;
+        }
       } else {
         _missingNetworkObservations = 0;
       }
 
       _lanAddress = address;
-      _networkError = null;
-      if (!firstObservation &&
-          address != null &&
-          (address != previous || hadRecoveryError)) {
-        await reconnectNetworkServices();
-      } else if (address != previous) {
+      final reconnect = shouldReconnectNetworkServices(
+        firstObservation: firstObservation,
+        previousAddress: previous,
+        address: address,
+        lastReconnectFailed: _networkReconnectFailures > 0,
+        retryNotBefore: _networkReconnectRetryAt,
+        now: DateTime.now(),
+      );
+      if (reconnect) {
+        try {
+          await reconnectNetworkServices();
+        } catch (_) {
+          // Lỗi đã được ghi vào networkError và lần thử lại có backoff
+          // (networkReconnectRetryDelay).
+        }
+      } else if (address != previous || hadReadError) {
         _emitState();
       }
-    } catch (error, stackTrace) {
-      _networkError = error.toString();
-      developer.log(
-        '[NETWORK] Cannot inspect LAN state',
-        error: error,
-        stackTrace: stackTrace,
-        name: 'CameraStationRuntime',
-      );
-      _emitState();
     } finally {
-      _networkCheckRunning = false;
+      if (session == _monitorSession) _networkCheckRunning = false;
     }
   }
 
@@ -2237,11 +3140,15 @@ class CameraStationRuntime {
   /// recording segment are deliberately preserved.
   Future<void> reconnectNetworkServices() async {
     if (_networkRecovering) return;
+    final session = _monitorSession;
     final server = _cameraServer;
     if (server == null || !server.running) {
-      throw StateError('Camera Station network server is not running.');
+      throw StationException.fromCode(
+        StationErrorCode.networkServerNotRunning,
+      );
     }
     final currentAddress = _lanAddress ?? await _readLanAddress();
+    if (session != _monitorSession) return;
     _lanAddress = currentAddress;
     if (currentAddress == null) {
       _networkError = null;
@@ -2253,16 +3160,32 @@ class CameraStationRuntime {
     _emitState();
     try {
       await server.reconnectNetworkServices();
+      if (session != _monitorSession) return;
       // RTSP server cục bộ không bị khởi động lại khi đổi mạng, nên relay
       // livestream (đặc biệt khi đi 4G/5G) giữ nguyên. Nếu đường mạng của nó
       // thực sự đứt, FFmpeg/WHIP tự kết nối lại.
-      _lanAddress = await _readLanAddress();
+      _networkReconnectFailures = 0;
+      _networkReconnectRetryAt = null;
+      try {
+        _lanAddress = await _readLanAddress();
+      } catch (error) {
+        developer.log(
+          '[NETWORK] Cannot re-read LAN address after recovery: $error',
+          name: 'CameraStationRuntime',
+        );
+      }
       developer.log(
         '[NETWORK] Live services ready at ${_lanAddress ?? 'no LAN address'}',
         name: 'CameraStationRuntime',
       );
     } catch (error, stackTrace) {
-      _networkError = error.toString();
+      if (session == _monitorSession) {
+        // Khôi phục thất bại: thử lại sau 5 s, 15 s rồi mỗi 60 s.
+        _networkError = error.toString();
+        _networkReconnectFailures++;
+        final delay = networkReconnectRetryDelay(_networkReconnectFailures);
+        _networkReconnectRetryAt = DateTime.now().add(delay);
+      }
       developer.log(
         '[NETWORK] Live service recovery failed',
         error: error,
@@ -2271,7 +3194,7 @@ class CameraStationRuntime {
       );
       rethrow;
     } finally {
-      _networkRecovering = false;
+      if (session == _monitorSession) _networkRecovering = false;
       _emitState();
     }
   }
@@ -2301,7 +3224,10 @@ class CameraStationRuntime {
     _storageCleanupTimer?.cancel();
     _storageCleanupTimer = Timer.periodic(const Duration(seconds: 60), (_) {
       final recording = _recordingService;
-      if (recording == null) return;
+      // Lần dọn trước (quét thư mục lớn) chưa xong: không chạy chồng.
+      if (recording == null || _storageCleanupRunning) return;
+      final session = _monitorSession;
+      _storageCleanupRunning = true;
       unawaited(() async {
         try {
           // Never inspect staging files while MediaRecorder/FFmpeg may still
@@ -2323,6 +3249,8 @@ class CameraStationRuntime {
             stackTrace: stackTrace,
             name: 'CameraStationRuntime',
           );
+        } finally {
+          if (session == _monitorSession) _storageCleanupRunning = false;
         }
       }());
     });
@@ -2339,6 +3267,7 @@ class CameraStationRuntime {
         !_cameraEnabled) {
       return;
     }
+    final session = _monitorSession;
     _healthCheckRunning = true;
     try {
       final webRtc = _webRtcService;
@@ -2357,8 +3286,30 @@ class CameraStationRuntime {
       if (!recording.recording && !recording.rotating) {
         _resetRecordingProgressWatchdog();
         if (server.stoppedByRequest || !recording.storageRetryDue) return;
+        final generation = _generation;
         try {
-          await server.ensureRecording();
+          // Chạy trong hàng đợi vòng đời để không mở recorder song song với
+          // đổi cấu hình / recovery / nền iOS; kiểm tra lại mọi điều kiện vì
+          // trạng thái có thể đã đổi trong lúc chờ hàng đợi.
+          await _serializeLifecycle(() async {
+            if (session != _monitorSession ||
+                generation != _generation ||
+                _stopping ||
+                _recovering ||
+                _profileSwitching ||
+                _thermalCriticalSuspended ||
+                _iosLifecycleSuspended ||
+                _scannerPaused ||
+                !_cameraEnabled ||
+                !identical(_cameraServer, server) ||
+                !identical(_recordingService, recording) ||
+                server.stoppedByRequest ||
+                recording.recording ||
+                recording.rotating) {
+              return;
+            }
+            await server.ensureRecording();
+          }, label: 'health_ensure_recording');
         } catch (error, stackTrace) {
           developer.log(
             '[RECORDING] Automatic recording retry failed',
@@ -2374,8 +3325,16 @@ class CameraStationRuntime {
         _resetRecordingProgressWatchdog();
         return;
       }
+      // Recorder đang tạm treo (vd thiếu dung lượng) và RecordingService tự
+      // thử mở lại theo nhịp riêng: mở lại camera không giúp gì, chỉ gây
+      // khoảng hở và nóng máy, nên không tính là lỗi tiến trình ghi.
+      if (recording.isRecordingSuspended) {
+        _resetRecordingProgressWatchdog();
+        return;
+      }
 
       final progress = await recording.currentRecordingProgress();
+      if (session != _monitorSession) return;
       if (progress == null) {
         _reportHealthFailure('recording_progress_missing', requiredFailures: 2);
         return;
@@ -2404,6 +3363,7 @@ class CameraStationRuntime {
       }
 
       final audioProgress = await recording.currentAudioProgress();
+      if (session != _monitorSession) return;
       var audioStalled = false;
       if (audioProgress != null) {
         if (!audioProgress.active) {
@@ -2456,7 +3416,7 @@ class CameraStationRuntime {
         name: 'CameraStationRuntime',
       );
     } finally {
-      _healthCheckRunning = false;
+      if (session == _monitorSession) _healthCheckRunning = false;
     }
   }
 
@@ -2520,9 +3480,12 @@ class CameraStationRuntime {
         _iosLifecycleSuspended) {
       return;
     }
+    final session = _monitorSession;
     _thermalCheckRunning = true;
     try {
       final snapshot = await _readThermalSnapshot();
+      // Runtime đã dừng/khởi tạo lại trong lúc đọc: bỏ kết quả cũ.
+      if (session != _monitorSession || _stopping) return;
       final temperature = snapshot.temperatureC;
       _temperatureC = temperature;
 
@@ -2535,12 +3498,16 @@ class CameraStationRuntime {
       final critical = snapshot.critical;
       final hot = snapshot.hot;
       _thermalCriticalStreak = critical ? _thermalCriticalStreak + 1 : 0;
+      _thermalNonCriticalStreak = critical ? 0 : _thermalNonCriticalStreak + 1;
       _thermalEmergencyStreak =
           snapshot.emergency ? _thermalEmergencyStreak + 1 : 0;
-      if (!critical && _thermalCriticalDegraded) {
-        // Hết critical: trả bitrate. Cấu hình 720p giữ nguyên và được khôi
-        // phục theo luồng _thermalThrottled bên dưới (không khôi phục khi đang
-        // livestream để tránh ngắt luồng thêm lần nữa).
+      if (shouldExitCriticalDegrade(
+        degraded: _thermalCriticalDegraded,
+        nonCriticalStreak: _thermalNonCriticalStreak,
+      )) {
+        // Hết critical (đủ số lần đọc liên tiếp): trả bitrate. Cấu hình 720p
+        // giữ nguyên và được khôi phục theo luồng _thermalThrottled bên dưới
+        // (không khôi phục khi đang livestream để tránh ngắt luồng thêm lần nữa).
         _thermalCriticalDegraded = false;
         _thermalCriticalDegradedSince = null;
         developer.log(
@@ -2560,6 +3527,7 @@ class CameraStationRuntime {
             temperatureC: temperature,
           ),
         );
+        if (session != _monitorSession || _stopping) return;
         final degradedSince = _thermalCriticalDegradedSince;
         final action = thermalEscalation(
           criticalStreak: _thermalCriticalStreak,
@@ -2573,11 +3541,11 @@ class CameraStationRuntime {
           _cancelPendingThermalTimers();
           _thermalNormalSince = null;
           if (action == ThermalAction.suspend) {
-            if (!_profileSwitching) {
-              await _serializeLifecycle(_suspendForCriticalThermal);
-            }
+            // Chỉ đặt yêu cầu vào hàng đợi rồi trả về: không chờ hàng đợi
+            // (có thể đang bận đổi cấu hình) để monitor không bị kẹt.
+            _requestThermalSuspend();
           } else {
-            await _degradeForCriticalThermal();
+            _degradeForCriticalThermal();
           }
           _emitState();
           return;
@@ -2600,8 +3568,9 @@ class CameraStationRuntime {
         _thermalNormalSince ??= now;
         if (now.difference(_thermalNormalSince!) >=
             _thermalEmergencyResumeDelay) {
-          await _serializeLifecycle(_resumeAfterCriticalThermal);
-          _thermalNormalSince = DateTime.now();
+          // Đếm lại thời gian chờ cho lần thử kế tiếp nếu lần này thất bại.
+          _thermalNormalSince = now;
+          _requestThermalResume();
         }
         _emitState();
         return;
@@ -2626,11 +3595,21 @@ class CameraStationRuntime {
             name: 'CameraStationRuntime',
           );
         }
-        if (_thermalThrottled && !_profileSwitching) {
+        // Còn trong trạng thái critical (chưa đủ số lần đọc mát liên tiếp)
+        // thì chưa tính thời gian khôi phục cấu hình.
+        if (_thermalThrottled &&
+            !_profileSwitching &&
+            !_thermalCriticalDegraded) {
           final now = DateTime.now();
-          final coolEnough =
-              snapshot.cool &&
-              (temperature == null || temperature <= _thermalRestoreMaxC);
+          // Android MODERATE kéo dài vẫn được tính nếu pin ≤ 40°C; thời gian
+          // ổn định 10 phút bên dưới (đếm lại mỗi lần chưa đủ mát) chống dao
+          // động.
+          final coolEnough = thermalRestoreCoolEnough(
+            hot: hot,
+            cool: snapshot.cool,
+            temperatureC: temperature,
+            maxTemperatureC: _thermalRestoreMaxC,
+          );
           if (_profileBeforeThermalThrottle != null &&
               (!coolEnough || _thermalAutoRestoreBlocked)) {
             // Chưa đủ mát (hoặc đã từng khôi phục rồi nóng lại): giữ cấu hình
@@ -2673,7 +3652,7 @@ class CameraStationRuntime {
         name: 'CameraStationRuntime',
       );
     } finally {
-      _thermalCheckRunning = false;
+      if (session == _monitorSession) _thermalCheckRunning = false;
     }
   }
 
@@ -2791,6 +3770,7 @@ class CameraStationRuntime {
     if (_stopping ||
         !_cameraEnabled ||
         _thermalCriticalSuspended ||
+        _thermalCriticalDegraded ||
         _iosLifecycleSuspended ||
         _scannerPaused ||
         !_thermalThrottled ||
@@ -2802,6 +3782,9 @@ class CameraStationRuntime {
     try {
       await _serializeLifecycle(
         () => _setResolutionProfileInternal(profile, persistSelection: false),
+        timeout: _reconfigureOperationTimeout,
+        label: 'thermal_restore',
+        recoverOnTimeout: true,
       );
       _profileBeforeThermalThrottle = null;
       _thermalNormalSince = null;
@@ -2832,28 +3815,9 @@ class CameraStationRuntime {
     return remaining - const Duration(milliseconds: 250);
   }
 
-  Future<
-    ({
-      double? temperatureC,
-      bool hot,
-      bool critical,
-      bool emergency,
-      bool cool,
-      double? headroom,
-      bool charging,
-    })
-  >
-  _readThermalSnapshot() async {
+  Future<_ThermalSnapshot> _readThermalSnapshot() async {
     if (!Platform.isAndroid && !Platform.isIOS) {
-      return (
-        temperatureC: null,
-        hot: false,
-        critical: false,
-        emergency: false,
-        cool: true,
-        headroom: null,
-        charging: false,
-      );
+      return _unknownThermalSnapshot;
     }
     final result = await _platformChannel.invokeMapMethod<String, dynamic>(
       'getThermalStatus',
@@ -2935,7 +3899,8 @@ class CameraStationRuntime {
   /// Bỏ qua khoá độ phân giải / lựa chọn của người dùng vì đây là mức an toàn.
   /// Gọi mỗi lần kiểm tra khi critical đã xác nhận. FPS/bitrate/màn hình đã
   /// giảm tại chỗ; chỉ hạ độ phân giải (mở lại camera) khi KHÔNG livestream.
-  Future<void> _degradeForCriticalThermal() async {
+  /// Không chờ hàng đợi vòng đời: chỉ xếp yêu cầu hạ cấu hình rồi trả về.
+  void _degradeForCriticalThermal() {
     // Đang đổi cấu hình (người dùng/lens): để lần kiểm tra 10 giây sau thử lại.
     if (_stopping || !_cameraEnabled || _profileSwitching) return;
     if (!_thermalCriticalDegraded) {
@@ -2955,36 +3920,116 @@ class CameraStationRuntime {
     final safeProfile = CameraResolutionProfile.hd720.withFps(30);
     if (_resolutionProfile == safeProfile ||
         _livePublishingActive ||
-        _criticalProfileSwitchFailed) {
+        _criticalProfileSwitchFailed ||
+        _thermalDegradeQueued) {
       return;
     }
-    try {
-      await _serializeLifecycle(
-        () => _setResolutionProfileInternal(
-          safeProfile,
-          persistSelection: false,
-        ),
-      );
-      final restoredAt = _lastThermalRestoreAt;
-      if (restoredAt != null &&
-          DateTime.now().difference(restoredAt) <
-              _thermalRestoreRelapseWindow) {
-        _thermalAutoRestoreBlocked = true;
-        developer.log(
-          '[THERMAL] Device overheated again soon after restoring quality; '
-          'keeping 720p until the user changes it',
-          name: 'CameraStationRuntime',
-        );
-      }
-    } catch (error, stackTrace) {
-      _criticalProfileSwitchFailed = true;
-      developer.log(
-        '[THERMAL] Failed to reduce camera profile for critical state',
-        error: error,
-        stackTrace: stackTrace,
-        name: 'CameraStationRuntime',
-      );
+    // Thật sự hạ cấu hình vì nhiệt: luôn ghi nhận profile người dùng muốn để
+    // khôi phục khi nguội (kể cả khi trước đó người dùng đã chọn lại).
+    _profileBeforeThermalThrottle ??= _resolutionProfile;
+    _thermalThrottled = true;
+    _thermalDegradeQueued = true;
+    unawaited(
+      _serializeLifecycle(
+            () => _setResolutionProfileInternal(
+              safeProfile,
+              persistSelection: false,
+            ),
+            timeout: _reconfigureOperationTimeout,
+            label: 'thermal_degrade',
+            recoverOnTimeout: true,
+          )
+          .then<void>(
+            (_) {
+              final restoredAt = _lastThermalRestoreAt;
+              if (restoredAt != null &&
+                  DateTime.now().difference(restoredAt) <
+                      _thermalRestoreRelapseWindow) {
+                _thermalAutoRestoreBlocked = true;
+                developer.log(
+                  '[THERMAL] Device overheated again soon after restoring quality; '
+                  'keeping 720p until the user changes it',
+                  name: 'CameraStationRuntime',
+                );
+              }
+            },
+            onError: (Object error, StackTrace stackTrace) {
+              // Bị chặn tạm thời (máy quét QR, nền iOS, dừng khẩn cấp) thì lần
+              // kiểm tra sau thử lại; lỗi thật thì không thử lại liên tục.
+              if (error is! StationException ||
+                  error.code == StationErrorCode.operationTimeout) {
+                _criticalProfileSwitchFailed = true;
+              }
+              developer.log(
+                '[THERMAL] Failed to reduce camera profile for critical state',
+                error: error,
+                stackTrace: stackTrace,
+                name: 'CameraStationRuntime',
+              );
+            },
+          )
+          .whenComplete(() {
+            _thermalDegradeQueued = false;
+            _emitState();
+          }),
+    );
+  }
+
+  /// Xếp yêu cầu dừng khẩn cấp vào hàng đợi vòng đời rồi trả về ngay.
+  void _requestThermalSuspend() {
+    if (_thermalSuspendQueued || _thermalCriticalSuspended || _profileSwitching) {
+      return;
     }
+    // Ngắt recovery ngay (trước khi xếp hàng): lượt recovery đang chờ giữa
+    // các lần thử thoát sớm để lệnh dừng được chạy, lượt đã xếp trước lệnh
+    // dừng sẽ bỏ qua (generation đổi), và không xếp recovery mới trong lúc
+    // yêu cầu dừng đang chờ (_thermalSuspendQueued).
+    _interruptRecovery();
+    _thermalSuspendQueued = true;
+    unawaited(
+      _serializeLifecycle(
+            _suspendForCriticalThermal,
+            timeout: _stopOperationTimeout,
+            label: 'thermal_suspend',
+          )
+          .catchError((Object error, StackTrace stackTrace) {
+            developer.log(
+              '[THERMAL] Emergency suspend failed',
+              error: error,
+              stackTrace: stackTrace,
+              name: 'CameraStationRuntime',
+            );
+          })
+          .whenComplete(() {
+            _thermalSuspendQueued = false;
+            _emitState();
+          }),
+    );
+  }
+
+  /// Xếp yêu cầu mở lại camera sau dừng khẩn cấp vào hàng đợi rồi trả về.
+  void _requestThermalResume() {
+    if (_thermalResumeQueued || !_thermalCriticalSuspended) return;
+    _thermalResumeQueued = true;
+    unawaited(
+      _serializeLifecycle(
+            _resumeAfterCriticalThermal,
+            timeout: _reconfigureOperationTimeout,
+            label: 'thermal_resume',
+          )
+          .catchError((Object error, StackTrace stackTrace) {
+            developer.log(
+              '[THERMAL] Resume after emergency suspend failed',
+              error: error,
+              stackTrace: stackTrace,
+              name: 'CameraStationRuntime',
+            );
+          })
+          .whenComplete(() {
+            _thermalResumeQueued = false;
+            _emitState();
+          }),
+    );
   }
 
   Future<void> _suspendForCriticalThermal() async {
@@ -2994,10 +4039,16 @@ class CameraStationRuntime {
     if (recording == null || webRtc == null) return;
 
     _thermalCriticalSuspended = true;
+    // Recovery đã quá hạn còn chạy nền (nếu có) không được mở lại camera.
+    _interruptRecovery();
     _thermalCriticalDegraded = false;
     _thermalCriticalDegradedSince = null;
     _profileBeforeThermalThrottle ??= _resolutionProfile;
     _thermalThrottled = true;
+    // Máy quét QR / nền iOS đã giải phóng camera: lens đã lưu lúc đó mới đúng.
+    _thermalSavedLens = _scannerPaused && _scannerSavedLens != null
+        ? _scannerSavedLens
+        : _currentLensState(webRtc);
     final safeProfile = CameraResolutionProfile.hd720.withFps(30);
     _resolutionProfile = safeProfile;
     webRtc.setResolutionProfile(safeProfile);
@@ -3022,22 +4073,42 @@ class CameraStationRuntime {
     if (!_thermalCriticalSuspended ||
         _stopping ||
         !_cameraEnabled ||
-        _iosLifecycleSuspended) {
+        _iosLifecycleSuspended ||
+        _scannerPaused) {
       return;
     }
     final webRtc = _webRtcService;
     final server = _cameraServer;
     if (webRtc == null || server == null) return;
+    final epoch = _lifecycleEpoch;
     try {
       final currentFacing = webRtc.currentFacingMode;
+      final lens = _thermalSavedLens;
+      _preselectLens(webRtc, lens, facingMode: currentFacing);
       await webRtc.initializeCamera(facingMode: currentFacing);
+      _throwIfLifecycleStale(epoch, 'thermal_resume');
       _recordingService?.setFacingMode(currentFacing);
       await webRtc.ensureMicrophoneEnabled();
+      await _restoreLensState(webRtc, lens, context: 'thermal resume');
+      await _waitForIosCaptureWarmup();
+      _throwIfLifecycleStale(epoch, 'thermal_resume');
       await server.ensureRecording();
+      _throwIfLifecycleStale(epoch, 'thermal_resume');
       if (Platform.isIOS && _iosAppInForeground) {
         server.resumeAfterIosBackground();
       }
       _thermalCriticalSuspended = false;
+      _thermalSavedLens = null;
+      // Camera có thể đã được bật lại trong lúc dừng khẩn cấp (wakelock tắt).
+      try {
+        await WakelockPlus.enable();
+      } catch (error) {
+        developer.log(
+          '[THERMAL] Unable to enable wakelock after resume: $error',
+          name: 'CameraStationRuntime',
+        );
+      }
+      await _setIosStationActive(true);
       _resumeLivePublishers();
       developer.log(
         '[THERMAL] Device stable; capture resumed at 720p/30fps',
@@ -3050,7 +4121,19 @@ class CameraStationRuntime {
         stackTrace: stackTrace,
         name: 'CameraStationRuntime',
       );
-      await webRtc.disposeCamera();
+      // Quá hạn: không đóng camera của thao tác sau (lần kiểm tra nhiệt kế
+      // tiếp tự thử mở lại vì cờ dừng khẩn cấp vẫn còn).
+      if (error is _StaleLifecycleOperation || epoch != _lifecycleEpoch) {
+        return;
+      }
+      try {
+        await webRtc.disposeCamera();
+      } catch (disposeError) {
+        developer.log(
+          '[THERMAL] Unable to release camera after failed resume: $disposeError',
+          name: 'CameraStationRuntime',
+        );
+      }
     }
   }
 
@@ -3114,34 +4197,66 @@ class CameraStationRuntime {
       _beginRecordingTransitionGrace();
       return;
     }
-    if (_stopping ||
-        _recovering ||
-        _thermalCriticalSuspended ||
-        _iosLifecycleSuspended ||
-        _scannerPaused ||
-        !_cameraEnabled) {
+    if (_profileSwitching || _lensSwitchOperation != null) {
+      // Đổi độ phân giải / lens đang chủ động đóng-mở camera: track cũ kết
+      // thúc (kể cả audio track iOS onEnded) là bình thường. Thao tác đó tự
+      // rollback khi lỗi; health monitor xác nhận nếu hỏng thật.
+      developer.log(
+        '[CAMERA] Ignoring $reason during a camera reconfiguration',
+        name: 'CameraStationRuntime',
+      );
+      _beginRecordingTransitionGrace();
       return;
     }
+    if (_recovering || !_recoveryMayProceed(superseded: false)) return;
     _recovering = true;
     final generation = _generation;
     final cancellation = _recoveryCancellation.future;
     _emitState();
     unawaited(
       _serializeLifecycle(
-        () => _recoverCamera(reason, generation, cancellation),
-      ).whenComplete(() {
-        _recovering = false;
-        _emitState();
-      }),
+            () => _recoverCamera(reason, generation, cancellation),
+            timeout: _recoveryOperationTimeout,
+            label: 'recovery',
+          )
+          .catchError((Object error, StackTrace stackTrace) {
+            developer.log(
+              '[CAMERA] Recovery operation failed',
+              error: error,
+              stackTrace: stackTrace,
+              name: 'CameraStationRuntime',
+            );
+          })
+          .whenComplete(() {
+            _recovering = false;
+            _emitState();
+          }),
     );
   }
+
+  /// Recovery có được (tiếp tục) mở lại camera không; xem
+  /// [cameraRecoveryMayProceed]. Yêu cầu dừng vì nhiệt đang chờ cũng chặn.
+  bool _recoveryMayProceed({required bool superseded}) =>
+      cameraRecoveryMayProceed(
+        stopping: _stopping,
+        cameraEnabled: _cameraEnabled,
+        superseded: superseded,
+        thermalSuspended: _thermalCriticalSuspended,
+        thermalSuspendPending: _thermalSuspendQueued,
+        iosSuspended: _iosLifecycleSuspended,
+        scannerActive: _scannerPaused,
+      );
 
   Future<void> _recoverCamera(
     String reason,
     int generation,
     Future<void> cancellation,
   ) async {
-    if (_stopping || generation != _generation) return;
+    final epoch = _lifecycleEpoch;
+    // Lượt recovery bị thay thế (generation đổi: dừng vì nhiệt, đổi cấu hình,
+    // stop…) hoặc đã quá hạn (hàng đợi giao cho thao tác khác).
+    bool superseded() => generation != _generation || epoch != _lifecycleEpoch;
+    if (!_recoveryMayProceed(superseded: superseded())) return;
     developer.log(
       '[CAMERA] Recovery requested: $reason',
       name: 'CameraStationRuntime',
@@ -3171,13 +4286,21 @@ class CameraStationRuntime {
       }
     }
 
+    // Lens/zoom trước khi đóng camera (giá trị vẫn giữ sau dispose) để mở lại
+    // đúng góc quay thay vì rơi về camera chính 1x.
+    final lens = _currentLensState(webRtc);
+    // Đã quá hạn giữa các bước dọn: không đóng camera/kết nối của thao tác sau.
+    if (epoch != _lifecycleEpoch) return;
     await teardownStep('pause publishers', _pauseLivePublishers);
+    if (epoch != _lifecycleEpoch) return;
     await teardownStep('stop recording', () => recording.stop());
+    if (epoch != _lifecycleEpoch) return;
     await teardownStep('dispose connection', webRtc.disposeConnection);
+    if (epoch != _lifecycleEpoch) return;
     await teardownStep('dispose camera', webRtc.disposeCamera);
 
     for (var attempt = 0; attempt < _recoveryDelays.length; attempt++) {
-      if (_stopping || generation != _generation) return;
+      if (!_recoveryMayProceed(superseded: superseded())) return;
 
       final delay = _recoveryDelays[attempt];
       developer.log(
@@ -3187,13 +4310,23 @@ class CameraStationRuntime {
       );
       await Future.any<void>([Future<void>.delayed(delay), cancellation]);
 
-      if (_stopping || generation != _generation) return;
+      // Kiểm tra lại ngay trước khi mở camera: trong lúc chờ có thể đã có yêu
+      // cầu dừng vì nhiệt, nền iOS, máy quét QR hoặc stop.
+      if (!_recoveryMayProceed(superseded: superseded())) return;
 
       try {
         final currentFacing = webRtc.currentFacingMode;
+        _preselectLens(webRtc, lens, facingMode: currentFacing);
         await webRtc.initializeCamera(facingMode: currentFacing);
+        // Camera đã mở: chỉ dừng khi bị chặn hẳn (nhiệt, nền, quét QR, stop)
+        // hoặc đã quá hạn; thao tác chặn đó (đang chờ trong hàng đợi) tự đóng
+        // camera. Generation đổi vì đổi cấu hình thì vẫn hoàn tất để camera
+        // không bị bỏ mở mà không ghi.
+        if (!_recoveryMayProceed(superseded: epoch != _lifecycleEpoch)) return;
         _recordingService?.setFacingMode(currentFacing);
+        await _restoreLensState(webRtc, lens, context: 'recovery');
         await _waitForIosCaptureWarmup();
+        if (!_recoveryMayProceed(superseded: epoch != _lifecycleEpoch)) return;
         await server.ensureRecording();
         if (Platform.isIOS && _iosAppInForeground) {
           server.resumeAfterIosBackground();
@@ -3212,7 +4345,18 @@ class CameraStationRuntime {
           stackTrace: stackTrace,
           name: 'CameraStationRuntime',
         );
-        await webRtc.disposeCamera();
+        // Đã quá hạn: không đóng camera của thao tác sau.
+        if (epoch != _lifecycleEpoch) return;
+        // Lỗi dọn camera không được dừng các lần thử còn lại.
+        try {
+          await webRtc.disposeCamera();
+        } catch (disposeError) {
+          developer.log(
+            '[CAMERA] Unable to release camera after failed recovery: '
+            '$disposeError',
+            name: 'CameraStationRuntime',
+          );
+        }
       }
     }
 

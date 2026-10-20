@@ -63,4 +63,40 @@ void main() {
       expect(QrStreamParseResult.parse('just_a_random_word'), isNull);
     });
   });
+
+  group('QR auto_start defaults', () {
+    test('JSON without auto_start does not auto-start', () {
+      final result = QrStreamParseResult.parse(
+        '{"stream_url": "rtmp://a.rtmp.youtube.com/live2/abcd"}',
+      );
+      expect(result, isNotNull);
+      expect(result!.autoStart, isFalse);
+    });
+
+    test('only an explicit true enables auto-start', () {
+      expect(
+        QrStreamParseResult.parse(
+          '{"stream_url": "rtmp://h/live/k", "auto_start": "yes"}',
+        )!.autoStart,
+        isFalse,
+      );
+      expect(
+        QrStreamParseResult.parse(
+          '{"stream_url": "rtmp://h/live/k", "auto_start": false}',
+        )!.autoStart,
+        isFalse,
+      );
+      expect(
+        QrStreamParseResult.parse(
+          '{"stream_url": "rtmp://h/live/k", "auto_start": true}',
+        )!.autoStart,
+        isTrue,
+      );
+    });
+
+    test('constructor defaults to no auto-start', () {
+      const result = QrStreamParseResult(streamUrl: 'rtmp://h/live/k');
+      expect(result.autoStart, isFalse);
+    });
+  });
 }

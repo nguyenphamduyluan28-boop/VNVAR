@@ -56,6 +56,86 @@ class CameraNotReadyException implements Exception {
   String toString() => 'CameraNotReadyException: $message';
 }
 
+/// Hàng đợi ICE candidate của các peer chưa sẵn sàng nhận (chưa có
+/// PeerConnection hoặc chưa setRemoteDescription).
+///
+/// - Mỗi hàng đợi sống tối đa [ttl] kể từ lúc tạo; hết hạn thì bị bỏ.
+/// - Đạt [maxQueues] hàng đợi thì loại hàng đợi cũ nhất thay vì từ chối peer
+///   mới (trước đây ném StateError làm Tablet mới bị 500 vĩnh viễn).
+/// - Mỗi hàng đợi giữ tối đa [maxPerQueue] candidate mới nhất.
+class PendingIceCandidateQueues<T> {
+  PendingIceCandidateQueues({
+    this.maxQueues = 8,
+    this.maxPerQueue = 64,
+    this.ttl = const Duration(seconds: 30),
+    DateTime Function()? clock,
+  }) : _clock = clock ?? DateTime.now;
+
+  final int maxQueues;
+  final int maxPerQueue;
+  final Duration ttl;
+  final DateTime Function() _clock;
+  // LinkedHashMap: thứ tự chèn = thứ tự tạo, phần tử đầu là cũ nhất.
+  final Map<String, _PendingIceQueue<T>> _queues =
+      <String, _PendingIceQueue<T>>{};
+
+  /// Số hàng đợi còn hạn.
+  int get length {
+    _purgeExpired();
+    return _queues.length;
+  }
+
+  bool containsKey(String peerId) {
+    _purgeExpired();
+    return _queues.containsKey(peerId);
+  }
+
+  /// Thêm [candidate] cho [peerId]. Trả về peerId của hàng đợi bị loại để
+  /// nhường chỗ (nếu có).
+  String? add(String peerId, T candidate) {
+    _purgeExpired();
+    String? evicted;
+    var queue = _queues[peerId];
+    if (queue == null) {
+      while (_queues.length >= maxQueues && _queues.isNotEmpty) {
+        evicted = _queues.keys.first;
+        _queues.remove(evicted);
+      }
+      queue = _PendingIceQueue<T>(_clock());
+      _queues[peerId] = queue;
+    }
+    while (queue.items.length >= maxPerQueue && queue.items.isNotEmpty) {
+      queue.items.removeAt(0);
+    }
+    queue.items.add(candidate);
+    return evicted;
+  }
+
+  /// Lấy và xoá hàng đợi của [peerId]; rỗng nếu không có hoặc đã hết hạn.
+  List<T> take(String peerId) {
+    _purgeExpired();
+    return _queues.remove(peerId)?.items ?? <T>[];
+  }
+
+  void remove(String peerId) {
+    _queues.remove(peerId);
+  }
+
+  void clear() => _queues.clear();
+
+  void _purgeExpired() {
+    final now = _clock();
+    _queues.removeWhere((_, queue) => now.difference(queue.createdAt) > ttl);
+  }
+}
+
+class _PendingIceQueue<T> {
+  _PendingIceQueue(this.createdAt);
+
+  final DateTime createdAt;
+  final List<T> items = <T>[];
+}
+
 class AvailableCameraDevice {
   final String id;
   final String facing;
@@ -128,8 +208,8 @@ class WebRtcService {
   final Map<String, Future<void>> _disposePeerOperations =
       <String, Future<void>>{};
   final Map<String, Timer> _peerDisconnectTimers = <String, Timer>{};
-  final Map<String, List<RTCIceCandidate>> _pendingIceCandidates =
-      <String, List<RTCIceCandidate>>{};
+  final PendingIceCandidateQueues<RTCIceCandidate> _pendingIceCandidates =
+      PendingIceCandidateQueues<RTCIceCandidate>();
   final Set<String> _remoteDescriptionReady = <String>{};
   // Video sender của từng peer, lưu ngay khi addTrack. Không suy ra từ
   // `sender.track` vì track cũ đã bị dispose khi đổi camera/độ phân giải.
@@ -160,6 +240,13 @@ class WebRtcService {
   Timer? _rtspRetryTimer;
   int _rtspRetryAttempt = 0;
   bool _rtspStarting = false;
+  // Track được yêu cầu start trong lúc một lần start khác còn chạy (vd đổi độ
+  // phân giải): lần start cũ kết thúc sẽ start lại với track mới nhất này.
+  MediaStreamTrack? _pendingRtspTrack;
+
+  /// Sau khi mở lại server RTSP, chờ encoder báo "configured" tối đa chừng
+  /// này rồi mới coi là lỗi và thử lại.
+  static const Duration rtspReadyTimeout = Duration(seconds: 8);
   // Tăng mỗi lần start/stop RTSP: lần start bị huỷ/hết giờ không được tự bật
   // lại server sau khi đã dừng.
   int _rtspStartGeneration = 0;
@@ -1230,9 +1317,18 @@ class WebRtcService {
     }
   }
 
-  Future<void> _startRtsp(MediaStreamTrack track) async {
-    if (_rtspStarting) return;
+  /// Mở server RTSP với [track]. Trả về true nếu native đã mở server cho
+  /// đúng lần start hiện hành (encoder có thể chưa báo sẵn sàng).
+  Future<bool> _startRtsp(MediaStreamTrack track) async {
+    if (_rtspStarting) {
+      // Không bỏ lệnh start mới: ghi nhớ track mới nhất, lần start đang chạy
+      // kết thúc sẽ start lại với nó (trước đây RTSP kẹt tắt sau khi đổi độ
+      // phân giải vì lệnh start sau bị bỏ qua).
+      _pendingRtspTrack = track;
+      return false;
+    }
     _rtspStarting = true;
+    _pendingRtspTrack = null;
     if (!rtspSupported) {
       _rtspRunning = false;
       _rtspError = 'RTSP không được hỗ trợ trên nền tảng này.';
@@ -1241,9 +1337,10 @@ class WebRtcService {
         name: 'WebRtcService',
       );
       _rtspStarting = false;
-      return;
+      return false;
     }
     final startGeneration = ++_rtspStartGeneration;
+    var started = false;
     try {
       _rtspRunning = false;
       _rtspAudio = false;
@@ -1272,41 +1369,83 @@ class WebRtcService {
       // Native có thể không trả lời (ví dụ iOS bị dừng trước khi server sẵn
       // sàng); không để _rtspStarting kẹt true mãi.
       ).timeout(const Duration(seconds: 15));
-      _rtspAudio = result?['audio'] == true;
-      developer.log(
-        '[RTSP] Server opened; waiting for H.264 encoder readiness.',
-        name: 'WebRtcService',
-      );
+      if (startGeneration != _rtspStartGeneration) {
+        // RTSP đã được dừng/khởi động lại trong lúc native đang mở server:
+        // trạng thái hiện tại thuộc về lệnh mới hơn, không ghi đè.
+        developer.log(
+          '[RTSP] Start superseded while opening the server.',
+          name: 'WebRtcService',
+        );
+      } else {
+        _rtspAudio = result?['audio'] == true;
+        started = true;
+        developer.log(
+          '[RTSP] Server opened; waiting for H.264 encoder readiness.',
+          name: 'WebRtcService',
+        );
+      }
     } catch (error, stackTrace) {
       if (startGeneration != _rtspStartGeneration) {
-        // RTSP đã được dừng trong lúc đang khởi động: không bật lại.
+        // RTSP đã được dừng trong lúc đang khởi động: không bật lại (trừ khi
+        // có lệnh start mới đang chờ — xử lý sau finally).
         developer.log(
           '[RTSP] Start superseded by stop: $error',
           name: 'WebRtcService',
         );
-        return;
+      } else {
+        // Keep the logical server state so transient encoder/network failures
+        // can be retried without requiring the tablet to reconnect manually.
+        _rtspServerStarted = true;
+        _rtspRunning = false;
+        _rtspAudio = false;
+        _rtspError = error.toString();
+        developer.log(
+          '[RTSP] Cannot start server',
+          error: error,
+          stackTrace: stackTrace,
+          name: 'WebRtcService',
+        );
+        _scheduleRtspRetry();
       }
-      // Keep the logical server state so transient encoder/network failures
-      // can be retried without requiring the tablet to reconnect manually.
-      _rtspServerStarted = true;
-      _rtspRunning = false;
-      _rtspAudio = false;
-      _rtspError = error.toString();
-      developer.log(
-        '[RTSP] Cannot start server',
-        error: error,
-        stackTrace: stackTrace,
-        name: 'WebRtcService',
-      );
-      _scheduleRtspRetry();
     } finally {
       _rtspStarting = false;
     }
+    // Chạy SAU finally: _rtspStarting đã về false nên lệnh start lại không bị
+    // ghi nhớ ngược thành "pending".
+    if (_pendingRtspTrack != null) {
+      return _runPendingRtspStart(track, startGeneration, started);
+    }
+    return started;
+  }
+
+  /// Có lệnh start mới đến trong lúc lần start [generation] với [track] còn
+  /// chạy: start lại với track mới nhất nếu RTSP đã được dừng/khởi động lại
+  /// hoặc track đã đổi.
+  Future<bool> _runPendingRtspStart(
+    MediaStreamTrack track,
+    int generation,
+    bool started,
+  ) async {
+    final pending = _pendingRtspTrack;
+    _pendingRtspTrack = null;
+    if (pending == null) return started;
+    if (generation == _rtspStartGeneration && pending.id == track.id) {
+      // Cùng track, chưa bị dừng: lần start vừa xong đã đủ.
+      return started;
+    }
+    developer.log(
+      '[RTSP] Restarting with the latest camera track ${pending.id}',
+      name: 'WebRtcService',
+    );
+    return _startRtsp(pending);
   }
 
   Future<void> _stopRtsp() async {
     if (!Platform.isAndroid && !Platform.isIOS) return;
     _rtspStartGeneration++;
+    // Lệnh dừng huỷ cả lệnh start đang chờ (nếu có lệnh start sau lệnh dừng
+    // này, nó sẽ tự ghi nhớ lại).
+    _pendingRtspTrack = null;
     if (!_rtspServerStarted) return;
     _rtspRetryTimer?.cancel();
     _rtspRetryTimer = null;
@@ -1359,8 +1498,24 @@ class WebRtcService {
     _rtspRetryTimer = Timer(delay, () async {
       _rtspRetryTimer = null;
       if (!_rtspServerStarted || _localStream == null) return;
-      await _startRtsp(track);
-      if (!_rtspRunning) _scheduleRtspRetry();
+      final currentTrack = localVideoTrack ?? track;
+      // Lỗi khi mở server đã tự lên lịch thử lại; bị dừng/thay thế thì thôi.
+      if (!await _startRtsp(currentTrack)) return;
+      // Server đã mở: encoder cần thêm thời gian mới báo "configured". Chỉ
+      // thử lại khi encoder báo lỗi (onRtspEncoderError tự lên lịch) hoặc
+      // hết [rtspReadyTimeout]; trước đây kiểm tra ngay nên server bị khởi
+      // động lại liên tục trước khi encoder kịp sẵn sàng.
+      final generation = _rtspStartGeneration;
+      final ready = await waitForRtspReady(timeout: rtspReadyTimeout);
+      if (ready ||
+          generation != _rtspStartGeneration ||
+          !_rtspServerStarted ||
+          _rtspStarting) {
+        return;
+      }
+      _rtspError ??= 'Encoder RTSP không sẵn sàng sau '
+          '${rtspReadyTimeout.inSeconds} giây.';
+      _scheduleRtspRetry();
     });
   }
 
@@ -1430,8 +1585,24 @@ class WebRtcService {
         _activeCameraId = deviceId;
         _preferredCameraDeviceIds[_currentFacingMode!] = deviceId;
       }
-      await refreshCameraZoom();
-      await _configureNaturalCameraMetering(track);
+      // Camera ĐÃ chuyển xong: lỗi đọc zoom/đặt đo sáng không được ném ra
+      // ngoài, nếu không switchCamera() sẽ fallback và lật ngược camera.
+      try {
+        await refreshCameraZoom();
+      } catch (error) {
+        developer.log(
+          '[CAMERA] Zoom refresh after switch failed: $error',
+          name: 'WebRtcService',
+        );
+      }
+      try {
+        await _configureNaturalCameraMetering(track);
+      } catch (error) {
+        developer.log(
+          '[CAMERA] Metering setup after switch failed: $error',
+          name: 'WebRtcService',
+        );
+      }
       developer.log(
         '[CAMERA] Switched camera to $deviceId ($_currentFacingMode)',
         name: 'WebRtcService',
@@ -1764,7 +1935,26 @@ class WebRtcService {
     int maximumPeers = maximumActivePeers,
   }) async {
     developer.log('Handling Tablet offer: $peerId', name: 'WebRtcService');
+    try {
+      return await _negotiateOffer(
+        sdp: sdp,
+        type: type,
+        peerId: peerId,
+        maximumPeers: maximumPeers,
+      );
+    } catch (_) {
+      // Offer thất bại: hàng đợi ICE của peer này không bao giờ được dùng.
+      _pendingIceCandidates.remove(peerId);
+      rethrow;
+    }
+  }
 
+  Future<RTCSessionDescription> _negotiateOffer({
+    required String sdp,
+    required String type,
+    required String peerId,
+    required int maximumPeers,
+  }) async {
     // ==========================================================
     // CREATE PC
     // ==========================================================
@@ -1870,16 +2060,15 @@ class WebRtcService {
     final pc = _peerConnections[targetPeerId];
 
     if (pc == null || !_remoteDescriptionReady.contains(targetPeerId)) {
-      if (!_pendingIceCandidates.containsKey(targetPeerId) &&
-          _pendingIceCandidates.length >= 8) {
-        throw StateError('Too many pending WebRTC peer candidates.');
+      // Hàng đợi đầy thì loại hàng đợi cũ nhất (thường là peer đã bỏ dở)
+      // thay vì ném lỗi: trước đây hàng đợi rò rỉ làm Tablet mới bị 500.
+      final evicted = _pendingIceCandidates.add(targetPeerId, ice);
+      if (evicted != null) {
+        developer.log(
+          'Dropped stale pending ICE queue [$evicted]',
+          name: 'WebRtcService',
+        );
       }
-      final pending = _pendingIceCandidates.putIfAbsent(
-        targetPeerId,
-        () => <RTCIceCandidate>[],
-      );
-      if (pending.length >= 64) pending.removeAt(0);
-      pending.add(ice);
       developer.log(
         'Queued remote ICE candidate [$targetPeerId]',
         name: 'WebRtcService',
@@ -1911,16 +2100,21 @@ class WebRtcService {
     String peerId, {
     RTCPeerConnection? expectedPeer,
   }) {
+    final pc = _peerConnections[peerId];
+    // Xoá hàng đợi ICE kể cả khi PeerConnection không tồn tại (offer thất
+    // bại trước/sau khi tạo PC). Chỉ giữ lại khi đây là lệnh đóng một PC cũ
+    // đã bị thay thế: hàng đợi lúc đó thuộc về lần đàm phán mới.
+    if (expectedPeer == null || identical(pc, expectedPeer)) {
+      _pendingIceCandidates.remove(peerId);
+    }
     final activeDispose = _disposePeerOperations[peerId];
     if (activeDispose != null) return activeDispose;
-    final pc = _peerConnections[peerId];
     if (pc == null || (expectedPeer != null && !identical(pc, expectedPeer))) {
       return Future<void>.value();
     }
     _peerConnections.remove(peerId);
     _videoSenders.remove(peerId);
     _remoteDescriptionReady.remove(peerId);
-    _pendingIceCandidates.remove(peerId);
     _peerDisconnectTimers.remove(peerId)?.cancel();
     if (_latestPeerId == peerId) {
       _latestPeerId = _peerConnections.isEmpty
@@ -2001,10 +2195,18 @@ class WebRtcService {
     RTCPeerConnection expectedPeer,
   ) async {
     if (!identical(_peerConnections[peerId], expectedPeer)) return;
-    final pending = _pendingIceCandidates.remove(peerId) ?? const [];
+    final pending = _pendingIceCandidates.take(peerId);
     for (final candidate in pending) {
       if (!identical(_peerConnections[peerId], expectedPeer)) return;
-      await expectedPeer.addCandidate(candidate);
+      try {
+        await expectedPeer.addCandidate(candidate);
+      } catch (error) {
+        // Một candidate hỏng/cũ không được làm hỏng cả lần đàm phán.
+        developer.log(
+          'Skipped queued ICE candidate [$peerId]: $error',
+          name: 'WebRtcService',
+        );
+      }
     }
   }
 

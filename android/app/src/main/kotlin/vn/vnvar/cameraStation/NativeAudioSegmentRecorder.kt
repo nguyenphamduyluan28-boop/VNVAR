@@ -5,7 +5,9 @@ import android.content.Context
 import android.content.pm.PackageManager
 import android.media.AudioFormat
 import android.media.AudioRecord
+import android.media.AudioTimestamp
 import android.media.MediaRecorder
+import android.os.Build
 import androidx.core.content.ContextCompat
 import java.io.File
 import java.io.RandomAccessFile
@@ -31,6 +33,16 @@ class NativeAudioSegmentRecorder(private val context: Context) {
     private var outputFile: File? = null
     private val dataBytes = AtomicLong(0L)
     private val lastProgressElapsedMs = AtomicLong(0L)
+    /**
+     * Wall-clock (ms) lúc mẫu đầu tiên trong file WAV hiện tại được thu. Ghi
+     * dưới [fileLock] khi chunk đầu tiên của segment được ghi vào file.
+     */
+    private var segmentFirstSampleEpochMs: Double? = null
+    /** Còn cần đo chính xác (AudioRecord.getTimestamp) cho chunk đầu của segment. */
+    @Volatile private var firstSampleStampNeeded = false
+
+    /** Một chunk PCM kèm thời điểm (epoch ms) mẫu đầu tiên của nó được thu. */
+    private class PcmChunk(val data: ByteArray, val captureEpochMs: Double)
 
     // Ghi file chạy trên luồng riêng. Luồng thu âm chỉ đọc AudioRecord và đẩy
     // dữ liệu đi, nên một lần ghi/fsync chậm của bộ nhớ (FFmpeg đóng gói
@@ -45,12 +57,16 @@ class NativeAudioSegmentRecorder(private val context: Context) {
                 continue
             }
             when (item) {
-                is ByteArray -> synchronized(fileLock) {
+                is PcmChunk -> synchronized(fileLock) {
                     try {
                         val writer = output
                         if (writer != null) {
-                            writer.write(item)
-                            dataBytes.addAndGet(item.size.toLong())
+                            writer.write(item.data)
+                            if (dataBytes.get() == 0L && segmentFirstSampleEpochMs == null) {
+                                segmentFirstSampleEpochMs = item.captureEpochMs
+                                firstSampleStampNeeded = false
+                            }
+                            dataBytes.addAndGet(item.data.size.toLong())
                         }
                     } catch (_: Exception) {}
                 }
@@ -152,15 +168,28 @@ class NativeAudioSegmentRecorder(private val context: Context) {
             } catch (_: Exception) {}
             val buffer = ByteArray(chunkBytes)
             var keepReading = true
+            // Số frame đã đọc từ AudioRecord này (để đối chiếu getTimestamp).
+            var framesRead = 0L
             while (keepReading && isAudioRecordRunning.get()) {
                 val count = activeRecorder.read(buffer, 0, buffer.size)
                 when {
                     count > 0 -> {
+                        val chunkStartFrame = framesRead
+                        val chunkFrames = count / 2
+                        framesRead += chunkFrames
                         // Apply zero-allocation high-pass filter to strip wind rumble
                         windRainFilter.processInPlace(buffer, count)
                         val pcmChunk = buffer.copyOf(count)
                         // Không bao giờ ghi file hay chờ khoá file trên luồng thu.
-                        if (recordingFileActive.get()) writeQueue.offer(pcmChunk)
+                        if (recordingFileActive.get()) {
+                            val captureEpochMs = estimateChunkStartEpochMs(
+                                activeRecorder,
+                                chunkStartFrame,
+                                chunkFrames,
+                                precise = firstSampleStampNeeded,
+                            )
+                            writeQueue.offer(PcmChunk(pcmChunk, captureEpochMs))
+                        }
                         try {
                             onPcm?.invoke(pcmChunk)
                         } catch (_: Exception) {}
@@ -182,6 +211,39 @@ class NativeAudioSegmentRecorder(private val context: Context) {
                 }
             }
         }, "VNVAR-NativeAudio").also { it.start() }
+    }
+
+    /**
+     * Ước lượng thời điểm wall-clock (ms) mẫu đầu tiên của chunk vừa đọc được
+     * thu từ micro. Mặc định: `now - thời lượng chunk`. Khi [precise] và máy hỗ
+     * trợ (API 24+), dùng AudioRecord.getTimestamp; chỉ nhận kết quả khi nó
+     * hợp lý so với ước lượng mặc định (tránh lệch do tràn bộ đệm).
+     */
+    private fun estimateChunkStartEpochMs(
+        record: AudioRecord,
+        chunkStartFrame: Long,
+        chunkFrames: Int,
+        precise: Boolean,
+    ): Double {
+        val nowEpochMs = System.currentTimeMillis().toDouble()
+        val fallback = nowEpochMs - chunkFrames * 1000.0 / SAMPLE_RATE
+        if (!precise || Build.VERSION.SDK_INT < Build.VERSION_CODES.N) return fallback
+        return try {
+            val timestamp = AudioTimestamp()
+            val status = record.getTimestamp(timestamp, AudioTimestamp.TIMEBASE_MONOTONIC)
+            if (status != AudioRecord.SUCCESS || timestamp.nanoTime <= 0L) {
+                fallback
+            } else {
+                val frameNanos = timestamp.nanoTime +
+                    (chunkStartFrame - timestamp.framePosition) * 1_000_000_000L / SAMPLE_RATE
+                val estimate = nowEpochMs - (System.nanoTime() - frameNanos) / 1_000_000.0
+                // Mẫu đầu chunk luôn được thu trước lúc đọc xong chunk; bộ đệm
+                // AudioRecord ~1 giây nên chênh hợp lệ nằm trong khoảng này.
+                if (estimate <= fallback + 50.0 && estimate >= fallback - 1_500.0) estimate else fallback
+            }
+        } catch (_: Throwable) {
+            fallback
+        }
     }
 
     /** Chạy trên luồng thu đã lỗi: đóng AudioRecord hỏng rồi mở lại (giãn dần). */
@@ -220,6 +282,7 @@ class NativeAudioSegmentRecorder(private val context: Context) {
 
     private companion object {
         const val LOG_TAG = "VNVAR-NativeAudio"
+        const val SAMPLE_RATE = 48_000
         const val MIC_RECOVERY_ATTEMPTS = 8
     }
 
@@ -252,8 +315,21 @@ class NativeAudioSegmentRecorder(private val context: Context) {
         writeWavHeader(writer, sampleRate, 1, 16, 0)
 
         synchronized(fileLock) {
-            try { output?.close() } catch (_: Exception) {}
+            // start() khi segment trước chưa stop(): hoàn tất header RIFF/data
+            // của file cũ (hàng ghi đã được xả ở trên) rồi mới đóng, để file
+            // cũ vẫn là WAV hợp lệ.
+            output?.let { previous ->
+                try {
+                    writeWavHeader(previous, sampleRate, 1, 16, dataBytes.get())
+                    previous.fd.sync()
+                } catch (error: Exception) {
+                    android.util.Log.w(LOG_TAG, "Unable to finalize previous WAV segment", error)
+                }
+                try { previous.close() } catch (_: Exception) {}
+            }
             dataBytes.set(0L)
+            segmentFirstSampleEpochMs = null
+            firstSampleStampNeeded = true
             lastProgressElapsedMs.set(android.os.SystemClock.elapsedRealtime())
             outputFile = file
             output = writer
@@ -268,6 +344,8 @@ class NativeAudioSegmentRecorder(private val context: Context) {
                 try { writer.close() } catch (_: Exception) {}
                 output = null
                 outputFile = null
+                segmentFirstSampleEpochMs = null
+                firstSampleStampNeeded = false
             }
             throw error
         }
@@ -310,7 +388,9 @@ class NativeAudioSegmentRecorder(private val context: Context) {
         drainWriteQueue()
         val bytes = dataBytes.get()
         val file = outputFile
+        var firstSampleEpochMs: Double? = null
         synchronized(fileLock) {
+            firstSampleEpochMs = segmentFirstSampleEpochMs
             try {
                 output?.let {
                     writeWavHeader(it, 48_000, 1, 16, bytes)
@@ -321,13 +401,20 @@ class NativeAudioSegmentRecorder(private val context: Context) {
             output = null
             outputFile = null
             dataBytes.set(0L)
+            segmentFirstSampleEpochMs = null
+            firstSampleStampNeeded = false
             lastProgressElapsedMs.set(0L)
         }
 
         if (!streamingActive.get()) {
             stopAudioRecordInternalLocked()
         }
-        return mapOf("path" to file?.absolutePath, "bytes" to bytes)
+        return mapOf(
+            "path" to file?.absolutePath,
+            "bytes" to bytes,
+            // Hợp đồng C2: null khi segment chưa ghi được mẫu nào.
+            "firstSampleEpochMs" to firstSampleEpochMs,
+        )
     }
 
     private fun writeWavHeader(

@@ -13,6 +13,8 @@ import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.os.Environment
+import android.os.Handler
+import android.os.Looper
 import android.os.PowerManager
 import android.os.StatFs
 import android.provider.DocumentsContract
@@ -26,13 +28,19 @@ import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.embedding.engine.FlutterEngineCache
 import io.flutter.plugin.common.MethodChannel
+import java.util.concurrent.ExecutorService
+import java.util.concurrent.Executors
 import kotlin.math.abs
 import kotlin.math.atan
 
 class MainActivity : FlutterActivity() {
     private var pendingStart: PendingStart? = null
     private var activityResumed = false
+    // Đọc từ luồng thu âm (onPcm) nên cần volatile.
+    @Volatile
     private var rtspPublisher: VnvarRtspPublisher? = null
+    /** MethodChannel.Result phải được trả trên main thread. */
+    private val mainHandler = Handler(Looper.getMainLooper())
     private var pendingFolderResult: MethodChannel.Result? = null
     /// Hướng màn hình được Flutter yêu cầu khóa. Giá trị hợp lệ:
     /// "landscape", "portrait", "auto".
@@ -43,7 +51,8 @@ class MainActivity : FlutterActivity() {
     private var lastKnownLandscapeRotation: Int = ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE
     private var manualQuarterTurns = 0
     private var orientationListener: OrientationEventListener? = null
-    private val cellularUplink by lazy { CellularUplink(applicationContext) }
+    private val cellularUplinkDelegate = lazy { CellularUplink(applicationContext) }
+    private val cellularUplink by cellularUplinkDelegate
     private val nativeAudioRecorder: NativeAudioSegmentRecorder
         get() = sharedAudioRecorder ?: synchronized(MainActivity::class.java) {
             sharedAudioRecorder ?: NativeAudioSegmentRecorder(applicationContext).also {
@@ -154,20 +163,34 @@ class MainActivity : FlutterActivity() {
                             null,
                         )
                     } else {
-                        try {
-                            refreshCameraStationForegroundTypes()
-                            result.success(nativeAudioRecorder.start(path))
-                        } catch (error: Exception) {
-                            result.error("AUDIO_START_FAILED", error.message, null)
+                        // Lỗi làm mới foreground type không được làm hỏng việc
+                        // thu âm (hàm tự bắt lỗi và chỉ chạy khi cần).
+                        refreshCameraStationForegroundTypes()
+                        // Xả hàng ghi, fsync và khởi tạo AudioRecord có thể mất
+                        // vài giây: chạy trên luồng âm thanh nền (giữ thứ tự).
+                        runInBackground(audioExecutor, "startNativeAudioSegment") {
+                            try {
+                                val response = nativeAudioRecorder.start(path)
+                                mainHandler.post { result.success(response) }
+                            } catch (error: Throwable) {
+                                mainHandler.post {
+                                    result.error("AUDIO_START_FAILED", error.message, null)
+                                }
+                            }
                         }
                     }
                 }
 
                 "stopNativeAudioSegment" -> {
-                    try {
-                        result.success(nativeAudioRecorder.stop())
-                    } catch (error: Exception) {
-                        result.error("AUDIO_STOP_FAILED", error.message, null)
+                    runInBackground(audioExecutor, "stopNativeAudioSegment") {
+                        try {
+                            val response = nativeAudioRecorder.stop()
+                            mainHandler.post { result.success(response) }
+                        } catch (error: Throwable) {
+                            mainHandler.post {
+                                result.error("AUDIO_STOP_FAILED", error.message, null)
+                            }
+                        }
                     }
                 }
 
@@ -176,6 +199,22 @@ class MainActivity : FlutterActivity() {
                 }
 
                 "isEmulator" -> result.success(isRunningOnEmulator())
+
+                "openAppSettings" -> {
+                    val opened = try {
+                        startActivity(
+                            Intent(
+                                Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                                Uri.fromParts("package", packageName, null),
+                            ).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
+                        )
+                        true
+                    } catch (error: Exception) {
+                        android.util.Log.w("MainActivity", "Unable to open app settings: ${error.message}")
+                        false
+                    }
+                    result.success(opened)
+                }
 
                 "setScreenDimmed" -> {
                     val dimmed = call.argument<Boolean>("dimmed") ?: false
@@ -309,7 +348,11 @@ class MainActivity : FlutterActivity() {
                         result.error("RTSP_TRACK_NOT_FOUND", "Không tìm thấy video track WebRTC.", null)
                     } else {
                         try {
-                            rtspPublisher?.stop()
+                            val previous = rtspPublisher
+                            rtspPublisher = null
+                            previous?.stop()
+                            // Callback mang id phiên publisher: callback trễ của
+                            // phiên cũ (đã stop/thay thế) bị bỏ qua.
                             rtspPublisher = VnvarRtspPublisher(
                                 track = track,
                                 audioAvailable = ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED,
@@ -317,20 +360,28 @@ class MainActivity : FlutterActivity() {
                                 bitrate = bitrate,
                                 fps = fps,
                                 remoteAudioEnabled = remoteAudio,
-                                onEncoderConfigured = {
-                                    runOnUiThread {
-                                        platformChannel.invokeMethod(
-                                            "onRtspEncoderConfigured",
-                                            null,
-                                        )
+                                onEncoderConfigured = { publisherId ->
+                                    mainHandler.post {
+                                        if (rtspPublisher?.publisherId == publisherId &&
+                                            ::platformChannel.isInitialized
+                                        ) {
+                                            platformChannel.invokeMethod(
+                                                "onRtspEncoderConfigured",
+                                                null,
+                                            )
+                                        }
                                     }
                                 },
-                                onEncoderError = { message ->
-                                    runOnUiThread {
-                                        platformChannel.invokeMethod(
-                                            "onRtspEncoderError",
-                                            mapOf("error" to message),
-                                        )
+                                onEncoderError = { publisherId, message ->
+                                    mainHandler.post {
+                                        if (rtspPublisher?.publisherId == publisherId &&
+                                            ::platformChannel.isInitialized
+                                        ) {
+                                            platformChannel.invokeMethod(
+                                                "onRtspEncoderError",
+                                                mapOf("error" to message),
+                                            )
+                                        }
                                     }
                                 },
                             ).also { it.start() }
@@ -340,7 +391,10 @@ class MainActivity : FlutterActivity() {
                             ) == PackageManager.PERMISSION_GRANTED
                             if (audioPermissionGranted) {
                                 nativeAudioRecorder.onPcm = { pcm -> rtspPublisher?.sendAudioPcm(pcm) }
-                                nativeAudioRecorder.startStreaming()
+                                // Khởi tạo AudioRecord có thể chậm: không chặn UI thread.
+                                runInBackground(audioExecutor, "startStreaming") {
+                                    nativeAudioRecorder.startStreaming()
+                                }
                             }
                             result.success(mapOf(
                                 "running" to true,
@@ -377,7 +431,11 @@ class MainActivity : FlutterActivity() {
                 }
 
                 "closeCellularTunnel" -> {
-                    Thread({ cellularUplink.close() }, "VNVAR-Cellular-Close").start()
+                    if (cellularUplinkDelegate.isInitialized()) {
+                        Thread({
+                            try { cellularUplink.close() } catch (_: Throwable) {}
+                        }, "VNVAR-Cellular-Close").start()
+                    }
                     result.success(null)
                 }
 
@@ -395,10 +453,13 @@ class MainActivity : FlutterActivity() {
                 }
 
                 "stopRtsp" -> {
-                    try { nativeAudioRecorder.stopStreaming() } catch (_: Exception) {}
                     nativeAudioRecorder.onPcm = null
-                    rtspPublisher?.stop()
+                    runInBackground(audioExecutor, "stopStreaming") {
+                        nativeAudioRecorder.stopStreaming()
+                    }
+                    val publisher = rtspPublisher
                     rtspPublisher = null
+                    try { publisher?.stop() } catch (_: Exception) {}
                     result.success(null)
                 }
 
@@ -419,20 +480,19 @@ class MainActivity : FlutterActivity() {
                     if (path.isNullOrBlank()) {
                         result.error("INVALID_PATH", "Thiếu đường dẫn thư mục cần xóa.", null)
                     } else {
-                        try {
-                            val dir = java.io.File(path)
-                            var success = false
-                            if (dir.exists()) {
-                                success = dir.deleteRecursively()
-                            } else {
-                                success = true
-                            }
+                        // Xóa đệ quy + MediaStore có thể chạm hàng nghìn file:
+                        // chạy trên luồng I/O nền, trả kết quả trên main thread.
+                        runInBackground(ioExecutor, "deleteDirectoryRecursively") {
                             try {
-                                purgeMediaStoreForVnvar(path)
-                            } catch (_: Exception) {}
-                            result.success(success)
-                        } catch (error: Exception) {
-                            result.error("DELETE_FAILED", error.message, path)
+                                val dir = java.io.File(path)
+                                val success = if (dir.exists()) dir.deleteRecursively() else true
+                                try {
+                                    purgeMediaStoreForVnvar(path)
+                                } catch (_: Exception) {}
+                                mainHandler.post { result.success(success) }
+                            } catch (error: Throwable) {
+                                mainHandler.post { result.error("DELETE_FAILED", error.message, path) }
+                            }
                         }
                     }
                 }
@@ -632,16 +692,21 @@ class MainActivity : FlutterActivity() {
     }
 
     private fun purgeMediaStoreForVnvar(folderPath: String) {
+        // `%` và `_` trong tên thư mục là ký tự đại diện của LIKE: escape để
+        // không xóa nhầm bản ghi của thư mục khác (vd "VNVAR_1" khớp "VNVARx1").
+        val escapedFolder = folderPath
+            .replace("\\", "\\\\")
+            .replace("%", "\\%")
+            .replace("_", "\\_")
+        val selectionArgs = arrayOf("$escapedFolder/%")
         try {
             val uri = android.provider.MediaStore.Video.Media.EXTERNAL_CONTENT_URI
-            val selection = "${android.provider.MediaStore.Video.Media.DATA} LIKE ?"
-            val selectionArgs = arrayOf("$folderPath/%")
+            val selection = "${android.provider.MediaStore.Video.Media.DATA} LIKE ? ESCAPE '\\'"
             contentResolver.delete(uri, selection, selectionArgs)
         } catch (_: Exception) {}
         try {
             val imageUri = android.provider.MediaStore.Images.Media.EXTERNAL_CONTENT_URI
-            val selection = "${android.provider.MediaStore.Images.Media.DATA} LIKE ?"
-            val selectionArgs = arrayOf("$folderPath/%")
+            val selection = "${android.provider.MediaStore.Images.Media.DATA} LIKE ? ESCAPE '\\'"
             contentResolver.delete(imageUri, selection, selectionArgs)
         } catch (_: Exception) {}
     }
@@ -992,14 +1057,41 @@ class MainActivity : FlutterActivity() {
         ContextCompat.startForegroundService(this, intent)
     }
 
+    /**
+     * Làm mới foreground type của dịch vụ CHỈ khi tập type cần thiết khác với
+     * tập đã áp dụng (vd vừa được cấp quyền micro) và Activity đang hiển thị.
+     * Gọi startForegroundService từ nền bị Android 12+/14 chặn bằng exception,
+     * nên lỗi chỉ được ghi log, không lan ra người gọi.
+     */
     private fun refreshCameraStationForegroundTypes() {
-        if (!CameraStationForegroundService.isRunning) return
-        ContextCompat.startForegroundService(
-            this,
-            Intent(this, CameraStationForegroundService::class.java).apply {
-                action = CameraStationForegroundService.ACTION_REFRESH_TYPES
-            },
-        )
+        if (!activityResumed || !CameraStationForegroundService.isRunning) return
+        try {
+            val required = CameraStationForegroundService.requiredForegroundTypes(this)
+            if (required == CameraStationForegroundService.appliedForegroundTypes) return
+            ContextCompat.startForegroundService(
+                this,
+                Intent(this, CameraStationForegroundService::class.java).apply {
+                    action = CameraStationForegroundService.ACTION_REFRESH_TYPES
+                },
+            )
+        } catch (error: Exception) {
+            android.util.Log.w("MainActivity", "Foreground type refresh failed: ${error.message}")
+        }
+    }
+
+    /** Chạy [block] trên [executor]; mọi lỗi được ghi log, không làm chết luồng. */
+    private fun runInBackground(executor: ExecutorService, label: String, block: () -> Unit) {
+        try {
+            executor.execute {
+                try {
+                    block()
+                } catch (error: Throwable) {
+                    android.util.Log.w("MainActivity", "$label failed: ${error.message}")
+                }
+            }
+        } catch (error: Exception) {
+            android.util.Log.e("MainActivity", "$label could not be scheduled", error)
+        }
     }
 
     private data class PendingStart(
@@ -1012,6 +1104,14 @@ class MainActivity : FlutterActivity() {
         private const val ENGINE_CACHE_KEY = "vnvar_camera_station_engine"
         @Volatile
         private var sharedAudioRecorder: NativeAudioSegmentRecorder? = null
+        // Dùng chung cho mọi instance Activity (recorder cũng dùng chung), một
+        // luồng mỗi loại để giữ thứ tự start/stop âm thanh và các thao tác file.
+        private val audioExecutor: ExecutorService = Executors.newSingleThreadExecutor { task ->
+            Thread(task, "VNVAR-Audio-Control").apply { isDaemon = true }
+        }
+        private val ioExecutor: ExecutorService = Executors.newSingleThreadExecutor { task ->
+            Thread(task, "VNVAR-Main-IO").apply { isDaemon = true }
+        }
         private const val CHANNEL_NAME = "vnvar/camera_station_service"
         private const val PERMISSION_REQUEST = 4101
         private const val NOTIFICATION_PERMISSION_REQUEST = 4102
@@ -1204,10 +1304,38 @@ class MainActivity : FlutterActivity() {
     override fun onDestroy() {
         orientationListener?.disable()
         orientationListener = null
-        try { nativeAudioRecorder.stopStreaming() } catch (_: Exception) {}
-        try { rtspPublisher?.stop() } catch (_: Exception) {}
+        nativeAudioRecorder.onPcm = null
+        runInBackground(audioExecutor, "stopStreaming(onDestroy)") {
+            nativeAudioRecorder.stopStreaming()
+        }
+        val publisher = rtspPublisher
         rtspPublisher = null
-        try { cellularUplink.close() } catch (_: Exception) {}
+        if (publisher != null) {
+            try { publisher.stop() } catch (_: Exception) {}
+            notifyRtspStoppedByActivityDestroy()
+        }
+        if (cellularUplinkDelegate.isInitialized()) {
+            // close() đồng bộ với open() (có thể đang chờ mạng di động vài giây).
+            val uplink = cellularUplink
+            runInBackground(ioExecutor, "cellularUplink.close") { uplink.close() }
+        }
         super.onDestroy()
+    }
+
+    /**
+     * Engine Flutter được giữ lại sau khi Activity bị huỷ: báo Dart rằng RTSP
+     * đã dừng để trạng thái không còn "đang chạy" (Dart sẽ tự thử khởi động lại).
+     */
+    private fun notifyRtspStoppedByActivityDestroy() {
+        if (!::platformChannel.isInitialized) return
+        if (FlutterEngineCache.getInstance().get(ENGINE_CACHE_KEY) == null) return
+        try {
+            platformChannel.invokeMethod(
+                "onRtspEncoderError",
+                mapOf("error" to "activity_destroyed", "reason" to "activity_destroyed"),
+            )
+        } catch (error: Exception) {
+            android.util.Log.w("MainActivity", "Unable to notify RTSP stop: ${error.message}")
+        }
     }
 }

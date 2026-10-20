@@ -682,7 +682,7 @@ object CameraExposureController {
             return
         }
         val generation = ++requestGeneration
-        cameraThread.post {
+        val posted = cameraThread.post {
             if (activeTrackId != trackId || requestGeneration != generation) {
                 callback(result(false, reason = "request_cancelled"))
                 return@post
@@ -831,6 +831,13 @@ object CameraExposureController {
                 Log.w(TAG, "Cannot apply Camera2 exposure boost", error)
                 callback(result(false, reason = error.javaClass.simpleName))
             }
+        }
+        if (!posted) {
+            // Looper của camera đã dừng (camera đóng/đổi phiên): khối trên sẽ
+            // không bao giờ chạy, nên trả lỗi ngay để Future phía Dart không treo.
+            lastAppliedKey = null
+            Log.w(TAG, "Camera thread is not running; exposure request dropped")
+            callback(result(false, reason = "camera_thread_unavailable"))
         }
     }
 

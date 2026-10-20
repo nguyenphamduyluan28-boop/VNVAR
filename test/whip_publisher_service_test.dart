@@ -34,11 +34,80 @@ void main() {
       await service.dispose();
     });
 
+    test('localizedError returns Vietnamese and English messages', () async {
+      final service = WhipPublisherService();
+      expect(service.localizedError(english: false), isNull);
+      expect(service.localizedError(english: true), isNull);
+
+      await service.startPublish(endpointUrl: '', webRtcService: null);
+
+      expect(
+        service.localizedError(english: false),
+        contains('Chưa cấu hình URL WHIP Endpoint'),
+      );
+      expect(service.localizedError(english: false), service.currentError);
+      expect(
+        service.localizedError(english: true),
+        contains('WHIP endpoint URL is not configured'),
+      );
+      await service.dispose();
+    });
+
     test('stopPublish resets state to idle cleanly', () async {
       final service = WhipPublisherService();
       await service.stopPublish();
       expect(service.state, WhipPublishState.idle);
       expect(service.isLive, isFalse);
+      await service.dispose();
+    });
+  });
+
+  group('WHIP rejection policy', () {
+    test('4xx except 408/429 stops retrying', () {
+      expect(isPermanentWhipRejection(400), isTrue);
+      expect(isPermanentWhipRejection(401), isTrue);
+      expect(isPermanentWhipRejection(403), isTrue);
+      expect(isPermanentWhipRejection(404), isTrue);
+      expect(isPermanentWhipRejection(408), isFalse);
+      expect(isPermanentWhipRejection(429), isFalse);
+      expect(isPermanentWhipRejection(500), isFalse);
+      expect(isPermanentWhipRejection(503), isFalse);
+      expect(isPermanentWhipRejection(201), isFalse);
+    });
+
+    test('bearer token only goes to the same origin on DELETE', () {
+      const endpoint = 'https://media.example.com:8889/live/whip';
+      expect(
+        whipSessionSharesOrigin(
+          endpoint,
+          'https://media.example.com:8889/live/whip/session/1',
+        ),
+        isTrue,
+      );
+      expect(
+        whipSessionSharesOrigin(endpoint, 'https://other.example.com:8889/s/1'),
+        isFalse,
+      );
+      expect(
+        whipSessionSharesOrigin(endpoint, 'http://media.example.com:8889/s/1'),
+        isFalse,
+      );
+      expect(
+        whipSessionSharesOrigin(endpoint, 'https://media.example.com/s/1'),
+        isFalse,
+      );
+      expect(
+        whipSessionSharesOrigin(
+          'https://media.example.com/live/whip',
+          'https://MEDIA.example.com:443/s/1',
+        ),
+        isTrue,
+      );
+    });
+
+    test('duration listenable starts at zero', () async {
+      final service = WhipPublisherService();
+      expect(service.durationListenable.value, Duration.zero);
       await service.dispose();
     });
   });

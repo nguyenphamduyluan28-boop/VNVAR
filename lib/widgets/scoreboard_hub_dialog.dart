@@ -3,6 +3,7 @@ import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:qr_flutter/qr_flutter.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 
 import '../models/scoreboard_state.dart';
 import '../services/app_language_service.dart';
@@ -172,10 +173,49 @@ class _ScoreboardHubSheetState extends State<ScoreboardHubSheet> {
       appText(context, 'ĐỔI MÃ', 'CHANGE'),
     );
     if (!ok) return;
-    await widget.service.regenerateKey();
+    final String newKey;
+    try {
+      newKey = await widget.service.regenerateKey();
+    } catch (error) {
+      if (!mounted) return;
+      _showMessage(
+        appText(
+          context,
+          'Không tạo được mã mới. Vui lòng thử lại.',
+          'Unable to create a new code. Please try again.',
+        ),
+        error: true,
+      );
+      return;
+    }
+    // regenerateKey() nuốt lỗi lưu mã và không trả kết quả lưu: đọc lại bộ
+    // nhớ để phát hiện trường hợp không mở được/không ghi được
+    // SharedPreferences (khi đó mở lại app sẽ quay về mã cũ). Lỗi ghi xuống
+    // đĩa sau khi cache đã cập nhật thì vẫn chưa phát hiện được từ đây.
+    final saved = await _isControlKeySaved(newKey);
     if (!mounted) return;
     setState(() {});
-    _showMessage(appText(context, 'Đã tạo mã mới', 'New code created'));
+    if (saved) {
+      _showMessage(appText(context, 'Đã tạo mã mới', 'New code created'));
+    } else {
+      _showMessage(
+        appText(
+          context,
+          'Đã đổi mã nhưng chưa lưu được vào máy. Mã có thể quay về mã cũ khi mở lại ứng dụng.',
+          'Code changed but could not be saved. It may revert after the app restarts.',
+        ),
+        error: true,
+      );
+    }
+  }
+
+  Future<bool> _isControlKeySaved(String key) async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      return prefs.getString(widget.service.controlKeyStorageKey) == key;
+    } catch (_) {
+      return false;
+    }
   }
 
   @override
@@ -274,6 +314,7 @@ class _ScoreboardHubSheetState extends State<ScoreboardHubSheet> {
                   ),
                 ),
                 IconButton(
+                  tooltip: appText(context, 'Đóng', 'Close'),
                   onPressed: () => Navigator.of(context).maybePop(),
                   icon: const Icon(Icons.close_rounded, color: Colors.white70),
                 ),

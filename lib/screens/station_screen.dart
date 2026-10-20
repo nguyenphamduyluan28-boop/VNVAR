@@ -12,17 +12,21 @@ import '../services/camera_station_foreground_service.dart';
 import '../services/app_language_service.dart';
 import '../services/camera_server.dart';
 import '../services/camera_station_runtime.dart';
-import '../services/recording_service.dart';
 import '../services/station_config_service.dart';
 import '../services/station_display_service.dart';
+import '../services/station_errors.dart';
 import '../services/station_platform_events.dart';
 import '../services/whip_publisher_service.dart';
 import '../services/rtsp_publisher_service.dart';
-import 'package:wakelock_plus/wakelock_plus.dart';
 import '../widgets/scoreboard_hub_dialog.dart';
+import 'station/station_ui_logic.dart';
 import 'setup_screen.dart';
 import 'video_storage_screen.dart';
 import 'live_stream_screen.dart';
+
+part 'station/station_camera_controls.dart';
+part 'station/station_overlay_widgets.dart';
+part 'station/station_resolution_sheet.dart';
 
 @visibleForTesting
 bool shouldSuspendIosCapture(AppLifecycleState state) {
@@ -92,6 +96,23 @@ class StationScreen extends StatefulWidget {
 // STATE
 // ============================================================
 
+/// Yêu cầu zoom đưa vào hàng đợi latest-wins: [quick] = nút chọn nhanh
+/// (0.5×/1×/2×/5×), ngược lại là thanh trượt/nút bước.
+@immutable
+class _ZoomRequest {
+  const _ZoomRequest(this.value, {required this.quick});
+
+  final double value;
+  final bool quick;
+
+  @override
+  bool operator ==(Object other) =>
+      other is _ZoomRequest && other.value == value && other.quick == quick;
+
+  @override
+  int get hashCode => Object.hash(value, quick);
+}
+
 class _StationScreenState extends State<StationScreen>
     with WidgetsBindingObserver {
   static const MethodChannel _platformChannel = MethodChannel(
@@ -103,17 +124,65 @@ class _StationScreenState extends State<StationScreen>
   StreamSubscription<WhipPublishState>? _whipSubscription;
   StreamSubscription<RtspPublishState>? _rtspSubscription;
 
+  /// Trạng thái RTSP/WHIP đã hiển thị lần trước: onStateChanged phát mỗi giây
+  /// (thời lượng live), chỉ dựng lại màn hình khi trạng thái/lỗi/ý định phát
+  /// thật sự thay đổi. Đồng hồ LIVE tự cập nhật qua durationListenable.
+  Object? _lastRtspSignature;
+  Object? _lastWhipSignature;
+
   bool _loading = true;
-  String? _error;
+
+  /// Lỗi khởi tạo (đối tượng lỗi gốc); thông báo được dịch lúc build theo
+  /// ngôn ngữ đang chọn.
+  Object? _error;
+
+  /// Cấu hình mới đã chọn nhưng khởi động lỗi. "Thử lại" và lần tự khởi tạo
+  /// lại của runtime đều dùng cấu hình này; chỉ lưu khi chạy được.
+  StationIdentity? _pendingIdentity;
+
+  /// Đã rời app (paused/hidden) trong lúc đang ở màn lỗi: khi quay lại mà lỗi
+  /// là thiếu quyền thì tự thử khởi tạo lại một lần (người dùng có thể vừa
+  /// cấp quyền trong Cài đặt).
+  bool _leftAppSinceError = false;
+  bool _handlingRuntimeRecovery = false;
+
   int _cameraQuarterTurns = 0;
   bool _cameraSwitching = false;
-  bool _lensSwitching = false;
+
+  /// Đang đổi camera trước/sau.
+  bool _facingSwitching = false;
+
+  /// Thao tác zoom đang đổi ống kính vật lý (siêu rộng ↔ chính). Chỉ thao tác
+  /// đặt cờ mới được xoá cờ (hàng đợi zoom chạy tuần tự).
+  bool _zoomLensSwitching = false;
+  bool get _lensSwitching => _facingSwitching || _zoomLensSwitching;
+
   bool _screenDimmed = false;
   bool _screenDimSwitching = false;
   String? _lastShownRtspError;
-  String _viewerAddress = 'Đang kiểm tra mạng...';
   Timer? _zoomDebounce;
   double? _zoomValue;
+
+  /// Zoom/đổi ống kính chạy tuần tự, chỉ giữ yêu cầu mới nhất: bấm chồng
+  /// nhiều nút không còn cho kết quả không xác định.
+  late final LatestWinsRunner<_ZoomRequest> _zoomRunner =
+      LatestWinsRunner<_ZoomRequest>(
+        _applyZoomRequest,
+        onError: _handleZoomError,
+      );
+
+  /// Độ sáng (EV) người dùng vừa chọn, chưa áp dụng xong. Bước kế tiếp tính
+  /// từ giá trị này nên bấm nhanh liên tiếp không bị mất bước.
+  double? _pendingEv;
+  late final LatestWinsRunner<double> _exposureRunner =
+      LatestWinsRunner<double>(
+        (ev) => _runtime.setExposureBias(ev),
+        onError: _handleExposureError,
+        onIdle: () {
+          if (mounted) setState(() => _pendingEv = null);
+        },
+      );
+
   String _screenOrientation = 'landscape';
   bool _isCurrentLayoutLandscape = true;
 
@@ -131,8 +200,10 @@ class _StationScreenState extends State<StationScreen>
     _previewRestTimer?.cancel();
     _previewRestTimer = Timer(_previewRestDelay, () {
       if (!mounted || _previewResting) return;
-      // Đang PiP: hình nhỏ vẫn hiện; thử lại sau.
-      if (_isInPipMode) {
+      // Đang PiP (hình nhỏ vẫn hiện), đang khởi động/lỗi, hoặc màn hình
+      // Station đang bị màn khác/hộp thoại che: không nghỉ, thử lại sau.
+      final routeCurrent = ModalRoute.of(context)?.isCurrent ?? true;
+      if (_isInPipMode || _loading || _error != null || !routeCurrent) {
         _schedulePreviewRest();
         return;
       }
@@ -166,6 +237,27 @@ class _StationScreenState extends State<StationScreen>
   bool get _cameraReady =>
       _runtime.cameraEnabled &&
       (_runtime.webRtcService?.cameraInitialized ?? false);
+
+  /// Ngôn ngữ đang chọn (cùng nguồn với [appText]).
+  bool get _english => AppLanguageScope.of(context).isEnglish;
+
+  /// Thông báo lỗi cho người dùng theo ngôn ngữ đang chọn (đã rút gọn).
+  String _errorText(Object error) =>
+      compactErrorText(stationErrorMessage(error, english: _english));
+
+  /// Cấu hình mà "Thử lại" sẽ khởi động.
+  StationIdentity get _targetIdentity => _pendingIdentity ?? widget.identity;
+
+  /// Gọi kênh native không chờ kết quả; lỗi chỉ ghi log.
+  void _invokePlatformQuietly(String method, [Object? arguments]) {
+    unawaited(
+      _platformChannel.invokeMethod<void>(method, arguments).catchError((
+        Object error,
+      ) {
+        debugPrint('[PLATFORM] $method thất bại: $error');
+      }),
+    );
+  }
 
   void _showStationToast(
     String message, {
@@ -288,7 +380,35 @@ class _StationScreenState extends State<StationScreen>
     }
   }
 
-  Future<void> _quickSelectZoom(double target) async {
+  /// Nút chọn nhanh zoom: xếp vào hàng đợi latest-wins (bấm 2× rồi 5× liên
+  /// tiếp thì chỉ 5× được áp dụng sau thao tác đang chạy).
+  void _quickSelectZoom(double target) {
+    _zoomDebounce?.cancel();
+    setState(() => _zoomValue = target);
+    unawaited(_zoomRunner.submit(_ZoomRequest(target, quick: true)));
+  }
+
+  void _changeZoom(double value) {
+    setState(() => _zoomValue = value);
+    _zoomDebounce?.cancel();
+    _zoomDebounce = Timer(const Duration(milliseconds: 60), () {
+      if (!mounted) return;
+      unawaited(_zoomRunner.submit(_ZoomRequest(value, quick: false)));
+    });
+  }
+
+  Future<void> _applyZoomRequest(_ZoomRequest request) {
+    return request.quick
+        ? _performQuickSelectZoom(request.value)
+        : _performZoomChange(request.value);
+  }
+
+  void _setZoomLensSwitching(bool switching) {
+    if (!mounted || _zoomLensSwitching == switching) return;
+    setState(() => _zoomLensSwitching = switching);
+  }
+
+  Future<void> _performQuickSelectZoom(double target) async {
     final webRtc = _runtime.webRtcService;
     if (webRtc == null) return;
 
@@ -302,81 +422,115 @@ class _StationScreenState extends State<StationScreen>
             webRtc.activeCameraId != webRtc.mainBackCamera!.id) ||
         (webRtc.currentFacingMode == 'user');
 
-    if (willSwitchHardware) {
-      setState(() => _lensSwitching = true);
-    }
+    if (willSwitchHardware) _setZoomLensSwitching(true);
     try {
       if (target < 0.95) {
         if (webRtc.hasUltraWideCamera) {
           await _runtime.switchToLensMode('ultra_wide');
           final actualRatio = webRtc.ultraWideZoomRatio;
           await _runtime.setCameraZoom(actualRatio);
-          if (mounted) {
-            setState(() => _zoomValue = actualRatio);
-          }
+          _showZoomResult(actualRatio);
         } else {
           await _runtime.setCameraZoom(target);
-          if (mounted) setState(() => _zoomValue = webRtc.cameraZoom);
+          _showZoomResult(webRtc.cameraZoom);
         }
       } else if (target >= 0.95 && target < 1.5) {
         if (webRtc.isCurrentUltraWide || webRtc.currentFacingMode == 'user') {
           await _runtime.switchToLensMode('wide');
         }
         await _runtime.setCameraZoom(1.0);
-        if (mounted) setState(() => _zoomValue = 1.0);
+        _showZoomResult(1.0);
       } else if (target >= 1.5) {
         if (webRtc.isCurrentUltraWide || webRtc.currentFacingMode == 'user') {
           await _runtime.switchToLensMode('wide');
         }
         await _runtime.setCameraZoom(target);
-        if (mounted) setState(() => _zoomValue = target);
+        _showZoomResult(target);
       }
-    } catch (e) {
-      debugPrint('[CAMERA] Quick select zoom error: $e');
     } finally {
-      if (willSwitchHardware && mounted) {
-        setState(() => _lensSwitching = false);
-      }
+      if (willSwitchHardware) _setZoomLensSwitching(false);
     }
   }
 
-  void _changeZoom(double value) {
-    setState(() => _zoomValue = value);
-    _zoomDebounce?.cancel();
-    _zoomDebounce = Timer(const Duration(milliseconds: 60), () async {
-      final webRtc = _runtime.webRtcService;
-      if (webRtc == null) return;
-      try {
-        final willSwitchHardwareToUW = value < 0.95 &&
-            !webRtc.isCurrentUltraWide &&
-            webRtc.ultraWideCamera != null &&
-            webRtc.activeCameraId != webRtc.ultraWideCamera!.id;
-        final willSwitchHardwareToWide = value >= 0.95 &&
-            webRtc.isCurrentUltraWide &&
-            webRtc.mainBackCamera != null &&
-            webRtc.activeCameraId != webRtc.mainBackCamera!.id;
+  Future<void> _performZoomChange(double value) async {
+    final webRtc = _runtime.webRtcService;
+    if (webRtc == null) return;
+    final willSwitchHardwareToUW = value < 0.95 &&
+        !webRtc.isCurrentUltraWide &&
+        webRtc.ultraWideCamera != null &&
+        webRtc.activeCameraId != webRtc.ultraWideCamera!.id;
+    final willSwitchHardwareToWide = value >= 0.95 &&
+        webRtc.isCurrentUltraWide &&
+        webRtc.mainBackCamera != null &&
+        webRtc.activeCameraId != webRtc.mainBackCamera!.id;
 
-        if (willSwitchHardwareToUW) {
-          setState(() => _lensSwitching = true);
-          try {
-            await _runtime.switchToLensMode('ultra_wide');
-          } finally {
-            if (mounted) setState(() => _lensSwitching = false);
-          }
-        } else if (willSwitchHardwareToWide) {
-          setState(() => _lensSwitching = true);
-          try {
-            await _runtime.switchToLensMode('wide');
-          } finally {
-            if (mounted) setState(() => _lensSwitching = false);
-          }
-        }
-        await _runtime.setCameraZoom(value);
-        if (mounted) setState(() => _zoomValue = value);
-      } catch (error) {
-        debugPrint('[CAMERA] Cannot set zoom: $error');
+    if (willSwitchHardwareToUW) {
+      _setZoomLensSwitching(true);
+      try {
+        await _runtime.switchToLensMode('ultra_wide');
+      } finally {
+        _setZoomLensSwitching(false);
       }
-    });
+    } else if (willSwitchHardwareToWide) {
+      _setZoomLensSwitching(true);
+      try {
+        await _runtime.switchToLensMode('wide');
+      } finally {
+        _setZoomLensSwitching(false);
+      }
+    }
+    await _runtime.setCameraZoom(value);
+    _showZoomResult(value);
+  }
+
+  /// Người dùng đã chọn mức zoom mới (còn chờ trong hàng đợi hoặc đang kéo
+  /// thanh trượt): kết quả của thao tác vừa chạy xong đã lỗi thời.
+  bool get _zoomResultStale =>
+      _zoomRunner.hasPending || (_zoomDebounce?.isActive ?? false);
+
+  /// Hiển thị kết quả zoom thật sau khi áp dụng, trừ khi đã có yêu cầu mới
+  /// hơn: khi đó UI giữ giá trị mục tiêu mới nhất của người dùng (tránh thanh
+  /// zoom nhảy về giá trị cũ rồi lại nhảy tới giá trị mới).
+  void _showZoomResult(double? value) {
+    if (!mounted || _zoomResultStale) return;
+    setState(() => _zoomValue = value);
+  }
+
+  void _handleZoomError(Object error, StackTrace stackTrace) {
+    debugPrint('[CAMERA] Không đổi được zoom/ống kính: $error');
+    if (!mounted) return;
+    // Hiển thị lại mức zoom thật của camera thay vì giá trị vừa chọn (trừ khi
+    // còn yêu cầu mới hơn đang chờ áp dụng).
+    _showZoomResult(_runtime.webRtcService?.cameraZoom);
+    final reason = _errorText(error);
+    _showStationToast(
+      appText(
+        context,
+        'Không đổi được zoom/ống kính: $reason',
+        'Unable to change zoom/lens: $reason',
+      ),
+      isError: true,
+    );
+  }
+
+  /// Độ sáng: giữ giá trị chờ ở UI, áp dụng tuần tự (latest-wins).
+  void _changeExposure(double ev) {
+    setState(() => _pendingEv = ev);
+    unawaited(_exposureRunner.submit(ev));
+  }
+
+  void _handleExposureError(Object error, StackTrace stackTrace) {
+    debugPrint('[CAMERA] Không chỉnh được độ sáng: $error');
+    if (!mounted) return;
+    final reason = _errorText(error);
+    _showStationToast(
+      appText(
+        context,
+        'Không chỉnh được độ sáng: $reason',
+        'Unable to adjust exposure: $reason',
+      ),
+      isError: true,
+    );
   }
 
   void _showRtspWarningIfNeeded() {
@@ -396,8 +550,9 @@ class _StationScreenState extends State<StationScreen>
   }
 
   Future<void> _switchCameraLens() async {
-    if (_lensSwitching || !_cameraReady) return;
-    setState(() => _lensSwitching = true);
+    if (_lensSwitching || _zoomRunner.busy || !_cameraReady) return;
+    _zoomDebounce?.cancel();
+    setState(() => _facingSwitching = true);
     try {
       await _runtime.switchCamera();
       if (mounted) {
@@ -414,10 +569,21 @@ class _StationScreenState extends State<StationScreen>
       }
     } catch (error) {
       debugPrint('[CAMERA] Bỏ qua yêu cầu đổi camera: $error');
+      if (mounted) {
+        final reason = _errorText(error);
+        _showStationToast(
+          appText(
+            context,
+            'Không đổi được camera: $reason',
+            'Unable to switch camera: $reason',
+          ),
+          isError: true,
+        );
+      }
     } finally {
       if (mounted) {
         setState(() {
-          _lensSwitching = false;
+          _facingSwitching = false;
           _zoomValue = null;
         });
       }
@@ -447,21 +613,17 @@ class _StationScreenState extends State<StationScreen>
           _screenDimmed = _runtime.autoScreenDimmed;
         }
         if (!_lensSwitching &&
+            !_zoomRunner.busy &&
             (_zoomDebounce == null || !_zoomDebounce!.isActive)) {
           _zoomValue = _runtime.webRtcService?.cameraZoom;
         }
-        final address = _runtime.lanAddress;
-        final port =
-            _runtime.cameraServer?.apiPort ?? CameraServer.defaultApiPort;
-        _viewerAddress = address == null
-            ? 'Chưa kết nối Wi-Fi'
-            : 'http://$address:$port/viewer';
       });
       _showRtspWarningIfNeeded();
+      _syncInitErrorFromRuntime();
     });
 
+    // Wakelock do runtime quản lý (bật khi khởi tạo xong, tắt khi dừng).
     unawaited(_initScreenOrientation());
-    unawaited(WakelockPlus.enable());
     if (Platform.isAndroid) {
       StationPlatformEvents.instance.addListener(this, (call) async {
         if (call.method == 'onDisplayRotationChanged') {
@@ -481,17 +643,41 @@ class _StationScreenState extends State<StationScreen>
       });
       unawaited(_checkInitialPipMode());
     }
+    // onStateChanged phát mỗi giây khi đang live (thời lượng): chỉ dựng lại
+    // màn hình khi trạng thái/lỗi/ý định phát thay đổi.
+    _lastWhipSignature = _whipSignature();
+    _lastRtspSignature = _rtspSignature();
     _whipSubscription =
         _runtime.whipPublisherService.onStateChanged.listen((_) {
+      final signature = _whipSignature();
+      if (signature == _lastWhipSignature) return;
+      _lastWhipSignature = signature;
       if (mounted) setState(() {});
     });
     _rtspSubscription =
         _runtime.rtspPublisherService.onStateChanged.listen((_) {
+      final signature = _rtspSignature();
+      if (signature == _lastRtspSignature) return;
+      _lastRtspSignature = signature;
       if (mounted) setState(() {});
     });
 
     _initialize();
-    _loadViewerAddress();
+  }
+
+  Object _whipSignature() {
+    final whip = _runtime.whipPublisherService;
+    return (whip.state, whip.currentError, whip.wantsPublishing);
+  }
+
+  Object _rtspSignature() {
+    final rtsp = _runtime.rtspPublisherService;
+    return (
+      rtsp.state,
+      rtsp.currentError,
+      rtsp.wantsPublishing,
+      rtsp.networkQuality,
+    );
   }
 
   @override
@@ -504,9 +690,15 @@ class _StationScreenState extends State<StationScreen>
       // sai giá trị).
       _appResumed = false;
 
+      // Rời hẳn app (không chỉ hộp thoại xin quyền làm app `inactive`) trong
+      // lúc đang ở màn lỗi: có thể người dùng đi cấp quyền trong Cài đặt.
+      if (_error != null && state != AppLifecycleState.inactive) {
+        _leftAppSinceError = true;
+      }
+
       // Khóa cứng ở tầng Android native ngay lập tức khi vuốt thanh thông báo hoặc tắt màn hình
       if (Platform.isAndroid) {
-        unawaited(_platformChannel.invokeMethod('lockOrientationForBackground'));
+        _invokePlatformQuietly('lockOrientationForBackground');
       }
 
       // Nếu người dùng đã chọn landscape/portrait cố định → luôn khóa theo
@@ -532,14 +724,13 @@ class _StationScreenState extends State<StationScreen>
       _wakePreview();
       if (Platform.isAndroid) {
         unawaited(_checkInitialPipMode());
-        unawaited(
-          _platformChannel.invokeMethod('setScreenOrientation', {
-            'mode': _screenOrientation,
-          }),
-        );
+        _invokePlatformQuietly('setScreenOrientation', {
+          'mode': _screenOrientation,
+        });
       }
       // Khôi phục hướng màn hình theo cấu hình người dùng
       unawaited(_applyScreenOrientation(_screenOrientation));
+      _retryAfterPermissionSettingsIfNeeded();
     }
 
     if (!Platform.isIOS) return;
@@ -555,6 +746,75 @@ class _StationScreenState extends State<StationScreen>
     if (shouldSuspendIosCapture(state)) {
       unawaited(_suspendIosCapture());
     }
+  }
+
+  /// Quay lại app khi đang ở màn lỗi thiếu quyền: tự thử khởi tạo lại MỘT
+  /// lần (người dùng có thể vừa cấp quyền trong Cài đặt).
+  void _retryAfterPermissionSettingsIfNeeded() {
+    final error = _error;
+    if (!_leftAppSinceError || _loading || error == null) return;
+    _leftAppSinceError = false;
+    if (!_isPermissionError(error)) return;
+    debugPrint('[STATION] Quay lại app từ màn lỗi quyền: thử khởi tạo lại');
+    unawaited(_retry());
+  }
+
+  bool _isPermissionError(Object error) =>
+      isPermissionDeniedError(error) || _runtime.initPermissionDenied;
+
+  /// Runtime tự khởi tạo lại (backoff) trong lúc màn hình đang báo lỗi: cập
+  /// nhật lỗi mới nhất, hoặc rời màn lỗi khi runtime đã chạy lại được.
+  void _syncInitErrorFromRuntime() {
+    if (_loading || _error == null || _handlingRuntimeRecovery) return;
+    final runtimeError = _runtime.lastInitError;
+    if (runtimeError != null) {
+      if (!identical(runtimeError, _error)) {
+        setState(() => _error = runtimeError);
+      }
+      return;
+    }
+    if (_runtime.ready) unawaited(_handleRuntimeRecovered());
+  }
+
+  Future<void> _handleRuntimeRecovered() async {
+    _handlingRuntimeRecovery = true;
+    try {
+      debugPrint('[STATION] Runtime đã tự khởi tạo lại thành công');
+      setState(() {
+        _error = null;
+        _leftAppSinceError = false;
+      });
+      final identity = _targetIdentity;
+      // Khởi tạo lỗi đã dừng foreground service: bật lại khi camera đã chạy.
+      await _startForegroundServiceAfterCamera(identity);
+      await _commitPendingIdentity(identity);
+      if (!mounted) return;
+      _showStationToast(
+        appText(
+          context,
+          'Camera Station đã tự khởi động lại thành công.',
+          'Camera Station restarted automatically.',
+        ),
+        isSuccess: true,
+      );
+    } finally {
+      _handlingRuntimeRecovery = false;
+    }
+  }
+
+  /// Cấu hình mới (đã chọn nhưng lần khởi động trước lỗi) vừa chạy được:
+  /// lưu lại và báo lên trên.
+  Future<void> _commitPendingIdentity(StationIdentity identity) async {
+    final pending = _pendingIdentity;
+    if (pending == null || pending != identity) return;
+    _pendingIdentity = null;
+    try {
+      await StationConfigService().saveIdentity(pending);
+    } catch (error) {
+      debugPrint('[CONFIG] Không thể lưu cấu hình mới: $error');
+    }
+    if (!mounted) return;
+    widget.onIdentityChanged(pending);
   }
 
   Future<void> _initScreenOrientation() async {
@@ -577,11 +837,7 @@ class _StationScreenState extends State<StationScreen>
       // của Flutter có thể đến chậm, nhưng Android native onPause() chạy
       // trước lifecycle callback nên sẽ dùng giá trị đã lưu.
       if (Platform.isAndroid) {
-        unawaited(
-          _platformChannel.invokeMethod('setScreenOrientation', {
-            'mode': mode,
-          }),
-        );
+        _invokePlatformQuietly('setScreenOrientation', {'mode': mode});
       }
     } catch (error) {
       debugPrint('[ORIENTATION] Không thể thiết lập hướng màn hình: $error');
@@ -667,49 +923,23 @@ class _StationScreenState extends State<StationScreen>
     }
   }
 
-  Future<void> _loadViewerAddress() async {
-    var result = 'Chưa kết nối Wi-Fi';
-    final apiPort =
-        _runtime.cameraServer?.apiPort ?? CameraServer.defaultApiPort;
-    try {
-      if (Platform.isIOS) {
-        final wifiIp = await _platformChannel
-            .invokeMethod<String>('getWifiIpAddress')
-            .timeout(const Duration(seconds: 2));
-        if (wifiIp != null && wifiIp.isNotEmpty) {
-          result = 'http://$wifiIp:$apiPort/viewer';
-        }
-        if (mounted) setState(() => _viewerAddress = result);
-        return;
-      }
-      final interfaces = await NetworkInterface.list(
-        type: InternetAddressType.IPv4,
-        includeLoopback: false,
+  /// Địa chỉ trang xem cho Tablet, dịch theo ngôn ngữ hiện tại. Lấy từ
+  /// runtime (đã chọn đúng giao diện LAN, kể cả iOS).
+  String _viewerAddressText() {
+    final address = _runtime.lanAddress;
+    if (address != null) {
+      final port =
+          _runtime.cameraServer?.apiPort ?? CameraServer.defaultApiPort;
+      return 'http://$address:$port/viewer';
+    }
+    if (_runtime.networkError != null) {
+      return appText(
+        context,
+        'Không đọc được địa chỉ IP',
+        'Unable to read the IP address',
       );
-      final addresses = interfaces
-          .expand((interface) => interface.addresses)
-          .where((address) => !address.isLoopback && !address.isLinkLocal)
-          .toList();
-      if (addresses.isNotEmpty) {
-        final localAddresses = addresses.where(
-          (address) =>
-              address.address.startsWith('192.168.') ||
-              address.address.startsWith('10.') ||
-              address.address.startsWith('172.'),
-        );
-        final address =
-            (localAddresses.isNotEmpty ? localAddresses.first : addresses.first)
-                .address;
-        result = 'http://$address:$apiPort/viewer';
-      }
-    } catch (_) {
-      result = 'Không đọc được địa chỉ IP';
     }
-    if (mounted) {
-      setState(() {
-        _viewerAddress = result;
-      });
-    }
+    return appText(context, 'Chưa kết nối Wi-Fi', 'No Wi-Fi connection');
   }
 
   Future<void> _reconnectNetwork() async {
@@ -748,11 +978,14 @@ class _StationScreenState extends State<StationScreen>
 
   /// Camera đã chạy: lỗi bật foreground service không được biến thành màn
   /// hình lỗi (camera/server vẫn chạy phía sau). Chỉ cảnh báo người vận hành.
-  Future<void> _startForegroundServiceAfterCamera() async {
+  Future<void> _startForegroundServiceAfterCamera([
+    StationIdentity? identity,
+  ]) async {
+    final target = identity ?? widget.identity;
     try {
       await CameraStationForegroundService.start(
-        cameraId: widget.identity.cameraId,
-        courtId: widget.identity.courtId,
+        cameraId: target.cameraId,
+        courtId: target.courtId,
       );
     } catch (error) {
       debugPrint('[STATION] Không thể bật foreground service: $error');
@@ -831,7 +1064,7 @@ class _StationScreenState extends State<StationScreen>
 
       setState(() {
         _loading = false;
-        _error = userFacingError(error);
+        _error = error;
       });
     }
   }
@@ -841,6 +1074,11 @@ class _StationScreenState extends State<StationScreen>
   // ============================================================
 
   Future<void> _retry() async {
+    if (_loading) return;
+    _leftAppSinceError = false;
+    // Thử lại cấu hình vừa chọn (nếu lần áp dụng trước lỗi), giống lần tự
+    // khởi tạo lại của runtime.
+    final identity = _targetIdentity;
     if (mounted) {
       setState(() {
         _loading = true;
@@ -850,14 +1088,15 @@ class _StationScreenState extends State<StationScreen>
 
     try {
       await _runtime.restart(
-        cameraId: widget.identity.cameraId,
-        courtId: widget.identity.courtId,
-        deviceId: widget.identity.deviceId,
+        cameraId: identity.cameraId,
+        courtId: identity.courtId,
+        deviceId: identity.deviceId,
       );
 
       // Khởi tạo lỗi đã dừng foreground service; bật lại ngay khi camera đã
       // mở (đã có quyền), nếu không Android sẽ cắt camera khi tắt màn hình.
-      await _startForegroundServiceAfterCamera();
+      await _startForegroundServiceAfterCamera(identity);
+      await _commitPendingIdentity(identity);
 
       if (!mounted) {
         return;
@@ -884,16 +1123,31 @@ class _StationScreenState extends State<StationScreen>
 
       setState(() {
         _loading = false;
-        _error = userFacingError(error);
+        _error = error;
       });
     }
   }
 
-  String _formatLiveDuration(Duration d) {
-    final h = d.inHours;
-    final m = d.inMinutes.remainder(60).toString().padLeft(2, '0');
-    final s = d.inSeconds.remainder(60).toString().padLeft(2, '0');
-    return h > 0 ? '$h:$m:$s' : '$m:$s';
+  /// Mở trang Cài đặt của ứng dụng để cấp quyền camera/micro.
+  Future<void> _openAppSettings() async {
+    var opened = false;
+    try {
+      opened =
+          await _platformChannel.invokeMethod<bool>('openAppSettings') ??
+          false;
+    } catch (error) {
+      debugPrint('[STATION] Không mở được Cài đặt ứng dụng: $error');
+    }
+    if (opened || !mounted) return;
+    _showStationToast(
+      appText(
+        context,
+        'Không mở được Cài đặt. Hãy vào Cài đặt > Ứng dụng > VNVAR Camera Station để cấp quyền Camera và Micro.',
+        'Cannot open Settings. Go to Settings > Apps > VNVAR Camera Station and allow Camera and Microphone.',
+      ),
+      isError: true,
+      duration: const Duration(seconds: 5),
+    );
   }
 
   void _openScoreboardHub() {
@@ -948,138 +1202,43 @@ class _StationScreenState extends State<StationScreen>
     }
     final newIdentity = updated;
 
+    final change = classifyStationConfigChange(
+      current: widget.identity,
+      next: newIdentity,
+      stationRunning: _runtime.ready && _error == null,
+    );
+    if (change == StationConfigChange.none) {
+      // Không đổi gì: chỉ đóng màn cài đặt, không khởi động lại camera.
+      return;
+    }
+    if (change == StationConfigChange.metadataOnly) {
+      await _applyMetadataOnlyIdentity(newIdentity);
+      return;
+    }
+    if (!mounted) return;
+
+    // Khởi động lại sẽ cắt ngang segment đang ghi và phiên livestream.
+    final interruptsCapture =
+        _recording ||
+        _runtime.isLiveStreaming ||
+        _runtime.rtspPublisherService.wantsPublishing ||
+        _runtime.whipPublisherService.wantsPublishing;
+
+    final courtLabel = _courtLabel(newIdentity.courtId);
     final confirmed = await showDialog<bool>(
       context: context,
-      builder: (dialogContext) {
-        final media = MediaQuery.of(dialogContext);
-        final landscape = media.orientation == Orientation.landscape;
-        final compactHeight = media.size.height < 480;
-        final identityDetails = landscape
-            ? Row(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Expanded(
-                    child: Column(
-                      mainAxisSize: MainAxisSize.min,
-                      children: [
-                        _ConfigLine(
-                          title: appText(context, 'Tên', 'Name'),
-                          value: newIdentity.cameraName,
-                        ),
-                        _ConfigLine(
-                          title: 'Camera',
-                          value: newIdentity.cameraId,
-                        ),
-                      ],
-                    ),
-                  ),
-                  const SizedBox(width: 16),
-                  Expanded(
-                    child: Column(
-                      mainAxisSize: MainAxisSize.min,
-                      children: [
-                        _ConfigLine(
-                          title: appText(context, 'Sân', 'Court'),
-                          value: _courtLabel(newIdentity.courtId),
-                        ),
-                      ],
-                    ),
-                  ),
-                ],
-              )
-            : Column(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  _ConfigLine(
-                    title: appText(context, 'Tên', 'Name'),
-                    value: newIdentity.cameraName,
-                  ),
-                  _ConfigLine(title: 'Camera', value: newIdentity.cameraId),
-                  _ConfigLine(
-                    title: appText(context, 'Sân', 'Court'),
-                    value: _courtLabel(newIdentity.courtId),
-                  ),
-                ],
-              );
-        return AlertDialog(
-          scrollable: true,
-          insetPadding: EdgeInsets.symmetric(
-            horizontal: landscape ? 32 : 20,
-            vertical: landscape ? 12 : 24,
-          ),
-          iconPadding: EdgeInsets.fromLTRB(20, compactHeight ? 12 : 20, 20, 4),
-          titlePadding: const EdgeInsets.fromLTRB(20, 4, 20, 8),
-          contentPadding: EdgeInsets.fromLTRB(
-            landscape ? 18 : 20,
-            0,
-            landscape ? 18 : 20,
-            compactHeight ? 8 : 14,
-          ),
-          actionsPadding: EdgeInsets.fromLTRB(
-            16,
-            0,
-            16,
-            compactHeight ? 10 : 16,
-          ),
-          shape: RoundedRectangleBorder(
-            borderRadius: BorderRadius.circular(20),
-          ),
-          icon: Icon(
-            Icons.settings_rounded,
-            color: const Color(0xFF1565C0),
-            size: compactHeight ? 30 : 38,
-          ),
-          title: Text(
-            appText(context, 'ÁP DỤNG CẤU HÌNH MỚI?', 'APPLY NEW SETTINGS?'),
-            textAlign: TextAlign.center,
-          ),
-          content: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              Text(
-                appText(
-                  context,
-                  'Camera Station sẽ khởi động lại dịch vụ với cấu hình mới.',
-                  'Camera Station will restart its services with the new settings.',
-                ),
-                textAlign: TextAlign.center,
-              ),
-              SizedBox(height: compactHeight ? 8 : 14),
-              Container(
-                width: double.infinity,
-                padding: EdgeInsets.all(compactHeight ? 9 : 12),
-                decoration: BoxDecoration(
-                  color: const Color(0xFFF4F6F9),
-                  borderRadius: BorderRadius.circular(14),
-                ),
-                child: identityDetails,
-              ),
-            ],
-          ),
-          actionsAlignment: MainAxisAlignment.center,
-          actions: [
-            OutlinedButton(
-              onPressed: () {
-                Navigator.pop(dialogContext, false);
-              },
-              child: Text(appText(context, 'HỦY', 'CANCEL')),
-            ),
-            FilledButton.icon(
-              onPressed: () {
-                Navigator.pop(dialogContext, true);
-              },
-              icon: const Icon(Icons.check_rounded),
-              label: Text(appText(context, 'ÁP DỤNG', 'APPLY')),
-            ),
-          ],
-        );
-      },
+      builder: (_) => _ApplyConfigDialog(
+        identity: newIdentity,
+        courtLabel: courtLabel,
+        interruptsCapture: interruptsCapture,
+      ),
     );
 
     if (confirmed != true || !mounted) {
       return;
     }
 
+    final stationWasRunning = _runtime.ready;
     setState(() {
       _loading = true;
       _error = null;
@@ -1092,21 +1251,38 @@ class _StationScreenState extends State<StationScreen>
         '${newIdentity.cameraId}',
       );
 
-      await _runtime.stop();
+      // Giữ thứ tự cũ: cập nhật foreground service theo sân mới TRƯỚC khi
+      // khởi động lại, nhưng chỉ khi camera đang chạy (Android 14 chỉ cho bật
+      // service loại camera|micro khi app đã có quyền). Lỗi ở bước này không
+      // chặn việc áp dụng cấu hình.
+      var foregroundStarted = false;
+      if (stationWasRunning) {
+        try {
+          await CameraStationForegroundService.start(
+            cameraId: newIdentity.cameraId,
+            courtId: newIdentity.courtId,
+          );
+          foregroundStarted = true;
+        } catch (error) {
+          debugPrint('[CONFIG] Không thể cập nhật foreground service: $error');
+        }
+      }
 
-      await CameraStationForegroundService.start(
-        cameraId: newIdentity.cameraId,
-        courtId: newIdentity.courtId,
-      );
-
-      await _runtime.initialize(
+      // Dừng + khởi tạo trong MỘT thao tác vòng đời của runtime (không để
+      // health monitor/recovery chen vào giữa).
+      await _runtime.restart(
         cameraId: newIdentity.cameraId,
         courtId: newIdentity.courtId,
         deviceId: newIdentity.deviceId,
       );
 
+      if (!foregroundStarted) {
+        await _startForegroundServiceAfterCamera(newIdentity);
+      }
+
       // Chỉ lưu sau khi sân mới chạy được: nếu khởi tạo lỗi, cấu hình đã lưu
-      // vẫn khớp với sân đang hiển thị/"Thử lại" (không gán nhầm sân).
+      // vẫn khớp với sân đang hiển thị.
+      _pendingIdentity = null;
       await StationConfigService().saveIdentity(newIdentity);
 
       if (!mounted) {
@@ -1127,6 +1303,10 @@ class _StationScreenState extends State<StationScreen>
 
       debugPrintStack(stackTrace: stackTrace);
 
+      // Runtime tự thử lại với cấu hình mới; "Thử lại" cũng dùng cấu hình
+      // này. Cấu hình chỉ được lưu khi chạy được.
+      _pendingIdentity = newIdentity;
+
       try {
         await CameraStationForegroundService.stop();
       } catch (stopError) {
@@ -1139,19 +1319,46 @@ class _StationScreenState extends State<StationScreen>
 
       setState(() {
         _loading = false;
-        _error = userFacingError(error);
+        _error = error;
       });
     }
+  }
+
+  /// Chỉ đổi tên/vị trí camera: lưu lại, không khởi động lại camera/server.
+  Future<void> _applyMetadataOnlyIdentity(StationIdentity identity) async {
+    try {
+      await StationConfigService().saveIdentity(identity);
+    } catch (error) {
+      debugPrint('[CONFIG] Không thể lưu cấu hình: $error');
+      if (!mounted) return;
+      _showStationToast(
+        appText(
+          context,
+          'Không thể lưu cấu hình. Vui lòng thử lại sau.',
+          'Cannot save settings. Please try again later.',
+        ),
+        isError: true,
+      );
+      return;
+    }
+    if (!mounted) return;
+    widget.onIdentityChanged(identity);
+    _showStationToast(
+      appText(context, 'Đã lưu cấu hình.', 'Settings saved.'),
+      isSuccess: true,
+    );
   }
 
   Future<void> _openVideoStorage() async {
     final recording = _runtime.recordingService;
     if (recording == null) return;
+    // Chuỗi đã dịch tại thời điểm mở màn Lưu video.
+    final viewerAddress = _viewerAddressText();
     await Navigator.of(context).push<void>(
       MaterialPageRoute(
         builder: (_) => VideoStorageScreen(
           recordingService: recording,
-          viewerAddress: _viewerAddress,
+          viewerAddress: viewerAddress,
         ),
       ),
     );
@@ -1172,7 +1379,13 @@ class _StationScreenState extends State<StationScreen>
       showDragHandle: true,
       isScrollControlled: true,
       constraints: const BoxConstraints(maxWidth: 560),
-      builder: _buildResolutionPicker,
+      builder: (_) => _ResolutionPickerSheet(
+        runtime: _runtime,
+        showToast: _showStationToast,
+        onChanged: () {
+          if (mounted) setState(() {});
+        },
+      ),
     );
     if (!mounted) return;
     _runtime.dismissCooledDownNotice();
@@ -1183,7 +1396,22 @@ class _StationScreenState extends State<StationScreen>
         setState(() {
           _zoomValue = _runtime.webRtcService?.cameraZoom;
         });
-        if (_runtime.thermalUserOverride) {
+        // Máy đang quá nóng (critical): runtime chỉ ghi nhận cấu hình mục
+        // tiêu, chưa đổi camera.
+        final deferredForThermal =
+            _runtime.resolutionProfile != selected &&
+            _runtime.thermalTargetProfile == selected;
+        if (deferredForThermal) {
+          _showStationToast(
+            appText(
+              context,
+              'Máy đang quá nóng: đã ghi nhận ${selected.title}. Sẽ áp dụng khi máy nguội.',
+              'Device is too hot: ${selected.title} saved. It will be applied once the device cools down.',
+            ),
+            icon: Icons.thermostat_rounded,
+            duration: const Duration(seconds: 4),
+          );
+        } else if (_runtime.thermalUserOverride) {
           _showStationToast(
             appText(
               context,
@@ -1195,407 +1423,20 @@ class _StationScreenState extends State<StationScreen>
         }
       }
     } catch (error) {
+      debugPrint('[CAMERA] Không đổi được chất lượng camera: $error');
       if (mounted) {
         _showStationToast(
-          appText(
-            context,
-            'Không thể đổi chất lượng camera lúc này. Vui lòng thử lại sau vài giây.',
-            'Cannot change camera quality right now. Please try again shortly.',
-          ),
+          error is StationException
+              ? error.message(english: _english)
+              : appText(
+                  context,
+                  'Không thể đổi chất lượng camera lúc này. Vui lòng thử lại sau vài giây.',
+                  'Cannot change camera quality right now. Please try again shortly.',
+                ),
           isError: true,
         );
       }
     }
-  }
-
-  Widget _buildResolutionPicker(BuildContext sheetContext) {
-    return StatefulBuilder(
-      builder: (context, setSheetState) {
-        final media = MediaQuery.of(sheetContext);
-        final profiles = _runtime.supportedResolutionProfiles;
-        final landscape = media.orientation == Orientation.landscape;
-        final columns = landscape && media.size.width >= 560 ? 2 : 1;
-        final rows = (profiles.length / columns).ceil();
-        final hasThermalBanner =
-            (_runtime.temperatureC != null && _runtime.temperatureC! >= 38.0) ||
-            _runtime.justCooledDown;
-        final contentHeight = 58.0 +
-            (rows * 88.0) +
-            ((rows - 1) * 10.0) +
-            (hasThermalBanner ? 52.0 : 16.0);
-        final maximumHeight = (media.size.height * (landscape ? 0.85 : 0.65)).clamp(
-          240.0,
-          480.0,
-        );
-        final sheetHeight = contentHeight < maximumHeight
-            ? contentHeight
-            : maximumHeight;
-        final isLocked = _runtime.resolutionLocked;
-
-        return SafeArea(
-          child: SizedBox(
-            height: sheetHeight,
-            child: Padding(
-              padding: const EdgeInsets.fromLTRB(16, 0, 16, 16),
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Row(
-                    children: [
-                      Expanded(
-                        child: Text(
-                          appText(context, 'CHẤT LƯỢNG CAMERA', 'CAMERA QUALITY'),
-                          style: const TextStyle(
-                            color: Colors.white,
-                            fontSize: 16,
-                            fontWeight: FontWeight.w900,
-                          ),
-                        ),
-                      ),
-                      Material(
-                        color: Colors.transparent,
-                        child: InkWell(
-                          borderRadius: BorderRadius.circular(20),
-                          onTap: () async {
-                            final nextLock = !_runtime.resolutionLocked;
-                            final currentTitle = _runtime.resolutionProfile.title;
-                            final lockMsg = nextLock
-                                ? appText(
-                                    sheetContext,
-                                    'Đã khóa chế độ $currentTitle. Camera sẽ giữ nguyên chất lượng này kể cả khi máy nóng.',
-                                    'Locked $currentTitle. Camera will remain at this quality even when device is hot.',
-                                  )
-                                : appText(
-                                    sheetContext,
-                                    'Đã mở khóa chế độ phân giải. Camera sẽ tự động điều chỉnh khi máy nóng.',
-                                    'Resolution mode unlocked. Camera will automatically adjust when hot.',
-                                  );
-                            try {
-                              await _runtime.setResolutionLocked(nextLock);
-                            } catch (error) {
-                              if (!mounted) return;
-                              _showStationToast(
-                                appText(
-                                  this.context,
-                                  'Không đổi được chế độ khóa: ${userFacingError(error)}',
-                                  'Unable to change lock mode: ${userFacingError(error)}',
-                                ),
-                                isError: true,
-                              );
-                              return;
-                            }
-                            if (!sheetContext.mounted) return;
-                            setSheetState(() {});
-                            if (mounted) {
-                              setState(() {});
-                              _showStationToast(
-                                lockMsg,
-                                icon: nextLock
-                                    ? Icons.lock_rounded
-                                    : Icons.lock_open_rounded,
-                              );
-                            }
-                          },
-                          child: Container(
-                            padding: const EdgeInsets.symmetric(
-                              horizontal: 10,
-                              vertical: 5,
-                            ),
-                            decoration: BoxDecoration(
-                              color: isLocked
-                                  ? const Color(0xFFE65100).withValues(alpha: 0.25)
-                                  : Colors.white.withValues(alpha: 0.08),
-                              borderRadius: BorderRadius.circular(20),
-                              border: Border.all(
-                                color: isLocked
-                                    ? const Color(0xFFFF9800)
-                                    : Colors.white24,
-                                width: 1.2,
-                              ),
-                            ),
-                            child: Row(
-                              mainAxisSize: MainAxisSize.min,
-                              children: [
-                                Icon(
-                                  isLocked
-                                      ? Icons.lock_rounded
-                                      : Icons.lock_open_rounded,
-                                  size: 14,
-                                  color: isLocked
-                                      ? const Color(0xFFFFB74D)
-                                      : Colors.white70,
-                                ),
-                                const SizedBox(width: 5),
-                                Text(
-                                  isLocked
-                                      ? appText(context, 'Đã khóa', 'Locked')
-                                      : appText(context, 'Khóa chế độ', 'Lock mode'),
-                                  style: TextStyle(
-                                    color: isLocked
-                                        ? const Color(0xFFFFB74D)
-                                        : Colors.white70,
-                                    fontSize: 12,
-                                    fontWeight: FontWeight.w700,
-                                  ),
-                                ),
-                              ],
-                            ),
-                          ),
-                        ),
-                      ),
-                    ],
-                  ),
-                  if (hasThermalBanner) ...[
-                    const SizedBox(height: 8),
-                    Container(
-                      padding: const EdgeInsets.symmetric(
-                        horizontal: 10,
-                        vertical: 6,
-                      ),
-                      decoration: BoxDecoration(
-                        color: _runtime.justCooledDown
-                            ? const Color(0xFF00C853).withValues(alpha: 0.15)
-                            : _runtime.thermalWarning
-                                ? const Color(0xFFC62828).withValues(alpha: 0.18)
-                                : const Color(0xFFE65100).withValues(alpha: 0.15),
-                        borderRadius: BorderRadius.circular(8),
-                        border: Border.all(
-                          color: _runtime.justCooledDown
-                              ? const Color(0xFF00E676).withValues(alpha: 0.35)
-                              : _runtime.thermalWarning
-                                  ? const Color(0xFFEF5350).withValues(alpha: 0.35)
-                                  : const Color(0xFFFF9800).withValues(alpha: 0.3),
-                        ),
-                      ),
-                      child: Row(
-                        children: [
-                          Icon(
-                            _runtime.justCooledDown
-                                ? Icons.ac_unit_rounded
-                                : _runtime.thermalWarning
-                                    ? Icons.whatshot_rounded
-                                    : Icons.thermostat_rounded,
-                            size: 15,
-                            color: _runtime.justCooledDown
-                                ? const Color(0xFF69F0AE)
-                                : _runtime.thermalWarning
-                                    ? const Color(0xFFFF8A80)
-                                    : const Color(0xFFFFB74D),
-                          ),
-                          const SizedBox(width: 8),
-                          Expanded(
-                            child: Text(
-                              _runtime.justCooledDown
-                                  ? appText(
-                                      context,
-                                      'Thiết bị đã hạ nhiệt an toàn (${_runtime.temperatureC?.toStringAsFixed(0) ?? ''}°C). Bạn có thể chọn lại độ phân giải mong muốn.',
-                                      'Device has cooled down (${_runtime.temperatureC?.toStringAsFixed(0) ?? ''}°C). You can re-select your preferred quality.',
-                                    )
-                                  : _runtime.thermalWarning
-                                      ? appText(
-                                          context,
-                                          'Thiết bị đang nóng (${_runtime.temperatureC?.toStringAsFixed(0)}°C). Bạn vẫn có thể chủ động chọn độ phân giải theo ý muốn.',
-                                          'Device is warm (${_runtime.temperatureC?.toStringAsFixed(0)}°C). You can still choose your preferred quality.',
-                                        )
-                                      : appText(
-                                          context,
-                                          'Nhiệt độ hiện tại: ${_runtime.temperatureC?.toStringAsFixed(0)}°C.',
-                                          'Current temperature: ${_runtime.temperatureC?.toStringAsFixed(0)}°C.',
-                                        ),
-                              style: TextStyle(
-                                color: _runtime.justCooledDown
-                                    ? const Color(0xFFB9F6CA)
-                                    : _runtime.thermalWarning
-                                        ? const Color(0xFFFFCDD2)
-                                        : const Color(0xFFFFE0B2),
-                                fontSize: 11.5,
-                              ),
-                            ),
-                          ),
-                        ],
-                      ),
-                    ),
-                  ],
-                  const SizedBox(height: 10),
-                  Expanded(
-                    child: GridView.builder(
-                      padding: EdgeInsets.zero,
-                      itemCount: profiles.length,
-                      gridDelegate: SliverGridDelegateWithFixedCrossAxisCount(
-                        crossAxisCount: columns,
-                        crossAxisSpacing: 10,
-                        mainAxisSpacing: 10,
-                        mainAxisExtent: 88,
-                      ),
-                      itemBuilder: (context, index) {
-                        final profile = profiles[index];
-                        final active = profile == _runtime.resolutionProfile;
-                        final displayProfile = profile;
-                        return Material(
-                          color: active
-                              ? const Color(0xFF1565C0)
-                              : isLocked
-                                  ? const Color(0xFF15181E)
-                                  : const Color(0xFF1A2028),
-                          borderRadius: BorderRadius.circular(14),
-                          child: InkWell(
-                            borderRadius: BorderRadius.circular(14),
-                            onTap: active
-                                ? null
-                                : () {
-                                    if (isLocked) {
-                                      _showStationToast(
-                                        appText(
-                                          context,
-                                          'Chế độ phân giải đang khóa. Vui lòng bấm nút mở khóa ở góc trên để đổi.',
-                                          'Resolution mode is locked. Please unlock using the top button to change.',
-                                        ),
-                                        icon: Icons.lock_rounded,
-                                      );
-                                      return;
-                                    }
-                                    Navigator.pop(sheetContext, profile);
-                                  },
-                            child: Container(
-                              decoration: BoxDecoration(
-                                borderRadius: BorderRadius.circular(14),
-                                border: Border.all(
-                                  color: active
-                                      ? const Color(0xFF64B5F6)
-                                      : Colors.white.withValues(alpha: 0.08),
-                                  width: active ? 1.5 : 1.0,
-                                ),
-                                boxShadow: active
-                                    ? [
-                                        BoxShadow(
-                                          color: const Color(0xFF1565C0)
-                                              .withValues(alpha: 0.35),
-                                          blurRadius: 8,
-                                          offset: const Offset(0, 2),
-                                        ),
-                                      ]
-                                    : null,
-                              ),
-                              child: Padding(
-                                padding: const EdgeInsets.symmetric(
-                                  horizontal: 12,
-                                  vertical: 10,
-                                ),
-                                child: Row(
-                                  children: [
-                                    Icon(
-                                      active
-                                          ? Icons.check_circle_rounded
-                                          : isLocked
-                                              ? Icons.lock_outline_rounded
-                                              : Icons.radio_button_unchecked_rounded,
-                                      color: active
-                                          ? Colors.white
-                                          : isLocked
-                                              ? Colors.white24
-                                              : Colors.white38,
-                                    ),
-                                    const SizedBox(width: 10),
-                                    Expanded(
-                                      child: Column(
-                                        mainAxisAlignment:
-                                            MainAxisAlignment.center,
-                                        crossAxisAlignment:
-                                            CrossAxisAlignment.start,
-                                        children: [
-                                          Row(
-                                            children: [
-                                              Expanded(
-                                                child: Text(
-                                                  displayProfile.title,
-                                                  maxLines: 1,
-                                                  overflow:
-                                                      TextOverflow.ellipsis,
-                                                  style: TextStyle(
-                                                    color: isLocked && !active
-                                                        ? Colors.white54
-                                                        : Colors.white,
-                                                    fontWeight: FontWeight.w800,
-                                                  ),
-                                                ),
-                                              ),
-                                              const SizedBox(width: 6),
-                                              Container(
-                                                padding:
-                                                    const EdgeInsets.symmetric(
-                                                  horizontal: 6,
-                                                  vertical: 2,
-                                                ),
-                                                decoration: BoxDecoration(
-                                                  color: displayProfile.fps >=
-                                                          50
-                                                      ? const Color(0xFF00E676)
-                                                          .withValues(
-                                                              alpha: 0.18)
-                                                      : Colors.white
-                                                          .withValues(
-                                                              alpha: 0.08),
-                                                  borderRadius:
-                                                      BorderRadius.circular(6),
-                                                  border: Border.all(
-                                                    color: displayProfile.fps >=
-                                                            50
-                                                        ? const Color(
-                                                                0xFF00E676)
-                                                            .withValues(
-                                                                alpha: 0.5)
-                                                        : Colors.white24,
-                                                    width: 0.8,
-                                                  ),
-                                                ),
-                                                child: Text(
-                                                  '${displayProfile.fps} FPS',
-                                                  style: TextStyle(
-                                                    color: displayProfile.fps >=
-                                                            50
-                                                        ? const Color(
-                                                            0xFF69F0AE)
-                                                        : Colors.white70,
-                                                    fontSize: 10.5,
-                                                    fontWeight:
-                                                        FontWeight.w800,
-                                                  ),
-                                                ),
-                                              ),
-                                            ],
-                                          ),
-                                          const SizedBox(height: 4),
-                                          Text(
-                                            '${displayProfile.width} × ${displayProfile.height}  •  '
-                                            '${(displayProfile.bitrate / 1000000).toStringAsFixed(1)} Mbps',
-                                            maxLines: 1,
-                                            overflow: TextOverflow.ellipsis,
-                                            style: TextStyle(
-                                              color: isLocked && !active
-                                                  ? Colors.white30
-                                                  : Colors.white60,
-                                              fontSize: 12,
-                                            ),
-                                          ),
-                                        ],
-                                      ),
-                                    ),
-                                  ],
-                                ),
-                              ),
-                            ),
-                          ),
-                        );
-                      },
-                    ),
-                  ),
-                ],
-              ),
-            ),
-          ),
-        );
-      },
-    );
   }
 
   void _handleResolutionPressed() {
@@ -1619,7 +1460,7 @@ class _StationScreenState extends State<StationScreen>
       return courtId;
     }
 
-    return 'SÂN $number';
+    return appText(context, 'SÂN $number', 'COURT $number');
   }
 
   // ============================================================
@@ -1650,6 +1491,8 @@ class _StationScreenState extends State<StationScreen>
     _whipSubscription?.cancel();
     _rtspSubscription?.cancel();
     _zoomDebounce?.cancel();
+    _zoomRunner.dispose();
+    _exposureRunner.dispose();
     if (_screenDimmed || _runtime.autoScreenDimmed) {
       unawaited(StationDisplayService.setDimmed(false));
     }
@@ -1663,11 +1506,7 @@ class _StationScreenState extends State<StationScreen>
       ]),
     );
     if (Platform.isAndroid) {
-      unawaited(
-        _platformChannel.invokeMethod('setScreenOrientation', {
-          'mode': 'portrait',
-        }),
-      );
+      _invokePlatformQuietly('setScreenOrientation', {'mode': 'portrait'});
     }
     super.dispose();
   }
@@ -1693,66 +1532,25 @@ class _StationScreenState extends State<StationScreen>
   // LOADING
   // ============================================================
 
-  Widget _buildLoading() {
-    return Scaffold(
-      backgroundColor: const Color(0xFF05070A),
-      body: SafeArea(
-        child: Center(
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              Image.asset(
-                'assets/images/vnvar_logo.png',
-                width: 240,
-                height: 54,
-                fit: BoxFit.contain,
-              ),
-              const SizedBox(height: 28),
-              const CircularProgressIndicator(
-                color: Colors.white,
-                strokeWidth: 2.6,
-              ),
-              const SizedBox(height: 18),
-              Text(
-                appText(
-                  context,
-                  'ĐANG KHỞI ĐỘNG CAMERA STATION...',
-                  'STARTING CAMERA STATION...',
-                ),
-                style: const TextStyle(
-                  color: Colors.white70,
-                  fontSize: 13,
-                  fontWeight: FontWeight.w800,
-                  letterSpacing: 0.4,
-                ),
-              ),
-            ],
-          ),
-        ),
-      ),
-    );
-  }
+  Widget _buildLoading() => const _StationLoadingView();
 
   // ============================================================
   // ERROR
   // ============================================================
 
-  String _formatErrorMessage(BuildContext context, String? raw) {
-    if (raw == null || raw.trim().isEmpty) {
+  String _formatErrorMessage(BuildContext context, Object? error) {
+    if (error == null || error.toString().trim().isEmpty) {
       return appText(
         context,
         'Không thể khởi động hệ thống camera. Vui lòng kiểm tra quyền truy cập camera và thử lại.',
         'Unable to initialize camera system. Please check camera permissions and try again.',
       );
     }
-    final lower = raw.toLowerCase();
-    if (lower.contains('permission') || lower.contains('quyền') || lower.contains('denied')) {
-      return appText(
-        context,
-        'Ứng dụng chưa được cấp quyền truy cập Camera hoặc Micro. Vui lòng kiểm tra cài đặt thiết bị.',
-        'Camera or Microphone permissions not granted. Please check device settings.',
-      );
+    // Lỗi có mã (gồm thiếu quyền) đã có thông báo hai ngôn ngữ.
+    if (error is StationException || _isPermissionError(error)) {
+      return _errorText(error);
     }
+    final lower = error.toString().toLowerCase();
     if (lower.contains('camera') &&
         (lower.contains('busy') ||
             lower.contains('bận') ||
@@ -1773,84 +1571,18 @@ class _StationScreenState extends State<StationScreen>
         'An issue occurred while connecting the camera. Please tap Try Again to recover.',
       );
     }
-    return raw;
+    return _errorText(error);
   }
 
   Widget _buildError() {
-    return Scaffold(
-      backgroundColor: const Color(0xFF05070A),
-      body: SafeArea(
-        child: Center(
-          child: SingleChildScrollView(
-            padding: const EdgeInsets.all(28),
-            child: Container(
-              width: double.infinity,
-              constraints: const BoxConstraints(maxWidth: 460),
-              padding: const EdgeInsets.all(28),
-              decoration: BoxDecoration(
-                color: const Color(0xFF11161D),
-                borderRadius: BorderRadius.circular(24),
-                border: Border.all(color: Colors.white.withValues(alpha: 0.06)),
-              ),
-              child: Column(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  Container(
-                    padding: const EdgeInsets.all(18),
-                    decoration: BoxDecoration(
-                      color: Colors.redAccent.withValues(alpha: 0.12),
-                      shape: BoxShape.circle,
-                    ),
-                    child: const Icon(
-                      Icons.videocam_off_rounded,
-                      color: Colors.redAccent,
-                      size: 48,
-                    ),
-                  ),
-                  const SizedBox(height: 22),
-                  Text(
-                    appText(context, 'LỖI KHỞI ĐỘNG CAMERA', 'CAMERA STATION ERROR'),
-                    style: const TextStyle(
-                      color: Colors.white,
-                      fontSize: 19,
-                      fontWeight: FontWeight.w900,
-                      letterSpacing: 0.3,
-                    ),
-                  ),
-                  const SizedBox(height: 10),
-                  Text(
-                    _formatErrorMessage(context, _error),
-                    textAlign: TextAlign.center,
-                    style: const TextStyle(
-                      color: Colors.white60,
-                      fontSize: 13,
-                      height: 1.4,
-                    ),
-                  ),
-                  const SizedBox(height: 26),
-                  SizedBox(
-                    width: double.infinity,
-                    child: FilledButton.icon(
-                      style: FilledButton.styleFrom(
-                        padding: const EdgeInsets.symmetric(vertical: 14),
-                        shape: RoundedRectangleBorder(
-                          borderRadius: BorderRadius.circular(14),
-                        ),
-                      ),
-                      onPressed: _retry,
-                      icon: const Icon(Icons.refresh_rounded),
-                      label: Text(
-                        appText(context, 'THỬ LẠI', 'TRY AGAIN'),
-                        style: const TextStyle(fontWeight: FontWeight.w800),
-                      ),
-                    ),
-                  ),
-                ],
-              ),
-            ),
-          ),
-        ),
-      ),
+    final error = _error;
+    final permissionError = error != null && _isPermissionError(error);
+    return _StationErrorView(
+      message: _formatErrorMessage(context, error),
+      permissionError: permissionError,
+      retryAt: permissionError ? null : _runtime.nextInitRetryAt,
+      onOpenSettings: _openAppSettings,
+      onRetry: _retry,
     );
   }
 
@@ -1890,6 +1622,7 @@ class _StationScreenState extends State<StationScreen>
   /// Các viên trạng thái: cùng chiều cao, cùng hàng, không lòi ra ngoài.
   List<Widget> _buildStatusPills(bool compact) {
     final rtsp = _runtime.rtspPublisherService;
+    final whip = _runtime.whipPublisherService;
     return [
       _StatusPill(
         dotColor: _recording ? const Color(0xFFFF5252) : const Color(0xFF69F0AE),
@@ -1926,33 +1659,43 @@ class _StationScreenState extends State<StationScreen>
           isLocked: _runtime.resolutionLocked,
           isThrottled: _runtime.thermalThrottled,
           targetProfile: _runtime.pendingThermalTarget,
-          pendingIn: _runtime.pendingThermalIn,
+          pendingAt: _runtime.pendingThermalAt,
           profile: _runtime.resolutionProfile,
           loadLevel: _runtime.thermalLoadLevel,
           onTap: _handleResolutionPressed,
           onDismiss: _runtime.dismissCooledDownNotice,
         ),
       if (_runtime.isLiveStreaming)
-        _StatusPill(
-          dotColor: Colors.white,
-          label:
-              'LIVE ${_formatLiveDuration(rtsp.isLive ? rtsp.liveDuration : _runtime.whipPublisherService.liveDuration)}',
-          color: Colors.white,
-          background: const Color(0xFFD32F2F),
-          trailingIcon:
-              rtsp.isLive && rtsp.networkQuality != StreamNetworkQuality.unknown
-              ? (rtsp.networkQuality == StreamNetworkQuality.good
-                    ? Icons.wifi
-                    : Icons.wifi_off)
-              : null,
-          trailingColor: switch (rtsp.networkQuality) {
-            StreamNetworkQuality.good => Colors.lightGreenAccent,
-            StreamNetworkQuality.warning => Colors.orangeAccent,
-            StreamNetworkQuality.poor => Colors.yellowAccent,
-            _ => Colors.white70,
-          },
-          tooltip: appText(context, 'Đang phát trực tiếp', 'Live streaming'),
-          onTap: _openLiveStreamScreen,
+        // Chỉ viên LIVE dựng lại mỗi giây (thời lượng/chất lượng mạng), không
+        // dựng lại cả màn hình.
+        ListenableBuilder(
+          listenable: Listenable.merge([
+            rtsp.durationListenable,
+            rtsp.metricsListenable,
+            whip.durationListenable,
+          ]),
+          builder: (context, _) => _StatusPill(
+            dotColor: Colors.white,
+            label:
+                'LIVE ${formatLiveDuration(rtsp.isLive ? rtsp.liveDuration : whip.liveDuration)}',
+            color: Colors.white,
+            background: const Color(0xFFD32F2F),
+            trailingIcon:
+                rtsp.isLive &&
+                    rtsp.networkQuality != StreamNetworkQuality.unknown
+                ? (rtsp.networkQuality == StreamNetworkQuality.good
+                      ? Icons.wifi
+                      : Icons.wifi_off)
+                : null,
+            trailingColor: switch (rtsp.networkQuality) {
+              StreamNetworkQuality.good => Colors.lightGreenAccent,
+              StreamNetworkQuality.warning => Colors.orangeAccent,
+              StreamNetworkQuality.poor => Colors.yellowAccent,
+              _ => Colors.white70,
+            },
+            tooltip: appText(context, 'Đang phát trực tiếp', 'Live streaming'),
+            onTap: _openLiveStreamScreen,
+          ),
         ),
     ];
   }
@@ -2202,25 +1945,12 @@ class _StationScreenState extends State<StationScreen>
           _runtime.webRtcService?.ultraWideZoomRatio ?? 0.5,
       ultraWideLabel:
           _runtime.webRtcService?.ultraWideLabel ?? '0.5×',
+      // Đang đổi camera trước/sau: khoá zoom (ống kính sắp thay đổi).
+      zoomEnabled: !_facingSwitching,
       onZoomChanged: _changeZoom,
       onQuickSelectZoom: _quickSelectZoom,
-      exposureEv: _runtime.exposureBiasEv,
-      onExposureChanged: (ev) async {
-        try {
-          await _runtime.setExposureBias(ev);
-        } catch (error) {
-          if (!mounted) return;
-          _showStationToast(
-            appText(
-              context,
-              'Không chỉnh được độ sáng: ${userFacingError(error)}',
-              'Unable to adjust exposure: ${userFacingError(error)}',
-            ),
-            isError: true,
-          );
-        }
-        if (mounted) setState(() {});
-      },
+      exposureEv: _pendingEv ?? _runtime.exposureBiasEv,
+      onExposureChanged: _changeExposure,
     );
   }
 
@@ -2480,96 +2210,11 @@ class _StationScreenState extends State<StationScreen>
                   top: 6,
                   left: 8,
                   right: 8,
-                  child: Row(
-                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                    children: [
-                      Row(
-                        mainAxisSize: MainAxisSize.min,
-                        children: [
-                          if (_recording)
-                            Container(
-                              padding: const EdgeInsets.symmetric(
-                                horizontal: 5,
-                                vertical: 2,
-                              ),
-                              margin: const EdgeInsets.only(right: 4),
-                              decoration: BoxDecoration(
-                                color: Colors.red.withValues(alpha: 0.85),
-                                borderRadius: BorderRadius.circular(6),
-                              ),
-                              child: const Row(
-                                mainAxisSize: MainAxisSize.min,
-                                children: [
-                                  Icon(Icons.circle, color: Colors.white, size: 6),
-                                  SizedBox(width: 3),
-                                  Text(
-                                    'REC',
-                                    style: TextStyle(
-                                      color: Colors.white,
-                                      fontSize: 9,
-                                      fontWeight: FontWeight.w900,
-                                      letterSpacing: 0.5,
-                                    ),
-                                  ),
-                                ],
-                              ),
-                            ),
-                          if (_runtime.isLiveStreaming)
-                            Container(
-                              padding: const EdgeInsets.symmetric(
-                                horizontal: 5,
-                                vertical: 2,
-                              ),
-                              decoration: BoxDecoration(
-                                color: Colors.blue.withValues(alpha: 0.85),
-                                borderRadius: BorderRadius.circular(6),
-                              ),
-                              child: const Text(
-                                'LIVE',
-                                style: TextStyle(
-                                  color: Colors.white,
-                                  fontSize: 9,
-                                  fontWeight: FontWeight.w900,
-                                  letterSpacing: 0.5,
-                                ),
-                              ),
-                            ),
-                        ],
-                      ),
-                      if (_runtime.thermalWarning)
-                        Container(
-                          padding: const EdgeInsets.symmetric(
-                            horizontal: 5,
-                            vertical: 2,
-                          ),
-                          decoration: BoxDecoration(
-                            color: const Color(0xFF2A1C08).withValues(alpha: 0.85),
-                            borderRadius: BorderRadius.circular(6),
-                            border: Border.all(
-                              color: Colors.amber.withValues(alpha: 0.7),
-                            ),
-                          ),
-                          child: Row(
-                            mainAxisSize: MainAxisSize.min,
-                            children: [
-                              const Icon(
-                                Icons.warning_amber_rounded,
-                                color: Colors.amber,
-                                size: 10,
-                              ),
-                              const SizedBox(width: 3),
-                              Text(
-                                profileLabel(_runtime.resolutionProfile),
-                                style: const TextStyle(
-                                  color: Colors.amber,
-                                  fontSize: 9,
-                                  fontWeight: FontWeight.w800,
-                                ),
-                              ),
-                            ],
-                          ),
-                        ),
-                    ],
+                  child: _PipStatusOverlay(
+                    recording: _recording,
+                    live: _runtime.isLiveStreaming,
+                    thermalWarning: _runtime.thermalWarning,
+                    profileText: profileLabel(_runtime.resolutionProfile),
                   ),
                 ),
 
@@ -2582,1197 +2227,3 @@ class _StationScreenState extends State<StationScreen>
   }
 }
 
-/// Màn hình nghỉ: nền đen, vẫn hiện trạng thái (REC, nhiệt độ, LIVE); chạm
-/// bất kỳ đâu để xem lại hình.
-class _PreviewRestOverlay extends StatelessWidget {
-  const _PreviewRestOverlay({required this.statusPills, required this.onWake});
-
-  final List<Widget> statusPills;
-  final VoidCallback onWake;
-
-  @override
-  Widget build(BuildContext context) {
-    return GestureDetector(
-      behavior: HitTestBehavior.opaque,
-      onTap: onWake,
-      child: ColoredBox(
-        color: Colors.black,
-        child: SafeArea(
-          child: Padding(
-            padding: const EdgeInsets.all(12),
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                // Chỉ để xem: chạm vào đâu cũng là "xem lại hình".
-                IgnorePointer(
-                  child: Wrap(spacing: 6, runSpacing: 6, children: statusPills),
-                ),
-                Expanded(
-                  child: Center(
-                    child: Column(
-                      mainAxisSize: MainAxisSize.min,
-                      children: [
-                        const Icon(
-                          Icons.touch_app_rounded,
-                          color: Colors.white38,
-                          size: 30,
-                        ),
-                        const SizedBox(height: 8),
-                        Text(
-                          appText(context, 'Chạm để xem hình', 'Tap to view'),
-                          style: const TextStyle(
-                            color: Colors.white60,
-                            fontSize: 14,
-                            fontWeight: FontWeight.w700,
-                          ),
-                        ),
-                        const SizedBox(height: 4),
-                        Text(
-                          appText(
-                            context,
-                            'Tạm tắt hình xem trước để giảm nhiệt. Ghi hình, Tablet và livestream vẫn chạy.',
-                            'Preview paused to reduce heat. Recording, tablet and livestream keep running.',
-                          ),
-                          textAlign: TextAlign.center,
-                          style: const TextStyle(
-                            color: Colors.white38,
-                            fontSize: 11.5,
-                          ),
-                        ),
-                      ],
-                    ),
-                  ),
-                ),
-              ],
-            ),
-          ),
-        ),
-      ),
-    );
-  }
-}
-
-
-class _BottomControlPanel extends StatelessWidget {
-  const _BottomControlPanel({
-    required this.compact,
-    required this.cameraReady,
-    required this.recording,
-    required this.zoomSupported,
-    required this.zoomValue,
-    required this.minimumZoom,
-    required this.maximumZoom,
-    required this.hasUltraWide,
-    required this.ultraWideRatio,
-    required this.ultraWideLabel,
-    required this.onZoomChanged,
-    required this.onQuickSelectZoom,
-    required this.exposureEv,
-    required this.onExposureChanged,
-  });
-
-  final bool compact;
-  final double exposureEv;
-  final ValueChanged<double> onExposureChanged;
-  final bool cameraReady;
-  final bool recording;
-  final bool zoomSupported;
-  final double zoomValue;
-  final double minimumZoom;
-  final double maximumZoom;
-  final bool hasUltraWide;
-  final double ultraWideRatio;
-  final String ultraWideLabel;
-  final ValueChanged<double> onZoomChanged;
-  final ValueChanged<double> onQuickSelectZoom;
-
-  @override
-  Widget build(BuildContext context) {
-    // Camera chưa sẵn sàng: không có zoom hay độ sáng để chỉnh, ẩn hẳn khung.
-    if (!cameraReady && !zoomSupported) return const SizedBox.shrink();
-    // Cùng kiểu nền với thanh trạng thái/menu; không làm mờ nền (đỡ tốn GPU).
-    return ClipRRect(
-      borderRadius: BorderRadius.circular(compact ? 18 : 20),
-      child: Container(
-          padding: EdgeInsets.symmetric(
-            horizontal: compact ? 8 : 10,
-            vertical: compact ? 4 : 6,
-          ),
-          decoration: BoxDecoration(
-            color: _glassColor,
-            borderRadius: BorderRadius.circular(compact ? 18 : 20),
-            border: Border.all(color: _glassBorder),
-          ),
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              if (zoomSupported) ...[
-                _CameraZoomSlider(
-                  compact: compact,
-                  value: zoomValue,
-                  minimum: minimumZoom,
-                  maximum: maximumZoom,
-                  hasUltraWide: hasUltraWide,
-                  ultraWideRatio: ultraWideRatio,
-                  ultraWideLabel: ultraWideLabel,
-                  onChanged: onZoomChanged,
-                  onQuickSelect: onQuickSelectZoom,
-                ),
-                Container(
-                  height: 1,
-                  margin: const EdgeInsets.symmetric(horizontal: 8),
-                  color: Colors.white.withValues(alpha: 0.09),
-                ),
-              ],
-              if (cameraReady)
-                _BrightnessControl(
-                  compact: compact,
-                  ev: exposureEv,
-                  onChanged: onExposureChanged,
-                ),
-            ],
-          ),
-        ),
-    );
-  }
-}
-
-class _NetworkStatusBanner extends StatelessWidget {
-  const _NetworkStatusBanner({
-    required this.compact,
-    required this.connectedAddress,
-    required this.recovering,
-    required this.hasError,
-    required this.onReconnect,
-  });
-
-  final bool compact;
-  final String? connectedAddress;
-  final bool recovering;
-  final bool hasError;
-  final VoidCallback? onReconnect;
-
-  @override
-  Widget build(BuildContext context) {
-    final message = recovering
-        ? appText(
-            context,
-            'Đang khởi động lại kết nối live…',
-            'Restarting live connection…',
-          )
-        : connectedAddress == null
-        ? appText(
-            context,
-            'Chưa có Wi-Fi. Camera vẫn ghi hình bình thường; Tablet sẽ kết nối được khi điện thoại vào Wi-Fi.',
-            'No Wi-Fi. Recording continues; tablets can connect once the phone joins Wi-Fi.',
-          )
-        : appText(
-            context,
-            hasError
-                ? 'Kết nối live gặp lỗi. Camera vẫn tiếp tục ghi hình.'
-                : 'Kết nối live cần được làm mới.',
-            hasError
-                ? 'Live connection has an error. Recording is still active.'
-                : 'Live connection needs to be refreshed.',
-          );
-    return Container(
-      width: double.infinity,
-      margin: EdgeInsets.only(bottom: compact ? 6 : 8),
-      padding: EdgeInsets.fromLTRB(
-        compact ? 10 : 12,
-        compact ? 6 : 8,
-        6,
-        compact ? 6 : 8,
-      ),
-      decoration: BoxDecoration(
-        color: const Color(0xFF37474F).withValues(alpha: 0.95),
-        borderRadius: BorderRadius.circular(compact ? 10 : 12),
-      ),
-      child: Row(
-        children: [
-          if (recovering)
-            const SizedBox(
-              width: 16,
-              height: 16,
-              child: CircularProgressIndicator(
-                strokeWidth: 2,
-                color: Colors.white,
-              ),
-            )
-          else
-            const Icon(Icons.wifi_off_rounded, color: Colors.white, size: 18),
-          const SizedBox(width: 8),
-          Expanded(
-            child: Text(
-              message,
-              maxLines: compact ? 2 : 1,
-              overflow: TextOverflow.ellipsis,
-              style: TextStyle(
-                color: Colors.white,
-                fontSize: compact ? 11 : 12,
-                fontWeight: FontWeight.w700,
-              ),
-            ),
-          ),
-          TextButton.icon(
-            onPressed: onReconnect,
-            icon: const Icon(Icons.sync_rounded, size: 17),
-            label: Text(
-              appText(context, 'KẾT NỐI LẠI', 'RECONNECT'),
-              style: const TextStyle(fontWeight: FontWeight.w900),
-            ),
-          ),
-        ],
-      ),
-    );
-  }
-}
-
-/// Nút chỉnh độ sáng hình cho người dùng phổ thông: "Tối hơn / Tự động /
-/// Sáng hơn", mỗi bước 0,5 EV, từ −1 tới +2.
-class _BrightnessControl extends StatelessWidget {
-  const _BrightnessControl({
-    required this.compact,
-    required this.ev,
-    required this.onChanged,
-  });
-
-  static const double _step = 0.5;
-  static const double _min = -1.0;
-  static const double _max = 2.0;
-
-  final bool compact;
-  final double ev;
-  final ValueChanged<double> onChanged;
-
-  @override
-  Widget build(BuildContext context) {
-    final label = ev.abs() < 0.01
-        ? appText(context, 'Tự động', 'Auto')
-        : ev > 0
-        ? appText(
-            context,
-            'Sáng hơn +${ev.toStringAsFixed(1)}',
-            'Brighter +${ev.toStringAsFixed(1)}',
-          )
-        : appText(
-            context,
-            'Tối hơn ${ev.toStringAsFixed(1)}',
-            'Darker ${ev.toStringAsFixed(1)}',
-          );
-    Widget button(IconData icon, double next, bool enabled) {
-      return InkResponse(
-        radius: 16,
-        onTap: enabled ? () => onChanged(next) : null,
-        child: SizedBox(
-          width: 30,
-          height: 28,
-          child: Icon(
-            icon,
-            size: 17,
-            color: enabled ? Colors.white : Colors.white24,
-          ),
-        ),
-      );
-    }
-
-    return Padding(
-      padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
-      child: Row(
-        children: [
-          const Icon(
-            Icons.wb_sunny_rounded,
-            size: 15,
-            color: Colors.amberAccent,
-          ),
-          const SizedBox(width: 6),
-          Text(
-            appText(context, 'Độ sáng', 'Brightness'),
-            style: const TextStyle(
-              color: Colors.white70,
-              fontSize: 11.5,
-              fontWeight: FontWeight.w600,
-            ),
-          ),
-          const Spacer(),
-          button(Icons.remove_rounded, ev - _step, ev > _min + 0.01),
-          SizedBox(
-            width: 92,
-            child: Text(
-              label,
-              textAlign: TextAlign.center,
-              style: const TextStyle(
-                color: Colors.white,
-                fontSize: 11.5,
-                fontWeight: FontWeight.w800,
-              ),
-            ),
-          ),
-          button(Icons.add_rounded, ev + _step, ev < _max - 0.01),
-        ],
-      ),
-    );
-  }
-}
-
-class _CameraZoomSlider extends StatelessWidget {
-  const _CameraZoomSlider({
-    required this.compact,
-    required this.value,
-    required this.minimum,
-    required this.maximum,
-    required this.hasUltraWide,
-    required this.ultraWideRatio,
-    required this.ultraWideLabel,
-    required this.onChanged,
-    required this.onQuickSelect,
-  });
-
-  final bool compact;
-  final double value;
-  final double minimum;
-  final double maximum;
-  final bool hasUltraWide;
-  final double ultraWideRatio;
-  final String ultraWideLabel;
-  final ValueChanged<double> onChanged;
-  final ValueChanged<double> onQuickSelect;
-
-  @override
-  Widget build(BuildContext context) {
-    final effectiveMin = hasUltraWide
-        ? math.min(ultraWideRatio, minimum)
-        : minimum.clamp(1.0, 5.0);
-    final effectiveMax = math.min(maximum, 5.0).clamp(effectiveMin + 0.1, 5.0);
-    final safeValue = value.clamp(effectiveMin, effectiveMax).toDouble();
-
-    void stepZoom(double delta) {
-      final raw = safeValue + delta;
-      final stepped = (raw * 10).round() / 10.0;
-      final clamped = stepped.clamp(effectiveMin, effectiveMax).toDouble();
-      onChanged(clamped);
-    }
-
-    final canDecrease = safeValue > (effectiveMin + 0.04);
-    final canIncrease = safeValue < (effectiveMax - 0.04);
-
-    Widget buildStepButton({
-      required IconData icon,
-      required VoidCallback? onTap,
-    }) {
-      final enabled = onTap != null;
-      return Material(
-        color: Colors.transparent,
-        child: InkWell(
-          onTap: onTap,
-          borderRadius: BorderRadius.circular(18),
-          child: Container(
-            width: 28,
-            height: 28,
-            alignment: Alignment.center,
-            decoration: BoxDecoration(
-              color: enabled
-                  ? Colors.white.withValues(alpha: 0.12)
-                  : Colors.white.withValues(alpha: 0.04),
-              shape: BoxShape.circle,
-              border: Border.all(
-                color: enabled
-                    ? Colors.white.withValues(alpha: 0.22)
-                    : Colors.white.withValues(alpha: 0.06),
-                width: 1,
-              ),
-            ),
-            child: Icon(
-              icon,
-              color: enabled ? Colors.white : Colors.white24,
-              size: 16,
-            ),
-          ),
-        ),
-      );
-    }
-
-    // Một hàng gọn: [nút nhanh] [−] [thanh trượt] [+] [giá trị]. Máy hẹp
-    // (dọc ~360px) bỏ ô giá trị để thanh trượt đủ dài.
-    return LayoutBuilder(
-      builder: (context, constraints) => Padding(
-      padding: const EdgeInsets.symmetric(horizontal: 2, vertical: 2),
-      child: Row(
-        children: [
-          if (hasUltraWide) ...[
-            _ZoomPresetButton(
-              label: ultraWideLabel,
-              selected: (safeValue - ultraWideRatio).abs() < 0.08,
-              compact: true,
-              onTap: () => onQuickSelect(ultraWideRatio),
-            ),
-            const SizedBox(width: 3),
-          ],
-          _ZoomPresetButton(
-            label: '1×',
-            selected: (safeValue - 1.0).abs() < 0.08,
-            compact: true,
-            onTap: () => onQuickSelect(1.0),
-          ),
-          const SizedBox(width: 3),
-          _ZoomPresetButton(
-            label: '2×',
-            selected: (safeValue - 2.0).abs() < 0.08,
-            compact: true,
-            onTap: () => onQuickSelect(2.0),
-          ),
-          const SizedBox(width: 3),
-          _ZoomPresetButton(
-            label: '5×',
-            selected: (safeValue - 5.0).abs() < 0.08,
-            compact: true,
-            onTap: () => onQuickSelect(5.0),
-          ),
-          const SizedBox(width: 6),
-          buildStepButton(
-            icon: Icons.remove_rounded,
-            onTap: canDecrease ? () => stepZoom(-0.1) : null,
-          ),
-          Expanded(
-            child: SliderTheme(
-              data: SliderTheme.of(context).copyWith(
-                trackHeight: 4,
-                thumbShape: const RoundSliderThumbShape(
-                  enabledThumbRadius: 8,
-                  elevation: 2.0,
-                  pressedElevation: 4.0,
-                ),
-                overlayShape: const RoundSliderOverlayShape(overlayRadius: 14),
-                activeTrackColor: const Color(0xFF22C55E),
-                inactiveTrackColor: Colors.white.withValues(alpha: 0.20),
-                thumbColor: Colors.white,
-              ),
-              child: Slider(
-                value: safeValue,
-                min: effectiveMin,
-                max: effectiveMax,
-                divisions: ((effectiveMax - effectiveMin) * 10)
-                    .round()
-                    .clamp(1, 100),
-                onChanged: onChanged,
-              ),
-            ),
-          ),
-          buildStepButton(
-            icon: Icons.add_rounded,
-            onTap: canIncrease ? () => stepZoom(0.1) : null,
-          ),
-          if (constraints.maxWidth >= 360)
-            SizedBox(
-              width: 38,
-              child: Text(
-                '${safeValue.toStringAsFixed(1)}×',
-                textAlign: TextAlign.right,
-                style: const TextStyle(
-                  color: Colors.white,
-                  fontSize: 12,
-                  fontWeight: FontWeight.w800,
-                ),
-              ),
-            ),
-        ],
-      ),
-      ),
-    );
-  }
-}
-
-class _ZoomPresetButton extends StatelessWidget {
-  final String label;
-  final bool selected;
-  final bool compact;
-  final VoidCallback onTap;
-
-  const _ZoomPresetButton({
-    required this.label,
-    required this.selected,
-    required this.compact,
-    required this.onTap,
-  });
-
-  @override
-  Widget build(BuildContext context) {
-    return GestureDetector(
-      onTap: onTap,
-      child: Container(
-        padding: EdgeInsets.symmetric(
-          horizontal: compact ? 8 : 10,
-          vertical: compact ? 2 : 3,
-        ),
-        decoration: BoxDecoration(
-          color: selected
-              ? const Color(0xFF1565C0)
-              : Colors.white.withValues(alpha: 0.12),
-          borderRadius: BorderRadius.circular(12),
-          border: Border.all(
-            color: selected
-                ? const Color(0xFF64B5F6)
-                : Colors.white.withValues(alpha: 0.15),
-            width: selected ? 1.5 : 1,
-          ),
-          boxShadow: selected
-              ? [
-                  BoxShadow(
-                    color: const Color(0xFF1565C0).withValues(alpha: 0.4),
-                    blurRadius: 6,
-                    offset: const Offset(0, 2),
-                  ),
-                ]
-              : null,
-        ),
-        child: Text(
-          label,
-          style: TextStyle(
-            color: Colors.white,
-            fontWeight: selected ? FontWeight.w900 : FontWeight.w600,
-            fontSize: compact ? 11 : 12,
-          ),
-        ),
-      ),
-    );
-  }
-}
-
-// ============================================================
-// HEADER
-// ============================================================
-
-// ============================================================
-// THANH TRẠNG THÁI & MENU (màn hình camera)
-// ============================================================
-
-const Color _glassColor = Color(0xA60E1116);
-const Color _glassBorder = Color(0x1FFFFFFF);
-const Color _accentBlue = Color(0xFF1E88E5);
-
-/// Nền tối dùng chung cho thanh trạng thái, menu và các viên.
-class _GlassSurface extends StatelessWidget {
-  const _GlassSurface({
-    required this.child,
-    this.radius = 16,
-    this.padding = EdgeInsets.zero,
-    this.color = _glassColor,
-    this.borderColor = _glassBorder,
-  });
-
-  final Widget child;
-  final double radius;
-  final EdgeInsetsGeometry padding;
-  final Color color;
-  final Color borderColor;
-
-  @override
-  Widget build(BuildContext context) {
-    // Không dùng làm mờ nền (BackdropFilter): vẽ lại mỗi khung hình camera
-    // tốn GPU và làm máy nóng thêm. Nền tối bán trong suốt là đủ đọc rõ.
-    return ClipRRect(
-      borderRadius: BorderRadius.circular(radius),
-      child: Container(
-        padding: padding,
-        decoration: BoxDecoration(
-          color: color,
-          borderRadius: BorderRadius.circular(radius),
-          border: Border.all(color: borderColor),
-        ),
-        child: child,
-      ),
-    );
-  }
-}
-
-/// Một viên trạng thái: cùng chiều cao, cùng kiểu chữ cho mọi thông tin.
-class _StatusPill extends StatelessWidget {
-  const _StatusPill({
-    required this.label,
-    required this.color,
-    required this.tooltip,
-    this.icon,
-    this.dotColor,
-    this.loading = false,
-    this.background,
-    this.trailingIcon,
-    this.trailingColor,
-    this.onTap,
-    this.onClose,
-  });
-
-  static const double height = 26;
-
-  final String label;
-  final Color color;
-  final String tooltip;
-  final IconData? icon;
-  final Color? dotColor;
-  final bool loading;
-  final Color? background;
-  final IconData? trailingIcon;
-  final Color? trailingColor;
-  final VoidCallback? onTap;
-  final VoidCallback? onClose;
-
-  @override
-  Widget build(BuildContext context) {
-    final leading = loading
-        ? SizedBox(
-            width: 12,
-            height: 12,
-            child: CircularProgressIndicator(strokeWidth: 2, color: color),
-          )
-        : dotColor != null
-        ? Container(
-            width: 8,
-            height: 8,
-            decoration: BoxDecoration(color: dotColor, shape: BoxShape.circle),
-          )
-        : icon != null
-        ? Icon(icon, size: 13, color: color)
-        : null;
-    final content = Container(
-      height: height,
-      padding: EdgeInsets.only(left: 9, right: onClose != null ? 3 : 10),
-      child: Row(
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          if (leading != null) ...[leading, const SizedBox(width: 6)],
-          Text(
-            label,
-            maxLines: 1,
-            style: TextStyle(
-              color: color,
-              fontSize: 11,
-              fontWeight: FontWeight.w800,
-              letterSpacing: 0.2,
-              height: 1.1,
-            ),
-          ),
-          if (trailingIcon != null) ...[
-            const SizedBox(width: 6),
-            Icon(trailingIcon, size: 14, color: trailingColor ?? color),
-          ],
-          if (onTap != null && onClose == null) ...[
-            const SizedBox(width: 3),
-            Icon(
-              Icons.expand_more_rounded,
-              size: 15,
-              color: color.withValues(alpha: 0.75),
-            ),
-          ],
-          if (onClose != null)
-            InkResponse(
-              onTap: onClose,
-              radius: 14,
-              child: Padding(
-                padding: const EdgeInsets.all(4),
-                child: Icon(
-                  Icons.close_rounded,
-                  size: 14,
-                  color: color.withValues(alpha: 0.8),
-                ),
-              ),
-            ),
-        ],
-      ),
-    );
-    return Tooltip(
-      message: tooltip,
-      child: _GlassSurface(
-        radius: height / 2,
-        color: background ?? _glassColor,
-        borderColor: background != null
-            ? Colors.transparent
-            : color.withValues(alpha: 0.30),
-        child: Material(
-          type: MaterialType.transparency,
-          child: InkWell(onTap: onTap, child: content),
-        ),
-      ),
-    );
-  }
-}
-
-/// Nhiệt độ trong thanh trạng thái: ngắn gọn, đọc lướt là hiểu. Chạm để chọn
-/// chất lượng; giữ để xem giải thích đầy đủ.
-class _ThermalPill extends StatelessWidget {
-  const _ThermalPill({
-    required this.onTap,
-    this.onDismiss,
-    this.temperatureC,
-    this.userOverride = false,
-    this.isCooledDown = false,
-    this.isLocked = false,
-    this.isThrottled = false,
-    this.targetProfile,
-    this.pendingIn,
-    this.profile,
-    this.loadLevel = 0,
-  });
-
-  final VoidCallback onTap;
-  final VoidCallback? onDismiss;
-  final double? temperatureC;
-  final bool userOverride;
-  final bool isCooledDown;
-  final bool isLocked;
-  final bool isThrottled;
-  final CameraResolutionProfile? targetProfile;
-  final Duration? pendingIn;
-  final CameraResolutionProfile? profile;
-
-  /// Bậc giảm tải tại chỗ của runtime (2 = nóng, 3 = critical).
-  final int loadLevel;
-
-  @override
-  Widget build(BuildContext context) {
-    final temp = temperatureC != null
-        ? '${temperatureC!.toStringAsFixed(0)}°C'
-        : null;
-    String short(CameraResolutionProfile? p) =>
-        p != null ? '${p.shortLabel}${p.fps}' : '720p30';
-    String full(CameraResolutionProfile? p) =>
-        p != null ? '${p.shortLabel} ${p.fps} FPS' : '720p 30 FPS';
-    String withTemp(String text) => temp == null ? text : '$temp · $text';
-
-    late final Color color;
-    late final IconData icon;
-    late final String label;
-    late final String tooltip;
-    if (isCooledDown) {
-      color = const Color(0xFF69F0AE);
-      icon = Icons.ac_unit_rounded;
-      label = appText(context, 'Đã mát · nâng chất lượng', 'Cool · raise quality');
-      tooltip = appText(
-        context,
-        'Máy đã mát. Chạm để chọn lại chất lượng video.',
-        'Device has cooled down. Tap to choose video quality.',
-      );
-    } else if (targetProfile != null) {
-      final secs = (pendingIn?.inSeconds ?? 0).clamp(0, 999);
-      color = const Color(0xFFFFB74D);
-      icon = Icons.timer_outlined;
-      label = withTemp(
-        secs < 5
-            ? appText(
-                context,
-                'hạ ${short(targetProfile)}',
-                'to ${short(targetProfile)}',
-              )
-            : appText(
-                context,
-                'hạ ${short(targetProfile)} sau ${secs}s',
-                'to ${short(targetProfile)} in ${secs}s',
-              ),
-      );
-      tooltip = appText(
-        context,
-        'Máy nóng: sẽ tự hạ xuống ${full(targetProfile)} để giảm nhiệt. Chạm để chọn chất lượng khác.',
-        'Device is hot: lowering to ${full(targetProfile)} to cool down. Tap to choose another quality.',
-      );
-    } else if (isThrottled) {
-      color = const Color(0xFFFFB74D);
-      icon = Icons.whatshot_rounded;
-      label = withTemp(
-        appText(context, 'giảm nhiệt', 'cooling'),
-      );
-      tooltip = appText(
-        context,
-        'Đã hạ xuống ${full(profile)} để giữ máy mát. Chạm để chọn chất lượng khác.',
-        'Lowered to ${full(profile)} to keep the device cool. Tap to choose another quality.',
-      );
-    } else if (userOverride || isLocked) {
-      color = const Color(0xFFFF8A65);
-      icon = isLocked ? Icons.lock_rounded : Icons.thermostat_rounded;
-      label = withTemp(appText(context, 'máy nóng', 'hot'));
-      tooltip = appText(
-        context,
-        'Máy nóng nhưng đang giữ ${full(profile)} theo lựa chọn của bạn.',
-        'Device is hot but keeping ${full(profile)} as you selected.',
-      );
-    } else if (loadLevel >= 2) {
-      color = const Color(0xFFFFB74D);
-      icon = Icons.whatshot_rounded;
-      label = withTemp(appText(context, 'giảm tải', 'reducing load'));
-      tooltip = appText(
-        context,
-        'Máy nóng: đã giảm FPS/bitrate và làm tối màn hình. Giữ nguyên độ phân giải để Tablet và livestream không mất hình.',
-        'Device is hot: FPS/bitrate reduced and screen dimmed. Resolution is kept so the tablet and livestream are not interrupted.',
-      );
-    } else {
-      color = const Color(0xFFFFE082);
-      icon = Icons.thermostat_rounded;
-      label = withTemp(appText(context, 'máy ấm', 'warm'));
-      tooltip = appText(
-        context,
-        'Máy hơi ấm, app đang theo dõi nhiệt độ.',
-        'Device is warm; temperature is being monitored.',
-      );
-    }
-    return _StatusPill(
-      icon: icon,
-      label: label,
-      color: color,
-      tooltip: tooltip,
-      onTap: onTap,
-      onClose: isCooledDown ? onDismiss : null,
-    );
-  }
-}
-
-/// Thanh trên: viên trạng thái + nút "Menu" có chữ.
-class _StationHeader extends StatelessWidget {
-  const _StationHeader({
-    required this.compact,
-    required this.landscape,
-    required this.statusPills,
-    required this.menuOpen,
-    required this.onToggleMenu,
-  });
-
-  final bool compact;
-  final bool landscape;
-  final List<Widget> statusPills;
-  final bool menuOpen;
-  final VoidCallback onToggleMenu;
-
-  @override
-  Widget build(BuildContext context) {
-    final menuButton = _MenuButton(open: menuOpen, onTap: onToggleMenu);
-    if (landscape) {
-      return Row(
-        children: [
-          Expanded(
-            child: Align(
-              alignment: Alignment.centerLeft,
-              // Máy hẹp: hàng trạng thái tự cuộn ngang, không đẩy nút Menu.
-              child: SingleChildScrollView(
-                scrollDirection: Axis.horizontal,
-                child: Row(
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    for (var i = 0; i < statusPills.length; i++) ...[
-                      if (i > 0) const SizedBox(width: 6),
-                      statusPills[i],
-                    ],
-                  ],
-                ),
-              ),
-            ),
-          ),
-          const SizedBox(width: 10),
-          menuButton,
-        ],
-      );
-    }
-    return Column(
-      mainAxisSize: MainAxisSize.min,
-      crossAxisAlignment: CrossAxisAlignment.stretch,
-      children: [
-        Row(
-          children: [
-            _GlassSurface(
-              radius: 10,
-              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
-              child: SizedBox(
-                width: compact ? 70 : 84,
-                height: compact ? 22 : 26,
-                child: Image.asset(
-                  'assets/images/vnvar_logo.png',
-                  fit: BoxFit.contain,
-                ),
-              ),
-            ),
-            const Spacer(),
-            menuButton,
-          ],
-        ),
-        SizedBox(height: compact ? 6 : 8),
-        Wrap(spacing: 6, runSpacing: 6, children: statusPills),
-      ],
-    );
-  }
-}
-
-/// Nút mở/đóng menu: có chữ để người dùng nhìn là biết.
-class _MenuButton extends StatelessWidget {
-  const _MenuButton({required this.open, required this.onTap});
-
-  final bool open;
-  final VoidCallback onTap;
-
-  @override
-  Widget build(BuildContext context) {
-    return Tooltip(
-      message: open
-          ? appText(context, 'Đóng menu', 'Close menu')
-          : appText(context, 'Mở menu chức năng', 'Open menu'),
-      child: _GlassSurface(
-        radius: 15,
-        color: open ? _accentBlue : _glassColor,
-        borderColor: open ? Colors.transparent : const Color(0x33FFFFFF),
-        child: Material(
-          type: MaterialType.transparency,
-          child: InkWell(
-            onTap: onTap,
-            child: SizedBox(
-              height: 30,
-              child: Padding(
-                padding: const EdgeInsets.symmetric(horizontal: 11),
-                child: Row(
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    Icon(
-                      open ? Icons.close_rounded : Icons.menu_rounded,
-                      size: 16,
-                      color: Colors.white,
-                    ),
-                    const SizedBox(width: 5),
-                    Text(
-                      open
-                          ? appText(context, 'Đóng', 'Close')
-                          : appText(context, 'Menu', 'Menu'),
-                      style: const TextStyle(
-                        color: Colors.white,
-                        fontSize: 12,
-                        fontWeight: FontWeight.w800,
-                      ),
-                    ),
-                  ],
-                ),
-              ),
-            ),
-          ),
-        ),
-      ),
-    );
-  }
-}
-
-/// Menu chức năng: một hàng nút nhỏ, gọn.
-class _QuickMenuPanel extends StatelessWidget {
-  const _QuickMenuPanel({required this.tiles});
-
-  final List<Widget> tiles;
-
-  @override
-  Widget build(BuildContext context) {
-    return _GlassSurface(
-      radius: 14,
-      padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 4),
-      child: Row(mainAxisSize: MainAxisSize.min, children: tiles),
-    );
-  }
-}
-
-/// Một nút trong menu: biểu tượng nhỏ + nhãn ngắn bên dưới.
-class _MenuTile extends StatelessWidget {
-  const _MenuTile({
-    required this.label,
-    required this.tooltip,
-    this.icon,
-    this.custom,
-    this.onTap,
-    this.active = false,
-    this.activeColor = _accentBlue,
-  });
-
-  static const double width = 52;
-
-  final String label;
-  final String tooltip;
-  final IconData? icon;
-
-  /// Nút tự xử lý chạm (ví dụ chọn ngôn ngữ).
-  final Widget? custom;
-  final VoidCallback? onTap;
-  final bool active;
-  final Color activeColor;
-
-  @override
-  Widget build(BuildContext context) {
-    final body = SizedBox(
-      width: width,
-      child: Padding(
-        padding: const EdgeInsets.symmetric(vertical: 4),
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            SizedBox(
-              height: 30,
-              child: Center(
-                child: custom ??
-                    Container(
-                      width: 30,
-                      height: 30,
-                      decoration: BoxDecoration(
-                        color: active
-                            ? activeColor.withValues(alpha: 0.9)
-                            : Colors.white.withValues(alpha: 0.10),
-                        shape: BoxShape.circle,
-                      ),
-                      child: Icon(icon, size: 17, color: Colors.white),
-                    ),
-              ),
-            ),
-            const SizedBox(height: 3),
-            Text(
-              label,
-              maxLines: 1,
-              overflow: TextOverflow.ellipsis,
-              textAlign: TextAlign.center,
-              style: const TextStyle(
-                color: Colors.white70,
-                fontSize: 9.5,
-                fontWeight: FontWeight.w700,
-              ),
-            ),
-          ],
-        ),
-      ),
-    );
-    if (custom != null) return body;
-    return Tooltip(
-      message: tooltip,
-      child: Material(
-        type: MaterialType.transparency,
-        child: InkWell(
-          borderRadius: BorderRadius.circular(10),
-          onTap: onTap,
-          child: body,
-        ),
-      ),
-    );
-  }
-}
-
-/// Cụm nút camera dọc ở mép phải, luôn hiện.
-class _CameraDock extends StatelessWidget {
-  const _CameraDock({required this.buttons});
-
-  final List<Widget> buttons;
-
-  @override
-  Widget build(BuildContext context) {
-    return _GlassSurface(
-      radius: 22,
-      padding: const EdgeInsets.all(5),
-      // Màn hình rất thấp (menu đang mở): cụm nút tự cuộn, không tràn.
-      child: SingleChildScrollView(
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            for (var i = 0; i < buttons.length; i++) ...[
-              if (i > 0) const SizedBox(height: 6),
-              buttons[i],
-            ],
-          ],
-        ),
-      ),
-    );
-  }
-}
-
-class _DockButton extends StatelessWidget {
-  const _DockButton({
-    required this.icon,
-    required this.tooltip,
-    required this.onTap,
-    this.loading = false,
-    this.background,
-  });
-
-  static const double size = 36;
-
-  final IconData icon;
-  final String tooltip;
-  final VoidCallback? onTap;
-  final bool loading;
-  final Color? background;
-
-  @override
-  Widget build(BuildContext context) {
-    return Tooltip(
-      message: tooltip,
-      child: Material(
-        color: background ?? Colors.white.withValues(alpha: 0.10),
-        shape: const CircleBorder(),
-        child: InkWell(
-          customBorder: const CircleBorder(),
-          onTap: onTap,
-          child: SizedBox(
-            width: size,
-            height: size,
-            child: Center(
-              child: loading
-                  ? const SizedBox(
-                      width: 14,
-                      height: 14,
-                      child: CircularProgressIndicator(
-                        strokeWidth: 2,
-                        color: Colors.white,
-                      ),
-                    )
-                  : Icon(
-                      icon,
-                      size: 18,
-                      color: onTap == null ? Colors.white30 : Colors.white,
-                    ),
-            ),
-          ),
-        ),
-      ),
-    );
-  }
-}
-
-
-// ============================================================
-// GRADIENT
-// ============================================================
-
-// ============================================================
-// CONFIG LINE
-// ============================================================
-
-class _ConfigLine extends StatelessWidget {
-  final String title;
-  final String value;
-
-  const _ConfigLine({required this.title, required this.value});
-
-  @override
-  Widget build(BuildContext context) {
-    return Padding(
-      padding: const EdgeInsets.symmetric(vertical: 4),
-      child: Row(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          SizedBox(
-            width: 72,
-            child: Text(
-              title,
-              style: const TextStyle(
-                color: Colors.black54,
-                fontSize: 12,
-                fontWeight: FontWeight.w700,
-              ),
-            ),
-          ),
-          Expanded(
-            child: Text(
-              value,
-              style: const TextStyle(
-                color: Color(0xFF112341),
-                fontSize: 12,
-                fontWeight: FontWeight.w900,
-              ),
-            ),
-          ),
-        ],
-      ),
-    );
-  }
-}

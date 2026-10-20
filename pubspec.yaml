@@ -49,3 +49,9 @@ flutter:
   assets:
     - assets/images/vnvar_logo.png
     - assets/images/LogoApp_SportOCam.png
+    # Logo nền tảng livestream (màn Phát trực tiếp).
+    - assets/images/sporto.jpg
+    - assets/images/logo_facebook.png
+    - assets/images/logo_youtube.png
+    - assets/images/logo_tiktok.png
+    - assets/images/logo_obs.png

@@ -1,3 +1,5 @@
+import 'dart:convert';
+
 import 'package:camera_station/models/scoreboard_state.dart';
 import 'package:camera_station/services/scoreboard_service.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -17,6 +19,10 @@ void rally(ScoreboardState state, String team, [int times = 1]) {
     act(state, {'action': 'point', 'team': team});
   }
 }
+
+Matcher throwsStatus(int status) => throwsA(
+  isA<ScoreboardException>().having((e) => e.statusCode, 'status', status),
+);
 
 void main() {
   group('pickleball doubles (side-out)', () {
@@ -298,6 +304,281 @@ void main() {
       expect((json['teamA'] as Map)['name'], 'Sài Gòn');
       expect((json['points'] as Map)['a'], 1);
       expect(reloaded.controlKey, service.controlKey);
+    });
+  });
+
+  group('reopen', () {
+    test('a match decided 2-0 cannot be reopened', () {
+      final state = newState('badminton');
+      act(state, {'action': 'setScore', 'scoreA': 20, 'scoreB': 0});
+      rally(state, 'A');
+      act(state, {'action': 'setScore', 'scoreA': 20, 'scoreB': 0});
+      rally(state, 'A');
+      expect(state.core.finished, isTrue);
+      expect(state.core.winner, 'A');
+      expect(() => act(state, {'action': 'reopen'}), throwsStatus(409));
+      expect(state.core.finished, isTrue);
+      expect(state.core.winner, 'A');
+    });
+
+    test('a match finished early can be reopened', () {
+      final state = newState('badminton');
+      act(state, {'action': 'setScore', 'scoreA': 20, 'scoreB': 0});
+      rally(state, 'A');
+      act(state, {'action': 'finish'});
+      expect(state.core.finished, isTrue);
+      expect(state.core.winner, 'A');
+      act(state, {'action': 'reopen'});
+      expect(state.core.finished, isFalse);
+      expect(state.core.winner, isNull);
+      rally(state, 'B');
+      expect(state.core.pointsB, 1);
+    });
+  });
+
+  group('tennis tie-break serve', () {
+    test('server order is first, then two each', () {
+      final order = [
+        for (var n = 0; n < 9; n++) scoreboardTiebreakServer('B', n),
+      ];
+      expect(order, ['B', 'A', 'A', 'B', 'B', 'A', 'A', 'B', 'B']);
+    });
+
+    test('adjust keeps the tie-break server in sync', () {
+      final state = newState('tennis');
+      act(state, {'action': 'setScore', 'gamesA': 6, 'gamesB': 5});
+      rally(state, 'B', 4);
+      expect(state.core.tiebreak, isTrue);
+      expect(state.core.tiebreakFirstServer, 'B');
+      // 3 điểm: B, A, A đã giao → điểm thứ 4 do B giao.
+      act(state, {'action': 'adjust', 'team': 'A', 'delta': 3});
+      expect(state.core.pointsA, 3);
+      expect(state.core.serving, 'B');
+      act(state, {'action': 'adjust', 'team': 'B', 'delta': 1});
+      expect(state.core.serving, 'B');
+      act(state, {'action': 'adjust', 'team': 'B', 'delta': 1});
+      expect(state.core.serving, 'A');
+      // Bớt điểm: tính lại người giao theo tổng điểm.
+      act(state, {'action': 'adjust', 'team': 'A', 'delta': -1});
+      expect(state.core.serving, 'B');
+      // Điểm thường tiếp tục đúng thứ tự.
+      rally(state, 'A');
+      expect(state.core.serving, 'A');
+    });
+
+    test('correcting the server mid tie-break continues from the correction', () {
+      final state = newState('tennis');
+      act(state, {'action': 'setScore', 'gamesA': 6, 'gamesB': 5});
+      rally(state, 'B', 4);
+      rally(state, 'A');
+      expect(state.core.serving, 'A');
+      act(state, {'action': 'setServe', 'team': 'B'});
+      expect(state.core.tiebreakFirstServer, 'A');
+      rally(state, 'A');
+      expect(state.core.serving, 'B');
+      rally(state, 'A');
+      expect(state.core.serving, 'A');
+    });
+  });
+
+  group('setScore keeps the set list consistent', () {
+    test('setsA = 1 moves to set 2 with a placeholder set', () {
+      final state = newState('pickleball');
+      act(state, {'action': 'setScore', 'setsA': 1});
+      expect(state.core.setsWonA, 1);
+      expect(state.core.sets.length, 1);
+      expect(state.core.sets.single.synthetic, isTrue);
+      expect(state.core.currentSetNumber(), 2);
+      final json = state.toJson(nowMs: 0);
+      expect(json['currentSet'], 2);
+      expect((json['sets'] as List).single, containsPair('synthetic', true));
+      // Lưu/khôi phục giữ nguyên.
+      final restored = ScoreboardState.fromJson(json, nowMs: 0);
+      expect(restored.core.sets.length, 1);
+      expect(restored.core.sets.single.synthetic, isTrue);
+      expect(restored.core.currentSetNumber(), 2);
+
+      act(state, {'action': 'setScore', 'setsB': 1});
+      expect(state.core.sets.length, 2);
+      expect(state.core.currentSetNumber(), 3);
+      act(state, {'action': 'setScore', 'setsA': 0, 'setsB': 0});
+      expect(state.core.sets, isEmpty);
+      expect(state.core.currentSetNumber(), 1);
+    });
+
+    test('lowering setsA removes placeholders before real sets', () {
+      final state = newState('badminton');
+      act(state, {'action': 'setScore', 'scoreA': 20, 'scoreB': 5});
+      rally(state, 'A');
+      act(state, {'action': 'setScore', 'setsA': 1, 'setsB': 1});
+      expect(state.core.sets.length, 2);
+      expect(state.core.sets.first.synthetic, isFalse);
+      act(state, {'action': 'setScore', 'setsB': 0});
+      expect(state.core.sets.single.a, 21);
+    });
+
+    test('enough sets won finishes the match', () {
+      final state = newState('pickleball');
+      act(state, {'action': 'setScore', 'setsA': 2});
+      expect(state.core.finished, isTrue);
+      expect(state.core.winner, 'A');
+    });
+  });
+
+  group('serve at 0-0', () {
+    test('setServe after a side-out keeps the first server of the set', () {
+      final state = newState('pickleball');
+      expect(state.core.setFirstServer, 'A');
+      // A (người giao 2) thua pha bóng: side-out, tỉ số vẫn 0-0.
+      rally(state, 'B');
+      expect(state.core.serving, 'B');
+      expect(state.core.pointsA + state.core.pointsB, 0);
+      act(state, {'action': 'setServe', 'team': 'B', 'serverNumber': 2});
+      expect(state.core.setFirstServer, 'A');
+      act(state, {'action': 'swapServe'});
+      expect(state.core.setFirstServer, 'A');
+      // Giữa set: đổi giao không còn là "0-0-2" đầu set.
+      expect(state.core.serverNumber, 1);
+      // Số pha bóng trong set sống qua lưu/khôi phục.
+      final restored = ScoreboardState.fromJson(state.toJson(nowMs: 0), nowMs: 0);
+      expect(restored.core.setRallies, 1);
+    });
+  });
+
+  group('numbers', () {
+    test('1e999 is rejected with 422 instead of crashing', () {
+      final state = newState('pickleball');
+      final action =
+          jsonDecode('{"action":"setScore","scoreA":1e999}') as Map<String, dynamic>;
+      expect(() => act(state, action), throwsStatus(422));
+      expect(
+        () => act(state, {'action': 'adjust', 'team': 'A', 'delta': double.infinity}),
+        throwsStatus(422),
+      );
+      expect(
+        () => act(state, {
+          'action': 'config',
+          'rules': {'pointsToWin': double.nan},
+        }),
+        throwsStatus(422),
+      );
+      expect(state.core.pointsA, 0);
+    });
+
+    test('non-finite stored numbers fall back to defaults', () {
+      final json = newState('pickleball').toJson(nowMs: 0);
+      json['points'] = {'a': double.infinity, 'b': double.nan};
+      final restored = ScoreboardState.fromJson(json, nowMs: 0);
+      expect(restored.core.pointsA, 0);
+      expect(restored.core.pointsB, 0);
+    });
+  });
+
+  group('rules', () {
+    test('tie-break must be at games per set or one less', () {
+      final state = newState('tennis');
+      expect(
+        () => act(state, {
+          'action': 'config',
+          'rules': {'tiebreakAt': 4},
+        }),
+        throwsStatus(422),
+      );
+      act(state, {
+        'action': 'config',
+        'rules': {'tiebreakAt': 5},
+      });
+      expect(state.core.rules.tiebreakAt, 5);
+      // Fast4: 4 game/set, tie-break ở 3-3.
+      act(state, {
+        'action': 'config',
+        'rules': {'gamesPerSet': 4, 'tiebreakAt': 3},
+      });
+      expect(state.core.rules.gamesPerSet, 4);
+      expect(state.core.rules.tiebreakAt, 3);
+    });
+  });
+
+  group('fromJson', () {
+    test('normalizes inconsistent saved state field by field', () {
+      final json = newState('badminton').toJson(nowMs: 0);
+      json.remove('v');
+      json['setsWon'] = {'a': 2, 'b': 0};
+      json['status'] = 'playing';
+      json['winner'] = null;
+      json['serverNumber'] = 2;
+      json['setRallies'] = 5;
+      json['rules'] = {
+        ...(json['rules'] as Map<String, dynamic>),
+        'bestOf': 4,
+        'pointsToWin': 15,
+      };
+      json['overlay'] = {'scene': 'nope', 'theme': 'light', 'scale': 1.5};
+      final restored = ScoreboardState.fromJson(json, nowMs: 0);
+      expect(restored.core.finished, isTrue);
+      expect(restored.core.winner, 'A');
+      expect(restored.core.serverNumber, 1);
+      expect(restored.core.sets.length, 2);
+      // v1 chưa có số pha bóng trong set.
+      expect(restored.core.setRallies, 0);
+      // Một trường luật sai không làm mất các trường khác.
+      expect(restored.core.rules.bestOf, 3);
+      expect(restored.core.rules.pointsToWin, 15);
+      // Một trường overlay sai không đưa cả overlay về mặc định.
+      expect(restored.overlay.scene, 'scorebar');
+      expect(restored.overlay.theme, 'light');
+      expect(restored.overlay.scale, 1.5);
+    });
+
+    test('a valid state is unchanged by a save/load round trip', () {
+      final state = newState('tennis');
+      rally(state, 'A', 5);
+      final json = state.toJson(nowMs: 0);
+      expect(json['v'], scoreboardStateVersion);
+      final again = ScoreboardState.fromJson(json, nowMs: 0).toJson(nowMs: 0);
+      expect(jsonEncode(again), jsonEncode(json));
+    });
+  });
+
+  group('ScoreboardService undo across matches', () {
+    setUp(() {
+      SharedPreferences.setMockInitialValues({});
+    });
+
+    test('undo after newMatch does not bring back the old match', () async {
+      final service = ScoreboardService(storageKey: 'test_state5', controlKeyStorageKey: 'test_key5');
+      await service.load();
+      service.apply({'action': 'point', 'team': 'A'});
+      service.apply({'action': 'point', 'team': 'A'});
+      final fresh = service.apply({'action': 'newMatch', 'resetTeams': true});
+      expect(service.canUndo, isFalse);
+      expect(() => service.apply({'action': 'undo'}), throwsStatus(409));
+      final now = service.snapshot();
+      expect((now['points'] as Map)['a'], 0);
+      expect(now['matchId'], fresh['matchId']);
+    });
+
+    test('undo after config reset does not bring back the old match', () async {
+      final service = ScoreboardService(storageKey: 'test_state6', controlKeyStorageKey: 'test_key6');
+      await service.load();
+      service.apply({'action': 'point', 'team': 'A'});
+      service.apply({'action': 'config', 'sport': 'badminton', 'reset': true});
+      expect(service.canUndo, isFalse);
+    });
+
+    test('undo of setScore also restores team names', () async {
+      final service = ScoreboardService(storageKey: 'test_state7', controlKeyStorageKey: 'test_key7');
+      await service.load();
+      service.apply({'action': 'setScore', 'scoreA': 5, 'teamA': 'Hà Nội'});
+      final undone = service.apply({'action': 'undo'});
+      expect((undone['teamA'] as Map)['name'], 'Đội A');
+      expect((undone['points'] as Map)['a'], 0);
+
+      // Tên đã sửa tiếp bằng lệnh khác thì giữ nguyên.
+      service.apply({'action': 'setScore', 'scoreA': 5, 'teamA': 'Hà Nội'});
+      service.apply({'action': 'setTeam', 'team': 'A', 'name': 'Hải Phòng'});
+      final kept = service.apply({'action': 'undo'});
+      expect((kept['teamA'] as Map)['name'], 'Hải Phòng');
     });
   });
 }

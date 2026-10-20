@@ -14,6 +14,7 @@ import 'package:path_provider/path_provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import 'audio_cleanup.dart';
+import 'station_platform_events.dart';
 import 'video_storage_service.dart';
 
 bool isPublishableVideoProbe({
@@ -173,31 +174,457 @@ List<String> fragmentCompanionPaths(String videoPath) {
   return [videoPath, '$base.wav', '$base.json'];
 }
 
-bool isManagedStorageFilePath(String path) {
+bool isManagedStorageFilePath(String path, {String? storageRoot}) {
   final normalized = path.replaceAll('\\', '/').toLowerCase();
-  return isAppManagedVideoPath(path) ||
-      (normalized.contains('/fragments/') &&
-          (normalized.endsWith('.wav') || normalized.endsWith('.json')));
+  if (isAppManagedVideoPath(path, storageRoot: storageRoot)) return true;
+  if (!normalized.endsWith('.wav') && !normalized.endsWith('.json')) {
+    return false;
+  }
+  // Âm thanh/metadata của mảnh ngắn chỉ nằm trong
+  // `<dd-mm-yyyy>/AUTOMODE/.../FRAGMENTS/`.
+  return normalized.contains('/fragments/') &&
+      RegExp(r'/\d{2}-\d{2}-\d{4}/automode/').hasMatch(normalized) &&
+      (storageRoot == null ||
+          normalized.startsWith('${_normalizedRootPrefix(storageRoot)}/'));
 }
 
-/// Video do chính app tạo ra: đoạn ghi trong `<dd-mm-yyyy>/AUTOMODE/...`
-/// (gồm FRAGMENTS và bản dự phòng .mp4) hoặc tên file kiểu cũ của VNVAR.
+/// Tên file kiểu cũ của VNVAR (lưu ngay ở gốc thư mục lưu), ví dụ
+/// `VNVAR_CAM-01_1756000000000.ts`, `CLIP_CAM1_1756000000000.mp4`,
+/// `CAM1_1756000000000.mp4`. Neo cả hai đầu, chỉ chấp nhận số camera và mốc
+/// thời gian epoch (giây hoặc mili-giây).
+final RegExp _legacyVideoNamePattern = RegExp(
+  r'^(VNVAR_|CLIP_)?CAM[-_]?\d{1,3}_\d{10,13}\.(TS|MP4)$',
+);
+
+/// Clip xuất tạm do API trim/Check VAR tạo trong `<gốc>/download/`
+/// (xem [buildTrimmedClipFileName]).
+final RegExp _exportClipNamePattern = RegExp(r'^[a-z0-9_-]+_trim_\d{10,}\.mp4$');
+
+/// Gốc lưu đã chuẩn hoá: dấu `/`, chữ thường, không có `/` ở cuối (gốc `/`
+/// trở thành chuỗi rỗng).
+String _normalizedRootPrefix(String storageRoot) {
+  var root = storageRoot.replaceAll('\\', '/').toLowerCase();
+  while (root.endsWith('/')) {
+    root = root.substring(0, root.length - 1);
+  }
+  return root;
+}
+
+/// Video do chính app tạo ra:
+/// - đoạn ghi trong `<dd-mm-yyyy>/AUTOMODE/...` (gồm FRAGMENTS và bản dự
+///   phòng .mp4);
+/// - clip xuất tạm `<camera>_trim_<epoch>.mp4` trong thư mục `download`;
+/// - file kiểu cũ của VNVAR nằm ngay ở gốc lưu, tên khớp regex chặt.
 /// Người dùng có thể chọn thư mục lưu dùng chung (ví dụ DCIM), nên mọi thao
-/// tác dọn dẹp/giới hạn dung lượng chỉ được đụng tới các file này.
-bool isAppManagedVideoPath(String path) {
+/// tác dọn dẹp/giới hạn dung lượng chỉ được đụng tới các file này. Khi biết
+/// [storageRoot], thư mục ngày phải là con trực tiếp của gốc và file kiểu cũ
+/// phải nằm ngay trong gốc (không nhận file trùng tên ở thư mục con khác).
+bool isAppManagedVideoPath(String path, {String? storageRoot}) {
   final normalized = path.replaceAll('\\', '/');
   final lower = normalized.toLowerCase();
   if (!lower.endsWith('.ts') && !lower.endsWith('.mp4')) return false;
-  if (RegExp(
-    r'/\d{2}-\d{2}-\d{4}/automode/',
-  ).hasMatch(lower)) {
-    return true;
+  final slash = normalized.lastIndexOf('/');
+  final name = normalized.substring(slash + 1);
+  final parentLower = slash < 0 ? '' : lower.substring(0, slash);
+
+  if (storageRoot == null) {
+    if (RegExp(r'/\d{2}-\d{2}-\d{4}/automode/').hasMatch(lower)) return true;
+    if (parentLower.endsWith('/download') &&
+        _exportClipNamePattern.hasMatch(name.toLowerCase())) {
+      return true;
+    }
+    return _legacyVideoNamePattern.hasMatch(name.toUpperCase());
   }
-  final name = normalized.split('/').last.toUpperCase();
-  if (name.contains('_CLIP_')) return true;
-  return RegExp(
-    r'^(VNVAR_|CLIP_)?CAM[-_]?[A-Z0-9]*_\d{10,}\.(TS|MP4)$',
-  ).hasMatch(name);
+
+  final root = _normalizedRootPrefix(storageRoot);
+  if (!lower.startsWith('$root/')) return false;
+  final relative = lower.substring(root.length);
+  if (RegExp(r'^/\d{2}-\d{2}-\d{4}/automode/').hasMatch(relative)) return true;
+  if (parentLower == '$root/download') {
+    return _exportClipNamePattern.hasMatch(name.toLowerCase());
+  }
+  if (parentLower == root) {
+    return _legacyVideoNamePattern.hasMatch(name.toUpperCase());
+  }
+  return false;
+}
+
+/// Thông số luồng video dùng để quyết định có nối hai segment bằng concat
+/// demuxer (stream copy) được hay không.
+class VideoStreamSignature {
+  final String? codec;
+  final int? width;
+  final int? height;
+
+  /// Góc xoay (0/90/180/270) đọc từ tag `rotate` hoặc side data display
+  /// matrix; 0 khi không có.
+  final int rotation;
+
+  const VideoStreamSignature({
+    required this.codec,
+    required this.width,
+    required this.height,
+    this.rotation = 0,
+  });
+
+  @override
+  String toString() => '${codec ?? '?'} ${width ?? '?'}x${height ?? '?'} '
+      'rotate=$rotation';
+}
+
+int? _propertyAsInt(Object? value) {
+  if (value is num) return value.isFinite ? value.round() : null;
+  if (value is String) {
+    final trimmed = value.trim();
+    final integer = int.tryParse(trimmed);
+    if (integer != null) return integer;
+    final decimal = double.tryParse(trimmed);
+    return decimal != null && decimal.isFinite ? decimal.round() : null;
+  }
+  return null;
+}
+
+int _normalizeRotation(int degrees) => (degrees % 360 + 360) % 360;
+
+/// Đọc [VideoStreamSignature] từ thuộc tính một stream của FFprobe
+/// (`codec_name`, `width`, `height`, `tags.rotate`, `side_data_list[].rotation`).
+VideoStreamSignature? videoStreamSignatureFromProperties(
+  Map<dynamic, dynamic>? properties,
+) {
+  if (properties == null) return null;
+  final codecType = properties['codec_type'];
+  if (codecType is String && codecType != 'video') return null;
+  final codecValue = properties['codec_name'];
+  var rotation = 0;
+  final tags = properties['tags'];
+  if (tags is Map) {
+    final rotate = _propertyAsInt(tags['rotate']);
+    if (rotate != null) rotation = rotate;
+  }
+  final sideData = properties['side_data_list'];
+  if (rotation == 0 && sideData is List) {
+    for (final item in sideData) {
+      if (item is! Map) continue;
+      final value = _propertyAsInt(item['rotation']);
+      if (value != null && value != 0) {
+        rotation = value;
+        break;
+      }
+    }
+  }
+  return VideoStreamSignature(
+    codec: codecValue is String && codecValue.trim().isNotEmpty
+        ? codecValue.trim().toLowerCase()
+        : null,
+    width: _propertyAsInt(properties['width']),
+    height: _propertyAsInt(properties['height']),
+    rotation: _normalizeRotation(rotation),
+  );
+}
+
+/// Hai file chỉ được nối bằng stream copy khi cùng codec, cùng kích thước và
+/// cùng góc xoay. Thiếu thông tin (probe lỗi) coi như không khớp.
+bool canJoinVideoStreams(
+  VideoStreamSignature? first,
+  VideoStreamSignature? second,
+) {
+  if (first == null || second == null) return false;
+  return first.codec != null &&
+      first.codec == second.codec &&
+      first.width != null &&
+      first.width == second.width &&
+      first.height != null &&
+      first.height == second.height &&
+      first.rotation == second.rotation;
+}
+
+/// Độ lệch (ms) giữa mẫu âm đầu tiên và lúc MediaRecorder bắt đầu ghi
+/// (`firstSampleEpochMs - videoStartEpochMs`). null khi thiếu dữ liệu.
+int? audioSyncOffsetMs({
+  required num? firstSampleEpochMs,
+  required num? videoStartEpochMs,
+}) {
+  if (firstSampleEpochMs == null || videoStartEpochMs == null) return null;
+  final difference = firstSampleEpochMs - videoStartEpochMs;
+  if (!difference.isFinite) return null;
+  return difference.round();
+}
+
+/// Ngưỡng áp dụng bù lệch A/V: chỉ khi 20 ms < |offset| < 3000 ms.
+const int minimumAudioSyncOffsetMs = 20;
+const int maximumAudioSyncOffsetMs = 3000;
+
+/// Đối số FFmpeg đặt NGAY TRƯỚC `-i <wav>` để căn tiếng theo hình:
+/// offset > 0 (tiếng bắt đầu muộn hơn hình) → `-itsoffset` làm trễ tiếng;
+/// offset < 0 (tiếng bắt đầu sớm hơn) → `-ss` cắt bỏ phần đầu của tiếng.
+List<String> audioOffsetInputArguments(int? offsetMs) {
+  if (offsetMs == null) return const <String>[];
+  final magnitude = offsetMs.abs();
+  if (magnitude <= minimumAudioSyncOffsetMs ||
+      magnitude >= maximumAudioSyncOffsetMs) {
+    return const <String>[];
+  }
+  final seconds = (magnitude / 1000).toStringAsFixed(3);
+  return offsetMs > 0
+      ? <String>['-itsoffset', seconds]
+      : <String>['-ss', seconds];
+}
+
+/// Đọc `firstSampleEpochMs` từ kết quả `stopNativeAudioSegment`. Native cũ
+/// có thể trả null/bool thay vì map: khi đó không biết mốc mẫu đầu tiên.
+num? firstSampleEpochMsFromStopResult(Object? result) {
+  if (result is! Map) return null;
+  final value = result['firstSampleEpochMs'];
+  if (value is num && value.isFinite && value > 0) return value;
+  return null;
+}
+
+/// Nhịp thử mở lại recorder khi phiên ghi đang bị treo vì không mở được
+/// segment mới: theo lịch thử lại dung lượng (2 phút) khi thiếu dung lượng,
+/// 30 giây cho các lỗi khác.
+Duration suspendedRecorderRetryDelay({
+  required bool storageSuspended,
+  required DateTime? nextStorageRetryAt,
+  required DateTime now,
+}) {
+  if (storageSuspended) {
+    if (nextStorageRetryAt == null) return const Duration(minutes: 2);
+    final remaining = nextStorageRetryAt.difference(now);
+    return remaining > const Duration(seconds: 1)
+        ? remaining
+        : const Duration(seconds: 1);
+  }
+  return const Duration(seconds: 30);
+}
+
+/// Tên cơ sở cho segment: lần đầu dùng nguyên [baseName], trùng thì thêm hậu
+/// tố `_1`, `_2`... thay vì ghi đè file cũ.
+String segmentBaseNameCandidate(String baseName, int attempt) =>
+    attempt <= 0 ? baseName : '${baseName}_$attempt';
+
+/// Thời gian sống tối đa của clip xuất tạm không có ai đóng phiên, tính từ
+/// lần dùng gần nhất (tạo hoặc đọc qua HTTP).
+const Duration exportClipTtl = Duration(minutes: 30);
+
+/// Có được xoá clip xuất tạm hay không (chưa xét lease đọc HTTP):
+/// [removeAll] khi khởi động/dispose; [closingOwner] khi một tablet đóng
+/// phiên tải — chỉ xoá clip của chính phiên đó; ngoài ra clip không được
+/// dùng trong [ttl] (tính từ max([createdAt], [lastAccessedAt])) được coi là
+/// mồ côi.
+bool shouldRemoveExportClip({
+  required String? clipOwner,
+  required DateTime createdAt,
+  required DateTime now,
+  DateTime? lastAccessedAt,
+  String? closingOwner,
+  bool removeAll = false,
+  Duration ttl = exportClipTtl,
+}) {
+  if (removeAll) return true;
+  if (closingOwner != null && clipOwner == closingOwner) return true;
+  final lastUsed = lastAccessedAt != null && lastAccessedAt.isAfter(createdAt)
+      ? lastAccessedAt
+      : createdAt;
+  return now.difference(lastUsed) >= ttl;
+}
+
+/// Hậu tố file tạm khi thử ghép lại tiếng cho bản MP4 dự phòng. Không kết
+/// thúc bằng `.ts`/`.mp4` nên chỉ mục video và [isAppManagedVideoPath] không
+/// nhận nhầm; `.tmp` được dọn như file phụ trợ mồ côi ([isOrphanAuxiliaryFile]).
+const String fallbackRetryTempSuffix = '.retry.tmp';
+
+/// Đường dẫn file tạm (cùng thư mục) cho file đích [targetPath].
+String fallbackRetryTempPath(String targetPath) =>
+    '$targetPath$fallbackRetryTempSuffix';
+
+/// Bản ghi clip xuất tạm: phiên sở hữu, lúc tạo và lần đọc HTTP gần nhất.
+typedef _ExportClipRecord = ({
+  String? owner,
+  DateTime createdAt,
+  DateTime? lastAccessedAt,
+});
+
+enum FallbackReplacementAction {
+  /// Đưa file tạm vào chỗ (rename đè/copy), rồi bỏ bản dự phòng cũ.
+  install,
+
+  /// Bản dự phòng cũ đang được đọc: bỏ file tạm, giữ nguồn staging, thử lại
+  /// ở lần dọn sau (không tính là một lần thử thất bại).
+  defer,
+
+  /// File tạm không hợp lệ (ghép lỗi): bỏ file tạm, bản cũ giữ nguyên.
+  discardTemp,
+}
+
+/// Quyết định ngay trước khi thay bản dự phòng cũ bằng kết quả ghép lại.
+/// [previousLeased] phải được đọc NGAY trước thao tác xoá/đè.
+FallbackReplacementAction fallbackReplacementAction({
+  required bool tempValid,
+  required bool previousLeased,
+}) {
+  if (!tempValid) return FallbackReplacementAction.discardTemp;
+  if (previousLeased) return FallbackReplacementAction.defer;
+  return FallbackReplacementAction.install;
+}
+
+/// Khoá journal ghi đường dẫn bản MP4 dự phòng sắp bị thay bằng TS: ghi
+/// TRƯỚC khi đưa TS vào chỗ, gỡ sau khi xoá xong bản MP4. Crash ở giữa thì
+/// lần khôi phục sau dùng khoá này để bỏ bản MP4 trùng.
+const String fallbackPendingDeleteJournalKey = 'pendingDelete';
+
+/// Đường dẫn TS thay thế cho bản MP4 dự phòng [mp4Path] (cùng thư mục, cùng
+/// tên cơ sở — như `_convertRecordingToTs` dựng khi thử lại). Không phải
+/// `.mp4` thì trả null.
+String? supersedingTsPathForFallback(String mp4Path) {
+  if (!mp4Path.toLowerCase().endsWith('.mp4')) return null;
+  return '${mp4Path.substring(0, mp4Path.length - 4)}.ts';
+}
+
+enum PendingFallbackDeleteAction {
+  /// Journal không có khoá xoá dở: xử lý như bình thường.
+  none,
+
+  /// Khoá không còn hiệu lực (TS chưa vào chỗ / không khớp bản dự phòng):
+  /// gỡ khoá rồi xử lý như bình thường.
+  clearStale,
+
+  /// TS dở dang (không đọc được): bỏ TS dở, gỡ khoá, giữ bản MP4.
+  discardBrokenTs,
+
+  /// TS đã vào chỗ nhưng bản MP4 đang được đọc: giữ nguyên, xét lại sau.
+  waitForLease,
+
+  /// TS đã vào chỗ: xoá bản MP4 trùng và chốt lượt thử như thành công.
+  deleteSuperseded,
+}
+
+/// Quyết định khi khôi phục một journal `preserved_fallback` còn khoá
+/// [fallbackPendingDeleteJournalKey] (crash giữa lúc đưa TS vào chỗ và lúc
+/// xoá bản MP4 cũ). [pendingDelete] chỉ có hiệu lực khi trùng [finalPath] và
+/// là `.mp4`. [tsPlayable] chỉ được xét khi [tsExists].
+PendingFallbackDeleteAction pendingFallbackDeleteAction({
+  required Object? pendingDelete,
+  required String? finalPath,
+  required bool tsExists,
+  required bool tsPlayable,
+  required bool mp4Leased,
+}) {
+  if (pendingDelete == null) return PendingFallbackDeleteAction.none;
+  if (pendingDelete is! String ||
+      pendingDelete != finalPath ||
+      supersedingTsPathForFallback(pendingDelete) == null ||
+      !tsExists) {
+    return PendingFallbackDeleteAction.clearStale;
+  }
+  if (!tsPlayable) return PendingFallbackDeleteAction.discardBrokenTs;
+  if (mp4Leased) return PendingFallbackDeleteAction.waitForLease;
+  return PendingFallbackDeleteAction.deleteSuperseded;
+}
+
+/// Cặp `X.ts` + `X.mp4` cùng thư mục, cùng tên cơ sở (phân biệt hoa thường,
+/// đuôi so không phân biệt) và đều do app quản lý ([isAppManagedVideoPath]):
+/// bản `.mp4` là bản dự phòng đã (hoặc đang) được thay bằng `.ts`.
+/// Trả về map đường dẫn `.mp4` -> đường dẫn `.ts`; chỉ mục chỉ liệt kê một
+/// bản ([preferFallbackMp4OverTs]), không xoá file. File khác tên cơ sở không
+/// bao giờ bị ghép cặp.
+Map<String, String> supersededFallbackVideoPairs(
+  Iterable<String> videoPaths, {
+  String? storageRoot,
+}) {
+  final tsByBase = <String, String>{};
+  final mp4ByBase = <String, String>{};
+  for (final path in videoPaths) {
+    final lower = path.toLowerCase();
+    if (lower.endsWith('.ts')) {
+      tsByBase.putIfAbsent(path.substring(0, path.length - 3), () => path);
+    } else if (lower.endsWith('.mp4')) {
+      mp4ByBase.putIfAbsent(path.substring(0, path.length - 4), () => path);
+    }
+  }
+  final result = <String, String>{};
+  for (final entry in mp4ByBase.entries) {
+    final mp4Path = entry.value;
+    final tsPath = tsByBase[entry.key];
+    if (tsPath == null) continue;
+    if (!isAppManagedVideoPath(mp4Path, storageRoot: storageRoot) ||
+        !isAppManagedVideoPath(tsPath, storageRoot: storageRoot)) {
+      continue;
+    }
+    result[mp4Path] = tsPath;
+  }
+  return result;
+}
+
+/// Với một cặp từ [supersededFallbackVideoPairs]: chỉ mục giữ bản `.mp4` (ẩn
+/// `.ts`) khi journal còn khoá [fallbackPendingDeleteJournalKey] trỏ tới bản
+/// `.mp4` đó — lượt thay chưa hoàn tất, `.ts` có thể dở dang — hoặc khi bản
+/// `.ts` không còn (lượt thay vừa hoãn và gỡ `.ts`), miễn bản `.mp4` vẫn còn
+/// trên đĩa. Ngược lại (thay thế đã hoàn tất) ưu tiên `.ts`.
+bool preferFallbackMp4OverTs({
+  required bool pendingDelete,
+  required bool mp4Exists,
+  bool tsExists = true,
+}) => mp4Exists && (pendingDelete || !tsExists);
+
+/// File tạm `*.retry.tmp` sót lại sau crash được coi là cũ sau khoảng này.
+const Duration staleFallbackRetryTempAge = Duration(minutes: 10);
+
+/// File tạm thử ghép lại ([fallbackRetryTempSuffix]) được phép dọn khi thư
+/// mục vẫn còn video: chỉ khi không có lượt thử nào đang chạy và file đã cũ
+/// hơn [staleAge]. Không bao giờ nhận file khác.
+bool isStaleFallbackRetryTemp({
+  required String path,
+  required DateTime modified,
+  required DateTime now,
+  required bool retryInFlight,
+  Duration staleAge = staleFallbackRetryTempAge,
+}) {
+  if (retryInFlight) return false;
+  final name = path.replaceAll('\\', '/').split('/').last.toLowerCase();
+  if (!name.endsWith(fallbackRetryTempSuffix) ||
+      name.length == fallbackRetryTempSuffix.length) {
+    return false;
+  }
+  return now.difference(modified) >= staleAge;
+}
+
+/// Số lần tối đa thử ghép lại tiếng cho bản MP4 dự phòng.
+const int maximumFallbackMuxAttempts = 3;
+
+enum PreservedFallbackAction {
+  /// Thử ghép tiếng lại từ MP4/WAV staging, ghi đè đúng bản dự phòng.
+  retry,
+
+  /// Giữ nguyên nguồn staging, xét lại ở lần dọn sau.
+  keep,
+
+  /// Bỏ nguồn staging (MP4/WAV/journal); bản dự phòng (nếu còn) được giữ.
+  discardSources,
+}
+
+/// Quyết định cho cặp MP4/WAV staging đã có bản MP4 dự phòng
+/// (journal `state: preserved_fallback`).
+PreservedFallbackAction preservedFallbackAction({
+  required int attempts,
+  required bool finalExists,
+  required bool finalLeased,
+  required Duration age,
+  required Duration maxAge,
+}) {
+  if (!finalExists) {
+    // Bản dự phòng đã bị xoá (người dùng xoá/thư mục ngày hết hạn): không
+    // dựng lại, chỉ dọn nguồn khi quá hạn.
+    return age >= maxAge
+        ? PreservedFallbackAction.discardSources
+        : PreservedFallbackAction.keep;
+  }
+  if (finalLeased) return PreservedFallbackAction.keep;
+  if (attempts < maximumFallbackMuxAttempts) {
+    return PreservedFallbackAction.retry;
+  }
+  return age >= maxAge
+      ? PreservedFallbackAction.discardSources
+      : PreservedFallbackAction.keep;
 }
 
 /// File phụ trợ mồ côi được phép xoá khi dọn thư mục ngày: âm thanh/metadata
@@ -285,6 +712,17 @@ class TrimProcessingException implements Exception {
   String toString() => message;
 }
 
+/// Check VAR không có segment để chốt. [code]: `NO_SEGMENT` (không còn file
+/// chứa thời điểm sự kiện) hoặc `NOT_RECORDING` (camera chưa/không ghi).
+class CheckVarSegmentUnavailableException implements Exception {
+  final String code;
+  final String message;
+  const CheckVarSegmentUnavailableException(this.code, this.message);
+
+  @override
+  String toString() => message;
+}
+
 // ============================================================
 // RECORDED SEGMENT
 // ============================================================
@@ -304,6 +742,10 @@ class RecordedSegment {
 
   bool downloaded;
 
+  /// Chỉ có ý nghĩa với clip: clip đã được nối thêm phần cuối của segment
+  /// liền trước (Check VAR bấm ngay sau lúc chuyển segment).
+  final bool joinedPrecedingSegment;
+
   RecordedSegment({
     required this.id,
     required this.cameraId,
@@ -312,6 +754,7 @@ class RecordedSegment {
     required this.endedAt,
     this.type = 'RECORDING',
     this.downloaded = false,
+    this.joinedPrecedingSegment = false,
   });
 
   // ============================================================
@@ -389,7 +832,12 @@ class RecordingService {
   RecordingService({
     required this.cameraId,
     VideoStorageService? videoStorageService,
-  }) : _videoStorage = videoStorageService ?? VideoStorageService();
+  }) : _videoStorage = videoStorageService ?? VideoStorageService() {
+    if (Platform.isAndroid || Platform.isIOS) {
+      // C3: iOS báo gián đoạn âm thanh (cuộc gọi, Siri...) kết thúc.
+      StationPlatformEvents.instance.addListener(this, _handlePlatformEvent);
+    }
+  }
 
   final VideoStorageService _videoStorage;
 
@@ -466,6 +914,11 @@ class RecordingService {
   File? _currentJournal;
   bool _currentSegmentHasAudio = false;
 
+  /// Số lượt thử ghép lại bản dự phòng đang chạy (cờ in-flight, dùng chung
+  /// mọi camera vì có thể chung thư mục lưu): khác 0 thì không dọn
+  /// `*.retry.tmp` vì file tạm có thể đang được FFmpeg ghi.
+  static int _fallbackRetriesInFlight = 0;
+
   // ============================================================
   // STATE
   // ============================================================
@@ -502,7 +955,33 @@ class RecordingService {
   Future<void>? _storageLimitOperation;
   Future<void>? _autoCleanupOperation;
   Future<void>? _exportCleanupOperation;
+  Future<void>? _abandonedCleanupOperation;
   final Map<String, int> _activeFileReaders = <String, int>{};
+
+  // Phiên ghi vẫn bật (_recording) nhưng không mở được recorder cho segment
+  // mới (thiếu dung lượng, lỗi native...). Lúc này KHÔNG có file nào đang
+  // được ghi; timer thử mở lại theo nhịp ngắn (suspendedRecorderRetryDelay).
+  String? _suspendedReason;
+
+  // Mốc wall-clock (ms) ngay sau khi MediaRecorder.start của segment hiện tại
+  // hoàn tất (C2): dùng tính độ lệch với mẫu âm đầu tiên.
+  int? _currentVideoStartEpochMs;
+
+  // Chủ sở hữu (phiên tablet) và thời điểm tạo của từng clip xuất tạm, theo
+  // đường dẫn tuyệt đối (_exportClipKey).
+  // [lastAccessedAt]: lần gần nhất clip được phục vụ qua HTTP (/download,
+  // /video); TTL dọn clip mồ côi tính từ max(createdAt, lastAccessedAt).
+  final Map<String, _ExportClipRecord> _exportClipOwners =
+      <String, _ExportClipRecord>{};
+
+  /// Phiên ghi đang bật nhưng chưa ghi được (recorder chưa mở lại được).
+  /// [recording] vẫn true trong trạng thái này (ý định ghi còn nguyên); UI và
+  /// health monitor nên dựa vào getter này để không coi là "đang ghi".
+  bool get isRecordingSuspended => _recording && _suspendedReason != null;
+
+  /// Lý do treo ghi (thông điệp lỗi rút gọn), null nếu không treo.
+  String? get recordingSuspendedReason =>
+      isRecordingSuspended ? _suspendedReason : null;
 
   bool get recording => _recording;
 
@@ -511,13 +990,20 @@ class RecordingService {
   String _leaseKey(String path) =>
       File(path).absolute.path.replaceAll('\\', '/').toLowerCase();
 
+  // Khoá theo đường dẫn tuyệt đối thật (không đổi chữ thường) vì còn dùng để
+  // kiểm tra file còn tồn tại trên hệ thống file phân biệt hoa/thường.
+  String _exportClipKey(String path) => File(path).absolute.path;
+
   /// Prevents retention cleanup from deleting a file while HTTP is reading it.
   void acquireFileRead(String path) {
     final key = _leaseKey(path);
     _activeFileReaders[key] = (_activeFileReaders[key] ?? 0) + 1;
+    _touchExportClip(path);
   }
 
   void releaseFileRead(String path) {
+    // Gia hạn TTL cả lúc tải xong: lượt tải dài không bị tính từ lúc bắt đầu.
+    _touchExportClip(path);
     final key = _leaseKey(path);
     final count = _activeFileReaders[key];
     if (count == null || count <= 1) {
@@ -529,6 +1015,36 @@ class RecordingService {
 
   bool isFileReadActive(String path) =>
       (_activeFileReaders[_leaseKey(path)] ?? 0) > 0;
+
+  /// Clip xuất tạm có bản ghi chủ phiên: ghi nhận lần đọc gần nhất để TTL
+  /// dọn clip mồ côi tính từ lần đọc cuối (tablet tải muộn không bị 404).
+  void _touchExportClip(String path) {
+    if (_exportClipOwners.isEmpty) return;
+    final key = _exportClipKey(path);
+    final record = _exportClipOwners[key];
+    if (record == null) return;
+    _exportClipOwners[key] = (
+      owner: record.owner,
+      createdAt: record.createdAt,
+      lastAccessedAt: DateTime.now(),
+    );
+  }
+
+  /// Chỉ dùng trong test: đăng ký bản ghi chủ phiên cho một clip xuất tạm
+  /// (bình thường do [trimSegment] tạo).
+  @visibleForTesting
+  void debugRegisterExportClip(
+    String path, {
+    String? owner,
+    required DateTime createdAt,
+    DateTime? lastAccessedAt,
+  }) {
+    _exportClipOwners[_exportClipKey(path)] = (
+      owner: owner,
+      createdAt: createdAt,
+      lastAccessedAt: lastAccessedAt,
+    );
+  }
 
   /// Có file nào nằm trong [directoryPath] đang được HTTP đọc hay không.
   bool _hasActiveReadUnder(String directoryPath) {
@@ -581,7 +1097,8 @@ class RecordingService {
 
   /// Cắt clip từ [segmentId]. [startMs] âm nghĩa là bắt đầu trong
   /// [precedingSegmentId] (segment liền trước); hai file `.ts` được nối liền
-  /// rồi cắt bằng stream copy.
+  /// rồi cắt bằng stream copy. [owner] là khoá phiên tải của tablet yêu cầu:
+  /// `cleanupExportDownloads(owner: ...)` chỉ xoá clip của đúng phiên đó.
   Future<RecordedSegment> trimSegment({
     required String segmentId,
     required int startMs,
@@ -589,6 +1106,7 @@ class RecordingService {
     bool streamCopy = false,
     int? minimumOutputDurationMs,
     String? precedingSegmentId,
+    String? owner,
   }) {
     final key = [
       segmentId,
@@ -597,6 +1115,7 @@ class RecordingService {
       streamCopy,
       minimumOutputDurationMs,
       precedingSegmentId,
+      owner,
     ].join('|');
     final duplicate = _pendingTrims[key];
     if (duplicate != null) return duplicate;
@@ -627,6 +1146,7 @@ class RecordingService {
         streamCopy: streamCopy,
         minimumOutputDurationMs: minimumOutputDurationMs,
         precedingSegmentId: precedingSegmentId,
+        owner: owner,
       );
       _trimOperation = run;
       try {
@@ -659,6 +1179,7 @@ class RecordingService {
     required bool streamCopy,
     required int? minimumOutputDurationMs,
     String? precedingSegmentId,
+    String? owner,
   }) async {
     if (endMs <= startMs ||
         endMs - startMs < 500 ||
@@ -666,11 +1187,48 @@ class RecordingService {
       throw const InvalidTrimRangeException('Khoảng cắt video không hợp lệ.');
     }
     final source = findById(segmentId) ?? findByFileName(segmentId);
-    if (source == null || !await File(source.path).exists()) {
+    if (source == null) {
       throw TrimSegmentNotFoundException(
         'Không tìm thấy video nguồn $segmentId.',
       );
     }
+    // Giữ lease đọc cho file nguồn (và segment liền trước nếu dùng) suốt quá
+    // trình FFmpeg đọc, để dọn dung lượng/xoá thủ công không xoá giữa chừng.
+    final leasedPaths = <String>[source.path];
+    acquireFileRead(source.path);
+    try {
+      if (!await File(source.path).exists()) {
+        throw TrimSegmentNotFoundException(
+          'Không tìm thấy video nguồn $segmentId.',
+        );
+      }
+      return await _trimLeasedSource(
+        source: source,
+        startMs: startMs,
+        endMs: endMs,
+        streamCopy: streamCopy,
+        minimumOutputDurationMs: minimumOutputDurationMs,
+        precedingSegmentId: precedingSegmentId,
+        owner: owner,
+        leasedPaths: leasedPaths,
+      );
+    } finally {
+      for (final path in leasedPaths) {
+        releaseFileRead(path);
+      }
+    }
+  }
+
+  Future<RecordedSegment> _trimLeasedSource({
+    required RecordedSegment source,
+    required int startMs,
+    required int endMs,
+    required bool streamCopy,
+    required int? minimumOutputDurationMs,
+    required String? precedingSegmentId,
+    required String? owner,
+    required List<String> leasedPaths,
+  }) async {
     if (endMs > source.duration.inMilliseconds + 1000) {
       throw const InvalidTrimRangeException(
         'Khoảng cắt vượt quá thời lượng video.',
@@ -681,7 +1239,8 @@ class RecordingService {
     // inpoint/outpoint) để nối phần cuối segment trước với segment hiện tại.
     // Không dùng giao thức `concat:` vì dấu thời gian của file TS thứ hai bắt
     // đầu lại từ đầu, FFmpeg sẽ bỏ mất phần sau (đã kiểm chứng). Thiếu segment
-    // trước hoặc không phải TS thì cắt từ đầu segment hiện tại như trước.
+    // trước, không phải TS hoặc hai file khác codec/kích thước/góc xoay thì
+    // cắt từ đầu segment hiện tại như trước.
     RecordedSegment? precedingSource;
     var precedingMs = 0;
     var effectiveStartMs = startMs;
@@ -689,13 +1248,33 @@ class RecordingService {
       final preceding = precedingSegmentId == null
           ? null
           : findById(precedingSegmentId);
+      if (preceding != null) {
+        acquireFileRead(preceding.path);
+        leasedPaths.add(preceding.path);
+      }
       final precedingProbe = preceding == null ||
               !source.path.toLowerCase().endsWith('.ts') ||
               !await File(preceding.path).exists()
           ? null
           : await _probeVideo(File(preceding.path));
       precedingMs = ((precedingProbe?.durationSeconds ?? 0) * 1000).round();
+      var compatible = false;
       if (preceding != null && precedingMs > 0) {
+        final previousSignature = await _probeVideoSignature(
+          File(preceding.path),
+        );
+        final currentSignature = await _probeVideoSignature(File(source.path));
+        compatible = canJoinVideoStreams(previousSignature, currentSignature);
+        if (!compatible) {
+          developer.log(
+            '[TRIM] Not joining ${preceding.fileName} + ${source.fileName}: '
+            'stream mismatch ($previousSignature vs $currentSignature); '
+            'using the current segment only.',
+            name: 'RecordingService',
+          );
+        }
+      }
+      if (preceding != null && precedingMs > 0 && compatible) {
         precedingSource = preceding;
         effectiveStartMs = startMs < -precedingMs ? -precedingMs : startMs;
       } else {
@@ -913,8 +1492,14 @@ class RecordingService {
             .subtract(actualDuration),
         endedAt: source.startedAt.add(Duration(milliseconds: endMs)),
         type: 'CLIP',
+        joinedPrecedingSegment: crossSegment != null,
       );
       _exportSegments[clip.fileName] = clip;
+      _exportClipOwners[_exportClipKey(clip.path)] = (
+        owner: owner,
+        createdAt: DateTime.now(),
+        lastAccessedAt: null,
+      );
       return clip;
     } catch (_) {
       // Dọn file dở dang nhưng không được che mất lỗi gốc (FFmpeg/trim).
@@ -1008,6 +1593,20 @@ class RecordingService {
     if (!Platform.isIOS || !source.path.toLowerCase().endsWith('.ts')) {
       return source;
     }
+    // Giữ lease đọc file nguồn suốt lúc FFmpeg chuyển TS→MP4: dọn theo dung
+    // lượng/thư mục ngày không được xoá file đang đọc.
+    acquireFileRead(source.path);
+    try {
+      return await _remuxForIosPlayback(segment, source);
+    } finally {
+      releaseFileRead(source.path);
+    }
+  }
+
+  Future<File> _remuxForIosPlayback(
+    RecordedSegment segment,
+    File source,
+  ) async {
     if (!await source.exists()) {
       throw FileSystemException('Video không còn tồn tại.', source.path);
     }
@@ -1026,10 +1625,18 @@ class RecordingService {
       } catch (_) {}
     }
     final safeId = segment.id.replaceAll(RegExp(r'[^a-zA-Z0-9_-]'), '_');
-    final target = File(
-      '${directory.path}${Platform.pathSeparator}$safeId.mp4',
+    // Hậu tố duy nhất: hai trình phát mở cùng một segment không được dùng
+    // chung (và xoá mất) file tạm của nhau. Trình phát xoá file này khi đóng.
+    var uniqueSuffix = DateTime.now().microsecondsSinceEpoch;
+    var target = File(
+      '${directory.path}${Platform.pathSeparator}${safeId}_$uniqueSuffix.mp4',
     );
-    if (await target.exists()) await target.delete();
+    while (await target.exists()) {
+      uniqueSuffix++;
+      target = File(
+        '${directory.path}${Platform.pathSeparator}${safeId}_$uniqueSuffix.mp4',
+      );
+    }
 
     var session = await FFmpegKit.executeWithArguments([
       '-y',
@@ -1331,13 +1938,47 @@ class RecordingService {
     return '${clock(startedAt)}_${clock(endedAt)}';
   }
 
-  Future<File> _convertRecordingToTs(
+  /// Chọn tên cơ sở chưa dùng (`HH-MM-SS_HH-MM-SS`, rồi `_1`, `_2`...) để
+  /// hai segment trùng giây không ghi đè lên nhau.
+  Future<String> _uniqueSegmentBaseName(
+    Directory directory,
+    String baseName,
+  ) async {
+    for (var attempt = 0; attempt < 1000; attempt++) {
+      final candidate = segmentBaseNameCandidate(baseName, attempt);
+      final prefix = '${directory.path}${Platform.pathSeparator}$candidate';
+      if (!await File('$prefix.ts').exists() &&
+          !await File('$prefix.mp4').exists()) {
+        return candidate;
+      }
+    }
+    return segmentBaseNameCandidate(
+      baseName,
+      DateTime.now().millisecondsSinceEpoch,
+    );
+  }
+
+  /// Chuyển MP4 staging sang TS (ghép WAV nếu có). [audioOffsetMs] là độ lệch
+  /// A/V theo C2. [replaceFallbackPath]: thử lại cho bản MP4 dự phòng cũ —
+  /// giữ đúng tên/thư mục của bản đó; FFmpeg ghi ra file tạm
+  /// ([fallbackRetryTempPath]) và chỉ khi thành công mới thay bản cũ
+  /// ([_installFallbackRetryOutput]); lỗi thì bản cũ còn nguyên.
+  /// `preservedFallback` = true khi chỉ giữ được MP4 dự phòng và MP4/WAV
+  /// staging được giữ lại để thử ghép tiếng lần sau. `deferred` = true khi
+  /// ghép được nhưng bản cũ đang được đọc nên chưa thay (không tính là lần
+  /// thử thất bại). [fallbackJournal]: journal của lượt thử lại, dùng để ghi
+  /// khoá [fallbackPendingDeleteJournalKey] khi thay bản MP4 bằng TS.
+  Future<({File file, bool preservedFallback, bool deferred})>
+  _convertRecordingToTs(
     File source,
     DateTime startedAt,
     DateTime endedAt,
     File? nativeAudio, {
     String? facingMode,
     int? quarterTurns,
+    int? audioOffsetMs,
+    String? replaceFallbackPath,
+    File? fallbackJournal,
   }) async {
     final effectiveRotation = calculateEffectiveVideoRotation(
       isIos: Platform.isIOS,
@@ -1353,16 +1994,48 @@ class RecordingService {
 
     // Dùng ngày kết thúc để segment đi qua 0 giờ không bị lưu vào thư mục ngày
     // cũ rồi bị RemoveExpiredData xóa ngay.
-    final directory = await _videoDirectory(date: endedAt);
+    final Directory directory;
+    final String baseName;
+    if (replaceFallbackPath != null) {
+      final previous = File(replaceFallbackPath);
+      directory = previous.parent;
+      final previousName = previous.uri.pathSegments.last;
+      baseName = previousName.replaceFirst(
+        RegExp(r'\.(mp4|ts)$', caseSensitive: false),
+        '',
+      );
+    } else {
+      directory = await _videoDirectory(date: endedAt);
+      baseName = await _uniqueSegmentBaseName(
+        directory,
+        _videoFileName(startedAt: startedAt, endedAt: endedAt),
+      );
+    }
     final target = File(
-      '${directory.path}${Platform.pathSeparator}'
-      '${_videoFileName(startedAt: startedAt, endedAt: endedAt)}.ts',
+      '${directory.path}${Platform.pathSeparator}$baseName.ts',
     );
+    final isRetry = replaceFallbackPath != null;
+    // Thử lại cho bản dự phòng: FFmpeg ghi ra file tạm cùng thư mục (không bị
+    // chỉ mục nhận nhầm), chỉ thay bản cũ khi thành công và không ai đang đọc.
+    final tsOutput = isRetry
+        ? File(fallbackRetryTempPath(target.path))
+        : target;
     final hasNativeAudio =
         nativeAudio != null &&
         await nativeAudio.exists() &&
         await nativeAudio.length() > 44;
-    final audioInput = hasNativeAudio ? ['-i', nativeAudio.path] : <String>[];
+    final audioOffsetArgs = hasNativeAudio
+        ? audioOffsetInputArguments(audioOffsetMs)
+        : const <String>[];
+    if (audioOffsetArgs.isNotEmpty) {
+      developer.log(
+        'A/V sync: audio offset ${audioOffsetMs}ms -> $audioOffsetArgs',
+        name: 'RecordingService',
+      );
+    }
+    final audioInput = hasNativeAudio
+        ? [...audioOffsetArgs, '-i', nativeAudio.path]
+        : <String>[];
     final audioMap = hasNativeAudio ? '1:a:0?' : '0:a:0?';
     // Lọc gió, mưa và tạp âm cho file ghi trên cả Android và iOS (trước đây
     // Android chỉ có bộ lọc gió bậc 1, iOS chỉ có high-pass; không có khử ồn).
@@ -1406,14 +2079,14 @@ class RecordingService {
         '+resend_headers+pat_pmt_at_frames',
         '-f',
         'mpegts',
-        target.path,
+        tsOutput.path,
       ]);
       code = await session.getReturnCode();
     }
 
     if (code == null || !ReturnCode.isSuccess(code)) {
       if (hardwareEncoder != null) {
-        if (await target.exists()) await target.delete();
+        if (await tsOutput.exists()) await tsOutput.delete();
         session = await FFmpegKit.executeWithArguments([
           '-y',
           '-fflags',
@@ -1447,13 +2120,13 @@ class RecordingService {
           '+resend_headers+pat_pmt_at_frames',
           '-f',
           'mpegts',
-          target.path,
+          tsOutput.path,
         ]);
         code = await session.getReturnCode();
       }
     }
     if (code == null || !ReturnCode.isSuccess(code)) {
-      if (await target.exists()) await target.delete();
+      if (await tsOutput.exists()) await tsOutput.delete();
       session = await FFmpegKit.executeWithArguments([
         '-y',
         '-fflags',
@@ -1487,29 +2160,35 @@ class RecordingService {
         '+resend_headers+pat_pmt_at_frames',
         '-f',
         'mpegts',
-        target.path,
+        tsOutput.path,
       ]);
       code = await session.getReturnCode();
     }
     if (code == null ||
         !ReturnCode.isSuccess(code) ||
-        !await target.exists() ||
-        await target.length() <= 0) {
+        !await tsOutput.exists() ||
+        await tsOutput.length() <= 0) {
       final output = await session?.getOutput();
-      if (await target.exists()) await target.delete();
+      if (await tsOutput.exists()) await tsOutput.delete();
       // Không được bỏ mất đoạn recorder đã ghi chỉ vì bước đóng gói TS lỗi.
       // Giữ nguyên MP4 trong thư mục video để segment vẫn xuất hiện và tải
       // được; lần ghi kế tiếp vẫn có thể tiếp tục bình thường.
-      final fallback = File(
-        '${directory.path}${Platform.pathSeparator}'
-        '${_videoFileName(startedAt: startedAt, endedAt: endedAt)}.mp4',
-      );
-      if (await fallback.exists()) await fallback.delete();
+      final fallback =
+          replaceFallbackPath != null &&
+              replaceFallbackPath.toLowerCase().endsWith('.mp4')
+          ? File(replaceFallbackPath)
+          : File('${directory.path}${Platform.pathSeparator}$baseName.mp4');
+      // Thử lại: KHÔNG xoá bản dự phòng cũ trước khi ghép — ghép ra file tạm.
+      final muxOutput = isRetry
+          ? File(fallbackRetryTempPath(fallback.path))
+          : fallback;
+      if (await muxOutput.exists()) await muxOutput.delete();
       if (hasNativeAudio) {
         final muxSession = await FFmpegKit.executeWithArguments([
           '-y',
           '-i',
           source.path,
+          ...audioOffsetArgs,
           '-i',
           nativeAudio.path,
           '-map',
@@ -1534,18 +2213,57 @@ class RecordingService {
           '-shortest',
           '-movflags',
           '+faststart',
-          fallback.path,
+          // File tạm không có đuôi .mp4: chỉ định định dạng rõ ràng.
+          '-f',
+          'mp4',
+          muxOutput.path,
         ]);
         final muxCode = await muxSession.getReturnCode();
-        if (ReturnCode.isSuccess(muxCode) &&
-            await fallback.exists() &&
-            await fallback.length() > 0) {
+        final muxSucceeded =
+            ReturnCode.isSuccess(muxCode) &&
+            await muxOutput.exists() &&
+            await muxOutput.length() > 0;
+        if (muxSucceeded && replaceFallbackPath != null) {
+          final outcome = await _installFallbackRetryOutput(
+            temp: muxOutput,
+            target: fallback,
+            previous: File(replaceFallbackPath),
+            journal: fallbackJournal,
+          );
+          if (outcome != FallbackReplacementAction.install) {
+            // Hoãn (đang có người đọc) hoặc thay lỗi: bản cũ còn nguyên, giữ
+            // nguồn staging để thử lại.
+            return (
+              file: File(replaceFallbackPath),
+              preservedFallback: true,
+              deferred: outcome == FallbackReplacementAction.defer,
+            );
+          }
+        }
+        if (muxSucceeded) {
           if (await source.exists()) await source.delete();
           if (await nativeAudio.exists()) await nativeAudio.delete();
           debugPrint('[VNVAR] MP4 WITH AUDIO FALLBACK SAVED: ${fallback.path}');
-          return fallback;
+          return (file: fallback, preservedFallback: false, deferred: false);
         }
-        if (await fallback.exists()) await fallback.delete();
+        if (await muxOutput.exists()) await muxOutput.delete();
+      }
+      if (replaceFallbackPath != null) {
+        // Ghép lại vẫn lỗi: bản dự phòng cũ giữ nguyên, không chép đè.
+        // Không có WAV thì nguồn staging không còn giúp được gì nữa.
+        if (!hasNativeAudio) {
+          if (await source.exists()) await source.delete();
+        }
+        developer.log(
+          'Fallback audio mux retry failed; kept $replaceFallbackPath. '
+          'FFmpeg: ${output ?? 'no error details'}',
+          name: 'RecordingService',
+        );
+        return (
+          file: File(replaceFallbackPath),
+          preservedFallback: hasNativeAudio,
+          deferred: false,
+        );
       }
       final preserved = await source.copy(fallback.path);
       if (!await preserved.exists() || await preserved.length() <= 0) {
@@ -1554,8 +2272,10 @@ class RecordingService {
           'FFmpeg: ${output ?? 'không có thông tin lỗi'}',
         );
       }
-      // Giữ lại cặp MP4/WAV staging khi mux audio thất bại. Lần khởi động
-      // sau sẽ thử recover lại thay vì xóa WAV hợp lệ và mất cơ hội ghép tiếng.
+      // Giữ lại cặp MP4/WAV staging khi mux audio thất bại. Lần dọn sau sẽ
+      // thử ghép lại (tối đa maximumFallbackMuxAttempts lần, thay đúng bản
+      // dự phòng này theo journal `preserved_fallback`) thay vì xóa WAV hợp
+      // lệ và mất cơ hội ghép tiếng.
       if (!hasNativeAudio) {
         if (await source.exists()) await source.delete();
       }
@@ -1565,7 +2285,28 @@ class RecordingService {
         name: 'RecordingService',
       );
       debugPrint('[VNVAR] MP4 FALLBACK SAVED: ${preserved.path}');
-      return preserved;
+      return (
+        file: preserved,
+        preservedFallback: hasNativeAudio,
+        deferred: false,
+      );
+    }
+    if (replaceFallbackPath != null) {
+      // Lần thử lại thành công: đưa TS tạm vào chỗ rồi bỏ bản MP4 dự phòng
+      // cũ (kiểm lease ngay trước khi xoá). Hoãn/lỗi thì bản cũ còn nguyên.
+      final outcome = await _installFallbackRetryOutput(
+        temp: tsOutput,
+        target: target,
+        previous: File(replaceFallbackPath),
+        journal: fallbackJournal,
+      );
+      if (outcome != FallbackReplacementAction.install) {
+        return (
+          file: File(replaceFallbackPath),
+          preservedFallback: true,
+          deferred: outcome == FallbackReplacementAction.defer,
+        );
+      }
     }
     if (await source.exists()) await source.delete();
     if (nativeAudio != null && await nativeAudio.exists()) {
@@ -1576,10 +2317,165 @@ class RecordingService {
       name: 'RecordingService',
     );
     debugPrint('[VNVAR] TS SAVED: ${target.path}');
-    return target;
+    return (file: target, preservedFallback: false, deferred: false);
   }
 
+  /// Đưa kết quả ghép lại ([temp]) vào [target] và bỏ bản dự phòng cũ
+  /// [previous] ([target] có thể trùng [previous] khi kết quả vẫn là MP4).
+  /// Lease đọc của [previous] được kiểm NGAY trước khi đè/xoá: đang có người
+  /// đọc thì hoãn (xoá file tạm, bản cũ giữ nguyên). Rename đè; rename lỗi
+  /// (một số bộ nhớ Android) thì copy rồi xoá file tạm. File tạm luôn được
+  /// dọn trước khi trả về. Khi [target] khác [previous] (MP4 -> TS), khoá
+  /// [fallbackPendingDeleteJournalKey] được ghi vào [journal] TRƯỚC khi đưa
+  /// TS vào chỗ và chỉ gỡ khi không còn cặp TS/MP4 trùng: crash ở giữa thì
+  /// lần khôi phục sau ([_resolvePendingFallbackDelete]) bỏ bản MP4.
+  Future<FallbackReplacementAction> _installFallbackRetryOutput({
+    required File temp,
+    required File target,
+    required File previous,
+    File? journal,
+  }) async {
+    var tempValid = false;
+    try {
+      tempValid = await temp.exists() && await temp.length() > 0;
+    } catch (_) {}
+    final overwritesPrevious = target.absolute.path == previous.absolute.path;
+    final pendingJournal = tempValid && !overwritesPrevious ? journal : null;
+    // Ghi khoá trước lần kiểm lease để giữa kiểm lease và rename không có
+    // await nào.
+    if (pendingJournal != null) {
+      await _setJournalPendingDelete(pendingJournal, previous.path);
+    }
+    // true khi có thể còn cặp TS/MP4 trùng trên đĩa: giữ khoá cho lần khôi
+    // phục sau xử lý.
+    var keepPendingDelete = false;
+    var action = fallbackReplacementAction(
+      tempValid: tempValid,
+      previousLeased: isFileReadActive(previous.path),
+    );
+    if (action == FallbackReplacementAction.install) {
+      try {
+        // Không có await nào giữa lần kiểm lease ở trên và lệnh rename.
+        await temp.rename(target.path);
+      } on FileSystemException catch (error) {
+        developer.log(
+          'Rename ${temp.path} -> ${target.path} failed, copying: $error',
+          name: 'RecordingService',
+        );
+        action = fallbackReplacementAction(
+          tempValid: true,
+          previousLeased: overwritesPrevious && isFileReadActive(previous.path),
+        );
+        if (action == FallbackReplacementAction.install) {
+          try {
+            await temp.copy(target.path);
+          } catch (copyError) {
+            developer.log(
+              'Unable to install fallback retry output ${target.path}: '
+              '$copyError',
+              name: 'RecordingService',
+            );
+            action = FallbackReplacementAction.discardTemp;
+            if (!overwritesPrevious) {
+              // Copy dở để lại TS cụt cạnh bản MP4: bỏ đi để chỉ mục không
+              // ưu tiên nhầm bản TS hỏng.
+              try {
+                if (await target.exists()) await target.delete();
+              } catch (_) {
+                keepPendingDelete = true;
+              }
+            }
+          }
+        }
+      }
+    }
+    if (action == FallbackReplacementAction.install && !overwritesPrevious) {
+      // TS mới đã vào chỗ (chỉ mục chưa trỏ tới). Kiểm lease ngay trước khi
+      // xoá bản MP4 cũ; có người vừa mở thì gỡ TS mới và hoãn.
+      if (isFileReadActive(previous.path)) {
+        try {
+          await target.delete();
+        } on PathNotFoundException {
+          // Không còn TS nào cạnh bản MP4.
+        } catch (_) {
+          keepPendingDelete = true;
+        }
+        action = FallbackReplacementAction.defer;
+        // Một lượt dựng chỉ mục có thể đã chen vào và trỏ sang TS.
+        _replaceIndexedSegmentPath(target.path, previous.path);
+      } else {
+        try {
+          await previous.delete();
+        } on PathNotFoundException {
+          // Đã bị xoá ở nơi khác: không còn gì để thay.
+        } catch (error) {
+          keepPendingDelete = true;
+          developer.log(
+            'Unable to remove superseded fallback ${previous.path}: $error',
+            name: 'RecordingService',
+          );
+        }
+      }
+    }
+    if (pendingJournal != null && !keepPendingDelete) {
+      await _setJournalPendingDelete(pendingJournal, null);
+    }
+    try {
+      if (await temp.exists()) await temp.delete();
+    } catch (_) {}
+    return action;
+  }
+
+  /// Ghi ([path] khác null) hoặc gỡ khoá [fallbackPendingDeleteJournalKey]
+  /// trong [journal], giữ nguyên các trường khác (kể cả `state`). Journal
+  /// không tồn tại/hỏng thì bỏ qua: chỉ mục vẫn không liệt kê trùng
+  /// ([supersededFallbackVideoPairs]).
+  Future<void> _setJournalPendingDelete(File journal, String? path) async {
+    try {
+      if (!await journal.exists()) return;
+      final decoded = jsonDecode(await journal.readAsString());
+      if (decoded is! Map<String, dynamic>) return;
+      if (path == null) {
+        if (!decoded.containsKey(fallbackPendingDeleteJournalKey)) return;
+        decoded.remove(fallbackPendingDeleteJournalKey);
+      } else {
+        decoded[fallbackPendingDeleteJournalKey] = path;
+      }
+      decoded['updatedAtMs'] = DateTime.now().millisecondsSinceEpoch;
+      await journal.writeAsString(jsonEncode(decoded), flush: true);
+    } catch (error, stackTrace) {
+      developer.log(
+        'Unable to update pending fallback delete in ${journal.path}',
+        error: error,
+        stackTrace: stackTrace,
+        name: 'RecordingService',
+      );
+    }
+  }
+
+  /// Chỉ dùng trong test (không có FFprobe): thay kết quả kiểm video đọc
+  /// được. Null (mặc định) thì dùng FFprobe như bình thường.
+  @visibleForTesting
+  Future<bool> Function(File file)? debugPlayableVideoOverride;
+
+  /// Chỉ dùng trong test: gọi [_installFallbackRetryOutput] với file giả lập
+  /// đầu ra FFmpeg. Không đổi hành vi.
+  @visibleForTesting
+  Future<FallbackReplacementAction> debugInstallFallbackRetryOutput({
+    required File temp,
+    required File target,
+    required File previous,
+    File? journal,
+  }) => _installFallbackRetryOutput(
+    temp: temp,
+    target: target,
+    previous: previous,
+    journal: journal,
+  );
+
   Future<bool> _isPlayableVideo(File file) async {
+    final override = debugPlayableVideoOverride;
+    if (override != null) return override(file);
     final probe = await _probeVideo(file);
     return probe != null &&
         isDecodableVideoProbe(
@@ -1604,6 +2500,29 @@ class RecordingService {
     } catch (error, stackTrace) {
       developer.log(
         'FFprobe validation failed: ${file.path}',
+        error: error,
+        stackTrace: stackTrace,
+        name: 'RecordingService',
+      );
+      return null;
+    }
+  }
+
+  /// Codec/kích thước/góc xoay của luồng video đầu tiên (null nếu probe lỗi).
+  Future<VideoStreamSignature?> _probeVideoSignature(File file) async {
+    try {
+      if (!await file.exists()) return null;
+      final session = await FFprobeKit.getMediaInformation(file.path);
+      final information = session.getMediaInformation();
+      if (information == null) return null;
+      for (final stream in information.getStreams()) {
+        if (stream.getType() != 'video') continue;
+        return videoStreamSignatureFromProperties(stream.getAllProperties());
+      }
+      return null;
+    } catch (error, stackTrace) {
+      developer.log(
+        'FFprobe stream signature failed: ${file.path}',
         error: error,
         stackTrace: stackTrace,
         name: 'RecordingService',
@@ -1676,6 +2595,7 @@ class RecordingService {
     String state, {
     String? finalPath,
     String? error,
+    Map<String, Object?>? extra,
   }) async {
     if (journal == null) return;
     try {
@@ -1688,6 +2608,7 @@ class RecordingService {
       values['updatedAtMs'] = DateTime.now().millisecondsSinceEpoch;
       if (finalPath != null) values['finalPath'] = finalPath;
       if (error != null) values['error'] = error;
+      if (extra != null) values.addAll(extra);
       await journal.writeAsString(jsonEncode(values), flush: true);
     } catch (journalError, stackTrace) {
       developer.log(
@@ -1708,9 +2629,13 @@ class RecordingService {
     bool audioAvailable = true,
     String? facingMode,
     int? quarterTurns,
+    bool Function()? isCancelled,
   }) async {
     final stopping = _stopOperation;
     if (stopping != null) await stopping;
+    // Yêu cầu dừng (ví dụ Tablet gọi /stop) đến trong lúc chờ lần dừng trước:
+    // không được mở lại recorder sau lệnh dừng đó.
+    if (isCancelled?.call() ?? false) return;
 
     if (facingMode != null) setFacingMode(facingMode);
     if (quarterTurns != null) setQuarterTurns(quarterTurns);
@@ -1732,6 +2657,7 @@ class RecordingService {
     _recordAudio = Platform.isAndroid || (Platform.isIOS && audioAvailable);
 
     _recording = true;
+    _suspendedReason = null;
     final startCompleter = Completer<void>();
     _startOperation = startCompleter.future;
 
@@ -1858,6 +2784,9 @@ class RecordingService {
     final recorderStartedAt = DateTime.now();
 
     _recorder = recorder;
+    // C2: mốc bắt đầu hình của segment, ghi ngay sau khi recorder.start xong.
+    _currentVideoStartEpochMs = recorderStartedAt.millisecondsSinceEpoch;
+    _setRecordingSuspended(null);
 
     _currentSegmentFacingMode = _facingMode;
     _currentSegmentQuarterTurns = _quarterTurns;
@@ -1869,6 +2798,7 @@ class RecordingService {
         jsonEncode({
           'cameraId': cameraId,
           'startedAtMs': recorderStartedAt.millisecondsSinceEpoch,
+          'videoStartEpochMs': recorderStartedAt.millisecondsSinceEpoch,
           'videoPath': path,
           'facingMode': _currentSegmentFacingMode,
           'quarterTurns': _currentSegmentQuarterTurns,
@@ -1943,10 +2873,14 @@ class RecordingService {
         _recorder = null;
         _currentPath = null;
         _segmentStartedAt = null;
+        _currentVideoStartEpochMs = null;
         final journal = _currentJournal;
         _currentJournal = null;
         try {
-          await _platformChannel.invokeMethod<void>('stopNativeAudioSegment');
+          // Kết quả (map trạng thái) không cần ở đây; nhận mọi kiểu trả về.
+          await _platformChannel.invokeMethod<Object?>(
+            'stopNativeAudioSegment',
+          );
         } catch (_) {}
         try {
           await recorder.stop();
@@ -2001,6 +2935,20 @@ class RecordingService {
     _setStorageSuspended(false);
   }
 
+  /// Đặt/xoá trạng thái treo ghi (recorder không mở lại được). [reason]
+  /// null = đã ghi lại bình thường.
+  void _setRecordingSuspended(String? reason) {
+    if (_suspendedReason == reason) return;
+    final wasSuspended = _suspendedReason != null;
+    _suspendedReason = reason;
+    if (wasSuspended != (reason != null)) {
+      debugPrint(
+        '[VNVAR] RECORDING ${reason == null ? 'RESUMED' : 'SUSPENDED: $reason'}',
+      );
+    }
+    _notifyVideoChanges();
+  }
+
   void _setStorageSuspended(bool value) {
     if (value) {
       _nextStorageRetryAt = DateTime.now().add(const Duration(minutes: 2));
@@ -2042,7 +2990,10 @@ class RecordingService {
     Future<void> Function()? onRecorderStopped,
   }) async {
     if (!_recording) {
-      throw StateError('Camera chưa bắt đầu ghi video.');
+      throw const CheckVarSegmentUnavailableException(
+        'NOT_RECORDING',
+        'Camera chưa bắt đầu ghi video.',
+      );
     }
     _lastCheckpointUsedPrevious = false;
     final checkpointRequestedAt = DateTime.now();
@@ -2087,7 +3038,12 @@ class RecordingService {
         _lastCheckpointUsedPrevious = true;
         return previousSegment;
       }
-      throw StateError('Không có file đang quay để chốt Check VAR.');
+      // Đang treo ghi (không có recorder) thì camera sẽ tự ghi lại: lỗi tạm
+      // thời. Ngược lại đoạn vừa chốt không dùng được.
+      throw CheckVarSegmentUnavailableException(
+        currentStartedAt == null ? 'NOT_RECORDING' : 'NO_SEGMENT',
+        'Không có file đang quay để chốt Check VAR.',
+      );
     }
     return segment;
   }
@@ -2145,51 +3101,120 @@ class RecordingService {
     _rotating = true;
     _segmentTimer?.cancel();
     _segmentTimer = null;
+    // Lượt này chỉ là thử mở lại recorder khi đang treo ghi (không có file
+    // nào để chốt): không thử thêm lần thứ hai ngay lập tức.
+    final retryingSuspended = _recorder == null;
+    // Lỗi mở recorder mới tại điểm bàn giao (null = chưa thử hoặc thành công).
+    Object? openError;
+    var openAttempted = false;
+    Future<void> tryOpenNextSegment() async {
+      if (!_recording || _stopping || _recorder != null) return;
+      openAttempted = true;
+      try {
+        await _startNewSegment();
+        openError = null;
+      } catch (error, stackTrace) {
+        openError = error;
+        developer.log(
+          'Unable to open the next recorder segment.',
+          error: error,
+          stackTrace: stackTrace,
+          name: 'RecordingService',
+        );
+      }
+    }
+
     try {
       final segment = await _finishCurrentSegment(
         onRecorderStopped: () async {
           if (onRecorderStopped != null) await onRecorderStopped();
-          if (_recording && !_stopping) await _startNewSegment();
+          await tryOpenNextSegment();
         },
       );
-      // Fallback if opening the next recorder failed at the hand-off point.
-      // The completed file is still finalized and indexed before retrying.
-      if (_recording && !_stopping && _recorder == null) {
-        await _startNewSegment();
+      // Fallback khi hand-off chưa thử mở (onRecorderStopped của caller lỗi)
+      // hoặc lỗi tạm thời không phải do dung lượng: thử thêm đúng một lần sau
+      // khi file cũ đã được chốt. Thiếu dung lượng thì chờ nhịp thử lại.
+      if (!openAttempted ||
+          (!retryingSuspended && openError is! StorageSafetyException)) {
+        if (_recorder == null) await tryOpenNextSegment();
       }
+      // Không mở được recorder: không ném lỗi (segment cũ đã chốt xong, Check
+      // VAR vẫn dùng được); chuyển sang trạng thái treo ghi + thử lại theo
+      // nhịp ngắn ở finally.
       return segment;
     } catch (_) {
-      // Nếu file cũ đã đóng nhưng file mới chưa mở được thì thử khôi phục ghi
-      // hình trước khi chuyển lỗi về caller của Check VAR.
-      if (_recording && _recorder == null && !_stopping) {
-        try {
-          await _startNewSegment();
-        } catch (restartError, restartStack) {
-          developer.log(
-            'Failed to restart recorder after rotation failure.',
-            error: restartError,
-            stackTrace: restartStack,
-            name: 'RecordingService',
-          );
-        }
-      }
+      // Chốt file cũ lỗi. Nếu recorder mới chưa được thử mở thì thử một lần
+      // trước khi chuyển lỗi về caller của Check VAR.
+      if (!openAttempted) await tryOpenNextSegment();
       rethrow;
     } finally {
       _rotating = false;
       if (_recording && !_stopping) {
-        final startedAt = _segmentStartedAt;
-        _segmentTimer = Timer(
-          startedAt == null
-              ? _segmentDuration
-              : nextSegmentRotationDelay(
-                  startedAt: startedAt,
-                  now: DateTime.now(),
-                  segmentDuration: _segmentDuration,
-                ),
-          _rotateSegment,
-        );
+        if (_recorder == null) {
+          final error = openError;
+          _setRecordingSuspended(
+            error == null
+                ? 'Không mở được segment ghi mới.'
+                : userFacingError(error),
+          );
+        }
+        _scheduleNextRotation();
       }
     }
+  }
+
+  /// Đặt timer cho lần xoay kế tiếp: hết thời lượng segment khi đang ghi,
+  /// hoặc nhịp thử lại ngắn khi đang treo ghi (không có recorder).
+  void _scheduleNextRotation() {
+    _segmentTimer?.cancel();
+    final startedAt = _segmentStartedAt;
+    final Duration delay;
+    if (_recorder == null || startedAt == null) {
+      delay = suspendedRecorderRetryDelay(
+        storageSuspended: _storageSuspended,
+        nextStorageRetryAt: _nextStorageRetryAt,
+        now: DateTime.now(),
+      );
+      developer.log(
+        'Recorder suspended; retrying in ${delay.inSeconds}s '
+        '(${_suspendedReason ?? 'unknown'})',
+        name: 'RecordingService',
+      );
+    } else {
+      delay = nextSegmentRotationDelay(
+        startedAt: startedAt,
+        now: DateTime.now(),
+        segmentDuration: _segmentDuration,
+      );
+    }
+    _segmentTimer = Timer(delay, _rotateSegment);
+  }
+
+  /// C3: gián đoạn âm thanh iOS kết thúc trong lúc đang ghi → xoay segment
+  /// sớm để segment mới đồng bộ tiếng/hình lại từ đầu.
+  Future<void> _handlePlatformEvent(MethodCall call) async {
+    if (call.method != 'onNativeAudioInterruption') return;
+    final arguments = call.arguments;
+    final state = arguments is Map ? arguments['state'] : null;
+    developer.log(
+      'Native audio interruption: $arguments',
+      name: 'RecordingService',
+    );
+    if (state != 'ended') return;
+    // Không chồng thao tác: đang dừng/khởi động/xoay thì segment mới sắp mở
+    // đã tự đồng bộ lại; đang treo ghi thì timer thử lại sẽ mở segment mới.
+    if (!_recording ||
+        _stopping ||
+        _rotating ||
+        _startOperation != null ||
+        _rotationOperation != null ||
+        _recorder == null) {
+      return;
+    }
+    debugPrint('[VNVAR] AUDIO INTERRUPTION ENDED: ROTATING SEGMENT');
+    // Không chờ: việc chốt segment (FFmpeg) mất vài giây, không được giữ
+    // lời gọi native và các listener khác của kênh.
+    unawaited(_rotateSegment());
   }
 
   // ============================================================
@@ -2229,6 +3254,7 @@ class RecordingService {
     final startedAt = _segmentStartedAt;
     final audioPath = _currentAudioPath;
     final journal = _currentJournal;
+    final videoStartEpochMs = _currentVideoStartEpochMs;
 
     // Clear trước để tránh stop gọi hai lần.
     _recorder = null;
@@ -2239,9 +3265,25 @@ class RecordingService {
     _currentAudioPath = null;
     _currentJournal = null;
     _currentSegmentHasAudio = false;
+    _currentVideoStartEpochMs = null;
     _notifyVideoChanges();
 
     if (recorder == null || path == null || startedAt == null) {
+      // Không có recorder (đang treo ghi): vẫn LUÔN gọi onRecorderStopped để
+      // việc bàn giao (mở lại recorder khi xoay, đổi camera, dispose camera
+      // khi dừng) không bị bỏ qua.
+      if (onRecorderStopped != null) {
+        try {
+          await onRecorderStopped();
+        } catch (error, stackTrace) {
+          developer.log(
+            'Recorder hand-off failed while no recorder was open.',
+            error: error,
+            stackTrace: stackTrace,
+            name: 'RecordingService',
+          );
+        }
+      }
       return null;
     }
 
@@ -2268,10 +3310,16 @@ class RecordingService {
         debugPrint('[VNVAR] RECORDER STOP ERROR, RECOVERING FILE: $error');
       }
     });
+    num? firstSampleEpochMs;
     final audioStopFuture = Future<void>.sync(() async {
       if (!(Platform.isAndroid || Platform.isIOS) || audioPath == null) return;
       try {
-        await _platformChannel.invokeMethod<void>('stopNativeAudioSegment');
+        // C2: native trả map (có `firstSampleEpochMs`); bản native cũ có thể
+        // trả null/kiểu khác nên không ép kiểu Map ở tầng kênh.
+        final result = await _platformChannel.invokeMethod<Object?>(
+          'stopNativeAudioSegment',
+        );
+        firstSampleEpochMs = firstSampleEpochMsFromStopResult(result);
         debugPrint('[VNVAR] NATIVE AUDIO STOPPED: $audioPath');
       } catch (error, stackTrace) {
         developer.log(
@@ -2296,6 +3344,22 @@ class RecordingService {
     }
 
     await Future.wait<void>([videoStopFuture, audioStopFuture]);
+
+    final audioOffsetMs = audioSyncOffsetMs(
+      firstSampleEpochMs: firstSampleEpochMs,
+      videoStartEpochMs: videoStartEpochMs,
+    );
+    if (audioOffsetMs != null) {
+      // Lưu để khôi phục sau crash (bước chốt chưa xong) vẫn căn được tiếng.
+      await _writeJournalState(
+        journal,
+        'finalizing',
+        extra: {
+          'firstSampleEpochMs': firstSampleEpochMs,
+          'audioOffsetMs': audioOffsetMs,
+        },
+      );
+    }
 
     // ==========================================================
     // STOP RECORDER
@@ -2432,14 +3496,16 @@ class RecordingService {
       debugPrint('[VNVAR] RECORDER FILE RECOVERED: $path | $fileSize bytes');
     }
 
-    file = await _convertRecordingToTs(
+    final converted = await _convertRecordingToTs(
       file,
       startedAt,
       endedAt,
       audioPath == null ? null : File(audioPath),
       facingMode: segmentFacingMode,
       quarterTurns: segmentQuarterTurns,
+      audioOffsetMs: audioOffsetMs,
     );
+    file = converted.file;
 
     // Lấy kích thước trước cleanup. Một RecordingService khác dùng chung thư
     // mục hoặc chính cơ chế giới hạn 20 GB có thể xóa file trong lúc cleanup.
@@ -2489,10 +3555,39 @@ class RecordingService {
         );
       }),
     );
+    // Dọn clip xuất tạm mồ côi (quá exportClipTtl) theo nhịp xoay segment.
+    unawaited(
+      cleanupExpiredExportDownloads().catchError((
+        Object error,
+        StackTrace stackTrace,
+      ) {
+        developer.log(
+          'Background export clip TTL cleanup failed',
+          error: error,
+          stackTrace: stackTrace,
+          name: 'RecordingService',
+        );
+      }),
+    );
 
     try {
-      await _writeJournalState(journal, 'completed', finalPath: file.path);
-      if (journal != null && await journal.exists()) await journal.delete();
+      if (converted.preservedFallback) {
+        // Giữ journal + MP4/WAV staging để lần dọn sau thử ghép tiếng lại,
+        // ghi đè đúng bản dự phòng này (không tạo bản trùng tên khác).
+        await _writeJournalState(
+          journal,
+          'preserved_fallback',
+          finalPath: file.path,
+          extra: {
+            'startedAtMs': startedAt.millisecondsSinceEpoch,
+            'endedAtMs': endedAt.millisecondsSinceEpoch,
+            'muxAttempts': 1,
+          },
+        );
+      } else {
+        await _writeJournalState(journal, 'completed', finalPath: file.path);
+        if (journal != null && await journal.exists()) await journal.delete();
+      }
     } catch (error) {
       developer.log(
         'Unable to close recording journal ${journal?.path}: $error',
@@ -2579,12 +3674,41 @@ class RecordingService {
     return directory;
   }
 
-  /// Kết thúc phiên QR/download và xóa toàn bộ clip xuất tạm.
-  Future<void> cleanupExportDownloads() {
-    final current = _exportCleanupOperation;
-    if (current != null) return current;
+  /// Dọn clip xuất tạm trong thư mục `download`.
+  /// - [owner] null: xoá TOÀN BỘ clip (khởi động server, dispose).
+  /// - [owner] khác null: một tablet đóng phiên tải — chỉ xoá clip của đúng
+  ///   phiên đó, kèm các clip mồ côi quá [exportClipTtl].
+  /// Clip đang có lease đọc HTTP không bao giờ bị xoá.
+  Future<void> cleanupExportDownloads({String? owner}) {
+    return _queueExportCleanup(owner: owner, removeAll: owner == null);
+  }
 
-    final operation = _cleanupExportDownloadsInternal();
+  /// Chỉ dọn clip xuất tạm mồ côi (quá [exportClipTtl]) của mọi phiên.
+  Future<void> cleanupExpiredExportDownloads() {
+    return _queueExportCleanup(owner: null, removeAll: false);
+  }
+
+  /// Các lần dọn chạy nối tiếp (mỗi lần có phạm vi riêng), không gộp chung
+  /// một future như trước: lần dọn theo phiên không được bị "nuốt" bởi một
+  /// lần dọn TTL đang chạy.
+  Future<void> _queueExportCleanup({
+    required String? owner,
+    required bool removeAll,
+  }) {
+    final previous = _exportCleanupOperation;
+    final operation = () async {
+      if (previous != null) {
+        try {
+          await previous;
+        } catch (_) {
+          // Lỗi lần trước đã được trả cho caller của nó.
+        }
+      }
+      await _cleanupExportDownloadsInternal(
+        owner: owner,
+        removeAll: removeAll,
+      );
+    }();
     _exportCleanupOperation = operation;
     return operation.whenComplete(() {
       if (identical(_exportCleanupOperation, operation)) {
@@ -2593,7 +3717,10 @@ class RecordingService {
     });
   }
 
-  Future<void> _cleanupExportDownloadsInternal() async {
+  Future<void> _cleanupExportDownloadsInternal({
+    required String? owner,
+    required bool removeAll,
+  }) async {
     final trimming = _trimOperation;
     if (trimming != null) {
       try {
@@ -2606,20 +3733,53 @@ class RecordingService {
     final directory = Directory(
       '${root.path}${Platform.pathSeparator}download',
     );
+    final now = DateTime.now();
     try {
       if (await directory.exists()) {
         await for (final entity in directory.list(recursive: true)) {
-          if (entity is File && !isFileReadActive(entity.path)) {
+          if (entity is! File || isFileReadActive(entity.path)) continue;
+          final record = _exportClipOwners[_exportClipKey(entity.path)];
+          DateTime createdAt;
+          DateTime? lastAccessedAt;
+          if (record != null) {
+            createdAt = record.createdAt;
+            lastAccessedAt = record.lastAccessedAt;
+          } else {
+            try {
+              createdAt = (await entity.stat()).modified;
+            } catch (_) {
+              createdAt = now;
+            }
+          }
+          if (!shouldRemoveExportClip(
+            clipOwner: record?.owner,
+            createdAt: createdAt,
+            lastAccessedAt: lastAccessedAt,
+            now: now,
+            closingOwner: owner,
+            removeAll: removeAll,
+          )) {
+            continue;
+          }
+          try {
             await entity.delete();
+          } catch (error) {
+            developer.log(
+              '[STORAGE] Unable to delete export clip ${entity.path}: $error',
+              name: 'RecordingService',
+            );
           }
         }
         await _deleteDirectoryTreeIfEmpty(directory);
       }
+      // Đồng bộ chỉ mục với các file thực sự còn trên đĩa.
       _exportSegments.removeWhere(
-        (_, segment) => !isFileReadActive(segment.path),
+        (_, segment) => !File(segment.path).existsSync(),
       );
+      _exportClipOwners.removeWhere((key, _) => !File(key).existsSync());
       developer.log(
-        '[STORAGE] Temporary download session cleaned.',
+        '[STORAGE] Temporary download clips cleaned '
+        '(${removeAll ? 'all' : owner == null ? 'expired' : 'session'}).',
         name: 'RecordingService',
       );
     } catch (error, stackTrace) {
@@ -2735,7 +3895,13 @@ class RecordingService {
     // Dựng chỉ mục mới vào danh sách riêng rồi mới thay một lần: trong lúc
     // duyệt thư mục (có thể vài giây) tablet vẫn tìm/trim/tải được video cũ.
     final rebuilt = <RecordedSegment>[];
+    // Bản MP4 dự phòng đã có TS thay thế cùng tên (crash/lượt quét chen vào
+    // giữa lúc đưa TS vào chỗ và lúc xoá MP4): chỉ mục liệt kê một bản (TS,
+    // hoặc MP4 khi lượt thay chưa hoàn tất — [preferFallbackMp4OverTs]),
+    // không liệt kê trùng. Không xoá file ở đây.
+    final supersededFallbacks = <String, String>{};
     for (final directory in roots) {
+    final scannedVideoPaths = <String>[];
     try {
       await for (final entity in directory.list(recursive: true)) {
         if (entity is! File) {
@@ -2746,6 +3912,7 @@ class RecordingService {
         if (!lowerPath.endsWith('.ts') && !lowerPath.endsWith('.mp4')) {
           continue;
         }
+        scannedVideoPaths.add(entity.path);
         try {
           final stat = await entity.stat();
           final fileName = entity.uri.pathSegments.last;
@@ -2762,8 +3929,9 @@ class RecordingService {
               : null;
           // `.mp4` là bản dự phòng khi đóng gói TS thất bại
           // (_convertRecordingToTs); phải được index lại sau khi khởi động.
+          // Hậu tố `_1`, `_2`... khi hai segment trùng tên (không ghi đè).
           final newNameMatch = RegExp(
-            r'^(\d{2})-(\d{2})-(\d{2})_(\d{2})-(\d{2})-(\d{2})\.(ts|mp4)$',
+            r'^(\d{2})-(\d{2})-(\d{2})_(\d{2})-(\d{2})-(\d{2})(_\d{1,3})?\.(ts|mp4)$',
             caseSensitive: false,
           ).firstMatch(fileName);
           final dateMatch = RegExp(
@@ -2800,10 +3968,11 @@ class RecordingService {
               startedAt = startedAt.subtract(const Duration(days: 1));
             }
             final timestamp = startedAt.millisecondsSinceEpoch;
+            final duplicateSuffix = newNameMatch.group(7) ?? '';
             rebuilt.add(
               previousByPath[entity.path] ??
               RecordedSegment(
-                id: '${indexedCameraId}_$timestamp',
+                id: '${indexedCameraId}_$timestamp$duplicateSuffix',
                 cameraId: indexedCameraId,
                 path: entity.path,
                 startedAt: startedAt,
@@ -2858,11 +4027,76 @@ class RecordingService {
         name: 'RecordingService',
       );
     }
+    supersededFallbacks.addAll(
+      supersededFallbackVideoPairs(
+        scannedVideoPaths,
+        storageRoot: directory.path,
+      ),
+    );
+    }
+    // Khoá pendingDelete còn trong journal staging: lượt thay MP4 -> TS chưa
+    // hoàn tất (TS có thể dở dang) nên chỉ mục giữ bản MP4 và ẩn TS.
+    final pendingFallbackDeletes = supersededFallbacks.isEmpty
+        ? const <String>{}
+        : await _pendingFallbackDeletePaths();
+    // Từ đây tới lúc thay chỉ mục không còn await nào: quyết định ưu tiên bản
+    // nào và danh sách gộp dựa trên cùng một trạng thái.
+    // Đường dẫn bị ẩn vì trùng cặp TS/MP4: không được thêm lại khi gộp.
+    final hiddenPaths = <String>{};
+    if (supersededFallbacks.isNotEmpty) {
+      final rebuiltByPath = {
+        for (final segment in rebuilt) segment.path: segment,
+      };
+      final previousSegments = [...previousByPath.values, ..._segments];
+      for (final entry in supersededFallbacks.entries) {
+        final mp4Path = entry.key;
+        final tsPath = entry.value;
+        final preferMp4 = preferFallbackMp4OverTs(
+          pendingDelete: pendingFallbackDeletes.contains(
+            _fallbackPathKey(mp4Path),
+          ),
+          // Kiểm đồng bộ để không có await chen giữa: bản MP4 đã bị xoá
+          // (lượt thay vừa xong) thì ưu tiên TS; TS đã bị gỡ (lượt thay
+          // hoãn) thì giữ MP4.
+          mp4Exists: File(mp4Path).existsSync(),
+          tsExists: File(tsPath).existsSync(),
+        );
+        final preferredPath = preferMp4 ? mp4Path : tsPath;
+        final hiddenPath = preferMp4 ? tsPath : mp4Path;
+        final preferredSegment = rebuiltByPath[preferredPath];
+        if (preferredSegment == null) continue;
+        hiddenPaths.add(hiddenPath);
+        rebuilt.remove(rebuiltByPath[hiddenPath]);
+        // Bản được giữ chưa có trong chỉ mục: giữ ID/trạng thái của bản bị ẩn
+        // để tablet không mất liên kết (như _replaceIndexedSegmentPath).
+        if (previousByPath.containsKey(preferredPath)) continue;
+        RecordedSegment? previousHidden;
+        for (final segment in previousSegments) {
+          if (segment.path == hiddenPath) {
+            previousHidden = segment;
+            break;
+          }
+        }
+        if (previousHidden == null) continue;
+        final preferredIndex = rebuilt.indexOf(preferredSegment);
+        if (preferredIndex < 0) continue;
+        rebuilt[preferredIndex] = RecordedSegment(
+          id: previousHidden.id,
+          cameraId: previousHidden.cameraId,
+          path: preferredPath,
+          startedAt: previousHidden.startedAt,
+          endedAt: previousHidden.endedAt,
+          type: previousHidden.type,
+          downloaded: previousHidden.downloaded,
+          joinedPrecedingSegment: previousHidden.joinedPrecedingSegment,
+        );
+      }
     }
 
     // Giữ các đoạn vừa ghi xong trong lúc đang duyệt (chưa có trong lần quét).
     // Đoạn đã có trong chỉ mục hiện tại thì giữ nguyên object (ID chính xác
     // tới mili-giây, trạng thái downloaded) thay vì bản dựng lại từ tên file.
+    // Bản trùng vừa bị ẩn ở trên không được thêm lại.
     final currentByPath = {
       for (final segment in _segments) segment.path: segment,
     };
@@ -2872,7 +4106,8 @@ class RecordingService {
     final rebuiltPaths = {for (final segment in rebuilt) segment.path};
     for (final segment in _segments) {
       if (!previousByPath.containsKey(segment.path) &&
-          !rebuiltPaths.contains(segment.path)) {
+          !rebuiltPaths.contains(segment.path) &&
+          !hiddenPaths.contains(segment.path)) {
         merged.add(segment);
       }
     }
@@ -2888,15 +4123,303 @@ class RecordingService {
     );
   }
 
+  /// Khoá so khớp đường dẫn bản MP4 dự phòng giữa journal và lần quét.
+  static String _fallbackPathKey(String path) =>
+      File(path).absolute.path.replaceAll('\\', '/');
+
+  /// Đường dẫn ([_fallbackPathKey]) các bản MP4 dự phòng còn khoá
+  /// [fallbackPendingDeleteJournalKey] trong journal staging, tức lượt thay
+  /// bằng TS chưa hoàn tất. Journal hỏng/không đọc được thì bỏ qua.
+  Future<Set<String>> _pendingFallbackDeletePaths() async {
+    final result = <String>{};
+    try {
+      final stagingRoot = await getTemporaryDirectory();
+      final directory = Directory(
+        '${stagingRoot.path}${Platform.pathSeparator}vnvar_recording',
+      );
+      if (!await directory.exists()) return result;
+      await for (final entity in directory.list()) {
+        if (entity is! File || !entity.path.toLowerCase().endsWith('.json')) {
+          continue;
+        }
+        try {
+          final decoded = jsonDecode(await entity.readAsString());
+          if (decoded is! Map<String, dynamic>) continue;
+          final pending = decoded[fallbackPendingDeleteJournalKey];
+          if (pending is String && pending.isNotEmpty) {
+            result.add(_fallbackPathKey(pending));
+          }
+        } catch (_) {
+          // Journal đang được ghi dở hoặc hỏng: không đủ căn cứ để ẩn TS.
+        }
+      }
+    } catch (error, stackTrace) {
+      developer.log(
+        'Unable to read pending fallback deletes',
+        error: error,
+        stackTrace: stackTrace,
+        name: 'RecordingService',
+      );
+    }
+    return result;
+  }
+
   /// Cleans only recorder staging files. This is safe to call while the
   /// station is running and avoids rebuilding the permanent video index.
   Future<void> cleanupStagingFiles({
     Duration maxAge = const Duration(hours: 24),
   }) async {
     await _cleanupAbandonedRecordings(maxAge: maxAge);
+    // Clip xuất tạm mồ côi (tablet không gọi /download/session/close).
+    await cleanupExpiredExportDownloads();
   }
 
-  Future<void> _cleanupAbandonedRecordings({required Duration maxAge}) async {
+  static num? _journalNumber(Object? value) =>
+      value is num && value.isFinite ? value : null;
+
+  /// Thử ghép tiếng lại cho một bản MP4 dự phòng (journal
+  /// `preserved_fallback`): tối đa [maximumFallbackMuxAttempts] lần, luôn ghi
+  /// đè đúng bản dự phòng cũ; hết lượt thì giữ bản dự phòng và dọn nguồn
+  /// staging sau [maxAge] như nhánh invalid.
+  Future<void> _retryPreservedFallback({
+    required File video,
+    required File wav,
+    required File journal,
+    required Map<String, dynamic> values,
+    required Duration age,
+    required Duration maxAge,
+    required String? facingMode,
+    required int? quarterTurns,
+    required int? audioOffsetMs,
+  }) async {
+    final finalPathValue = values['finalPath'];
+    final finalPath = finalPathValue is String && finalPathValue.isNotEmpty
+        ? finalPathValue
+        : null;
+    final attemptsValue = values['muxAttempts'];
+    final attempts = attemptsValue is num && attemptsValue.isFinite
+        ? attemptsValue.toInt()
+        : maximumFallbackMuxAttempts;
+    // Crash giữa lúc đưa TS vào chỗ và lúc xoá bản MP4 cũ: hoàn tất trước khi
+    // xét thử lại (kể cả khi đã hết lượt thử).
+    if (values.containsKey(fallbackPendingDeleteJournalKey)) {
+      final handled = await _resolvePendingFallbackDelete(
+        video: video,
+        wav: wav,
+        journal: journal,
+        pendingDelete: values[fallbackPendingDeleteJournalKey],
+        finalPath: finalPath,
+      );
+      if (handled) return;
+    }
+    final finalExists = finalPath != null && await File(finalPath).exists();
+    final action = preservedFallbackAction(
+      attempts: attempts,
+      finalExists: finalExists,
+      finalLeased: finalPath != null && isFileReadActive(finalPath),
+      age: age,
+      maxAge: maxAge,
+    );
+    if (action == PreservedFallbackAction.keep) return;
+    if (action == PreservedFallbackAction.discardSources || finalPath == null) {
+      for (final file in <File>[video, wav, journal]) {
+        try {
+          if (await file.exists()) await file.delete();
+        } catch (_) {}
+      }
+      developer.log(
+        'Preserved fallback sources discarded after $attempts attempt(s): '
+        '${finalPath ?? video.path}',
+        name: 'RecordingService',
+      );
+      return;
+    }
+
+    // Tăng bộ đếm TRƯỚC khi chạy FFmpeg: crash giữa chừng vẫn tính một lượt.
+    await _writeJournalState(
+      journal,
+      'preserved_fallback',
+      extra: {'muxAttempts': attempts + 1},
+    );
+    final startedAtMs = _journalNumber(values['startedAtMs']);
+    final endedAtMs = _journalNumber(values['endedAtMs']);
+    final startedAt = DateTime.fromMillisecondsSinceEpoch(
+      (startedAtMs ?? 0).toInt(),
+    );
+    final endedAt = endedAtMs == null
+        ? startedAt
+        : DateTime.fromMillisecondsSinceEpoch(endedAtMs.toInt());
+    final ({File file, bool preservedFallback, bool deferred}) converted;
+    _fallbackRetriesInFlight++;
+    try {
+      converted = await _convertRecordingToTs(
+        video,
+        startedAt,
+        endedAt,
+        await wav.exists() ? wav : null,
+        facingMode: facingMode,
+        quarterTurns: quarterTurns,
+        audioOffsetMs: audioOffsetMs,
+        replaceFallbackPath: finalPath,
+        fallbackJournal: journal,
+      );
+    } finally {
+      _fallbackRetriesInFlight--;
+    }
+    if (converted.deferred) {
+      // Bản dự phòng đang được đọc ngay lúc thay: không tính là một lần thử
+      // thất bại — trả lại bộ đếm, giữ nguồn staging cho lần dọn sau.
+      await _writeJournalState(
+        journal,
+        'preserved_fallback',
+        extra: {'muxAttempts': attempts},
+      );
+      developer.log(
+        'Fallback replacement deferred (file being read): $finalPath',
+        name: 'RecordingService',
+      );
+      return;
+    }
+    if (converted.preservedFallback) {
+      await _writeJournalState(
+        journal,
+        'preserved_fallback',
+        finalPath: converted.file.path,
+      );
+      return;
+    }
+    _replaceIndexedSegmentPath(finalPath, converted.file.path);
+    await _writeJournalState(
+      journal,
+      'completed',
+      finalPath: converted.file.path,
+    );
+    if (await journal.exists()) await journal.delete();
+    debugPrint('[VNVAR] FALLBACK AUDIO MUX RECOVERED: ${converted.file.path}');
+  }
+
+  /// Khôi phục khoá [fallbackPendingDeleteJournalKey] còn sót trong journal
+  /// `preserved_fallback`. Trả về true khi đã xử lý xong lượt này (đã chốt
+  /// TS thay bản MP4, hoặc bản MP4 đang được đọc nên chờ lần dọn sau); false
+  /// thì tiếp tục xét thử lại như bình thường.
+  Future<bool> _resolvePendingFallbackDelete({
+    required File video,
+    required File wav,
+    required File journal,
+    required Object? pendingDelete,
+    required String? finalPath,
+  }) async {
+    final pendingPath = pendingDelete is String ? pendingDelete : null;
+    final tsPath = pendingPath == null
+        ? null
+        : supersedingTsPathForFallback(pendingPath);
+    var tsExists = false;
+    var tsPlayable = false;
+    if (tsPath != null) {
+      final candidate = File(tsPath);
+      try {
+        tsExists = await candidate.exists() && await candidate.length() > 0;
+      } catch (_) {}
+      if (tsExists) tsPlayable = await _isPlayableVideo(candidate);
+    }
+    // Kiểm lease bản MP4 ngay trước khi xoá (không có await ở giữa).
+    final action = pendingFallbackDeleteAction(
+      pendingDelete: pendingDelete,
+      finalPath: finalPath,
+      tsExists: tsExists,
+      tsPlayable: tsPlayable,
+      mp4Leased: pendingPath != null && isFileReadActive(pendingPath),
+    );
+    if (action == PendingFallbackDeleteAction.none) return false;
+    if (pendingPath == null || tsPath == null) {
+      await _setJournalPendingDelete(journal, null);
+      return false;
+    }
+    final ts = File(tsPath);
+    final mp4 = File(pendingPath);
+    switch (action) {
+      case PendingFallbackDeleteAction.none:
+        return false;
+      case PendingFallbackDeleteAction.clearStale:
+        await _setJournalPendingDelete(journal, null);
+        return false;
+      case PendingFallbackDeleteAction.discardBrokenTs:
+        // TS dở dang do lượt thay trước để lại (khoá chỉ được ghi cho đúng
+        // lần thay này); bản MP4 vẫn là bản đọc được.
+        try {
+          if (!isFileReadActive(ts.path)) await ts.delete();
+        } catch (_) {}
+        if (!await ts.exists()) {
+          await _setJournalPendingDelete(journal, null);
+        }
+        return false;
+      case PendingFallbackDeleteAction.waitForLease:
+        return true;
+      case PendingFallbackDeleteAction.deleteSuperseded:
+        try {
+          await mp4.delete();
+        } on PathNotFoundException {
+          // Đã được xoá trước khi crash.
+        } catch (error) {
+          developer.log(
+            'Unable to remove superseded fallback ${mp4.path}: $error',
+            name: 'RecordingService',
+          );
+          return true;
+        }
+        _replaceIndexedSegmentPath(mp4.path, ts.path);
+        for (final file in <File>[video, wav]) {
+          try {
+            if (await file.exists()) await file.delete();
+          } catch (_) {}
+        }
+        await _writeJournalState(journal, 'completed', finalPath: ts.path);
+        try {
+          if (await journal.exists()) await journal.delete();
+        } catch (_) {}
+        debugPrint('[VNVAR] FALLBACK REPLACEMENT COMPLETED: ${ts.path}');
+        return true;
+    }
+  }
+
+  /// Bản dự phòng đã được thay bằng file mới (TS có tiếng): giữ nguyên ID để
+  /// tablet không mất liên kết, chỉ đổi đường dẫn.
+  void _replaceIndexedSegmentPath(String oldPath, String newPath) {
+    if (oldPath == newPath) return;
+    final index = _segments.indexWhere((segment) => segment.path == oldPath);
+    if (index < 0) return;
+    final previous = _segments[index];
+    _segments[index] = RecordedSegment(
+      id: previous.id,
+      cameraId: previous.cameraId,
+      path: newPath,
+      startedAt: previous.startedAt,
+      endedAt: previous.endedAt,
+      type: previous.type,
+      downloaded: previous.downloaded,
+      joinedPrecedingSegment: previous.joinedPrecedingSegment,
+    );
+    _notifyVideoChanges();
+  }
+
+  /// Single-flight: được gọi từ khởi động, màn hình video và dọn định kỳ;
+  /// hai lượt chạy song song có thể convert cùng một MP4 staging hai lần.
+  Future<void> _cleanupAbandonedRecordings({required Duration maxAge}) {
+    final current = _abandonedCleanupOperation;
+    if (current != null) return current;
+
+    final operation = _cleanupAbandonedRecordingsInternal(maxAge: maxAge);
+    _abandonedCleanupOperation = operation;
+    return operation.whenComplete(() {
+      if (identical(_abandonedCleanupOperation, operation)) {
+        _abandonedCleanupOperation = null;
+      }
+    });
+  }
+
+  Future<void> _cleanupAbandonedRecordingsInternal({
+    required Duration maxAge,
+  }) async {
     final stagingRoot = await getTemporaryDirectory();
     final directory = Directory(
       '${stagingRoot.path}${Platform.pathSeparator}vnvar_recording',
@@ -2921,30 +4444,64 @@ class RecordingService {
         final timestamp = int.tryParse(timestampText);
         if (fileName.startsWith(prefix) && timestamp != null && stat.size > 0) {
           final journal = File('${entity.path}.json');
-          // Hướng lúc quay được lưu trong journal; dùng lại khi khôi phục sau
-          // crash thay vì hướng hiện tại của camera.
+          final wav = File(
+            entity.path.replaceFirst(
+              RegExp(r'\.mp4$', caseSensitive: false),
+              '.wav',
+            ),
+          );
+          // Hướng lúc quay và độ lệch A/V được lưu trong journal; dùng lại khi
+          // khôi phục sau crash thay vì hướng hiện tại của camera.
           String? journalFacingMode;
           int? journalQuarterTurns;
+          int? journalAudioOffsetMs;
+          Map<String, dynamic>? journalValues;
           if (await journal.exists()) {
             try {
               final decoded = jsonDecode(await journal.readAsString());
-              if (decoded is Map<String, dynamic>) {
-                final facing = decoded['facingMode'];
-                final turns = decoded['quarterTurns'];
-                if (facing is String) journalFacingMode = facing;
-                if (turns is num) journalQuarterTurns = turns.toInt();
-              }
-              if (decoded is Map<String, dynamic> &&
-                  decoded['state'] == 'invalid') {
-                if (now.difference(stat.modified) >= maxAge) {
-                  await entity.delete();
-                  await journal.delete();
-                }
-                continue;
-              }
+              if (decoded is Map<String, dynamic>) journalValues = decoded;
             } catch (_) {
               // A damaged journal does not prove the media is damaged; FFprobe
               // below remains the source of truth.
+            }
+          }
+          if (journalValues != null) {
+            final facing = journalValues['facingMode'];
+            final turns = journalValues['quarterTurns'];
+            if (facing is String) journalFacingMode = facing;
+            if (turns is num) journalQuarterTurns = turns.toInt();
+            final offset = journalValues['audioOffsetMs'];
+            journalAudioOffsetMs = offset is num && offset.isFinite
+                ? offset.round()
+                : audioSyncOffsetMs(
+                    firstSampleEpochMs: _journalNumber(
+                      journalValues['firstSampleEpochMs'],
+                    ),
+                    videoStartEpochMs: _journalNumber(
+                      journalValues['videoStartEpochMs'],
+                    ),
+                  );
+            final state = journalValues['state'];
+            if (state == 'invalid') {
+              if (now.difference(stat.modified) >= maxAge) {
+                await entity.delete();
+                await journal.delete();
+              }
+              continue;
+            }
+            if (state == 'preserved_fallback') {
+              await _retryPreservedFallback(
+                video: entity,
+                wav: wav,
+                journal: journal,
+                values: journalValues,
+                age: now.difference(stat.modified),
+                maxAge: maxAge,
+                facingMode: journalFacingMode,
+                quarterTurns: journalQuarterTurns,
+                audioOffsetMs: journalAudioOffsetMs,
+              );
+              continue;
             }
           }
           await _writeJournalState(journal, 'recovering');
@@ -2968,12 +4525,6 @@ class RecordingService {
           final endedAt = stat.modified.isAfter(startedAt)
               ? stat.modified
               : startedAt;
-          final wav = File(
-            entity.path.replaceFirst(
-              RegExp(r'\.mp4$', caseSensitive: false),
-              '.wav',
-            ),
-          );
           if (!isPublishableVideoProbe(
             hasVideo: recoveredProbe.hasVideo,
             durationSeconds: recoveredProbe.durationSeconds,
@@ -2988,20 +4539,37 @@ class RecordingService {
             if (await journal.exists()) await journal.delete();
             continue;
           }
-          final recovered = await _convertRecordingToTs(
+          final converted = await _convertRecordingToTs(
             entity,
             startedAt,
             endedAt,
             await wav.exists() ? wav : null,
             facingMode: journalFacingMode,
             quarterTurns: journalQuarterTurns,
+            audioOffsetMs: journalAudioOffsetMs,
           );
-          await _writeJournalState(
-            journal,
-            'completed',
-            finalPath: recovered.path,
-          );
-          if (await journal.exists()) await journal.delete();
+          final recovered = converted.file;
+          if (converted.preservedFallback) {
+            // Lưu tên bản dự phòng + số lần thử: lần dọn sau ghép lại đúng
+            // bản này thay vì tạo bản trùng với endedAt khác.
+            await _writeJournalState(
+              journal,
+              'preserved_fallback',
+              finalPath: recovered.path,
+              extra: {
+                'startedAtMs': startedAt.millisecondsSinceEpoch,
+                'endedAtMs': endedAt.millisecondsSinceEpoch,
+                'muxAttempts': 1,
+              },
+            );
+          } else {
+            await _writeJournalState(
+              journal,
+              'completed',
+              finalPath: recovered.path,
+            );
+            if (await journal.exists()) await journal.delete();
+          }
           debugPrint(
             '[VNVAR] ABANDONED RECORDING RECOVERED: ${recovered.path}',
           );
@@ -3051,6 +4619,18 @@ class RecordingService {
       }
       if (_currentJournal?.path == entity.path) continue;
       try {
+        // Journal còn MP4 staging đi kèm (ví dụ `preserved_fallback`) được
+        // vòng MP4 phía trên quản lý; xoá ở đây sẽ làm MP4 bị khôi phục lại
+        // như sau crash và sinh bản trùng.
+        final companion = File(
+          entity.path.replaceFirst(
+            RegExp(r'\.json$', caseSensitive: false),
+            '',
+          ),
+        );
+        if (companion.path != entity.path && await companion.exists()) {
+          continue;
+        }
         final stat = await entity.stat();
         if (now.difference(stat.modified) >= maxAge) await entity.delete();
       } catch (error, stackTrace) {
@@ -3069,7 +4649,8 @@ class RecordingService {
     final root = await _videoRootDirectory();
     var total = 0;
     await for (final entity in root.list(recursive: true)) {
-      if (entity is File && isManagedStorageFilePath(entity.path)) {
+      if (entity is File &&
+          isManagedStorageFilePath(entity.path, storageRoot: root.path)) {
         try {
           total += await entity.length();
         } catch (_) {}
@@ -3240,7 +4821,8 @@ class RecordingService {
   /// Dọn sạch các thư mục cũ và thư mục rỗng trong thư mục lưu trữ video.
   ///
   /// - Thư mục ngày hiện tại (`today`) luôn được bảo vệ để không ảnh hưởng
-  ///   phiên quay video đang hoạt động hoặc sắp bắt đầu.
+  ///   phiên quay video đang hoạt động hoặc sắp bắt đầu; trong đó chỉ dọn
+  ///   file tạm `*.retry.tmp` đã cũ ([isStaleFallbackRetryTemp]).
   /// - Thư mục `download` tạm thời không bị can thiệp ở đây (đã có luồng riêng).
   /// - Quét đệ quy từ nhánh con sâu nhất lên (post-order traversal). Nếu thư
   ///   mục không còn chứa file video nào, dọn các file rác mồ côi (.wav, .json, .tmp)
@@ -3266,7 +4848,12 @@ class RecordingService {
             .last;
 
         if (dirName.toLowerCase() == 'download') continue;
-        if (dirName == todayName) continue;
+        if (dirName == todayName) {
+          // Thư mục hôm nay được bảo vệ: chỉ dọn file tạm thử ghép lại
+          // (`*.retry.tmp`) đã cũ, không đụng file hay thư mục nào khác.
+          await _cleanStaleRetryTempsRecursively(entity);
+          continue;
+        }
         // Chỉ dọn thư mục ngày do app tạo, không đụng thư mục của người dùng.
         if (!RegExp(r'^\d{2}-\d{2}-\d{4}$').hasMatch(dirName)) continue;
 
@@ -3310,9 +4897,64 @@ class RecordingService {
           }
         }
       }
+    } else {
+      // Thư mục còn video (hoặc thư mục con): chỉ dọn file tạm thử ghép lại
+      // (`*.retry.tmp`) sót sau crash — đã cũ và không có lượt thử nào đang
+      // chạy. Không đụng file khác.
+      await _deleteStaleRetryTemps(remainingFiles);
     }
 
     await _deleteDirectoryIfEmpty(directory);
+  }
+
+  /// Chỉ dọn `*.retry.tmp` đã cũ trong [directory] và thư mục con (dùng cho
+  /// thư mục ngày hôm nay). Không xoá file hay thư mục nào khác.
+  Future<void> _cleanStaleRetryTempsRecursively(Directory directory) async {
+    final files = <File>[];
+    try {
+      await for (final entity in directory.list(recursive: true)) {
+        if (entity is File &&
+            entity.path.toLowerCase().endsWith(fallbackRetryTempSuffix)) {
+          files.add(entity);
+        }
+      }
+    } catch (error) {
+      developer.log(
+        '[STORAGE] Unable to list ${directory.path} for retry temps: $error',
+        name: 'RecordingService',
+      );
+    }
+    await _deleteStaleRetryTemps(files);
+  }
+
+  /// Xoá các file tạm thử ghép lại trong [files] khi đã cũ hơn
+  /// [staleFallbackRetryTempAge], không có lượt thử nào đang chạy và không
+  /// có lease đọc. File khác bị bỏ qua.
+  Future<void> _deleteStaleRetryTemps(List<File> files) async {
+    final now = DateTime.now();
+    for (final file in files) {
+      if (!file.path.toLowerCase().endsWith(fallbackRetryTempSuffix)) {
+        continue;
+      }
+      try {
+        final modified = (await file.stat()).modified;
+        if (!isStaleFallbackRetryTemp(
+              path: file.path,
+              modified: modified,
+              now: now,
+              retryInFlight: _fallbackRetriesInFlight > 0,
+            ) ||
+            isFileReadActive(file.path)) {
+          continue;
+        }
+        await file.delete();
+      } catch (error) {
+        developer.log(
+          '[STORAGE] Unable to delete stale retry temp ${file.path}: $error',
+          name: 'RecordingService',
+        );
+      }
+    }
   }
 
   Future<void> enforceStorageLimit() {
@@ -3368,10 +5010,14 @@ class RecordingService {
       if (normalizedPath.contains('/download/')) continue;
       try {
         final stat = await entity.stat();
-        if (isManagedStorageFilePath(entity.path)) total += stat.size;
+        if (isManagedStorageFilePath(entity.path, storageRoot: root.path)) {
+          total += stat.size;
+        }
         // Chỉ xoá video do app tạo; file của người dùng trong thư mục dùng
         // chung (DCIM...) không bao giờ bị đưa vào danh sách xoá.
-        if (!isAppManagedVideoPath(entity.path)) continue;
+        if (!isAppManagedVideoPath(entity.path, storageRoot: root.path)) {
+          continue;
+        }
         final normalized = entity.path.replaceAll('\\', '/');
         final match = RegExp(
           r'/([0-9]{2}-[0-9]{2}-[0-9]{4})/',
@@ -3572,6 +5218,7 @@ class RecordingService {
       return finalSegment ?? rotatedSegment;
     } finally {
       _recording = false;
+      _suspendedReason = null;
       _videoTrack = null;
       _recordAudio = false;
       _stopping = false;
@@ -3583,6 +5230,7 @@ class RecordingService {
   // ============================================================
 
   Future<void> dispose({Future<void> Function()? onRecorderStopped}) async {
+    StationPlatformEvents.instance.removeListener(this);
     _segmentTimer?.cancel();
 
     _segmentTimer = null;

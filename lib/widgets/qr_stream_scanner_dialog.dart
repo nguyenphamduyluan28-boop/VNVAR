@@ -21,7 +21,7 @@ class QrStreamParseResult {
     this.matchTitle,
     this.protocol = 'rtsp',
     this.token,
-    this.autoStart = true,
+    this.autoStart = false,
   });
 
   /// Phân tích chuỗi quét được từ mã QR thành [QrStreamParseResult].
@@ -55,7 +55,9 @@ class QrStreamParseResult {
                 data['title']?.toString(),
             protocol: protocol,
             token: data['token']?.toString() ?? data['key']?.toString(),
-            autoStart: data['auto_start'] != false,
+            // Chỉ tự phát khi QR ghi rõ "auto_start": true. Dù vậy, màn hình
+            // phát vẫn hỏi lại nếu đích là nền tảng công cộng/máy chủ lạ.
+            autoStart: data['auto_start'] == true || data['autoStart'] == true,
           );
         }
       } catch (_) {
@@ -100,6 +102,70 @@ class QrStreamParseResult {
   }
 }
 
+enum _ImageScanStatus { found, noCode, invalid, failed }
+
+class _ImageScanOutcome {
+  final _ImageScanStatus status;
+  final QrStreamParseResult? result;
+
+  const _ImageScanOutcome(this.status, [this.result]);
+}
+
+/// Phân tích một file ảnh, trả về mã QR luồng phát hợp lệ đầu tiên.
+Future<_ImageScanOutcome> _scanImageFile(
+  MobileScannerController controller,
+  String path,
+) async {
+  final capture = await controller.analyzeImage(path);
+  if (capture == null || capture.barcodes.isEmpty) {
+    return const _ImageScanOutcome(_ImageScanStatus.noCode);
+  }
+  for (final barcode in capture.barcodes) {
+    final raw = barcode.rawValue;
+    if (raw == null || raw.trim().isEmpty) continue;
+    final parsed = QrStreamParseResult.parse(raw);
+    if (parsed != null) {
+      return _ImageScanOutcome(_ImageScanStatus.found, parsed);
+    }
+  }
+  return const _ImageScanOutcome(_ImageScanStatus.invalid);
+}
+
+void _showImageScanError(
+  ScaffoldMessengerState? messenger,
+  _ImageScanStatus status,
+  Object? error,
+) {
+  if (messenger == null || !messenger.mounted) return;
+  final isEn = AppLanguageService.instance.isEnglish;
+  final String message;
+  final Color color;
+  switch (status) {
+    case _ImageScanStatus.found:
+      return;
+    case _ImageScanStatus.noCode:
+      message = isEn
+          ? 'No QR code found in the selected photo.'
+          : 'Không tìm thấy mã QR trong ảnh đã chọn.';
+      color = const Color(0xFFC62828);
+    case _ImageScanStatus.invalid:
+      message = isEn
+          ? 'QR code content is not a valid stream link or match info.'
+          : 'Mã QR trong ảnh không phải thông tin luồng phát hợp lệ.';
+      color = const Color(0xFFE65100);
+    case _ImageScanStatus.failed:
+      message = isEn ? 'Error reading photo: $error' : 'Lỗi khi đọc ảnh: $error';
+      color = const Color(0xFFC62828);
+  }
+  messenger.showSnackBar(
+    SnackBar(
+      content: Text(message),
+      backgroundColor: color,
+      behavior: SnackBarBehavior.floating,
+    ),
+  );
+}
+
 /// Màn hình/Hộp thoại quét mã QR dành cho luồng phát trực tiếp.
 class QrStreamScannerDialog extends StatefulWidget {
   const QrStreamScannerDialog({super.key});
@@ -111,6 +177,43 @@ class QrStreamScannerDialog extends StatefulWidget {
         builder: (_) => const QrStreamScannerDialog(),
       ),
     );
+  }
+
+  /// Đọc mã QR từ một ảnh trong thư viện máy mà KHÔNG mở camera, nên không
+  /// phải tạm dừng camera của trạm (đang ghi hình / đang phát cho Tablet).
+  /// Trả về null nếu người dùng huỷ hoặc ảnh không có mã hợp lệ (đã báo lỗi
+  /// bằng SnackBar).
+  static Future<QrStreamParseResult?> scanFromGallery(
+    BuildContext context,
+  ) async {
+    final messenger = ScaffoldMessenger.maybeOf(context);
+    final XFile? file;
+    try {
+      file = await ImagePicker().pickImage(
+        source: ImageSource.gallery,
+        imageQuality: 100,
+      );
+    } catch (error) {
+      _showImageScanError(messenger, _ImageScanStatus.failed, error);
+      return null;
+    }
+    if (file == null) return null;
+
+    // Controller chỉ dùng để phân tích ảnh; không gắn vào widget và không
+    // start nên không chiếm camera phần cứng.
+    final controller = MobileScannerController(autoStart: false);
+    try {
+      final outcome = await _scanImageFile(controller, file.path);
+      if (outcome.result == null) {
+        _showImageScanError(messenger, outcome.status, null);
+      }
+      return outcome.result;
+    } catch (error) {
+      _showImageScanError(messenger, _ImageScanStatus.failed, error);
+      return null;
+    } finally {
+      controller.dispose();
+    }
   }
 
   @override
@@ -178,6 +281,7 @@ class _QrStreamScannerDialogState extends State<QrStreamScannerDialog> {
   Future<void> _pickImageFromGallery() async {
     if (_isProcessingImage || _hasDetected) return;
     setState(() => _isProcessingImage = true);
+    final messenger = ScaffoldMessenger.maybeOf(context);
 
     try {
       final picker = ImagePicker();
@@ -192,68 +296,22 @@ class _QrStreamScannerDialogState extends State<QrStreamScannerDialog> {
         return;
       }
 
-      final capture = await _controller.analyzeImage(file.path);
+      final outcome = await _scanImageFile(_controller, file.path);
       if (!mounted) return;
 
-      if (capture == null || capture.barcodes.isEmpty) {
-        setState(() => _isProcessingImage = false);
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(
-            content: Text(
-              AppLanguageService.instance.isEnglish
-                  ? 'No QR code found in the selected photo.'
-                  : 'Không tìm thấy mã QR trong ảnh đã chọn.',
-            ),
-            backgroundColor: const Color(0xFFC62828),
-            behavior: SnackBarBehavior.floating,
-          ),
-        );
+      final parsed = outcome.result;
+      if (parsed != null) {
+        _hasDetected = true;
+        HapticFeedback.mediumImpact();
+        await _handleClose(parsed);
         return;
       }
-
-      bool foundValid = false;
-      for (final barcode in capture.barcodes) {
-        final raw = barcode.rawValue;
-        if (raw == null || raw.trim().isEmpty) continue;
-
-        final parsed = QrStreamParseResult.parse(raw);
-        if (parsed != null) {
-          foundValid = true;
-          _hasDetected = true;
-          HapticFeedback.mediumImpact();
-          await _handleClose(parsed);
-          break;
-        }
-      }
-
-      if (!foundValid && mounted) {
-        setState(() => _isProcessingImage = false);
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(
-            content: Text(
-              AppLanguageService.instance.isEnglish
-                  ? 'QR code content is not a valid stream link or match info.'
-                  : 'Mã QR trong ảnh không phải thông tin luồng phát hợp lệ.',
-            ),
-            backgroundColor: const Color(0xFFE65100),
-            behavior: SnackBarBehavior.floating,
-          ),
-        );
-      }
+      setState(() => _isProcessingImage = false);
+      _showImageScanError(messenger, outcome.status, null);
     } catch (e) {
       if (mounted) {
         setState(() => _isProcessingImage = false);
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(
-            content: Text(
-              AppLanguageService.instance.isEnglish
-                  ? 'Error reading photo: $e'
-                  : 'Lỗi khi đọc ảnh: $e',
-            ),
-            backgroundColor: const Color(0xFFC62828),
-            behavior: SnackBarBehavior.floating,
-          ),
-        );
+        _showImageScanError(messenger, _ImageScanStatus.failed, e);
       }
     }
   }

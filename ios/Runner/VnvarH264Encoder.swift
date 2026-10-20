@@ -16,11 +16,16 @@ final class VnvarH264Encoder {
 
   private let queue = DispatchQueue(label: "vnvar.rtsp.h264.encoder")
   private let queueKey = DispatchSpecificKey<Void>()
-  // Bảo vệ encodeQueued, pendingCompletion, pendingFrameToken, nextFrameToken.
+  // Bảo vệ encodeQueued, pendingCompletion, pendingFrameToken, nextFrameToken
+  // và lastParameterSets (callback VideoToolbox chạy trên luồng riêng, còn
+  // resetSession/ensureSession/stopLocked chạy trên `queue`).
   private let admissionLock = NSLock()
   private let maximumBitrate: Int
   private var currentBitrate: Int
   private let fps: Int
+  // Số giây giữa hai IDR. Luồng chính giữ 1 s (khôi phục nhanh cho tablet);
+  // luồng overlay cho RTMP dùng 2 s như khuyến nghị của nền tảng livestream.
+  private let keyFrameIntervalSeconds: Int
   private var session: VTCompressionSession?
   private var dimensions: (width: Int, height: Int)?
   private var forceNextKeyFrame = true
@@ -37,11 +42,30 @@ final class VnvarH264Encoder {
   /// và tạo lại phiên, thay vì để RTSP đứng hình vĩnh viễn.
   private static let stallTimeout: TimeInterval = 1.0
 
-  init(bitrate: Int, fps: Int) {
+  /// Trần tức thời cho kVTCompressionPropertyKey_DataRateLimits trong cửa sổ
+  /// 1 s, tính theo bội số của bitrate trung bình. Đặt trần đúng bằng trung
+  /// bình buộc encoder bóp chất lượng mọi khung IDR/cảnh động.
+  static let peakBitrateMultiplier = 1.5
+
+  /// [bytes, giây] cho kVTCompressionPropertyKey_DataRateLimits.
+  static func dataRateLimits(forAverageBitrate bitrate: Int) -> [Int] {
+    let peakBitsPerSecond = Double(max(0, bitrate)) * peakBitrateMultiplier
+    return [Int(peakBitsPerSecond / 8), 1]
+  }
+
+  init(bitrate: Int, fps: Int, keyFrameIntervalSeconds: Int = 1) {
     maximumBitrate = max(250_000, bitrate)
     currentBitrate = max(250_000, bitrate)
     self.fps = max(1, min(fps, 60))
+    self.keyFrameIntervalSeconds = max(1, min(keyFrameIntervalSeconds, 4))
     queue.setSpecific(key: queueKey, value: ())
+  }
+
+  deinit {
+    // Phiên VideoToolbox giữ con trỏ unretained tới self (refcon): phải huỷ
+    // phiên trước khi bộ nhớ của self bị giải phóng. stop() tự chạy thẳng nếu
+    // deinit xảy ra trên chính `queue`.
+    stop()
   }
 
   func encode(
@@ -133,7 +157,7 @@ final class VnvarH264Encoder {
       )
       self.setIfSupported(
         kVTCompressionPropertyKey_DataRateLimits,
-        value: [target / 8, 1],
+        value: Self.dataRateLimits(forAverageBitrate: target),
         on: session
       )
     }
@@ -156,8 +180,14 @@ final class VnvarH264Encoder {
     }
     session = nil
     dimensions = nil
-    lastParameterSets = nil
+    clearParameterSets()
     finishPendingFrame()
+  }
+
+  private func clearParameterSets() {
+    admissionLock.lock()
+    lastParameterSets = nil
+    admissionLock.unlock()
   }
 
   /// Chạy trên `queue`. Huỷ phiên hiện tại để khung kế tiếp tạo phiên mới.
@@ -167,7 +197,7 @@ final class VnvarH264Encoder {
     }
     session = nil
     dimensions = nil
-    lastParameterSets = nil
+    clearParameterSets()
     forceNextKeyFrame = true
   }
 
@@ -231,7 +261,11 @@ final class VnvarH264Encoder {
       )
       try set(kVTCompressionPropertyKey_AverageBitRate, value: currentBitrate, on: newSession)
       try set(kVTCompressionPropertyKey_ExpectedFrameRate, value: fps, on: newSession)
-      try set(kVTCompressionPropertyKey_MaxKeyFrameInterval, value: fps, on: newSession)
+      try set(
+        kVTCompressionPropertyKey_MaxKeyFrameInterval,
+        value: fps * keyFrameIntervalSeconds,
+        on: newSession
+      )
       // Keep at most one frame inside VideoToolbox. A deep encoder queue makes
       // 4K preview and recording appear frozen several seconds behind live.
       setIfSupported(
@@ -241,7 +275,7 @@ final class VnvarH264Encoder {
       )
       try set(
         kVTCompressionPropertyKey_DataRateLimits,
-        value: [currentBitrate / 8, 1],
+        value: Self.dataRateLimits(forAverageBitrate: currentBitrate),
         on: newSession
       )
       let prepareStatus = VTCompressionSessionPrepareToEncodeFrames(newSession)
@@ -254,7 +288,7 @@ final class VnvarH264Encoder {
     }
     session = newSession
     dimensions = (width, height)
-    lastParameterSets = nil
+    clearParameterSets()
     forceNextKeyFrame = true
   }
 
@@ -320,11 +354,18 @@ final class VnvarH264Encoder {
     }
 
     let parameterSets = parameterSets(from: format)
-    if let parameterSets = parameterSets,
-       (lastParameterSets?.sps != parameterSets.sps ||
-        lastParameterSets?.pps != parameterSets.pps) {
-      lastParameterSets = (parameterSets.sps, parameterSets.pps)
-      onFormat?(parameterSets.sps, parameterSets.pps)
+    if let parameterSets = parameterSets {
+      admissionLock.lock()
+      let changed = lastParameterSets?.sps != parameterSets.sps ||
+        lastParameterSets?.pps != parameterSets.pps
+      if changed {
+        lastParameterSets = (parameterSets.sps, parameterSets.pps)
+      }
+      admissionLock.unlock()
+      // Gọi callback ngoài khoá để không giữ khoá khi sang publisher/server.
+      if changed {
+        onFormat?(parameterSets.sps, parameterSets.pps)
+      }
     }
     let nals = lengthPrefixedNals(
       from: dataBuffer,

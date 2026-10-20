@@ -24,9 +24,161 @@ class ScoreboardFrameRenderer {
   /// Màu nền thanh chữ chạy khi FFmpeg vẽ chữ (chữ trắng) trên livestream.
   static const Color liveTickerBarColor = Color(0xEB0A101C);
 
+  /// Bảng lớn (full/intro/result) chiếm tối đa tỉ lệ này của bề rộng và
+  /// chiều cao khung, kể cả khi "Kích thước" lớn.
+  static const double maxPanelFraction = 0.95;
+
+  /// Logo lớn nhất được vẽ (cảnh giới thiệu), đơn vị khung thiết kế.
+  static const double maxLogoDesignSize = 180;
+
   /// Tỉ lệ từ khung thiết kế sang video [width]×[height].
   static double baseScale(int width, int height) =>
       math.min(width / designWidth, height / designHeight);
+
+  /// Kẹp hệ số vẽ [k] (pixel / đơn vị thiết kế) để bảng [panel] (đơn vị thiết
+  /// kế) không vượt [fraction] bề rộng/chiều cao khung [frame] (pixel).
+  /// [panel] null (thanh tỉ số): giữ nguyên [k].
+  static double fitScale(
+    double k,
+    Size frame,
+    Size? panel, {
+    double fraction = maxPanelFraction,
+  }) {
+    if (panel == null || panel.width <= 0 || panel.height <= 0) return k;
+    return math.min(
+      k,
+      math.min(
+        frame.width * fraction / panel.width,
+        frame.height * fraction / panel.height,
+      ),
+    );
+  }
+
+  /// Cạnh dài tối đa (pixel) khi giải mã logo cho video [width]×[height]:
+  /// đủ nét cho logo lớn nhất ở "Kích thước" 200 %, không giải mã ảnh gốc
+  /// lớn hơn mức cần.
+  static int logoDecodeSize(int width, int height) =>
+      (maxLogoDesignSize * 2 * baseScale(width, height)).ceil().clamp(32, 1024);
+
+  /// Vùng (pixel video) có nội dung của trạng thái hiện tại: thanh tỉ số /
+  /// bảng lớn, thông báo, chữ chạy, đã gồm bóng đổ. Tính từ bố cục (giới hạn
+  /// trên, không đo chữ, không quét pixel). null: không vẽ gì.
+  static Rect? contentBounds(
+    Map<String, dynamic> state, {
+    required int width,
+    required int height,
+    required int nowMs,
+    Map<String, ui.Image> logos = const {},
+  }) {
+    final view = _ScoreView(state, nowMs: nowMs, logos: logos);
+    final size = Size(width.toDouble(), height.toDouble());
+    if (!view.visible || view.scene == 'hidden' || size.isEmpty) return null;
+    final tickerOn = view.tickerText().isNotEmpty;
+    return _pixelBounds(
+      view,
+      size,
+      scenes: [view.scene],
+      logoOptions: [view.hasLogo],
+      tickerOptions: [tickerOn],
+      banner: view.bannerText().isNotEmpty,
+      tickerBand: tickerOn,
+    );
+  }
+
+  /// Vùng chứa mọi thứ có thể hiện trong một phiên livestream mà không cần
+  /// khởi động lại FFmpeg: hợp của mọi cảnh (có/không logo, có/không chữ
+  /// chạy), thông báo dài nhất và thanh chữ chạy, theo vị trí, "Kích thước",
+  /// số set hiện tại. Đổi vị trí/kích thước/số set có thể làm vùng lớn hơn.
+  static Rect sessionRegion(
+    Map<String, dynamic> state, {
+    required int width,
+    required int height,
+  }) {
+    final view = _ScoreView(state, nowMs: 0, logos: const {});
+    final size = Size(width.toDouble(), height.toDouble());
+    final frame = Offset.zero & size;
+    if (size.isEmpty) return frame;
+    return _pixelBounds(
+          view,
+          size,
+          scenes: const ['scorebar', 'full', 'intro', 'result'],
+          logoOptions: const [false, true],
+          tickerOptions: const [false, true],
+          banner: true,
+          tickerBand: true,
+        ) ??
+        frame;
+  }
+
+  static Rect? _pixelBounds(
+    _ScoreView view,
+    Size size,
+    {
+    required List<String> scenes,
+    required List<bool> logoOptions,
+    required List<bool> tickerOptions,
+    required bool banner,
+    required bool tickerBand,
+  }) {
+    final base = math.min(size.width / designWidth, size.height / designHeight);
+    if (base <= 0) return null;
+    final rects = <Rect>[];
+    for (final scene in scenes) {
+      for (final hasLogo in logoOptions) {
+        final k = fitScale(
+          base * view.scale,
+          size,
+          _Painter.panelSize(view, scene, hasLogo),
+        );
+        final virtual = Size(size.width / k, size.height / k);
+        for (final tickerOn in tickerOptions) {
+          final layout = _Painter.layoutBounds(
+            view,
+            virtual,
+            base / k,
+            scene: scene,
+            hasLogo: hasLogo,
+            tickerOn: tickerOn,
+            banner: banner,
+          );
+          for (final rect in layout) {
+            rects.add(
+              Rect.fromLTRB(
+                rect.left * k,
+                rect.top * k,
+                rect.right * k,
+                rect.bottom * k,
+              ),
+            );
+          }
+        }
+      }
+    }
+    if (tickerBand) {
+      // Thanh chữ chạy + viền nhấn 4 px phía trên (khung thiết kế × base).
+      rects.add(
+        Rect.fromLTRB(
+          0,
+          size.height - (tickerBarHeight + 4) * base,
+          size.width,
+          size.height,
+        ),
+      );
+    }
+    if (rects.isEmpty) return null;
+    var union = rects.first;
+    for (final rect in rects.skip(1)) {
+      union = union.expandToInclude(rect);
+    }
+    final clipped = Rect.fromLTRB(
+      union.left.floorToDouble(),
+      union.top.floorToDouble(),
+      union.right.ceilToDouble(),
+      union.bottom.ceilToDouble(),
+    ).intersect(Offset.zero & size);
+    if (clipped.width <= 0 || clipped.height <= 0) return null;
+    return clipped;
+  }
 
   /// Chữ chạy đang hiện (rỗng nếu overlay đang ẩn, cảnh "hidden" hoặc tắt).
   static String visibleTickerText(Map<String, dynamic> state) {
@@ -41,6 +193,9 @@ class ScoreboardFrameRenderer {
     return _int(ticker['speed']).clamp(1, 3);
   }
 
+  /// Vẽ khung [width]×[height] thành PNG. [region] (pixel, số nguyên): chỉ
+  /// xuất phần khung trong vùng này (ảnh có kích thước của vùng), bố cục vẫn
+  /// tính theo cả khung.
   Future<Uint8List> renderPng(
     Map<String, dynamic> state, {
     required int width,
@@ -48,12 +203,23 @@ class ScoreboardFrameRenderer {
     required int nowMs,
     Map<String, ui.Image> logos = const {},
     bool tickerText = true,
+    Rect? region,
   }) async {
+    final frame = Rect.fromLTWH(0, 0, width.toDouble(), height.toDouble());
+    final crop = region == null ? frame : region.intersect(frame);
+    final left = crop.left.roundToDouble();
+    final top = crop.top.roundToDouble();
+    final outWidth = crop.width.round();
+    final outHeight = crop.height.round();
+    if (outWidth <= 0 || outHeight <= 0) {
+      throw ArgumentError.value(region, 'region', 'Vùng vẽ nằm ngoài khung hình');
+    }
     final recorder = ui.PictureRecorder();
     final canvas = Canvas(
       recorder,
-      Rect.fromLTWH(0, 0, width.toDouble(), height.toDouble()),
+      Rect.fromLTWH(0, 0, outWidth.toDouble(), outHeight.toDouble()),
     );
+    if (left != 0 || top != 0) canvas.translate(-left, -top);
     paint(
       canvas,
       Size(width.toDouble(), height.toDouble()),
@@ -62,9 +228,11 @@ class ScoreboardFrameRenderer {
       logos: logos,
       tickerText: tickerText,
     );
-    final picture = recorder.endRecording();
-    final image = await picture.toImage(width, height);
-    picture.dispose();
+    final image = await _rasterize(
+      recorder.endRecording(),
+      outWidth,
+      outHeight,
+    );
     try {
       final data = await image.toByteData(format: ui.ImageByteFormat.png);
       if (data == null) {
@@ -73,6 +241,19 @@ class ScoreboardFrameRenderer {
       return data.buffer.asUint8List(data.offsetInBytes, data.lengthInBytes);
     } finally {
       image.dispose();
+    }
+  }
+
+  /// Giải phóng [picture] cả khi chuyển sang ảnh lỗi.
+  static Future<ui.Image> _rasterize(
+    ui.Picture picture,
+    int width,
+    int height,
+  ) async {
+    try {
+      return await picture.toImage(width, height);
+    } finally {
+      picture.dispose();
     }
   }
 
@@ -93,9 +274,14 @@ class ScoreboardFrameRenderer {
     final base = math.min(size.width / designWidth, size.height / designHeight);
     if (base <= 0) return;
     // Lề, vị trí và thanh chữ chạy giữ nguyên khi đổi "Kích thước"; chỉ bảng
-    // tỉ số/thông báo to nhỏ theo (giống trang /overlay).
-    final k = base * view.scale;
-    final painter = _Painter(canvas, view, unit: 1 / view.scale);
+    // tỉ số/thông báo to nhỏ theo (giống trang /overlay). Bảng lớn được kẹp
+    // để không tràn khung khi "Kích thước" lớn hoặc video dọc.
+    final k = fitScale(
+      base * view.scale,
+      size,
+      _Painter.panelSize(view, view.scene, view.hasLogo),
+    );
+    final painter = _Painter(canvas, view, unit: base / k);
     canvas.save();
     canvas.scale(base);
     painter.ticker(
@@ -141,7 +327,10 @@ Map<String, dynamic> _map(Object? value) {
   return const <String, dynamic>{};
 }
 
-int _int(Object? value) => value is num ? value.toInt() : int.tryParse('$value') ?? 0;
+// Số không hữu hạn (Infinity/NaN) không đổi được sang int: coi như 0.
+int _int(Object? value) => value is num
+    ? (value.isFinite ? value.toInt() : 0)
+    : int.tryParse('$value') ?? 0;
 
 Color _color(Object? value, Color fallback) {
   final text = value?.toString() ?? '';
@@ -223,6 +412,10 @@ class _ScoreView {
   bool showFlag(String key) => show[key] != false && (key != 'timer' || show[key] == true);
 
   _Team team(String id) => id == 'A' ? teamA : teamB;
+  bool get hasLogo => teamA.logo != null || teamB.logo != null;
+
+  /// Số cột set của bảng lớn.
+  int get fullColumns => math.max(bestOf, sets.length);
   List<String> get order => swapped ? const ['B', 'A'] : const ['A', 'B'];
 
   String title() => match['tournament']?.toString() ?? '';
@@ -335,6 +528,111 @@ class _Painter {
   final double unit;
   static const double margin = 48;
 
+  /// Thanh tỉ số: kích thước lớn nhất (xem [scorebar]: tiêu đề 36, hai hàng
+  /// 62, chân 30, viền 4).
+  static const double scorebarRowHeight = 62;
+  static const double scorebarMaxWidth = 820;
+  static const double scorebarMaxHeight = 36.0 + 62.0 * 2 + 30.0 + 4.0;
+
+  /// Thông báo: chữ cỡ 46 một dòng + đệm 32 (giới hạn trên của chiều cao).
+  static const double bannerMaxHeight = 110;
+
+  /// Bóng đổ (blur 15 ≈ 45 px) quanh bảng; phía dưới lệch thêm 12.
+  static const double shadowExtent = 48;
+
+  static const double fullRowH = 92;
+  static const double fullColW = 108;
+  static const double fullNameW = 560;
+  static const double fullPtsW = 140;
+  static const double introTeamW = 560;
+  static const Size resultSize = Size(960, 96.0 + 250);
+
+  static Size fullSize(int cols) =>
+      Size(36 + fullNameW + cols * fullColW + fullPtsW, 96 + 44 + fullRowH * 2 + 8);
+
+  static double introBodyH(bool hasLogo) => (hasLogo ? 194.0 : 0.0) + 90 + 54;
+
+  static Size introSize(bool hasLogo) =>
+      Size(introTeamW * 2 + 160 + 96, 96 + 36 + introBodyH(hasLogo) + 36);
+
+  /// Kích thước bảng lớn của [scene] (đơn vị thiết kế); null với thanh tỉ số.
+  static Size? panelSize(_ScoreView view, String scene, bool hasLogo) =>
+      switch (scene) {
+        'full' => fullSize(view.fullColumns),
+        'intro' => introSize(hasLogo),
+        'result' => resultSize,
+        _ => null,
+      };
+
+  static Rect _withShadow(Rect rect) => Rect.fromLTRB(
+    rect.left - shadowExtent,
+    rect.top - shadowExtent,
+    rect.right + shadowExtent,
+    rect.bottom + shadowExtent + 12,
+  );
+
+  /// Các vùng có thể vẽ của [scene] và thông báo, theo toạ độ đang vẽ (khung
+  /// [size] đã chia hệ số vẽ). Giới hạn trên: không đo chữ.
+  static List<Rect> layoutBounds(
+    _ScoreView view,
+    Size size,
+    double unit, {
+    required String scene,
+    required bool hasLogo,
+    required bool tickerOn,
+    required bool banner,
+  }) {
+    final rects = <Rect>[];
+    final panel = panelSize(view, scene, hasLogo);
+    if (panel != null) {
+      rects.add(
+        _withShadow(
+          Rect.fromLTWH(
+            (size.width - panel.width) / 2,
+            (size.height - panel.height) / 2,
+            panel.width,
+            panel.height,
+          ),
+        ),
+      );
+    } else {
+      // Cùng công thức vị trí với [scorebar], dùng bề rộng/cao lớn nhất: phía
+      // neo (lề) trùng nên vùng luôn chứa thanh thật.
+      const width = scorebarMaxWidth;
+      const height = scorebarMaxHeight;
+      final pos = view.position;
+      final m = margin * unit;
+      final left = pos.endsWith('l')
+          ? m
+          : pos.endsWith('r')
+          ? size.width - m - width
+          : (size.width - width) / 2;
+      final top = pos.startsWith('b')
+          ? size.height - m - height - (tickerOn ? 72 * unit : 0)
+          : m;
+      rects.add(_withShadow(Rect.fromLTWH(left, top, width, height)));
+    }
+    if (banner) {
+      // Cùng công thức với [banner]: chữ rộng tối đa size.width - 200, đệm 92.
+      final width = math.max(0.0, size.width - 200) + 92;
+      final atBottom = scene == 'scorebar' && view.position == 'tc';
+      final top = atBottom
+          ? size.height - 150 * unit - bannerMaxHeight
+          : 150 * unit;
+      rects.add(
+        _withShadow(
+          Rect.fromLTWH(
+            (size.width - width) / 2,
+            top,
+            width,
+            bannerMaxHeight,
+          ),
+        ),
+      );
+    }
+    return rects;
+  }
+
   TextPainter _text(
     String text,
     double size,
@@ -407,7 +705,7 @@ class _Painter {
   // ---------------- SCOREBAR ----------------
   void scorebar(Size size) {
     final v = view;
-    const rowH = 62.0;
+    const rowH = scorebarRowHeight;
     final showSets = v.showFlag('sets');
     final showServe = v.showFlag('serve');
     final showTimer = v.showFlag('timer');
@@ -437,7 +735,7 @@ class _Painter {
     final serveW = showServe ? 26.0 : 0.0;
     final logoW = hasLogo ? 56.0 : 0.0;
     final width = math.min(
-      820.0,
+      scorebarMaxWidth,
       math.max(560.0, 10 + logoW + nameW + serveW + setsW + gamesW + ptsW),
     );
     final height = headH + rowH * 2 + footH + 4;
@@ -536,7 +834,8 @@ class _Painter {
           final mine = _int(set[low]);
           final theirs = _int(set[other]);
           _centerText(
-            '$mine',
+            // Set đánh dấu (không rõ tỉ số): chỉ tô sáng đội thắng.
+            set['synthetic'] == true ? '–' : '$mine',
             Rect.fromLTWH(sx, y, 40, rowH),
             24,
             mine > theirs ? palette.fg : palette.muted,
@@ -621,14 +920,13 @@ class _Painter {
   // ---------------- FULL ----------------
   void full(Size size) {
     final v = view;
-    final cols = math.max(v.bestOf, v.sets.length);
-    const rowH = 92.0;
-    const colW = 108.0;
-    const nameW = 560.0;
-    const ptsW = 140.0;
-    final width = 36 + nameW + cols * colW + ptsW;
-    final height = 96 + 44 + rowH * 2 + 8;
-    final rrect = _panel(size, width, height);
+    final cols = v.fullColumns;
+    const rowH = fullRowH;
+    const colW = fullColW;
+    const nameW = fullNameW;
+    const ptsW = fullPtsW;
+    final dims = fullSize(cols);
+    final rrect = _panel(size, dims.width, dims.height);
     final panel = rrect.outerRect;
     final sub = [
       v.subtitle(),
@@ -696,7 +994,7 @@ class _Painter {
         if (i < v.sets.length) {
           final mine = _int(v.sets[i][low]);
           final theirs = _int(v.sets[i][other]);
-          text = '$mine';
+          text = v.sets[i]['synthetic'] == true ? '–' : '$mine';
           if (mine > theirs) color = palette.fg;
         } else if (i == v.sets.length && !v.finished && v.tennis) {
           text = '${_int(v.games[low])}';
@@ -722,12 +1020,11 @@ class _Painter {
   // ---------------- INTRO ----------------
   void intro(Size size) {
     final v = view;
-    final hasLogo = v.teamA.logo != null || v.teamB.logo != null;
-    const teamW = 560.0;
-    final bodyH = (hasLogo ? 194.0 : 0.0) + 90 + 54;
-    final width = teamW * 2 + 160 + 96;
-    final height = 96 + 36 + bodyH + 36;
-    final rrect = _panel(size, width, height);
+    final hasLogo = v.hasLogo;
+    const teamW = introTeamW;
+    final bodyH = introBodyH(hasLogo);
+    final dims = introSize(hasLogo);
+    final rrect = _panel(size, dims.width, dims.height);
     final panel = rrect.outerRect;
     final top = _panelHeader(
       panel,
@@ -745,7 +1042,10 @@ class _Painter {
       var y = top;
       if (hasLogo) {
         final logo = team.logo;
-        if (logo != null) _logo(logo, Rect.fromLTWH(x + (teamW - 180) / 2, y, 180, 180));
+        if (logo != null) {
+          const logoSize = ScoreboardFrameRenderer.maxLogoDesignSize;
+          _logo(logo, Rect.fromLTWH(x + (teamW - logoSize) / 2, y, logoSize, logoSize));
+        }
         y += 194;
       }
       final name = _text(team.name, 52, palette.fg, weight: FontWeight.w900, maxWidth: teamW);
@@ -770,9 +1070,8 @@ class _Painter {
   // ---------------- RESULT ----------------
   void result(Size size) {
     final v = view;
-    const width = 960.0;
-    const height = 96.0 + 250;
-    final rrect = _panel(size, width, height);
+    final width = resultSize.width;
+    final rrect = _panel(size, width, resultSize.height);
     final panel = rrect.outerRect;
     final y = _panelHeader(
       panel,
@@ -799,7 +1098,7 @@ class _Painter {
     );
     final detail = v.sets.isEmpty
         ? '$setsA – $setsB'
-        : '$setsA – $setsB   (${v.sets.map((s) => '${_int(s['a'])}-${_int(s['b'])}').join(', ')})';
+        : '$setsA – $setsB   (${v.sets.map((s) => s['synthetic'] == true ? '–' : '${_int(s['a'])}-${_int(s['b'])}').join(', ')})';
     _centerText(detail, Rect.fromLTWH(panel.left + 30, y + 164, width - 60, 50), 36, palette.muted);
     canvas.restore();
   }

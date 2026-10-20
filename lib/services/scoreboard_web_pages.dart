@@ -338,7 +338,7 @@ section.tab{overflow-y:auto;overflow-x:hidden;-webkit-overflow-scrolling:touch;o
     <div class="card needs-conn" data-sub="stream">
       <h3>Livestream từ điện thoại</h3>
       <label class="check"><input type="checkbox" id="oBurnIn">In bảng tỉ số vào video livestream</label>
-      <div class="muted">Áp dụng cho phát RTMP/RTSP trên điện thoại Android, không cần OBS. Bật/tắt khi đang phát sẽ khởi động lại luồng vài giây. Video ghi và Tablet không bị ảnh hưởng.</div>
+      <div class="muted">Áp dụng cho phát RTMP/RTSP trên điện thoại Android và iPhone, không cần OBS. Bật/tắt khi đang phát sẽ khởi động lại luồng vài giây. Video ghi và Tablet không bị ảnh hưởng.</div>
     </div>
   </section>
 
@@ -941,7 +941,7 @@ function renderScorebar(pos){
     row.querySelector('.sb-serve').classList.toggle('on',o.show.serve&&s.serving===id&&s.status!=='finished');
     row.querySelector('.sb-serve').style.display=o.show.serve?'':'none';
     var sets=row.querySelector('.sb-sets');sets.textContent='';
-    if(o.show.sets){s.sets.forEach(function(x){var sp=document.createElement('span');sp.className='num'+(x[low]>x[low==='a'?'b':'a']?' win':'');sp.textContent=x[low];sets.appendChild(sp);});}
+    if(o.show.sets){s.sets.forEach(function(x){var sp=document.createElement('span');sp.className='num'+(x[low]>x[low==='a'?'b':'a']?' win':'');sp.textContent=x.synthetic?'–':x[low];sets.appendChild(sp);});}
     var games=row.querySelector('.sb-games');games.style.display=tennis?'flex':'none';setText(games,String(s.games[low]));
     setNum(row.querySelector('.sb-pts span'),s.status==='finished'?String(s.setsWon[low]):s.display[low]);
   });
@@ -974,7 +974,7 @@ function renderFull(){
     for(var i=0;i<cols;i++){
       var td=document.createElement('td');td.className='s num';
       var x=s.sets[i];
-      if(x){td.textContent=String(x[low]);if(x[low]>x[other])td.className+=' win';}
+      if(x){td.textContent=x.synthetic?'–':String(x[low]);if(x[low]>x[other])td.className+=' win';}
       else if(i===s.sets.length&&s.status!=='finished'&&tennis){td.textContent=String(s.games[low]);td.className+=' win';}
       else td.textContent='–';
       tr.appendChild(td);
@@ -1009,7 +1009,7 @@ function renderResult(){
   setText($('rWin'),leader?teamOf(leader).name:(teamOf('A').short+' – '+teamOf('B').short));
   var box=$('rSets');box.textContent='';
   var b=document.createElement('b');b.textContent=s.setsWon.a+' – '+s.setsWon.b;box.appendChild(b);
-  if(s.sets.length){box.appendChild(document.createTextNode('   ('+s.sets.map(function(x){var tb=(x.tbA!=null&&x.tbB!=null)?('⁽'+Math.min(x.tbA,x.tbB)+'⁾'):'';return x.a+'-'+x.b+tb;}).join(', ')+')'));}
+  if(s.sets.length){box.appendChild(document.createTextNode('   ('+s.sets.map(function(x){var tb=(x.tbA!=null&&x.tbB!=null)?('⁽'+Math.min(x.tbA,x.tbB)+'⁾'):'';return x.synthetic?'–':(x.a+'-'+x.b+tb);}).join(', ')+')'));}
 }
 
 function renderBanner(scene){

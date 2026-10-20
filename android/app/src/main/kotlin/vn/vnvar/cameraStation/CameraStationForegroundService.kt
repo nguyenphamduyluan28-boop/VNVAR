@@ -5,6 +5,7 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.app.Service
+import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.content.pm.PackageManager
@@ -48,31 +49,107 @@ class CameraStationForegroundService : Service() {
             currentCourtId = intent?.getStringExtra(EXTRA_COURT_ID) ?: currentCourtId
         }
         val notification = buildNotification(currentCameraId, currentCourtId)
+        val isRefresh = intent?.action == ACTION_REFRESH_TYPES
 
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            val foregroundTypes = if (
-                checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
-            ) {
-                ServiceInfo.FOREGROUND_SERVICE_TYPE_CAMERA or
-                    ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE
-            } else {
-                ServiceInfo.FOREGROUND_SERVICE_TYPE_CAMERA
+        if (!startForegroundSafely(notification)) {
+            if (!isRefresh) {
+                // Không vào được foreground (Android 12+ chặn khởi động từ nền,
+                // Android 14 thiếu điều kiện cho type camera/micro): dừng gọn
+                // thay vì để exception làm sập cả tiến trình.
+                Log.e(TAG, "[SERVICE] Unable to enter foreground; stopping service")
+                // Dịch vụ được khởi động bằng startForegroundService: trên
+                // Android 8–11, stopSelf() khi chưa từng startForeground vẫn
+                // làm hệ thống ném "did not then call startForeground" và sập
+                // tiến trình. Thử vào foreground tối thiểu rồi rời ngay.
+                if (startForegroundMinimal()) {
+                    Log.w(TAG, "[SERVICE] Entered minimal foreground only to stop cleanly")
+                }
+                appliedForegroundTypes = 0
+                try {
+                    stopForeground(STOP_FOREGROUND_REMOVE)
+                } catch (error: Exception) {
+                    Log.w(TAG, "[SERVICE] stopForeground failed", error)
+                }
+                stopSelf()
             }
-            startForeground(
-                NOTIFICATION_ID,
-                notification,
-                foregroundTypes,
-            )
-        } else {
-            startForeground(NOTIFICATION_ID, notification)
+            return START_NOT_STICKY
         }
-
-        val action = if (intent?.action == ACTION_REFRESH_TYPES) "types refreshed" else "active"
+        val action = if (isRefresh) "types refreshed" else "active"
         Log.i(TAG, "[SERVICE] Foreground $action: $currentCameraId / $currentCourtId")
 
         // Camera services must be started while the Activity is visible. Do not
         // ask Android to recreate this service silently from the background.
         return START_NOT_STICKY
+    }
+
+    /**
+     * Gọi startForeground với type camera (+ micro khi đã có quyền). Lỗi từ hệ
+     * thống (ForegroundServiceStartNotAllowedException, SecurityException...)
+     * chỉ được ghi log; nếu type micro bị từ chối thì thử lại chỉ với camera.
+     */
+    private fun startForegroundSafely(notification: Notification): Boolean {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
+            return try {
+                startForeground(NOTIFICATION_ID, notification)
+                appliedForegroundTypes = 0
+                true
+            } catch (error: Exception) {
+                Log.e(TAG, "[SERVICE] startForeground failed", error)
+                false
+            }
+        }
+        val required = requiredForegroundTypes(this)
+        val attempts = if (required != ServiceInfo.FOREGROUND_SERVICE_TYPE_CAMERA) {
+            listOf(required, ServiceInfo.FOREGROUND_SERVICE_TYPE_CAMERA)
+        } else {
+            listOf(required)
+        }
+        for (types in attempts) {
+            try {
+                startForeground(NOTIFICATION_ID, notification, types)
+                appliedForegroundTypes = types
+                return true
+            } catch (error: Exception) {
+                Log.e(TAG, "[SERVICE] startForeground(types=$types) failed", error)
+            }
+        }
+        return false
+    }
+
+    /**
+     * Lần thử cuối trước khi dừng: notification tối thiểu, không kèm type
+     * camera/micro. Android < 10: startForeground(id, notification). Android
+     * 10–13: type 0 (NONE, luôn là tập con của manifest), rồi dạng 2 tham số
+     * (= FOREGROUND_SERVICE_TYPE_MANIFEST). Android 14+ bắt buộc type hợp lệ và
+     * đã thử camera ở trên, nên giữ nguyên hành vi (không thử thêm).
+     */
+    private fun startForegroundMinimal(): Boolean {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) return false
+        val notification = try {
+            Notification.Builder(this, CHANNEL_ID)
+                .setSmallIcon(android.R.drawable.presence_video_online)
+                .setContentTitle("SportO Cam")
+                .setCategory(Notification.CATEGORY_SERVICE)
+                .build()
+        } catch (error: Exception) {
+            Log.e(TAG, "[SERVICE] Unable to build minimal notification", error)
+            return false
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            try {
+                startForeground(NOTIFICATION_ID, notification, 0)
+                return true
+            } catch (error: Exception) {
+                Log.e(TAG, "[SERVICE] Minimal startForeground(type=0) failed", error)
+            }
+        }
+        return try {
+            startForeground(NOTIFICATION_ID, notification)
+            true
+        } catch (error: Exception) {
+            Log.e(TAG, "[SERVICE] Minimal startForeground failed", error)
+            false
+        }
     }
 
     override fun onBind(intent: Intent?): IBinder? = null
@@ -131,6 +208,7 @@ class CameraStationForegroundService : Service() {
     override fun onDestroy() {
         mainHandler.removeCallbacks(taskRemovalTimeout)
         isRunning = false
+        appliedForegroundTypes = 0
         stopForeground(STOP_FOREGROUND_REMOVE)
         Log.i(TAG, "[SERVICE] Camera Station foreground service destroyed")
         super.onDestroy()
@@ -178,6 +256,25 @@ class CameraStationForegroundService : Service() {
         @Volatile
         var isRunning: Boolean = false
             private set
+
+        /** Tập foreground type đã áp dụng thành công gần nhất (0 khi chưa/không dùng). */
+        @Volatile
+        var appliedForegroundTypes: Int = 0
+            private set
+
+        /** Tập foreground type dịch vụ cần với quyền hiện tại (0 trước Android 10). */
+        fun requiredForegroundTypes(context: Context): Int {
+            if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) return 0
+            return if (
+                context.checkSelfPermission(Manifest.permission.RECORD_AUDIO) ==
+                PackageManager.PERMISSION_GRANTED
+            ) {
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_CAMERA or
+                    ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE
+            } else {
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_CAMERA
+            }
+        }
 
         const val ACTION_START = "vn.vnvar.cameraStation.action.START"
         const val ACTION_STOP = "vn.vnvar.cameraStation.action.STOP"

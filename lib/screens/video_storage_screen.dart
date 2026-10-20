@@ -68,6 +68,28 @@ class _VideoStorageScreenState extends State<VideoStorageScreen> {
         _storagePath = storagePath;
         _loading = false;
       });
+    } catch (error) {
+      // Không để màn hình quay vòng mãi: hiện danh sách đang có và báo lỗi.
+      if (mounted) {
+        setState(() {
+          _videos = widget.recordingService.segments;
+          _loading = false;
+        });
+        ScaffoldMessenger.of(context)
+          ..hideCurrentSnackBar()
+          ..showSnackBar(
+            SnackBar(
+              content: Text(
+                appText(
+                  context,
+                  'Không tải lại được danh sách video: '
+                      '${userFacingError(error)}',
+                  'Unable to refresh videos: ${userFacingError(error)}',
+                ),
+              ),
+            ),
+          );
+      }
     } finally {
       _refreshing = false;
       if (_refreshPending && mounted) {
@@ -1049,8 +1071,16 @@ class _VideoPlayerScreenState extends State<_VideoPlayerScreen> {
   @override
   void dispose() {
     _disposed = true;
-    _controller?.dispose();
-    unawaited(_deleteTemporaryPlaybackFile());
+    final controller = _controller;
+    _controller = null;
+    // Đóng trình phát xong mới xoá file tạm (tên riêng cho từng trình phát)
+    // để không xoá file đang mở.
+    unawaited(() async {
+      try {
+        await controller?.dispose();
+      } catch (_) {}
+      await _deleteTemporaryPlaybackFile();
+    }());
     super.dispose();
   }
 

@@ -23,6 +23,13 @@ import UIKit
   // Trả kết quả "đã huỷ" cho lần startRtsp đang chờ khi stopRtsp chạy trước lúc
   // server sẵn sàng; nếu không FlutterResult không bao giờ được gọi.
   private var pendingRtspStartCancel: (() -> Void)?
+  // Luồng RTSP overlay (bảng tỉ số, chỉ loopback) cho livestream iOS (C5).
+  // Chỉ truy cập trên main thread.
+  private var overlayPublisher: VnvarOverlayRtspPublisher?
+  private var overlayGeneration: UInt64 = 0
+  private var pendingOverlayStartCancel: (() -> Void)?
+  /// Thời gian chờ server nghe + encoder có SPS/PPS (cần cho DESCRIBE của FFmpeg).
+  private let overlayStartTimeout: TimeInterval = 5
   private var finalizationTask: UIBackgroundTaskIdentifier = .invalid
   private var brightnessBeforeDimming: CGFloat?
 
@@ -46,6 +53,7 @@ import UIKit
 
   override func applicationWillTerminate(_ application: UIApplication) {
     restoreBrightnessIfNeeded()
+    stopOverlayRtsp()
     super.applicationWillTerminate(application)
   }
 
@@ -76,6 +84,7 @@ import UIKit
 
   func didInitializeImplicitFlutterEngine(_ engineBridge: FlutterImplicitEngineBridge) {
     stopRtsp()
+    stopOverlayRtsp()
     GeneratedPluginRegistrant.register(with: engineBridge.pluginRegistry)
 
     let stationChannel = FlutterMethodChannel(
@@ -89,6 +98,15 @@ import UIKit
     // Chỉ đọc PCM từ file ghi âm khi có client RTSP đang nhận tiếng.
     audioSegmentRecorder.isPcmNeeded = { [weak self] in
       self?.currentAudioPublisher()?.needsNativeAudio ?? false
+    }
+    // Gián đoạn micro (cuộc gọi, Siri...): báo Dart để xoay segment đồng bộ lại.
+    audioSegmentRecorder.onInterruption = { [weak self] state, resumed in
+      DispatchQueue.main.async {
+        self?.stationChannel?.invokeMethod(
+          "onNativeAudioInterruption",
+          arguments: ["state": state, "resumed": resumed]
+        )
+      }
     }
     stationChannel.setMethodCallHandler { [weak self] call, result in
       guard let self = self else {
@@ -106,6 +124,30 @@ import UIKit
         self.startRtsp(call, result)
       case "stopRtsp":
         self.stopRtsp()
+        result(nil)
+      case "startOverlayRtsp":
+        self.startOverlayRtsp(call, result)
+      case "updateOverlayImage":
+        guard let path = (call.arguments as? [String: Any])?["path"] as? String,
+              !path.isEmpty else {
+          result(
+            FlutterError(
+              code: "OVERLAY_RTSP_FAILED",
+              message: "Overlay image path is required.",
+              details: nil
+            )
+          )
+          return
+        }
+        self.overlayPublisher?.updateOverlayImage(path: path)
+        result(nil)
+      case "setOverlayRtspBitrate":
+        if let bitrate = (call.arguments as? [String: Any])?["bitrate"] as? NSNumber {
+          self.overlayPublisher?.setTargetBitrate(bitrate.intValue)
+        }
+        result(nil)
+      case "stopOverlayRtsp":
+        self.stopOverlayRtsp()
         result(nil)
       case "openCellularTunnel":
         guard let arguments = call.arguments as? [String: Any],
@@ -137,11 +179,14 @@ import UIKit
         let enabled = (call.arguments as? [String: Any])?["enabled"] as? Bool ?? false
         self.rtspPublisher?.setRemoteAudioEnabled(enabled)
         result(nil)
+      case "openAppSettings":
+        self.openAppSettings(result)
       case "requestMicrophonePermission":
         self.requestMicrophonePermission(result)
       case "startNativeAudioSegment":
         self.startNativeAudioSegment(call, result)
       case "stopNativeAudioSegment":
+        // Map: path, active, bytes, firstSampleEpochMs (ms since epoch, nếu biết).
         do {
           result(try self.audioSegmentRecorder.stop())
         } catch {
@@ -469,11 +514,146 @@ import UIKit
     cancelPendingStart?()
   }
 
+  private func overlayFailure(_ message: String, details: Any? = nil) -> FlutterError {
+    FlutterError(code: "OVERLAY_RTSP_FAILED", message: message, details: details)
+  }
+
+  /// C5: `true` khi server loopback đã nghe VÀ encoder đã có SPS/PPS (để
+  /// DESCRIBE của FFmpeg không nhận 503). FlutterResult được gọi đúng một lần.
+  private func startOverlayRtsp(_ call: FlutterMethodCall, _ result: @escaping FlutterResult) {
+    guard let arguments = call.arguments as? [String: Any],
+          let trackId = arguments["trackId"] as? String, !trackId.isEmpty else {
+      result(overlayFailure("A WebRTC video track is required."))
+      return
+    }
+    guard let overlayPath = arguments["overlayPath"] as? String, !overlayPath.isEmpty else {
+      result(overlayFailure("Overlay image path is required."))
+      return
+    }
+    let port = (arguments["port"] as? NSNumber)?.intValue ?? 8555
+    let bitrate = (arguments["bitrate"] as? NSNumber)?.intValue ?? 2_500_000
+    let fps = (arguments["fps"] as? NSNumber)?.intValue ?? 30
+    guard (1...65_535).contains(port) else {
+      result(overlayFailure("Overlay RTSP port must be between 1 and 65535.", details: port))
+      return
+    }
+    guard let track = VnvarWebRtcTrackBridge.videoTrack(forId: trackId) else {
+      result(overlayFailure("The active iOS WebRTC video track was not found.", details: trackId))
+      return
+    }
+    // Gọi lại khi đang chạy: dừng phiên cũ rồi chạy lại.
+    stopOverlayRtsp()
+
+    let publisher: VnvarOverlayRtspPublisher
+    do {
+      publisher = try VnvarOverlayRtspPublisher(
+        track: track,
+        port: port,
+        bitrate: bitrate,
+        fps: fps,
+        overlayPath: overlayPath
+      )
+    } catch {
+      result(overlayFailure(String(describing: error)))
+      return
+    }
+
+    let generation = overlayGeneration
+    var resultSent = false
+    var serverReady = false
+    var encoderReady = false
+    let finish: (Any?) -> Void = { value in
+      guard !resultSent else { return }
+      resultSent = true
+      result(value)
+    }
+    pendingOverlayStartCancel = {
+      finish(
+        FlutterError(
+          code: "OVERLAY_RTSP_FAILED",
+          message: "Overlay RTSP start was cancelled.",
+          details: nil
+        )
+      )
+    }
+    let completeIfReady: () -> Void = { [weak self] in
+      guard let self = self,
+            self.overlayGeneration == generation,
+            serverReady, encoderReady, !resultSent else { return }
+      self.pendingOverlayStartCancel = nil
+      finish(true)
+    }
+    publisher.onServerReady = {
+      serverReady = true
+      completeIfReady()
+    }
+    publisher.onEncoderConfigured = {
+      encoderReady = true
+      completeIfReady()
+    }
+    publisher.onError = { [weak self] message in
+      guard let self = self, self.overlayGeneration == generation else { return }
+      let startPending = !resultSent
+      finish(
+        FlutterError(code: "OVERLAY_RTSP_FAILED", message: message, details: nil)
+      )
+      // Dừng ngay để nhả GPU/encoder/cổng; Dart gọi stopOverlayRtsp sau đó
+      // vẫn an toàn.
+      self.stopOverlayRtsp()
+      if !startPending {
+        self.stationChannel?.invokeMethod(
+          "onOverlayRtspError",
+          arguments: ["error": message]
+        )
+      }
+    }
+    overlayPublisher = publisher
+    do {
+      try publisher.start()
+    } catch {
+      finish(overlayFailure(String(describing: error)))
+      stopOverlayRtsp()
+      return
+    }
+    DispatchQueue.main.asyncAfter(deadline: .now() + overlayStartTimeout) { [weak self] in
+      guard let self = self,
+            self.overlayGeneration == generation,
+            !resultSent else { return }
+      let reason = serverReady
+        ? "No camera frame was encoded for the overlay stream."
+        : "Overlay RTSP server did not start listening."
+      finish(
+        FlutterError(code: "OVERLAY_RTSP_FAILED", message: reason, details: nil)
+      )
+      self.stopOverlayRtsp()
+    }
+  }
+
+  /// An toàn khi chưa chạy. Chỉ gọi trên main thread.
+  private func stopOverlayRtsp() {
+    overlayGeneration &+= 1
+    let cancelPendingStart = pendingOverlayStartCancel
+    pendingOverlayStartCancel = nil
+    overlayPublisher?.stop()
+    overlayPublisher = nil
+    cancelPendingStart?()
+  }
+
   /// An toàn khi gọi từ luồng nền (timer đọc PCM).
   private func currentAudioPublisher() -> VnvarRtspPublisher? {
     audioPublisherLock.lock()
     defer { audioPublisherLock.unlock() }
     return audioPublisher
+  }
+
+  private func openAppSettings(_ result: @escaping FlutterResult) {
+    guard let url = URL(string: UIApplication.openSettingsURLString) else {
+      result(false)
+      return
+    }
+    UIApplication.shared.open(url, options: [:]) { opened in
+      result(opened)
+    }
   }
 
   private func requestMicrophonePermission(_ result: @escaping FlutterResult) {

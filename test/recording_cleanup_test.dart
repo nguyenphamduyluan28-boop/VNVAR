@@ -207,8 +207,94 @@ void main() {
     expect(isAppManagedVideoPath('/DCIM/Camera/VID_20260824_100000.mp4'), isFalse);
     expect(isAppManagedVideoPath('/DCIM/holiday.mp4'), isFalse);
     expect(isManagedStorageFilePath('/DCIM/holiday.mp4'), isFalse);
+    // Luật cũ `_CLIP_` ở bất kỳ đâu trong tên đã bị bỏ: file người dùng có
+    // tên chứa `_CLIP_` không còn bị coi là của app.
+    expect(isAppManagedVideoPath('/DCIM/MY_CLIP_HOLIDAY.mp4'), isFalse);
+    expect(isAppManagedVideoPath('/DCIM/VNVAR_CAM1_CLIP_1756000000000.mp4'), isFalse);
+    // Regex tên cũ được neo chặt: không nhận tiền tố/hậu tố lạ.
+    expect(isAppManagedVideoPath('/VNVAR/MYCAM1_1756000000000.mp4'), isFalse);
+    expect(isAppManagedVideoPath('/VNVAR/CAMERA_1756000000000.mp4'), isFalse);
+    expect(isAppManagedVideoPath('/VNVAR/CAM1_1756000000000.mp4.bak'), isFalse);
+    // Clip trim/Check VAR do app xuất vẫn được nhận diện.
+    expect(
+      isAppManagedVideoPath('/VNVAR/download/cam1_trim_1787624130000.mp4'),
+      isTrue,
+    );
     expect(isOrphanAuxiliaryFile('/x/24-08-2026/a.wav'), isTrue);
     expect(isOrphanAuxiliaryFile('/x/24-08-2026/photo.jpg'), isFalse);
   });
-}
 
+  test('with a known storage root, only recognises app layouts under it', () {
+    const root = '/storage/emulated/0/DCIM';
+    expect(
+      isAppManagedVideoPath(
+        '$root/24-08-2026/AUTOMODE/10-00-00_10-03-00.ts',
+        storageRoot: root,
+      ),
+      isTrue,
+    );
+    expect(
+      isAppManagedVideoPath(
+        '$root/24-08-2026/AUTOMODE/CAM2/10-00-00_10-03-00_1.ts',
+        storageRoot: '$root/',
+      ),
+      isTrue,
+    );
+    // Thư mục ngày lồng trong thư mục khác của người dùng: không phải của app.
+    expect(
+      isAppManagedVideoPath(
+        '$root/Trips/24-08-2026/AUTOMODE/a.mp4',
+        storageRoot: root,
+      ),
+      isFalse,
+    );
+    // Tên kiểu cũ chỉ được nhận khi nằm ngay ở gốc lưu.
+    expect(
+      isAppManagedVideoPath(
+        '$root/VNVAR_CAM-01_1756000000000.ts',
+        storageRoot: root,
+      ),
+      isTrue,
+    );
+    expect(
+      isAppManagedVideoPath(
+        '$root/Camera/CAM1_1756000000000.mp4',
+        storageRoot: root,
+      ),
+      isFalse,
+    );
+    expect(
+      isAppManagedVideoPath(
+        '$root/download/cam1_trim_1787624130000.mp4',
+        storageRoot: root,
+      ),
+      isTrue,
+    );
+    expect(
+      isAppManagedVideoPath(
+        '$root/download/holiday.mp4',
+        storageRoot: root,
+      ),
+      isFalse,
+    );
+    // Ngoài gốc lưu: không bao giờ.
+    expect(
+      isAppManagedVideoPath(
+        '/sdcard/Movies/24-08-2026/AUTOMODE/a.ts',
+        storageRoot: root,
+      ),
+      isFalse,
+    );
+    expect(
+      isManagedStorageFilePath(
+        '$root/24-08-2026/AUTOMODE/FRAGMENTS/F1.wav',
+        storageRoot: root,
+      ),
+      isTrue,
+    );
+    expect(
+      isManagedStorageFilePath('$root/notes/fragments/a.json', storageRoot: root),
+      isFalse,
+    );
+  });
+}

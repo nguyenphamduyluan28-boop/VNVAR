@@ -114,6 +114,9 @@ struct VnvarRtcpFeedback: Equatable {
   var fractionLost: Double?
   var requestsKeyFrame = false
 
+  /// Phân tích gói RTCP (có thể ghép): RR (PT 201) lấy fraction lost xấu nhất;
+  /// PSFB (PT 206) FMT=1 (PLI) hoặc FMT=4 (FIR) yêu cầu khung khoá. Các gói
+  /// khác (SR, SDES, BYE, REMB...) được bỏ qua.
   static func parse(_ data: Data) -> VnvarRtcpFeedback? {
     var feedback = VnvarRtcpFeedback()
     var found = false
@@ -140,6 +143,12 @@ struct VnvarRtcpFeedback: Equatable {
           found = true
         }
       } else if packetType == 206, reportCount == 1, packetLength >= 12 {
+        // PSFB FMT=1: Picture Loss Indication (RFC 4585).
+        feedback.requestsKeyFrame = true
+        found = true
+      } else if packetType == 206, reportCount == 4, packetLength >= 20 {
+        // PSFB FMT=4: Full Intra Request (RFC 5104 §4.3.1), ít nhất một mục
+        // FCI 8 byte sau sender SSRC + media SSRC.
         feedback.requestsKeyFrame = true
         found = true
       }

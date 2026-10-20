@@ -15,11 +15,12 @@ Tham số tùy chọn của `/overlay` (ghi đè cấu hình trên server cho ri
 
 ## In bảng tỉ số thẳng vào livestream (không cần OBS)
 
-Khi phát RTMP/RTSP từ điện thoại **Android**, app tự chồng bảng tỉ số lên video gửi đi (YouTube, Facebook, máy chủ RTMP…). Bật/tắt bằng ô **"In bảng tỉ số vào video livestream"** (tab Overlay của trang điều khiển); mặc định bật. Video ghi trên máy và luồng xem trên Tablet không bị ảnh hưởng.
+Khi phát RTMP/RTSP từ điện thoại **Android** hoặc **iPhone**, app tự chồng bảng tỉ số lên video gửi đi (YouTube, Facebook, máy chủ RTMP…). Bật/tắt bằng ô **"In bảng tỉ số vào video livestream"** (tab Overlay của trang điều khiển); mặc định bật. Video ghi trên máy và luồng xem trên Tablet không bị ảnh hưởng.
 
 - Cách hoạt động: app vẽ bảng tỉ số thành ảnh PNG trong suốt đúng kích thước video và vẽ lại khi điểm/thông tin đổi; FFmpeg đọc lại ảnh vài lần mỗi giây, chồng lên hình rồi mã hoá lại bằng bộ mã hoá phần cứng (`h264_mediacodec`). Bảng tỉ số trên livestream trễ khoảng 0,5–1 giây so với lúc bấm.
 - Hỗ trợ các cảnh: thanh tỉ số, bảng lớn, giới thiệu, kết quả, ẩn, thông báo, chữ chạy.
 - Chữ chạy: FFmpeg vẽ chữ (`drawtext`, font hệ thống Android) và cho chạy mượt theo từng khung hình; đổi nội dung có hiệu lực ngay. Tốc độ mới áp dụng từ lần phát/kết nối lại sau. Thanh chữ chạy trên livestream luôn nền tối, chữ trắng. Máy không có font/bộ lọc phù hợp thì app tự dùng chữ đứng yên.
+- iPhone: bảng tỉ số được chồng bằng native (Core Image + VideoToolbox) trên một luồng RTSP nội bộ riêng `127.0.0.1:8555`, FFmpeg chỉ copy lên máy chủ; chữ chạy trên iPhone là chữ đứng yên vẽ trong ảnh. Luồng RTSP 8554 cho Tablet không có bảng tỉ số. Nếu không mở được luồng này, app phát tiếp không có bảng tỉ số.
 - **Hiện/ẩn overlay** (nút "Overlay: Hiện/Ẩn" trên thanh trên cùng của trang điều khiển, hoặc tab Overlay): ẩn/hiện ngay cả trên OBS lẫn livestream, không khởi động lại luồng; cảnh và cấu hình được giữ nguyên.
 - **Kích thước** (50–200 %) và **vị trí** thanh tỉ số chỉnh trong tab Overlay; lề và thanh chữ chạy giữ cố định.
 - Tốn CPU/pin hơn phát thường (phải giải mã và mã hoá lại hình); FFmpeg giải mã đa luồng để theo kịp thời gian thực. Máy nóng thì app vẫn tự hạ độ phân giải như trước (luồng khởi động lại vài giây).

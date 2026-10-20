@@ -23,6 +23,48 @@ struct VnvarVideoRecoveryGate {
   }
 }
 
+/// Giữ báo cáo RTCP Receiver Report gần nhất của từng client mạng để quyết
+/// định bitrate theo TRUNG VỊ fraction lost, không để một tablet mạng yếu (hay
+/// relay FFmpeg loopback) kéo bitrate của mọi người xem xuống.
+struct VnvarRtcpLossTracker {
+  /// Báo cáo cũ hơn chừng này (giây) bị bỏ.
+  static let reportLifetime: TimeInterval = 5
+  private var reports: [UUID: (fractionLost: Double, uptime: TimeInterval)] = [:]
+
+  /// Trả false khi báo cáo bị bỏ qua (client loopback: relay FFmpeg cục bộ
+  /// không phản ánh chất lượng mạng Wi-Fi).
+  @discardableResult
+  mutating func record(
+    client: UUID,
+    isLoopback: Bool,
+    fractionLost: Double,
+    now: TimeInterval
+  ) -> Bool {
+    guard !isLoopback else { return false }
+    reports[client] = (fractionLost: min(1, max(0, fractionLost)), uptime: now)
+    return true
+  }
+
+  mutating func remove(client: UUID) {
+    reports.removeValue(forKey: client)
+  }
+
+  /// Trung vị fraction lost của các client trong [activeClients] (client mạng
+  /// đang PLAY) có báo cáo còn hạn. Khi số client chẵn lấy giá trị giữa thấp
+  /// hơn: với hai tablet, một máy mạng yếu không đủ để hạ bitrate chung.
+  mutating func medianFractionLost(
+    activeClients: Set<UUID>,
+    now: TimeInterval
+  ) -> Double? {
+    reports = reports.filter {
+      activeClients.contains($0.key) && now - $0.value.uptime <= Self.reportLifetime
+    }
+    let values = reports.values.map { $0.fractionLost }.sorted()
+    guard !values.isEmpty else { return nil }
+    return values[(values.count - 1) / 2]
+  }
+}
+
 final class VnvarRtspServer {
   var onPlayRequested: (() -> Void)?
   var onReceiverReport: ((Double) -> Void)?
@@ -33,6 +75,9 @@ final class VnvarRtspServer {
   private let queue = DispatchQueue(label: "vnvar.rtsp.server")
   private let queueKey = DispatchSpecificKey<Void>()
   private let port: Int
+  // Luồng RTSP overlay (bảng tỉ số) chỉ phục vụ FFmpeg cục bộ: bind 127.0.0.1
+  // và từ chối mọi kết nối không phải loopback.
+  let loopbackOnly: Bool
   private var listener: NWListener?
   private var sessions: [UUID: ClientSession] = [:]
   private var sps: Data?
@@ -48,10 +93,21 @@ final class VnvarRtspServer {
   // Client chưa PLAY (hoặc đang PAUSE) mà im lặng quá lâu thường là kết nối
   // half-open (tablet mất Wi-Fi): thu hồi để không giữ chỗ mãi.
   private let idleSessionTimeout: TimeInterval = 60
+  // Phiên đã SETUP mà không PLAY (client bỏ dở, trình dò cổng) chỉ được giữ
+  // chỗ chừng này; reaper chạy mỗi 5 s nên bị thu hồi sau ~10–15 s.
+  private let unplayedSetupTimeout: TimeInterval = 10
   private var idleReaper: DispatchSourceTimer?
+  // Bản sao có khoá của trạng thái phát, chỉ cập nhật trên `queue`. Luồng capture
+  // WebRTC đọc nó mỗi khung: không được queue.sync sang hàng đợi đang
+  // packetize/gửi (làm nghẽn capture và giảm FPS ghi).
+  private let playingStateLock = NSLock()
+  private var cachedHasPlayingClients = false
+  private var cachedHasPlayingAudioClients = false
+  private var lossTracker = VnvarRtcpLossTracker()
 
-  init(port: Int) {
+  init(port: Int, loopbackOnly: Bool = false) {
     self.port = port
+    self.loopbackOnly = loopbackOnly
     queue.setSpecific(key: queueKey, value: ())
   }
 
@@ -67,7 +123,18 @@ final class VnvarRtspServer {
     // reuse then makes the new listener fail with errno 17 (File exists) and
     // every viewer sees Connection refused. A single exclusive listener is
     // safer and the Dart retry path handles the short handoff window.
-    let listener = try NWListener(using: parameters, on: endpointPort)
+    let listener: NWListener
+    if loopbackOnly {
+      // Cổng nằm trong requiredLocalEndpoint; không truyền thêm `on:` để hai
+      // nguồn cổng không xung đột (giống VnvarCellularUplink).
+      parameters.requiredLocalEndpoint = .hostPort(
+        host: .ipv4(.loopback),
+        port: endpointPort
+      )
+      listener = try NWListener(using: parameters)
+    } else {
+      listener = try NWListener(using: parameters, on: endpointPort)
+    }
     self.listener = listener
     listener.stateUpdateHandler = { [weak self] state in
       guard let self = self else { return }
@@ -96,18 +163,26 @@ final class VnvarRtspServer {
   private func startIdleReaper() {
     idleReaper?.cancel()
     let timer = DispatchSource.makeTimerSource(queue: queue)
-    timer.schedule(deadline: .now() + 10, repeating: 10)
+    timer.schedule(deadline: .now() + 5, repeating: 5)
     timer.setEventHandler { [weak self] in self?.reapIdleSessions() }
     idleReaper = timer
     timer.resume()
   }
 
   /// Chạy trên `queue`. Đóng các phiên không phát (chưa PLAY/đang PAUSE) đã im
-  /// lặng quá `idleSessionTimeout`.
+  /// lặng quá `idleSessionTimeout`, và các phiên đã SETUP nhưng chưa từng PLAY
+  /// quá `unplayedSetupTimeout`.
   private func reapIdleSessions() {
     let now = ProcessInfo.processInfo.systemUptime
-    let idle = sessions.values.filter {
-      !$0.playing && now - $0.lastActivityUptime > idleSessionTimeout
+    let idle = sessions.values.filter { session in
+      guard !session.playing else { return false }
+      if now - session.lastActivityUptime > idleSessionTimeout { return true }
+      if !session.hasPlayed,
+         let setupUptime = session.setupUptime,
+         now - setupUptime > unplayedSetupTimeout {
+        return true
+      }
+      return false
     }
     for session in idle {
       NSLog("[VNVAR-RTSP] Closing idle RTSP session")
@@ -191,17 +266,46 @@ final class VnvarRtspServer {
     }
   }
 
+  /// An toàn gọi từ mọi luồng; không chặn chờ `queue`.
   var hasPlayingClients: Bool {
-    queue.sync { sessions.values.contains(where: \.playing) }
+    playingStateLock.lock()
+    defer { playingStateLock.unlock() }
+    return cachedHasPlayingClients
   }
 
+  /// An toàn gọi từ mọi luồng; không chặn chờ `queue`.
   var hasPlayingAudioClients: Bool {
-    queue.sync {
-      sessions.values.contains { $0.playing && $0.audioConfigured }
-    }
+    playingStateLock.lock()
+    defer { playingStateLock.unlock() }
+    return cachedHasPlayingAudioClients
+  }
+
+  /// Chạy trên `queue` sau mọi thay đổi `sessions` / `playing` / `audioConfigured`.
+  private func refreshPlayingState() {
+    let playing = sessions.values.contains(where: \.playing)
+    let playingAudio = sessions.values.contains { $0.playing && $0.audioConfigured }
+    playingStateLock.lock()
+    cachedHasPlayingClients = playing
+    cachedHasPlayingAudioClients = playingAudio
+    playingStateLock.unlock()
+  }
+
+  /// Quyết định nhận kết nối theo chế độ server. Thuần, để kiểm thử.
+  static func allowsConnection(from endpoint: NWEndpoint, loopbackOnly: Bool) -> Bool {
+    !loopbackOnly || isLoopbackEndpoint(endpoint)
+  }
+
+  static func isLoopbackEndpoint(_ endpoint: NWEndpoint) -> Bool {
+    ClientSession.isLoopbackEndpoint(endpoint)
   }
 
   private func accept(_ connection: NWConnection) {
+    // Phòng thủ thêm khi bind loopback không có hiệu lực trên một bản iOS nào đó.
+    guard Self.allowsConnection(from: connection.endpoint, loopbackOnly: loopbackOnly) else {
+      NSLog("[VNVAR-RTSP] Rejecting non-loopback client on loopback-only server")
+      connection.cancel()
+      return
+    }
     let loopback = ClientSession.isLoopbackEndpoint(connection.endpoint)
     func countFull() -> Bool {
       let sameKind = sessions.values.filter { $0.isLoopback == loopback }.count
@@ -322,7 +426,23 @@ final class VnvarRtspServer {
       onPictureLossIndication?()
     }
     if let fractionLost = feedback.fractionLost {
-      onReceiverReport?(fractionLost)
+      let now = ProcessInfo.processInfo.systemUptime
+      // RR của relay FFmpeg loopback không phản ánh mạng tới tablet: bỏ qua.
+      guard lossTracker.record(
+        client: session.id,
+        isLoopback: session.isLoopback,
+        fractionLost: fractionLost,
+        now: now
+      ) else { return }
+      let activeClients = Set(
+        sessions.values.filter { $0.playing && !$0.isLoopback }.map(\.id)
+      )
+      if let median = lossTracker.medianFractionLost(
+        activeClients: activeClients,
+        now: now
+      ) {
+        onReceiverReport?(median)
+      }
     }
   }
 
@@ -331,6 +451,8 @@ final class VnvarRtspServer {
     let requestLine = lines.first ?? ""
     let method = requestLine.split(separator: " ").first.map(String.init) ?? ""
     let cseq = headerValue("cseq", in: request) ?? "0"
+    // Mọi nhánh có thể đổi playing/audioConfigured: cập nhật bản sao có khoá.
+    defer { refreshPlayingState() }
     switch method.uppercased() {
     case "OPTIONS":
       session.respond(
@@ -347,6 +469,12 @@ final class VnvarRtspServer {
         session: session
       )
     case "PLAY":
+      guard session.videoConfigured else {
+        session.sendText(
+          "RTSP/1.0 455 Method Not Valid in This State\r\nCSeq: \(cseq)\r\n\r\n"
+        )
+        return
+      }
       var rtpInfo = "url=track0"
       if audioAvailable && session.audioConfigured {
         rtpInfo += ",url=track1"
@@ -386,6 +514,7 @@ final class VnvarRtspServer {
       "v=0\r\n" +
       "o=- 0 0 IN IP4 0.0.0.0\r\n" +
       "s=VNVAR Camera\r\n" +
+      "c=IN IP4 0.0.0.0\r\n" +
       "t=0 0\r\n" +
       "a=control:*\r\n" +
       "m=video 0 RTP/AVP 96\r\n" +
@@ -437,6 +566,9 @@ final class VnvarRtspServer {
         .flatMap { UInt8($0) }
       channel = min(value ?? channel, 254)
     }
+    if session.setupUptime == nil {
+      session.setupUptime = ProcessInfo.processInfo.systemUptime
+    }
     if isAudio {
       session.audioRtpChannel = channel
       session.audioConfigured = true
@@ -465,6 +597,8 @@ final class VnvarRtspServer {
   private func detach(_ session: ClientSession) {
     sessions.removeValue(forKey: session.id)
     session.connection.stateUpdateHandler = nil
+    lossTracker.remove(client: session.id)
+    refreshPlayingState()
   }
 
   private func close(_ session: ClientSession) {
@@ -482,6 +616,8 @@ final class VnvarRtspServer {
       session.cancelIfNeeded()
     }
     sessions.removeAll()
+    lossTracker = VnvarRtcpLossTracker()
+    refreshPlayingState()
   }
 
   private enum ServerError: Error {
@@ -505,6 +641,9 @@ final class VnvarRtspServer {
     var audioSequence = UInt16.random(in: UInt16.min...UInt16.max)
     var pendingSends = 0
     var lastActivityUptime = ProcessInfo.processInfo.systemUptime
+    // Thời điểm SETUP đầu tiên; dùng để thu hồi phiên SETUP mà không PLAY.
+    var setupUptime: TimeInterval?
+    private(set) var hasPlayed = false
     // A new client, or one whose network queue overflowed, must start again at
     // an IDR frame. Sending dependent P-frames after dropping an access unit
     // produces green/yellow macroblocks until the next keyframe.
@@ -561,6 +700,7 @@ final class VnvarRtspServer {
     func beginPlaying() {
       recoveryGate.beginPlaying()
       playing = true
+      hasPlayed = true
     }
 
     /// Returns true when the encoder should be asked for a fresh keyframe.

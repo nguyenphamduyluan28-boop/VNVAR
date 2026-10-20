@@ -40,10 +40,15 @@ android {
 
     signingConfigs {
         create("release") {
-            val keyAliasVal = keystoreProperties["keyAlias"] as String?
-            val keyPasswordVal = keystoreProperties["keyPassword"] as String?
-            val storePasswordVal = keystoreProperties["storePassword"] as String?
-            val storeFileVal = keystoreProperties["storeFile"] as String?
+            // Ưu tiên biến môi trường (CI đọc từ GitHub Secrets), sau đó mới tới
+            // android/key.properties trên máy phát triển. Không ghi mật khẩu vào repo.
+            fun signingValue(propertyKey: String, envKey: String): String? =
+                System.getenv(envKey)?.takeIf { it.isNotBlank() }
+                    ?: (keystoreProperties[propertyKey] as String?)
+            val keyAliasVal = signingValue("keyAlias", "VNVAR_KEY_ALIAS")
+            val keyPasswordVal = signingValue("keyPassword", "VNVAR_KEY_PASSWORD")
+            val storePasswordVal = signingValue("storePassword", "VNVAR_KEYSTORE_PASSWORD")
+            val storeFileVal = signingValue("storeFile", "VNVAR_KEYSTORE_PATH")
             if (keyAliasVal != null && keyPasswordVal != null && storePasswordVal != null && storeFileVal != null) {
                 keyAlias = keyAliasVal
                 keyPassword = keyPasswordVal
@@ -81,7 +86,7 @@ gradle.taskGraph.whenReady {
     if (buildsRelease && !releaseSigningReady) {
         if (!allowDebugReleaseSigning) {
             throw GradleException(
-                "Missing release keystore (android/key.properties). Refusing to sign " +
+                "Missing release keystore (android/key.properties or VNVAR_KEYSTORE_* env). Refusing to sign " +
                     "the release build with the debug key. Set " +
                     "VNVAR_ALLOW_DEBUG_SIGNING=true only for test builds.",
             )

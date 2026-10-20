@@ -57,6 +57,16 @@ String generateScoreboardKey([math.Random? random]) {
   return List.generate(6, (_) => alphabet[source.nextInt(alphabet.length)]).join();
 }
 
+/// Một bước hoàn tác: phần điểm/luật trước lệnh, và tên hai đội nếu lệnh
+/// (`setScore` kèm `teamA`/`teamB`) đã đổi tên.
+class _UndoStep {
+  const _UndoStep(this.core, {this.namesBefore, this.namesAfter});
+
+  final ScoreCore core;
+  final ({String a, String b})? namesBefore;
+  final ({String a, String b})? namesAfter;
+}
+
 /// Giữ trạng thái bảng tỉ số cho toàn app (sống qua các lần khởi động lại
 /// server camera), áp lệnh, lưu vào máy và phát thay đổi cho SSE/UI.
 class ScoreboardService {
@@ -85,7 +95,7 @@ class ScoreboardService {
 
   late ScoreboardState _state = ScoreboardState.initial(nowMs: _clock());
   String _controlKey = '';
-  final List<ScoreCore> _undo = <ScoreCore>[];
+  final List<_UndoStep> _undo = <_UndoStep>[];
   final LinkedHashMap<String, bool> _recentActionIds =
       LinkedHashMap<String, bool>();
   final StreamController<Map<String, dynamic>> _changes =
@@ -183,7 +193,20 @@ class ScoreboardService {
       if (_undo.isEmpty) {
         throw const ScoreboardException(409, 'nothing_to_undo', 'Không còn thao tác để hoàn tác.');
       }
-      _state.core = _undo.removeLast();
+      final step = _undo.removeLast();
+      _state.core = step.core;
+      // Lệnh được hoàn tác đã đổi tên đội: trả lại tên cũ, trừ khi tên đã
+      // được sửa tiếp bằng lệnh khác sau đó.
+      final namesBefore = step.namesBefore;
+      final namesAfter = step.namesAfter;
+      if (namesBefore != null && namesAfter != null) {
+        if (_state.teamA.name == namesAfter.a) {
+          _state.teamA.name = namesBefore.a;
+        }
+        if (_state.teamB.name == namesAfter.b) {
+          _state.teamB.name = namesBefore.b;
+        }
+      }
     } else {
       // Áp lên bản sao: lệnh lỗi giữa chừng không làm hỏng trạng thái thật.
       final working = ScoreboardState.fromJson(
@@ -191,6 +214,7 @@ class ScoreboardService {
         nowMs: now,
       );
       final before = _state.core.copy();
+      final namesBefore = (a: _state.teamA.name, b: _state.teamB.name);
       final logosBefore = {_state.teamA.logoId, _state.teamB.logoId};
       final change = applyScoreboardAction(working, action, nowMs: now);
       _state = working;
@@ -199,8 +223,20 @@ class ScoreboardService {
       for (final id in logosBefore) {
         if (id != null && !logosAfter.contains(id)) unawaited(_deleteLogo(id));
       }
-      if (change == ScoreboardChange.score) {
-        _undo.add(before);
+      if (change == ScoreboardChange.newMatch) {
+        // Trận mới (mã trận mới, có thể đổi đội): các bước hoàn tác thuộc trận
+        // cũ, giữ lại thì "undo" sẽ đưa điểm trận cũ về dưới trận mới.
+        _undo.clear();
+      } else if (change == ScoreboardChange.score) {
+        final namesAfter = (a: _state.teamA.name, b: _state.teamB.name);
+        final renamed = namesAfter != namesBefore;
+        _undo.add(
+          _UndoStep(
+            before,
+            namesBefore: renamed ? namesBefore : null,
+            namesAfter: renamed ? namesAfter : null,
+          ),
+        );
         if (_undo.length > maximumUndoSteps) _undo.removeAt(0);
       }
       if (name == 'banner') _scheduleBannerExpiry();

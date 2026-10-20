@@ -1,4 +1,5 @@
 import 'dart:typed_data';
+import 'dart:ui' show Rect, Size;
 
 import 'package:camera_station/models/scoreboard_state.dart';
 import 'package:camera_station/services/rtsp_publisher_service.dart';
@@ -56,6 +57,21 @@ void main() {
     expect(video[1], contains('overlay=0:0'));
   });
 
+  test('Android overlay arguments are exactly the MediaCodec re-encode', () {
+    expect(livestreamOverlayVideoArgs(bitrateBps: 4000000, fps: 30), [
+      '-filter_complex',
+      livestreamOverlayFilter(null),
+      '-map',
+      '[vout]',
+      '-c:v',
+      'h264_mediacodec',
+      '-b:v',
+      '4000000',
+      '-g',
+      '60',
+    ]);
+  });
+
   test('only encoder/filter errors disable the scoreboard overlay', () {
     const banner = 'configuration: --enable-mediacodec --enable-jni';
     expect(isLivestreamOverlayFailure('$banner\nConnection refused'), isFalse);
@@ -106,6 +122,18 @@ void main() {
       '/b.ttf',
     );
     expect(findLivestreamTickerFont(candidates: ['/a.ttf'], exists: (_) => false), isNull);
+  });
+
+  test('iOS always draws a static ticker into the PNG (no drawtext)', () {
+    // iOS: FFmpeg chỉ copy luồng overlay native, không có bộ lọc drawtext.
+    expect(useScrollingLivestreamTicker(requested: true, isIos: true), isFalse);
+    expect(useScrollingLivestreamTicker(requested: false, isIos: true), isFalse);
+    // Android giữ nguyên: chữ chạy do FFmpeg vẽ khi được yêu cầu.
+    expect(useScrollingLivestreamTicker(requested: true, isIos: false), isTrue);
+    expect(
+      useScrollingLivestreamTicker(requested: false, isIos: false),
+      isFalse,
+    );
   });
 
   test('only drawtext errors switch to a static ticker', () {
@@ -210,6 +238,137 @@ void main() {
       final banner = sampleState();
       (banner['overlay'] as Map)['banner'] = {'text': 'KIỂM TRA VAR', 'untilMs': 0};
       await renderAndCheck(banner, 854, 480);
+    });
+  });
+
+  test('overlay can be placed at an offset; old call keeps 0:0', () {
+    expect(livestreamOverlayFilter(null, x: 12, y: 34), contains('overlay=12:34:'));
+    final video = livestreamOverlayVideoArgs(
+      bitrateBps: 3000000,
+      fps: 30,
+      overlayX: 100,
+      overlayY: 40,
+    );
+    expect(video[1], contains('overlay=100:40:'));
+    const overlay = LivestreamOverlay(imagePath: '/tmp/o.png', width: 1280, height: 720);
+    expect(overlay.x, 0);
+    expect(overlay.y, 0);
+    expect(overlay.imageWidth, 1280);
+    expect(overlay.imageHeight, 720);
+  });
+
+  test('logos are decoded no larger than needed, keeping aspect ratio', () {
+    expect(ScoreboardFrameRenderer.logoDecodeSize(1920, 1080), 360);
+    expect(ScoreboardFrameRenderer.logoDecodeSize(1280, 720), 240);
+    expect(livestreamLogoDecodeSize(4000, 2000, 360), (width: 360, height: null));
+    expect(livestreamLogoDecodeSize(1000, 3000, 360), (width: null, height: 360));
+    expect(livestreamLogoDecodeSize(200, 100, 360), (width: null, height: null));
+  });
+
+  test('region containment', () {
+    const outer = Rect.fromLTWH(0, 0, 100, 100);
+    expect(livestreamRegionContains(outer, const Rect.fromLTWH(10, 10, 50, 50)), isTrue);
+    expect(livestreamRegionContains(outer, const Rect.fromLTWH(60, 10, 50, 50)), isFalse);
+  });
+
+  group('frame layout', () {
+    test('large panels are scaled down to fit the frame', () {
+      const frame = Size(1920, 1080);
+      expect(ScoreboardFrameRenderer.fitScale(2, frame, null), 2);
+      expect(
+        ScoreboardFrameRenderer.fitScale(2, frame, const Size(1500, 500)),
+        closeTo(0.95 * 1920 / 1500, 1e-9),
+      );
+      expect(
+        ScoreboardFrameRenderer.fitScale(2, const Size(720, 1280), const Size(500, 1000)),
+        closeTo(0.95 * 1280 / 1000, 1e-9),
+      );
+      expect(ScoreboardFrameRenderer.fitScale(0.5, frame, const Size(500, 500)), 0.5);
+    });
+
+    test('content bounds come from the layout', () {
+      final bounds = ScoreboardFrameRenderer.contentBounds(
+        sampleState(),
+        width: 1920,
+        height: 1080,
+        nowMs: 0,
+      );
+      // Thanh tỉ số góc trên trái: lề 48, rộng tối đa 820, cao tối đa 194,
+      // cộng bóng đổ 48 (dưới thêm 12).
+      expect(bounds, const Rect.fromLTRB(0, 0, 916, 302));
+      expect(
+        ScoreboardFrameRenderer.contentBounds(
+          sampleState(overlay: {'visible': false}),
+          width: 1920,
+          height: 1080,
+          nowMs: 0,
+        ),
+        isNull,
+      );
+    });
+
+    test('session region contains every scene and position', () {
+      for (final size in const [(1920, 1080), (720, 1280)]) {
+        for (final position in scoreboardPositions) {
+          for (final scale in const [0.5, 1.0, 2.0]) {
+            final base = {'position': position, 'scale': scale};
+            final region = ScoreboardFrameRenderer.sessionRegion(
+              sampleState(overlay: base),
+              width: size.$1,
+              height: size.$2,
+            );
+            expect(region.left, greaterThanOrEqualTo(0));
+            expect(region.right, lessThanOrEqualTo(size.$1));
+            for (final scene in scoreboardScenes) {
+              final state = sampleState(
+                overlay: {
+                  ...base,
+                  'scene': scene,
+                  'ticker': {'enabled': true, 'text': 'Tài trợ'},
+                },
+              );
+              (state['overlay'] as Map)['banner'] = {'text': 'KIỂM TRA VAR', 'untilMs': 0};
+              final bounds = ScoreboardFrameRenderer.contentBounds(
+                state,
+                width: size.$1,
+                height: size.$2,
+                nowMs: 0,
+              );
+              if (bounds == null) continue;
+              expect(
+                livestreamRegionContains(region, bounds),
+                isTrue,
+                reason: '$scene $position $scale $size',
+              );
+            }
+          }
+        }
+      }
+    });
+
+    test('renders only the requested region and placeholder sets', () async {
+      const renderer = ScoreboardFrameRenderer();
+      final state = ScoreboardState.initial(nowMs: 0);
+      applyScoreboardAction(state, {'action': 'overlay', 'visible': true, 'scene': 'full'}, nowMs: 0);
+      applyScoreboardAction(state, {'action': 'setScore', 'setsA': 1}, nowMs: 0);
+      final bytes = await renderer.renderPng(
+        state.toJson(nowMs: 0),
+        width: 1920,
+        height: 1080,
+        nowMs: 0,
+        region: const Rect.fromLTWH(10, 20, 300, 200),
+      );
+      expect(pngSize(bytes), (width: 300, height: 200));
+      for (final scene in ['scorebar', 'result']) {
+        applyScoreboardAction(state, {'action': 'overlay', 'scene': scene}, nowMs: 0);
+        final full = await renderer.renderPng(
+          state.toJson(nowMs: 0),
+          width: 1280,
+          height: 720,
+          nowMs: 0,
+        );
+        expect(pngSize(full), (width: 1280, height: 720));
+      }
     });
   });
 }

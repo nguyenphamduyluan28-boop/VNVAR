@@ -1,6 +1,7 @@
 #import "VnvarWebRtcTrackBridge.h"
 #import <AVFoundation/AVFoundation.h>
 #import <CoreImage/CoreImage.h>
+#import <ImageIO/ImageIO.h>
 #import <flutter_webrtc/FlutterWebRTCPlugin.h>
 #import <flutter_webrtc/FlutterRTCAudioSink.h>
 #import <math.h>
@@ -19,110 +20,107 @@
   return (RTCVideoTrack *)track;
 }
 
-+ (CVPixelBufferRef _Nullable)copyPixelBufferForFrame:(RTCVideoFrame *)frame {
-  @autoreleasepool {
-    id<RTCI420Buffer> source = [frame.buffer toI420];
-    if (source == nil) {
-      return nil;
-    }
-
-  // RTSP clients cannot renegotiate video dimensions in the middle of an
-  // active H.264 session. Keep one stable encoded canvas for the lifetime of
-  // the capture profile even when WebRTC changes frame.rotation.
-  // Recording may keep the original 4K track, but encoding a second 4K H.264
-  // stream for RTSP competes with MediaRecorder for VideoToolbox resources.
-  // That contention is especially visible when CheckVAR rotates the recorder:
-  // the live encoder can stop producing decodable frames. Cap only the RTSP
-  // copy at 1080p; the source track and recorded CheckVAR clip remain 4K.
+// RTSP clients cannot renegotiate video dimensions in the middle of an active
+// H.264 session. Keep one stable encoded canvas for the lifetime of the capture
+// profile even when WebRTC changes frame.rotation.
+// Recording may keep the original 4K track, but encoding a second 4K H.264
+// stream for RTSP competes with MediaRecorder for VideoToolbox resources. That
+// contention is especially visible when CheckVAR rotates the recorder: the live
+// encoder can stop producing decodable frames. Cap only the RTSP copy at 1080p;
+// the source track and recorded CheckVAR clip remain 4K.
+static void VnvarOutputSize(int sourceWidth, int sourceHeight,
+                            int *outputWidth, int *outputHeight) {
   const CGFloat outputScale = MIN(
       1.0,
-      MIN(1920.0 / (CGFloat)source.width,
-          1080.0 / (CGFloat)source.height));
-  const int outputWidth = MAX(2, ((int)floor(source.width * outputScale)) & ~1);
-  const int outputHeight = MAX(2, ((int)floor(source.height * outputScale)) & ~1);
-  int rotatedWidth = source.width;
-  int rotatedHeight = source.height;
-  if (frame.rotation == RTCVideoRotation_90 ||
-      frame.rotation == RTCVideoRotation_270) {
-    rotatedWidth = source.height;
-    rotatedHeight = source.width;
-  }
-  RTCI420Buffer *rotated = [[RTCI420Buffer alloc] initWithWidth:rotatedWidth
-                                                        height:rotatedHeight];
-  [RTCYUVHelper I420Rotate:source.dataY
-                srcStrideY:source.strideY
-                      srcU:source.dataU
-                srcStrideU:source.strideU
-                      srcV:source.dataV
-                srcStrideV:source.strideV
-                      dstY:(uint8_t *)rotated.dataY
-                dstStrideY:rotated.strideY
-                      dstU:(uint8_t *)rotated.dataU
-                dstStrideU:rotated.strideU
-                      dstV:(uint8_t *)rotated.dataV
-                dstStrideV:rotated.strideV
-                     width:source.width
-                    height:source.height
-                      mode:frame.rotation];
+      MIN(1920.0 / (CGFloat)MAX(1, sourceWidth),
+          1080.0 / (CGFloat)MAX(1, sourceHeight)));
+  *outputWidth = MAX(2, ((int)floor(sourceWidth * outputScale)) & ~1);
+  *outputHeight = MAX(2, ((int)floor(sourceHeight * outputScale)) & ~1);
+}
 
+static CIContext *VnvarSharedCIContext(CGColorSpaceRef *colorSpaceOut) {
+  static CIContext *context;
+  static CGColorSpaceRef colorSpace;
+  static dispatch_once_t onceToken;
+  dispatch_once(&onceToken, ^{
+    context = [CIContext contextWithOptions:@{
+      kCIContextUseSoftwareRenderer: @NO,
+    }];
+    colorSpace = CGColorSpaceCreateDeviceRGB();
+  });
+  if (colorSpaceOut != NULL) *colorSpaceOut = colorSpace;
+  return context;
+}
+
+// Pool NV12 cho canvas RTSP: tránh cấp phát IOSurface mới mỗi khung. Chỉ
+// truy cập trong @synchronized; được nhả bởi +releaseConversionResources.
+static CVPixelBufferPoolRef gVnvarOutputPool = NULL;
+static int gVnvarOutputPoolWidth = 0;
+static int gVnvarOutputPoolHeight = 0;
+
+static CVPixelBufferRef VnvarCreateOutputBuffer(int width, int height) {
+  CVPixelBufferRef buffer = NULL;
+  @synchronized ([VnvarWebRtcTrackBridge class]) {
+    if (gVnvarOutputPool == NULL ||
+        gVnvarOutputPoolWidth != width ||
+        gVnvarOutputPoolHeight != height) {
+      if (gVnvarOutputPool != NULL) {
+        CVPixelBufferPoolRelease(gVnvarOutputPool);
+        gVnvarOutputPool = NULL;
+      }
+      NSDictionary *pixelAttributes = @{
+        (id)kCVPixelBufferPixelFormatTypeKey:
+            @(kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange),
+        (id)kCVPixelBufferWidthKey: @(width),
+        (id)kCVPixelBufferHeightKey: @(height),
+        (id)kCVPixelBufferIOSurfacePropertiesKey: @{},
+      };
+      NSDictionary *poolAttributes = @{
+        (id)kCVPixelBufferPoolMinimumBufferCountKey: @3,
+      };
+      CVPixelBufferPoolRef pool = NULL;
+      CVReturn poolStatus = CVPixelBufferPoolCreate(
+          kCFAllocatorDefault,
+          (__bridge CFDictionaryRef)poolAttributes,
+          (__bridge CFDictionaryRef)pixelAttributes,
+          &pool);
+      if (poolStatus == kCVReturnSuccess && pool != NULL) {
+        gVnvarOutputPool = pool;
+        gVnvarOutputPoolWidth = width;
+        gVnvarOutputPoolHeight = height;
+      }
+    }
+    if (gVnvarOutputPool != NULL) {
+      CVReturn status = CVPixelBufferPoolCreatePixelBuffer(
+          kCFAllocatorDefault, gVnvarOutputPool, &buffer);
+      if (status != kCVReturnSuccess) buffer = NULL;
+    }
+  }
+  if (buffer != NULL) return buffer;
+  // Pool lỗi: cấp phát trực tiếp như trước.
   NSDictionary *attributes = @{
     (id)kCVPixelBufferIOSurfacePropertiesKey: @{},
   };
-  CVPixelBufferRef pixelBuffer = nil;
   CVReturn status = CVPixelBufferCreate(
       kCFAllocatorDefault,
-      rotatedWidth,
-      rotatedHeight,
+      width,
+      height,
       kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
       (__bridge CFDictionaryRef)attributes,
-      &pixelBuffer);
-  if (status != kCVReturnSuccess || pixelBuffer == nil) {
-    return nil;
-  }
+      &buffer);
+  return status == kCVReturnSuccess ? buffer : NULL;
+}
 
-  CVPixelBufferLockBaseAddress(pixelBuffer, 0);
-  uint8_t *dstY = CVPixelBufferGetBaseAddressOfPlane(pixelBuffer, 0);
-  uint8_t *dstUV = CVPixelBufferGetBaseAddressOfPlane(pixelBuffer, 1);
-  const size_t dstYStride = CVPixelBufferGetBytesPerRowOfPlane(pixelBuffer, 0);
-  const size_t dstUVStride = CVPixelBufferGetBytesPerRowOfPlane(pixelBuffer, 1);
-  [RTCYUVHelper I420ToNV12:rotated.dataY
-                srcStrideY:rotated.strideY
-                      srcU:rotated.dataU
-                srcStrideU:rotated.strideU
-                      srcV:rotated.dataV
-                srcStrideV:rotated.strideV
-                      dstY:dstY
-                dstStrideY:(int)dstYStride
-                     dstUV:dstUV
-               dstStrideUV:(int)dstUVStride
-                     width:rotated.width
-                    height:rotated.height];
-  CVPixelBufferUnlockBaseAddress(pixelBuffer, 0);
-
-  if (rotatedWidth == outputWidth && rotatedHeight == outputHeight) {
-    return pixelBuffer;
-  }
-
-  // Portrait and landscape have opposite aspect ratios. Fit the fully rotated
-  // image inside the stable encoder canvas instead of cropping court content.
-  // The resulting letterbox is preferable to changing SPS dimensions, which
-  // freezes the tablet decoder until the phone returns to its initial angle.
-  CVPixelBufferRef stableBuffer = nil;
-  status = CVPixelBufferCreate(
-      kCFAllocatorDefault,
-      outputWidth,
-      outputHeight,
-      kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
-      (__bridge CFDictionaryRef)attributes,
-      &stableBuffer);
-  if (status != kCVReturnSuccess || stableBuffer == nil) {
-    CVPixelBufferRelease(pixelBuffer);
-    return nil;
-  }
-
-  CIImage *image = [CIImage imageWithCVPixelBuffer:pixelBuffer];
-  const CGFloat scale = MIN((CGFloat)outputWidth / rotatedWidth,
-                            (CGFloat)outputHeight / rotatedHeight);
+// Portrait and landscape have opposite aspect ratios. Fit the fully rotated
+// image inside the stable encoder canvas instead of cropping court content.
+// The resulting letterbox is preferable to changing SPS dimensions, which
+// freezes the tablet decoder until the phone returns to its initial angle.
+static CIImage *VnvarFittedImage(CIImage *image,
+                                 int outputWidth,
+                                 int outputHeight) {
+  const CGRect extent = image.extent;
+  const CGFloat scale = MIN((CGFloat)outputWidth / MAX(1.0, extent.size.width),
+                            (CGFloat)outputHeight / MAX(1.0, extent.size.height));
   CIImage *scaled = [image imageByApplyingTransform:
       CGAffineTransformMakeScale(scale, scale)];
   const CGFloat offsetX = ((CGFloat)outputWidth - scaled.extent.size.width) / 2.0;
@@ -134,22 +132,258 @@
   CIImage *background = [[[CIImage alloc]
       initWithColor:[CIColor colorWithRed:0 green:0 blue:0 alpha:1]]
       imageByCroppingToRect:outputBounds];
-  CIImage *composited = [positioned imageByCompositingOverImage:background];
-  static CIContext *context;
-  static CGColorSpaceRef colorSpace;
-  static dispatch_once_t onceToken;
-  dispatch_once(&onceToken, ^{
-    context = [CIContext contextWithOptions:@{
-      kCIContextUseSoftwareRenderer: @NO,
-    }];
-    colorSpace = CGColorSpaceCreateDeviceRGB();
-  });
+  return [positioned imageByCompositingOverImage:background];
+}
+
+static void VnvarRenderFitted(CIImage *image,
+                              CVPixelBufferRef destination,
+                              int outputWidth,
+                              int outputHeight) {
+  const CGRect outputBounds = CGRectMake(0, 0, outputWidth, outputHeight);
+  CIImage *composited = VnvarFittedImage(image, outputWidth, outputHeight);
+  CGColorSpaceRef colorSpace = NULL;
+  CIContext *context = VnvarSharedCIContext(&colorSpace);
   [context render:composited
-   toCVPixelBuffer:stableBuffer
+   toCVPixelBuffer:destination
             bounds:outputBounds
         colorSpace:colorSpace];
-  CVPixelBufferRelease(pixelBuffer);
-  return stableBuffer;
+}
+
+// WebRTC rotation = góc cần xoay THEO CHIỀU KIM ĐỒNG HỒ để hiển thị đúng
+// (giống libyuv kRotate90). CGImagePropertyOrientation .right nghĩa là ảnh
+// được hiển thị sau khi xoay 90° theo chiều kim đồng hồ.
+static CGImagePropertyOrientation VnvarOrientation(RTCVideoRotation rotation) {
+  switch (rotation) {
+    case RTCVideoRotation_90:
+      return kCGImagePropertyOrientationRight;
+    case RTCVideoRotation_180:
+      return kCGImagePropertyOrientationDown;
+    case RTCVideoRotation_270:
+      return kCGImagePropertyOrientationLeft;
+    default:
+      return kCGImagePropertyOrientationUp;
+  }
+}
+
+// Đường nhanh cho khung camera (RTCCVPixelBuffer): không chuyển qua I420 trên
+// CPU. Crop/xoay/scale đều do Core Image trên GPU, ghi thẳng vào buffer NV12
+// từ pool. Không cần crop/xoay/scale và đã là NV12 thì đưa thẳng buffer gốc
+// cho VideoToolbox (giống RTCVideoEncoderH264 của WebRTC). Trả NULL để caller
+// rơi về đường I420.
+static CVPixelBufferRef VnvarCopyFromNativeBuffer(RTCCVPixelBuffer *buffer,
+                                                  RTCVideoRotation rotation) {
+  CVPixelBufferRef source = buffer.pixelBuffer;
+  if (source == NULL) return NULL;
+  const int bufferWidth = (int)CVPixelBufferGetWidth(source);
+  const int bufferHeight = (int)CVPixelBufferGetHeight(source);
+  if (bufferWidth <= 0 || bufferHeight <= 0 ||
+      buffer.cropWidth <= 0 || buffer.cropHeight <= 0 ||
+      buffer.cropX < 0 || buffer.cropY < 0 ||
+      buffer.cropX + buffer.cropWidth > bufferWidth ||
+      buffer.cropY + buffer.cropHeight > bufferHeight) {
+    return NULL;
+  }
+  // Canvas theo kích thước logic (chưa xoay) của khung, như đường I420.
+  int outputWidth = 0;
+  int outputHeight = 0;
+  VnvarOutputSize(buffer.width, buffer.height, &outputWidth, &outputHeight);
+
+  const BOOL cropped = buffer.cropX != 0 || buffer.cropY != 0 ||
+      buffer.cropWidth != bufferWidth || buffer.cropHeight != bufferHeight;
+  const OSType format = CVPixelBufferGetPixelFormatType(source);
+  const BOOL isNV12 =
+      format == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange ||
+      format == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange;
+  if (!cropped && rotation == RTCVideoRotation_0 && isNV12 &&
+      bufferWidth == outputWidth && bufferHeight == outputHeight) {
+    return CVPixelBufferRetain(source);
+  }
+
+  CIImage *image = [CIImage imageWithCVPixelBuffer:source];
+  if (image == nil) return NULL;
+  if (cropped) {
+    // Gốc toạ độ Core Image ở góc dưới-trái; cropY tính từ hàng trên cùng.
+    const CGRect cropRect = CGRectMake(
+        buffer.cropX,
+        bufferHeight - buffer.cropY - buffer.cropHeight,
+        buffer.cropWidth,
+        buffer.cropHeight);
+    image = [image imageByCroppingToRect:cropRect];
+  }
+  if (rotation != RTCVideoRotation_0) {
+    image = [image imageByApplyingCGOrientation:VnvarOrientation(rotation)];
+  }
+  CVPixelBufferRef destination = VnvarCreateOutputBuffer(outputWidth, outputHeight);
+  if (destination == NULL) return NULL;
+  VnvarRenderFitted(image, destination, outputWidth, outputHeight);
+  return destination;
+}
+
+// Như VnvarCopyFromNativeBuffer nhưng KHÔNG render: trả đồ thị CIImage của
+// canvas (crop/xoay/letterbox) để luồng overlay chồng ảnh rồi render một lần.
+static CIImage *VnvarCanvasImageFromNativeBuffer(RTCCVPixelBuffer *buffer,
+                                                 RTCVideoRotation rotation) {
+  CVPixelBufferRef source = buffer.pixelBuffer;
+  if (source == NULL) return nil;
+  const int bufferWidth = (int)CVPixelBufferGetWidth(source);
+  const int bufferHeight = (int)CVPixelBufferGetHeight(source);
+  if (bufferWidth <= 0 || bufferHeight <= 0 ||
+      buffer.cropWidth <= 0 || buffer.cropHeight <= 0 ||
+      buffer.cropX < 0 || buffer.cropY < 0 ||
+      buffer.cropX + buffer.cropWidth > bufferWidth ||
+      buffer.cropY + buffer.cropHeight > bufferHeight) {
+    return nil;
+  }
+  int outputWidth = 0;
+  int outputHeight = 0;
+  VnvarOutputSize(buffer.width, buffer.height, &outputWidth, &outputHeight);
+  CIImage *image = [CIImage imageWithCVPixelBuffer:source];
+  if (image == nil) return nil;
+  const BOOL cropped = buffer.cropX != 0 || buffer.cropY != 0 ||
+      buffer.cropWidth != bufferWidth || buffer.cropHeight != bufferHeight;
+  if (!cropped && rotation == RTCVideoRotation_0 &&
+      bufferWidth == outputWidth && bufferHeight == outputHeight) {
+    return image;
+  }
+  if (cropped) {
+    const CGRect cropRect = CGRectMake(
+        buffer.cropX,
+        bufferHeight - buffer.cropY - buffer.cropHeight,
+        buffer.cropWidth,
+        buffer.cropHeight);
+    image = [image imageByCroppingToRect:cropRect];
+  }
+  if (rotation != RTCVideoRotation_0) {
+    image = [image imageByApplyingCGOrientation:VnvarOrientation(rotation)];
+  }
+  return [VnvarFittedImage(image, outputWidth, outputHeight)
+      imageByCroppingToRect:CGRectMake(0, 0, outputWidth, outputHeight)];
+}
+
++ (CIImage * _Nullable)canvasImageForFrame:(RTCVideoFrame *)frame {
+  @autoreleasepool {
+    if ([frame.buffer isKindOfClass:[RTCCVPixelBuffer class]]) {
+      CIImage *native = VnvarCanvasImageFromNativeBuffer(
+          (RTCCVPixelBuffer *)frame.buffer, frame.rotation);
+      if (native != nil) return native;
+    }
+    // Đường I420 (hiếm): dùng lại bộ chuyển đổi đầy đủ rồi bọc CIImage. CIImage
+    // giữ (retain) CVPixelBuffer nên có thể nhả tham chiếu của mình ngay.
+    CVPixelBufferRef converted = [self copyPixelBufferForFrame:frame];
+    if (converted == NULL) return nil;
+    CIImage *image = [CIImage imageWithCVPixelBuffer:converted];
+    CVPixelBufferRelease(converted);
+    return image;
+  }
+}
+
++ (void)releaseConversionResources {
+  @synchronized ([VnvarWebRtcTrackBridge class]) {
+    if (gVnvarOutputPool != NULL) {
+      CVPixelBufferPoolRelease(gVnvarOutputPool);
+      gVnvarOutputPool = NULL;
+    }
+    gVnvarOutputPoolWidth = 0;
+    gVnvarOutputPoolHeight = 0;
+  }
+}
+
++ (CVPixelBufferRef _Nullable)copyPixelBufferForFrame:(RTCVideoFrame *)frame {
+  @autoreleasepool {
+    if ([frame.buffer isKindOfClass:[RTCCVPixelBuffer class]]) {
+      CVPixelBufferRef native = VnvarCopyFromNativeBuffer(
+          (RTCCVPixelBuffer *)frame.buffer, frame.rotation);
+      if (native != NULL) {
+        return native;
+      }
+    }
+
+    // Đường dự phòng cho buffer I420 (hoặc khi đường nhanh thất bại).
+    id<RTCI420Buffer> source = [frame.buffer toI420];
+    if (source == nil) {
+      return nil;
+    }
+
+    int outputWidth = 0;
+    int outputHeight = 0;
+    VnvarOutputSize(source.width, source.height, &outputWidth, &outputHeight);
+    int rotatedWidth = source.width;
+    int rotatedHeight = source.height;
+    if (frame.rotation == RTCVideoRotation_90 ||
+        frame.rotation == RTCVideoRotation_270) {
+      rotatedWidth = source.height;
+      rotatedHeight = source.width;
+    }
+    // Không xoay thì dùng thẳng buffer nguồn, bỏ một lượt sao chép toàn khung.
+    id<RTCI420Buffer> rotated = source;
+    if (frame.rotation != RTCVideoRotation_0) {
+      RTCI420Buffer *rotatedBuffer =
+          [[RTCI420Buffer alloc] initWithWidth:rotatedWidth height:rotatedHeight];
+      [RTCYUVHelper I420Rotate:source.dataY
+                    srcStrideY:source.strideY
+                          srcU:source.dataU
+                    srcStrideU:source.strideU
+                          srcV:source.dataV
+                    srcStrideV:source.strideV
+                          dstY:(uint8_t *)rotatedBuffer.dataY
+                    dstStrideY:rotatedBuffer.strideY
+                          dstU:(uint8_t *)rotatedBuffer.dataU
+                    dstStrideU:rotatedBuffer.strideU
+                          dstV:(uint8_t *)rotatedBuffer.dataV
+                    dstStrideV:rotatedBuffer.strideV
+                         width:source.width
+                        height:source.height
+                          mode:frame.rotation];
+      rotated = rotatedBuffer;
+    }
+
+    NSDictionary *attributes = @{
+      (id)kCVPixelBufferIOSurfacePropertiesKey: @{},
+    };
+    CVPixelBufferRef pixelBuffer = nil;
+    CVReturn status = CVPixelBufferCreate(
+        kCFAllocatorDefault,
+        rotatedWidth,
+        rotatedHeight,
+        kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
+        (__bridge CFDictionaryRef)attributes,
+        &pixelBuffer);
+    if (status != kCVReturnSuccess || pixelBuffer == nil) {
+      return nil;
+    }
+
+    CVPixelBufferLockBaseAddress(pixelBuffer, 0);
+    uint8_t *dstY = CVPixelBufferGetBaseAddressOfPlane(pixelBuffer, 0);
+    uint8_t *dstUV = CVPixelBufferGetBaseAddressOfPlane(pixelBuffer, 1);
+    const size_t dstYStride = CVPixelBufferGetBytesPerRowOfPlane(pixelBuffer, 0);
+    const size_t dstUVStride = CVPixelBufferGetBytesPerRowOfPlane(pixelBuffer, 1);
+    [RTCYUVHelper I420ToNV12:rotated.dataY
+                  srcStrideY:rotated.strideY
+                        srcU:rotated.dataU
+                  srcStrideU:rotated.strideU
+                        srcV:rotated.dataV
+                  srcStrideV:rotated.strideV
+                        dstY:dstY
+                  dstStrideY:(int)dstYStride
+                       dstUV:dstUV
+                 dstStrideUV:(int)dstUVStride
+                       width:rotated.width
+                      height:rotated.height];
+    CVPixelBufferUnlockBaseAddress(pixelBuffer, 0);
+
+    if (rotatedWidth == outputWidth && rotatedHeight == outputHeight) {
+      return pixelBuffer;
+    }
+
+    CVPixelBufferRef stableBuffer = VnvarCreateOutputBuffer(outputWidth, outputHeight);
+    if (stableBuffer == NULL) {
+      CVPixelBufferRelease(pixelBuffer);
+      return nil;
+    }
+    CIImage *image = [CIImage imageWithCVPixelBuffer:pixelBuffer];
+    VnvarRenderFitted(image, stableBuffer, outputWidth, outputHeight);
+    CVPixelBufferRelease(pixelBuffer);
+    return stableBuffer;
   }
 }
 

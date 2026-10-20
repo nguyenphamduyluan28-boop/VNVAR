@@ -35,9 +35,19 @@ class _FakeConfig extends StationConfigService {
   }
 }
 
-Future<void> _pumpScreen(WidgetTester tester, StationConfigService config) {
+Future<void> _pumpScreen(
+  WidgetTester tester,
+  StationConfigService config, {
+  double textScale = 1.0,
+}) {
   return tester.pumpWidget(
     MaterialApp(
+      builder: (context, child) => MediaQuery(
+        data: MediaQuery.of(context).copyWith(
+          textScaler: TextScaler.linear(textScale),
+        ),
+        child: child ?? const SizedBox.shrink(),
+      ),
       home: LiveStreamScreen(
         runtime: CameraStationRuntime.instance,
         configService: config,
@@ -82,5 +92,41 @@ void main() {
 
     expect(find.byType(CircularProgressIndicator), findsNothing);
     expect(find.byType(SnackBar), findsNothing);
+  });
+
+  testWidgets('idle screen does not overflow at 320x640 with large text',
+      (tester) async {
+    tester.view.physicalSize = const Size(320, 640);
+    tester.view.devicePixelRatio = 1.0;
+    addTearDown(tester.view.reset);
+
+    await _pumpScreen(tester, _FakeConfig(), textScale: 1.3);
+    await tester.pump();
+    await tester.pump();
+
+    expect(find.byType(CircularProgressIndicator), findsNothing);
+    expect(tester.takeException(), isNull);
+
+    // Nút chính dài nhất khi chưa phát: "SAO CHÉP LINK" (OBS).
+    await tester.tap(find.text('OBS'));
+    await tester.pump();
+    expect(find.text('SAO CHÉP LINK'), findsOneWidget);
+    expect(tester.takeException(), isNull);
+
+    // Nền tảng có ô Server URL riêng (TikTok).
+    await tester.tap(find.text('TikTok'));
+    await tester.pump();
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('idle main button keeps its go-live label', (tester) async {
+    await _pumpScreen(tester, _FakeConfig());
+    await tester.pump();
+    await tester.pump();
+
+    expect(find.text('PHÁT TRỰC TIẾP'), findsOneWidget);
+    expect(find.text('DỪNG'), findsNothing);
+    expect(find.text('ĐANG KẾT NỐI · HỦY'), findsNothing);
+    expect(tester.takeException(), isNull);
   });
 }

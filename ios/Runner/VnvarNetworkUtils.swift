@@ -104,6 +104,10 @@ final class VnvarCellularUplink {
 
   private func closeLinksLocked() {
     for link in links.values {
+      // Gỡ handler trước khi cancel: handler giữ closure finish, vốn giữ cả hai
+      // NWConnection (vòng tham chiếu nếu không gỡ).
+      link.local.stateUpdateHandler = nil
+      link.remote.stateUpdateHandler = nil
       link.local.cancel()
       link.remote.cancel()
     }
@@ -192,28 +196,44 @@ final class VnvarCellularUplink {
     let remote = NWConnection(host: NWEndpoint.Host(host), port: port, using: parameters)
     let key = ObjectIdentifier(local)
     links[key] = (local, remote)
+    // finish giữ mạnh local/remote; mỗi stateUpdateHandler giữ finish. Gỡ cả
+    // hai handler trong finish để phá vòng tham chiếu connection → handler →
+    // finish → connection. Có thể bị gọi nhiều lần (hai chiều pipe + handler).
     let finish: () -> Void = { [weak self] in
+      local.stateUpdateHandler = nil
+      remote.stateUpdateHandler = nil
       local.cancel()
       remote.cancel()
-      self?.links.removeValue(forKey: key)
+      // ObjectIdentifier có thể được tái dùng cho kết nối mới sau khi local cũ
+      // được giải phóng: chỉ xoá nếu mục vẫn là của cặp này.
+      if let link = self?.links[key], link.local === local {
+        self?.links.removeValue(forKey: key)
+      }
     }
-    remote.stateUpdateHandler = { state in
+    remote.stateUpdateHandler = { [weak self] state in
       switch state {
       case .ready:
-        self.pipe(from: local, to: remote, finish: finish)
-        self.pipe(from: remote, to: local, finish: finish)
+        self?.pipe(from: local, to: remote, finish: finish)
+        self?.pipe(from: remote, to: local, finish: finish)
       case let .failed(error):
         NSLog("[VNVAR-Cellular] Link to %@ failed: %@", host, "\(error)")
         finish()
       case .waiting:
         // Không có đường 4G/5G: báo lỗi để FFmpeg kết nối lại thay vì chờ mãi.
         finish()
+      case .cancelled:
+        finish()
       default:
         break
       }
     }
     local.stateUpdateHandler = { state in
-      if case .failed = state { finish() }
+      switch state {
+      case .failed, .cancelled:
+        finish()
+      default:
+        break
+      }
     }
     local.start(queue: queue)
     remote.start(queue: queue)

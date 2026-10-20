@@ -16,6 +16,7 @@ import java.net.Socket
 import java.util.Collections
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicInteger
 import javax.net.ssl.HttpsURLConnection
 import javax.net.ssl.SSLSocket
 import javax.net.ssl.SSLSocketFactory
@@ -39,6 +40,7 @@ class CellularUplink(context: Context) {
     private var server: ServerSocket? = null
     private var target: Triple<String, Int, Boolean>? = null
     private val sockets = Collections.synchronizedSet(mutableSetOf<Socket>())
+    private val activeLinks = AtomicInteger(0)
 
     /** Trả cổng cục bộ của bộ chuyển tiếp, hoặc null khi không có mạng di động. */
     @Synchronized
@@ -66,8 +68,28 @@ class CellularUplink(context: Context) {
                 } catch (_: Exception) {
                     break
                 }
-                thread(name = "VNVAR-Cellular-Link", isDaemon = true) {
-                    bridge(local, host, port, tls)
+                // FFmpeg chỉ cần một kết nối; giới hạn để một vòng lặp kết nối
+                // lại không sinh vô hạn luồng/socket 4G/5G.
+                if (activeLinks.incrementAndGet() > MAX_CONCURRENT_LINKS) {
+                    activeLinks.decrementAndGet()
+                    Log.w(TAG, "Rejecting mobile data link: limit $MAX_CONCURRENT_LINKS reached")
+                    closeQuietly(local)
+                    continue
+                }
+                try {
+                    thread(name = "VNVAR-Cellular-Link", isDaemon = true) {
+                        try {
+                            bridge(local, listener, host, port, tls)
+                        } catch (error: Throwable) {
+                            Log.w(TAG, "Mobile data link crashed: ${error.message}")
+                        } finally {
+                            activeLinks.decrementAndGet()
+                        }
+                    }
+                } catch (error: Throwable) {
+                    activeLinks.decrementAndGet()
+                    closeQuietly(local)
+                    Log.w(TAG, "Unable to start mobile data link: ${error.message}")
                 }
             }
         }
@@ -133,44 +155,70 @@ class CellularUplink(context: Context) {
         return network
     }
 
-    private fun bridge(local: Socket, host: String, port: Int, tls: Boolean) {
-        var remote: Socket? = null
+    private fun bridge(
+        local: Socket,
+        listener: ServerSocket,
+        host: String,
+        port: Int,
+        tls: Boolean,
+    ) {
+        // Mọi socket được đăng ký ngay khi tạo để close()/closeLinksLocked()
+        // cắt được cả kết nối đang kẹt ở connect hoặc bắt tay TLS.
+        var plain: Socket? = null
+        var secure: SSLSocket? = null
+        sockets += local
         try {
+            if (listener.isClosed) throw IllegalStateException("Uplink closed")
             val cellular = network ?: throw IllegalStateException("Mobile data network lost")
             val address = cellular.getAllByName(host)
                 .sortedBy { if (it is Inet4Address) 0 else 1 }
                 .first()
-            val plain = cellular.socketFactory.createSocket()
-            plain.connect(InetSocketAddress(address, port), CONNECT_TIMEOUT_MS)
-            plain.tcpNoDelay = true
-            remote = if (tls) {
-                val secure = (SSLSocketFactory.getDefault() as SSLSocketFactory)
-                    .createSocket(plain, host, port, true) as SSLSocket
-                secure.startHandshake()
-                if (!HttpsURLConnection.getDefaultHostnameVerifier().verify(host, secure.session)) {
+            val raw = cellular.socketFactory.createSocket()
+            plain = raw
+            sockets += raw
+            // close() có thể đã chạy giữa lúc tạo và đăng ký socket.
+            if (listener.isClosed) throw IllegalStateException("Uplink closed")
+            raw.connect(InetSocketAddress(address, port), CONNECT_TIMEOUT_MS)
+            raw.tcpNoDelay = true
+            val remote: Socket = if (tls) {
+                // startHandshake() không có timeout riêng: dùng soTimeout trong
+                // lúc bắt tay rồi trả về 0 cho luồng dữ liệu dài hạn.
+                raw.soTimeout = TLS_HANDSHAKE_TIMEOUT_MS
+                val tlsSocket = (SSLSocketFactory.getDefault() as SSLSocketFactory)
+                    .createSocket(raw, host, port, true) as SSLSocket
+                secure = tlsSocket
+                sockets += tlsSocket
+                tlsSocket.soTimeout = TLS_HANDSHAKE_TIMEOUT_MS
+                tlsSocket.startHandshake()
+                if (!HttpsURLConnection.getDefaultHostnameVerifier().verify(host, tlsSocket.session)) {
                     throw IllegalStateException("TLS certificate does not match $host")
                 }
-                secure
+                tlsSocket.soTimeout = 0
+                raw.soTimeout = 0
+                tlsSocket
             } else {
-                plain
+                raw
             }
             local.tcpNoDelay = true
-            sockets += local
-            sockets += remote
-            val upstream = remote
             thread(name = "VNVAR-Cellular-Up", isDaemon = true) {
-                pipe(local.getInputStream(), upstream.getOutputStream())
-                closeQuietly(upstream)
-                closeQuietly(local)
+                try {
+                    pipe(local.getInputStream(), remote.getOutputStream())
+                } catch (_: Throwable) {
+                } finally {
+                    closeQuietly(remote)
+                    closeQuietly(local)
+                }
             }
-            pipe(upstream.getInputStream(), local.getOutputStream())
+            pipe(remote.getInputStream(), local.getOutputStream())
         } catch (error: Exception) {
             Log.w(TAG, "Mobile data link to $host:$port failed: ${error.message}")
         } finally {
             closeQuietly(local)
-            remote?.let { closeQuietly(it) }
+            secure?.let { closeQuietly(it) }
+            plain?.let { closeQuietly(it) }
             sockets -= local
-            remote?.let { sockets -= it }
+            secure?.let { sockets -= it }
+            plain?.let { sockets -= it }
         }
     }
 
@@ -194,5 +242,7 @@ class CellularUplink(context: Context) {
         private const val TAG = "VNVAR-Cellular"
         private const val NETWORK_WAIT_MS = 5_000L
         private const val CONNECT_TIMEOUT_MS = 10_000
+        private const val TLS_HANDSHAKE_TIMEOUT_MS = 10_000
+        private const val MAX_CONCURRENT_LINKS = 4
     }
 }

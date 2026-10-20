@@ -50,6 +50,16 @@ void main() {
       expect(buildStreamUrl(parsed.server, parsed.key), equals(input));
     });
 
+    test('parses SportO live RTMP url', () {
+      const input = 'rtmp://live.sporto.vn/live/match-999';
+      final parsed = parseStreamUrl(input);
+
+      expect(parsed.platform, equals(StreamPlatform.sporto));
+      expect(parsed.server, equals('rtmp://live.sporto.vn/live'));
+      expect(parsed.key, equals('match-999'));
+      expect(buildStreamUrl(parsed.server, parsed.key), equals(input));
+    });
+
     test('parses custom local RTMP url', () {
       const input = 'rtmp://192.168.1.10/live/cam1';
       final parsed = parseStreamUrl(input);
@@ -112,6 +122,163 @@ void main() {
     test('returns URL unchanged when key is null or blank', () {
       expect(mergeStreamUrlWithKey(' rtmp://h/live ', null), 'rtmp://h/live');
       expect(mergeStreamUrlWithKey('rtmp://h/live', '  '), 'rtmp://h/live');
+    });
+  });
+
+  group('platform detection uses domain suffixes', () {
+    test('look-alike hosts are not treated as platforms', () {
+      expect(
+        parseStreamUrl('rtmp://evilyoutube.com/live2/k').platform,
+        StreamPlatform.custom,
+      );
+      expect(
+        parseStreamUrl('rtmp://youtube.com.evil.example/live2/k').platform,
+        StreamPlatform.custom,
+      );
+      expect(
+        parseStreamUrl('rtmp://notsporto.vn/live/k').platform,
+        StreamPlatform.custom,
+      );
+    });
+
+    test('regional TikTok CDNs are detected', () {
+      expect(
+        parseStreamUrl('rtmp://push.tiktokcdn-us.com/game/k').platform,
+        StreamPlatform.tiktok,
+      );
+    });
+
+    test('toString does not leak the stream key', () {
+      final parsed = parseStreamUrl(
+        'rtmp://a.rtmp.youtube.com/live2/abcd-efgh-ijkl-mnop',
+      );
+      expect(parsed.toString(), isNot(contains('efgh-ijkl')));
+      expect(parsed.toString(), contains('abcd'));
+    });
+  });
+
+  group('classifyStreamDestination', () {
+    test('partner servers', () {
+      expect(
+        classifyStreamDestination('rtmp://live.sporto.vn/live/match-1'),
+        StreamDestinationKind.partner,
+      );
+      expect(
+        classifyStreamDestination('rtmp://media.aqvision.net:11935/live/cam1'),
+        StreamDestinationKind.partner,
+      );
+    });
+
+    test('local network servers', () {
+      for (final url in [
+        'http://192.168.1.20:8889/cam/whip',
+        'rtsp://10.0.0.5:8554/live',
+        'rtmp://172.16.4.2/live/k',
+        'rtmp://127.0.0.1/live/k',
+        'rtmp://localhost/live/k',
+        'http://mediamtx.local:8889/cam/whip',
+        'rtmp://[fd00::1]/live/k',
+      ]) {
+        expect(
+          classifyStreamDestination(url),
+          StreamDestinationKind.local,
+          reason: url,
+        );
+      }
+    });
+
+    test('public platforms always need confirmation', () {
+      for (final url in [
+        'rtmp://a.rtmp.youtube.com/live2/k',
+        'rtmps://live-api-s.facebook.com:443/rtmp/k',
+        'rtmp://push-rtmp-l11.tiktokcdn.com/game/k',
+        'rtmps://edge.fbcdn.net/rtmp/k',
+      ]) {
+        expect(
+          classifyStreamDestination(url),
+          StreamDestinationKind.publicPlatform,
+          reason: url,
+        );
+        expect(isTrustedAutoStartDestination(url), isFalse, reason: url);
+      }
+    });
+
+    test('unknown and malformed hosts', () {
+      expect(
+        classifyStreamDestination('rtmp://evil.example/live/k'),
+        StreamDestinationKind.unknown,
+      );
+      expect(
+        classifyStreamDestination('rtmp://evilyoutube.com/live/k'),
+        StreamDestinationKind.unknown,
+      );
+      expect(
+        classifyStreamDestination('rtmp://8.8.8.8/live/k'),
+        StreamDestinationKind.unknown,
+      );
+      // Octet > 255 không phải IPv4 nội bộ.
+      expect(
+        classifyStreamDestination('rtmp://192.168.1.300/live/k'),
+        StreamDestinationKind.unknown,
+      );
+      expect(classifyStreamDestination(''), StreamDestinationKind.unknown);
+    });
+
+    test('only partner and local destinations auto-start', () {
+      expect(
+        isTrustedAutoStartDestination('rtmp://media.aqvision.net/live/cam1'),
+        isTrue,
+      );
+      expect(
+        isTrustedAutoStartDestination('http://192.168.1.20:8889/cam/whip'),
+        isTrue,
+      );
+      expect(
+        isTrustedAutoStartDestination('rtmp://a.rtmp.youtube.com/live2/k'),
+        isFalse,
+      );
+      expect(
+        isTrustedAutoStartDestination('rtmp://evil.example/live/k'),
+        isFalse,
+      );
+    });
+  });
+
+  group('stream key masking', () {
+    test('keeps at most the first 4 characters', () {
+      expect(maskStreamSecret('abcd-efgh-ijkl'), 'abcd••••');
+      // Khoá ngắn: chỉ lộ nửa đầu.
+      expect(maskStreamSecret('abcdef'), 'abc••••');
+      expect(maskStreamSecret(''), '');
+    });
+
+    test('masks the key part of a stream URL', () {
+      expect(
+        maskedStreamKeyOf('rtmp://a.rtmp.youtube.com/live2/abcd-efgh-ijkl'),
+        'abcd••••',
+      );
+      expect(maskedStreamKeyOf('rtmp://a.rtmp.youtube.com/live2'), '');
+      expect(
+        streamDestinationLabel('rtmp://a.rtmp.youtube.com/live2/k'),
+        'YouTube',
+      );
+      expect(streamDestinationLabel('rtmp://evil.example/live/k'), '');
+    });
+  });
+
+  group('mergeStreamUrlWithKey with short tokens', () {
+    test('a short token matching a digit elsewhere is still appended', () {
+      expect(
+        mergeStreamUrlWithKey('rtmp://10.0.0.1:1935/live', '1'),
+        'rtmp://10.0.0.1:1935/live/1',
+      );
+    });
+
+    test('token present as query value is not duplicated', () {
+      expect(
+        mergeStreamUrlWithKey('rtmp://h/live?key=1', '1'),
+        'rtmp://h/live?key=1',
+      );
     });
   });
 }

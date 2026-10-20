@@ -32,11 +32,14 @@ class SetupScreen extends StatefulWidget {
 class _SetupScreenState extends State<SetupScreen> {
   static const List<String> _cameraIds = ['CAM-01', 'CAM-02', 'CAM-03'];
 
+  /// Số sân lớn nhất được chọn (đủ cho mọi cụm sân, giữ nhãn 2 chữ số).
+  static const int _maxCourtNumber = 99;
+
   final GlobalKey<FormState> _formKey = GlobalKey<FormState>();
   final StationConfigService _config = StationConfigService();
 
-  late final TextEditingController _cameraNameController;
-  late final TextEditingController _apiPortController;
+  /// Tên camera: giữ tên đã lưu, đổi theo Camera ID khi chọn camera khác.
+  late String _cameraName;
 
   late String _cameraId;
   late String _courtId;
@@ -63,10 +66,8 @@ class _SetupScreenState extends State<SetupScreen> {
     _courtId = identity?.courtId ?? 'COURT-01';
     _deviceId = identity?.deviceId ?? _generateDeviceId();
 
-    _cameraNameController = TextEditingController(
-      text: identity?.cameraName ?? 'Camera ${_cameraId.replaceAll('CAM-', '')}',
-    );
-    _apiPortController = TextEditingController(text: '8080');
+    _cameraName =
+        identity?.cameraName ?? 'Camera ${_cameraId.replaceAll('CAM-', '')}';
     _loadConfig();
   }
 
@@ -98,10 +99,6 @@ class _SetupScreenState extends State<SetupScreen> {
       if (prefs.containsKey('venueMapAddress')) {
         await prefs.remove('venueMapAddress');
       }
-      final port = await _config.loadApiPort();
-      // Màn hình đã đóng: controller đã dispose, không được gán nữa.
-      if (!mounted) return;
-      _apiPortController.text = port.toString();
     } catch (error) {
       // Không đọc được cấu hình: vẫn mở form (giữ giá trị mặc định) thay vì
       // quay vòng mãi.
@@ -115,64 +112,27 @@ class _SetupScreenState extends State<SetupScreen> {
     }
   }
 
-  @override
-  void dispose() {
-    _cameraNameController.dispose();
-    _apiPortController.dispose();
-    super.dispose();
-  }
-
   int get _selectedCourtNumber {
     return int.tryParse(_courtId.split('-').last) ?? 1;
   }
 
   void _selectCourtNumber(int number) {
     if (number < 1) return;
+    // Cấu hình cũ có thể lưu số sân lớn hơn giới hạn: kéo về giới hạn.
+    final court = number > _maxCourtNumber ? _maxCourtNumber : number;
     setState(() {
-      _courtId = 'COURT-${number.toString().padLeft(2, '0')}';
+      _courtId = 'COURT-${court.toString().padLeft(2, '0')}';
     });
   }
 
   Future<void> _showCourtNumberInputDialog(int current) async {
-    final controller = TextEditingController(text: current.toString());
+    // Dialog tự quản lý (và dispose) TextEditingController của nó.
     final result = await showDialog<int>(
       context: context,
-      builder: (dialogCtx) {
-        return AlertDialog(
-          title: Text(
-            appText(dialogCtx, 'Nhập số sân', 'Enter court number'),
-            style: const TextStyle(fontSize: 16, fontWeight: FontWeight.w800),
-          ),
-          content: TextField(
-            controller: controller,
-            keyboardType: TextInputType.number,
-            autofocus: true,
-            decoration: InputDecoration(
-              hintText: appText(
-                dialogCtx,
-                'Ví dụ: 1, 2, 25...',
-                'Example: 1, 2, 25...',
-              ),
-              border: const OutlineInputBorder(),
-            ),
-          ),
-          actions: [
-            TextButton(
-              onPressed: () => Navigator.of(dialogCtx).pop(),
-              child: Text(appText(dialogCtx, 'HỦY', 'CANCEL')),
-            ),
-            FilledButton(
-              onPressed: () {
-                final num = int.tryParse(controller.text.trim());
-                if (num != null && num >= 1) {
-                  Navigator.of(dialogCtx).pop(num);
-                }
-              },
-              child: Text(appText(dialogCtx, 'XÁC NHẬN', 'CONFIRM')),
-            ),
-          ],
-        );
-      },
+      builder: (_) => _CourtNumberDialog(
+        initial: current,
+        maxCourtNumber: _maxCourtNumber,
+      ),
     );
     if (result != null && mounted) {
       _selectCourtNumber(result);
@@ -182,7 +142,7 @@ class _SetupScreenState extends State<SetupScreen> {
   void _onCameraIdSelected(String id) {
     setState(() {
       _cameraId = id;
-      _cameraNameController.text = 'Camera ${id.replaceAll('CAM-', '')}';
+      _cameraName = 'Camera ${id.replaceAll('CAM-', '')}';
     });
   }
 
@@ -240,8 +200,8 @@ class _SetupScreenState extends State<SetupScreen> {
   Future<void> _save() async {
     if (_saving || !(_formKey.currentState?.validate() ?? false)) return;
 
-    final cameraName = _cameraNameController.text.trim().isNotEmpty
-        ? _cameraNameController.text.trim()
+    final cameraName = _cameraName.trim().isNotEmpty
+        ? _cameraName.trim()
         : _cameraId;
 
     setState(() => _saving = true);
@@ -254,10 +214,9 @@ class _SetupScreenState extends State<SetupScreen> {
         cameraName: cameraName,
         cameraPosition: '',
       );
+      // Cổng API không chỉnh trên màn này: giữ nguyên giá trị đã lưu.
       if (widget.persistOnSave) {
         await _config.saveIdentity(identity);
-        final port = int.tryParse(_apiPortController.text.trim()) ?? 8080;
-        await _config.saveApiPort(port);
       }
       if (!mounted) return;
       widget.onConfigured(identity);
@@ -331,7 +290,7 @@ class _SetupScreenState extends State<SetupScreen> {
             title: appText(context, 'SÂN THI ĐẤU', 'COURT'),
           ),
           const SizedBox(height: 10),
-          // Stepper bar: [-]  SÂN X  [+] (Tăng giảm tự do không giới hạn 20 sân)
+          // Stepper bar: [-]  SÂN X  [+] (từ 1 tới _maxCourtNumber)
           Container(
             padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
             decoration: BoxDecoration(
@@ -371,7 +330,9 @@ class _SetupScreenState extends State<SetupScreen> {
                   ),
                 ),
                 IconButton(
-                  onPressed: () => _selectCourtNumber(courtNumber + 1),
+                  onPressed: courtNumber < _maxCourtNumber
+                      ? () => _selectCourtNumber(courtNumber + 1)
+                      : null,
                   icon: const Icon(Icons.add_circle_outline_rounded),
                   color: const Color(0xFF1565C0),
                   iconSize: 28,
@@ -502,9 +463,9 @@ class _SetupScreenState extends State<SetupScreen> {
             color: Color(0xFF64748B),
           ),
           const SizedBox(width: 8),
-          const Text(
-            'Device ID: ',
-            style: TextStyle(
+          Text(
+            appText(context, 'Mã thiết bị: ', 'Device ID: '),
+            style: const TextStyle(
               fontSize: 11.5,
               fontWeight: FontWeight.w600,
               color: Color(0xFF64748B),
@@ -727,6 +688,93 @@ class _SetupScreenState extends State<SetupScreen> {
               _buildSaveButton(),
             ],
           ),
+        ),
+      ],
+    );
+  }
+}
+
+/// Hộp thoại nhập số sân (1…[maxCourtNumber]). Là StatefulWidget để
+/// TextEditingController được dispose sau khi hộp thoại đóng hẳn (dispose
+/// ngay sau showDialog có thể chạy trước khi hiệu ứng đóng kết thúc).
+class _CourtNumberDialog extends StatefulWidget {
+  const _CourtNumberDialog({
+    required this.initial,
+    required this.maxCourtNumber,
+  });
+
+  final int initial;
+  final int maxCourtNumber;
+
+  @override
+  State<_CourtNumberDialog> createState() => _CourtNumberDialogState();
+}
+
+class _CourtNumberDialogState extends State<_CourtNumberDialog> {
+  late final TextEditingController _controller = TextEditingController(
+    text: widget.initial.toString(),
+  );
+  bool _invalid = false;
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
+  }
+
+  void _submit() {
+    final number = int.tryParse(_controller.text.trim());
+    if (number == null || number < 1 || number > widget.maxCourtNumber) {
+      setState(() => _invalid = true);
+      return;
+    }
+    Navigator.of(context).pop(number);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final maxCourt = widget.maxCourtNumber;
+    return AlertDialog(
+      title: Text(
+        appText(context, 'Nhập số sân', 'Enter court number'),
+        style: const TextStyle(fontSize: 16, fontWeight: FontWeight.w800),
+      ),
+      content: TextField(
+        controller: _controller,
+        keyboardType: TextInputType.number,
+        inputFormatters: [
+          FilteringTextInputFormatter.digitsOnly,
+          LengthLimitingTextInputFormatter(maxCourt.toString().length),
+        ],
+        autofocus: true,
+        onChanged: (_) {
+          if (_invalid) setState(() => _invalid = false);
+        },
+        onSubmitted: (_) => _submit(),
+        decoration: InputDecoration(
+          hintText: appText(
+            context,
+            'Ví dụ: 1, 2, 25...',
+            'Example: 1, 2, 25...',
+          ),
+          errorText: _invalid
+              ? appText(
+                  context,
+                  'Số sân từ 1 đến $maxCourt',
+                  'Court number must be 1 to $maxCourt',
+                )
+              : null,
+          border: const OutlineInputBorder(),
+        ),
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.of(context).pop(),
+          child: Text(appText(context, 'HỦY', 'CANCEL')),
+        ),
+        FilledButton(
+          onPressed: _submit,
+          child: Text(appText(context, 'XÁC NHẬN', 'CONFIRM')),
         ),
       ],
     );

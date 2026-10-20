@@ -52,9 +52,11 @@ String _cleanColor(Object? value, String fallback) {
   return _colorPattern.hasMatch(text) ? text.toUpperCase() : fallback;
 }
 
+// Số không hữu hạn (Infinity/NaN, ví dụ JSON "1e999") không đổi được sang
+// int: `toInt()` sẽ ném UnsupportedError (lỗi 500). Coi như giá trị sai.
 int _readInt(Object? value, int fallback) {
   if (value is int) return value;
-  if (value is num) return value.toInt();
+  if (value is num) return value.isFinite ? value.toInt() : fallback;
   if (value is String) return int.tryParse(value.trim()) ?? fallback;
   return fallback;
 }
@@ -62,9 +64,27 @@ int _readInt(Object? value, int fallback) {
 int? _readNullableInt(Object? value) {
   if (value == null) return null;
   if (value is int) return value;
-  if (value is num) return value.toInt();
+  if (value is num) return value.isFinite ? value.toInt() : null;
   if (value is String) return int.tryParse(value.trim());
   return null;
+}
+
+/// Ném 422 nếu [value] (hoặc phần tử lồng bên trong lệnh) là số không hữu
+/// hạn: lệnh có "1e999" bị từ chối rõ ràng thay vì âm thầm dùng mặc định.
+void _rejectNonFinite(Object? value, [int depth = 0]) {
+  if (value is double && !value.isFinite) {
+    throw const ScoreboardException(422, 'invalid_number', 'Giá trị số không hợp lệ.');
+  }
+  if (depth >= 4) return;
+  if (value is Map) {
+    for (final item in value.values) {
+      _rejectNonFinite(item, depth + 1);
+    }
+  } else if (value is List) {
+    for (final item in value) {
+      _rejectNonFinite(item, depth + 1);
+    }
+  }
 }
 
 bool _readBool(Object? value, bool fallback) {
@@ -218,9 +238,11 @@ class ScoreRules {
     check(const [1, 3, 5, 7].contains(bestOf), 'Số set phải là 1, 3, 5 hoặc 7.');
     check(scoring == 'sideout' || scoring == 'rally', 'Cách tính điểm không hợp lệ.');
     check(gamesPerSet >= 1 && gamesPerSet <= 10, 'Số game mỗi set phải từ 1 đến 10.');
+    // Mốc tie-break thấp hơn (số game - 1) làm set kết thúc trước khi có đội
+    // đạt đủ số game (ví dụ 6 game/set, tie-break ở 4-4 → thắng set 5-4).
     check(
-      tiebreakAt >= 1 && tiebreakAt <= gamesPerSet,
-      'Mốc tie-break phải từ 1 đến số game mỗi set.',
+      tiebreakAt >= math.max(1, gamesPerSet - 1) && tiebreakAt <= gamesPerSet,
+      'Mốc tie-break phải bằng số game mỗi set hoặc nhỏ hơn 1.',
     );
     check(tiebreakPoints >= 1 && tiebreakPoints <= 20, 'Điểm tie-break phải từ 1 đến 20.');
 
@@ -235,6 +257,47 @@ class ScoreRules {
       tiebreakAt: tiebreakAt,
       tiebreakPoints: tiebreakPoints,
     );
+  }
+
+  /// Như [merge] nhưng dùng cho dữ liệu đã lưu: nếu cả bộ không hợp lệ thì
+  /// áp từng trường, trường sai giữ giá trị của [base] thay vì bỏ cả bộ luật.
+  factory ScoreRules.mergeLenient(ScoreRules base, Map<String, dynamic> json) {
+    try {
+      return ScoreRules.merge(base, json);
+    } on ScoreboardException {
+      var rules = base;
+      for (final key in const [
+        'pointsToWin',
+        'winBy',
+        'cap',
+        'bestOf',
+        'scoring',
+        'doubles',
+        'gamesPerSet',
+        'tiebreakAt',
+        'tiebreakPoints',
+      ]) {
+        if (!json.containsKey(key)) continue;
+        try {
+          rules = ScoreRules.merge(rules, {key: json[key]});
+        } on ScoreboardException {
+          // Trường này hỏng: giữ giá trị đang có.
+        }
+      }
+      // gamesPerSet và tiebreakAt ràng buộc lẫn nhau (ví dụ 4 game, tie-break
+      // ở 3): áp riêng từng trường sẽ bị từ chối cả hai, nên thử áp cùng lúc.
+      if (json.containsKey('gamesPerSet') && json.containsKey('tiebreakAt')) {
+        try {
+          rules = ScoreRules.merge(rules, {
+            'gamesPerSet': json['gamesPerSet'],
+            'tiebreakAt': json['tiebreakAt'],
+          });
+        } on ScoreboardException {
+          // Cặp giá trị này hỏng: giữ giá trị đang có.
+        }
+      }
+      return rules;
+    }
   }
 
   int get setsToWin => bestOf ~/ 2 + 1;
@@ -423,11 +486,15 @@ class ScoreOverlayConfig {
   factory ScoreOverlayConfig.fromJson(Object? value) {
     final json = _readMap(value);
     final config = ScoreOverlayConfig();
-    try {
-      config.patch(json);
-    } on ScoreboardException {
-      // Dữ liệu lưu cũ/hỏng: dùng mặc định.
-      return ScoreOverlayConfig();
+    // Áp từng trường riêng: dữ liệu lưu cũ/hỏng ở một trường chỉ làm trường đó
+    // về mặc định, các trường khác giữ nguyên.
+    for (final entry in json.entries) {
+      if (entry.key == 'banner') continue;
+      try {
+        config.patch({entry.key: entry.value});
+      } on ScoreboardException {
+        // Trường này hỏng: giữ mặc định.
+      }
     }
     final banner = _readMap(json['banner']);
     config.bannerText = _cleanText(banner['text'], maxLength: 80);
@@ -578,7 +645,16 @@ class SetScore {
   final int? tbA;
   final int? tbB;
 
-  const SetScore(this.a, this.b, {this.tbA, this.tbB});
+  /// Set do lệnh `setScore` (ghi đè số set thắng) thêm vào, không biết tỉ số
+  /// thật: [a]/[b] chỉ đánh dấu đội thắng (1-0 hoặc 0-1). Overlay hiện "–".
+  final bool synthetic;
+
+  const SetScore(this.a, this.b, {this.tbA, this.tbB, this.synthetic = false});
+
+  /// Set đánh dấu [team] thắng (tỉ số không rõ).
+  factory SetScore.placeholder(String team) => team == 'A'
+      ? const SetScore(1, 0, synthetic: true)
+      : const SetScore(0, 1, synthetic: true);
 
   factory SetScore.fromJson(Object? value) {
     final json = _readMap(value);
@@ -587,7 +663,19 @@ class SetScore {
       math.max(0, _readInt(json['b'], 0)),
       tbA: _readNullableInt(json['tbA']),
       tbB: _readNullableInt(json['tbB']),
+      synthetic: _readBool(json['synthetic'], false),
     );
+  }
+
+  /// Đội thắng set ('A' | 'B'), null nếu hoà (dữ liệu lạ).
+  String? get winner {
+    if (a != b) return a > b ? 'A' : 'B';
+    final tieA = tbA;
+    final tieB = tbB;
+    if (tieA != null && tieB != null && tieA != tieB) {
+      return tieA > tieB ? 'A' : 'B';
+    }
+    return null;
   }
 
   Map<String, dynamic> toJson() => {
@@ -595,8 +683,24 @@ class SetScore {
     'b': b,
     if (tbA != null) 'tbA': tbA,
     if (tbB != null) 'tbB': tbB,
+    if (synthetic) 'synthetic': true,
   };
 }
+
+/// Phiên bản JSON trạng thái (trường `v`). 2: thêm `setRallies` và
+/// `sets[].synthetic`.
+const int scoreboardStateVersion = 2;
+
+/// Đội giao điểm thứ [pointsPlayed] + 1 của tie-break tennis khi [first] giao
+/// điểm đầu: người giao đầu giao 1 điểm, sau đó mỗi bên giao 2 điểm
+/// (A, B, B, A, A, B, B, ...).
+String scoreboardTiebreakServer(String first, int pointsPlayed) =>
+    _firstServerServesTiebreakPoint(pointsPlayed)
+    ? first
+    : scoreboardOtherTeam(first);
+
+bool _firstServerServesTiebreakPoint(int pointsPlayed) =>
+    ((pointsPlayed + 1) ~/ 2).isEven;
 
 class ScoreCore {
   String sport;
@@ -621,6 +725,10 @@ class ScoreCore {
   String? tiebreakFirstServer;
   bool sidesSwapped;
 
+  /// Số pha bóng đã đánh trong set hiện tại (kể cả pha side-out không có
+  /// điểm). Dùng để biết set đã thật sự bắt đầu chưa khi tỉ số vẫn 0-0.
+  int setRallies;
+
   /// 'playing' | 'finished'
   String status;
   String? winner;
@@ -641,6 +749,7 @@ class ScoreCore {
     this.tiebreak = false,
     this.tiebreakFirstServer,
     this.sidesSwapped = false,
+    this.setRallies = 0,
     this.status = 'playing',
     this.winner,
   }) : sets = sets ?? <SetScore>[];
@@ -661,12 +770,12 @@ class ScoreCore {
   factory ScoreCore.fromJson(Map<String, dynamic> json) {
     final sportValue = json['sport']?.toString() ?? 'pickleball';
     final sport = scoreboardSports.contains(sportValue) ? sportValue : 'pickleball';
-    ScoreRules rules;
-    try {
-      rules = ScoreRules.merge(ScoreRules.preset(sport), _readMap(json['rules']));
-    } on ScoreboardException {
-      rules = ScoreRules.preset(sport);
-    }
+    // v1 (bản cũ) chưa có `setRallies`.
+    final version = _readInt(json['v'], 1);
+    final rules = ScoreRules.mergeLenient(
+      ScoreRules.preset(sport),
+      _readMap(json['rules']),
+    );
     final points = _readMap(json['points']);
     final games = _readMap(json['games']);
     final setsWon = _readMap(json['setsWon']);
@@ -678,15 +787,16 @@ class ScoreCore {
 
     final winnerValue = json['winner']?.toString();
     final tbFirst = json['tiebreakFirstServer']?.toString();
-    return ScoreCore(
+    final core = ScoreCore(
       sport: sport,
       rules: rules,
       pointsA: math.max(0, _readInt(points['a'], 0)),
       pointsB: math.max(0, _readInt(points['b'], 0)),
       gamesA: math.max(0, _readInt(games['a'], 0)),
       gamesB: math.max(0, _readInt(games['b'], 0)),
+      // Tối đa 9 set thắng mỗi đội (xem [overwrite]) + set hoà lạ.
       sets: setsJson is List
-          ? setsJson.take(9).map(SetScore.fromJson).toList()
+          ? setsJson.take(20).map(SetScore.fromJson).toList()
           : <SetScore>[],
       setsWonA: math.max(0, _readInt(setsWon['a'], 0)),
       setsWonB: math.max(0, _readInt(setsWon['b'], 0)),
@@ -696,9 +806,15 @@ class ScoreCore {
       tiebreak: _readBool(json['tiebreak'], false),
       tiebreakFirstServer: tbFirst == 'A' || tbFirst == 'B' ? tbFirst : null,
       sidesSwapped: _readBool(json['sidesSwapped'], false),
+      setRallies: version >= 2
+          ? math.max(0, _readInt(json['setRallies'], 0))
+          : 0,
       status: json['status'] == 'finished' ? 'finished' : 'playing',
       winner: winnerValue == 'A' || winnerValue == 'B' ? winnerValue : null,
     );
+    core._reconcileSets();
+    core.normalize();
+    return core;
   }
 
   ScoreCore copy() => ScoreCore(
@@ -717,6 +833,7 @@ class ScoreCore {
     tiebreak: tiebreak,
     tiebreakFirstServer: tiebreakFirstServer,
     sidesSwapped: sidesSwapped,
+    setRallies: setRallies,
     status: status,
     winner: winner,
   );
@@ -734,6 +851,18 @@ class ScoreCore {
       setsWonA == 0 &&
       setsWonB == 0 &&
       status == 'playing';
+
+  /// Chưa có pha bóng nào trong set hiện tại (tỉ số 0-0, chưa side-out).
+  bool get atSetStart =>
+      setRallies == 0 &&
+      pointsA == 0 &&
+      pointsB == 0 &&
+      gamesA == 0 &&
+      gamesB == 0;
+
+  /// Môn/luật có người giao 1/2 (pickleball đánh đôi side-out).
+  bool get usesServerNumbers =>
+      rules.scoring == 'sideout' && rules.doubles && !isTennis;
 
   int currentSetNumber() {
     if (finished) return math.max(1, sets.length);
@@ -776,8 +905,9 @@ class ScoreCore {
 
   void winRally(String team) {
     _ensurePlaying();
+    setRallies += 1;
     if (isTennis) {
-      _tennisPoint(team, switchServeInTiebreak: true);
+      _tennisPoint(team);
       return;
     }
     if (rules.scoring == 'sideout' && serving != 'none') {
@@ -812,7 +942,8 @@ class ScoreCore {
       for (var i = 0; i < delta && !finished; i++) {
         final setsBefore = sets.length;
         if (isTennis) {
-          _tennisPoint(team, switchServeInTiebreak: false);
+          // Cùng luật đổi giao tie-break như điểm thường.
+          _tennisPoint(team);
         } else {
           _setPoints(team, _points(team) + 1);
           _checkSetEnd();
@@ -827,6 +958,8 @@ class ScoreCore {
       if (pointsA >= 4 && pointsB <= 2) pointsA = 3;
       if (pointsB >= 4 && pointsA <= 2) pointsB = 3;
     }
+    // Bớt điểm tie-break: người giao tính lại theo tổng điểm.
+    _syncTiebreakServer();
   }
 
   /// Ghi đè điểm/set trực tiếp (tích hợp tablet). Không áp luật.
@@ -850,16 +983,26 @@ class ScoreCore {
     if (scoreB != null) pointsB = scoreB;
     if (gamesAValue != null) gamesA = gamesAValue;
     if (gamesBValue != null) gamesB = gamesBValue;
-    if (setsA != null) setsWonA = math.min(setsA, 9);
-    if (setsB != null) setsWonB = math.min(setsB, 9);
-    if (json.containsKey('serving')) {
+    if (setsA != null || setsB != null) {
+      if (setsA != null) setsWonA = math.min(setsA, 9);
+      if (setsB != null) setsWonB = math.min(setsB, 9);
+      // Giữ danh sách set khớp số set thắng (số set hiện tại, cột set).
+      final setsBefore = sets.length;
+      _reconcileSets();
+      if (sets.length != setsBefore) setRallies = 0;
+    }
+    final servingGiven = json.containsKey('serving');
+    if (servingGiven) {
       serving = _readTeam(json['serving'], allowNone: true);
     }
     if (isTennis) {
       final atTiebreak =
           gamesA == rules.tiebreakAt && gamesB == rules.tiebreakAt;
-      if (atTiebreak && !tiebreak) {
-        tiebreakFirstServer = serving == 'none' ? null : serving;
+      if (atTiebreak && (!tiebreak || servingGiven)) {
+        // Suy ra người giao đầu tie-break từ người đang giao và tổng điểm.
+        tiebreakFirstServer = serving == 'none'
+            ? null
+            : _tiebreakFirstFor(serving, pointsA + pointsB);
       }
       tiebreak = atTiebreak;
       if (!atTiebreak) tiebreakFirstServer = null;
@@ -874,10 +1017,14 @@ class ScoreCore {
         winner = null;
       }
     }
+    normalize();
   }
 
   void setServe(String team, int? number) {
     final changedTeam = team != serving;
+    // Đo trước khi đổi: chưa có pha bóng nào trong set thì đây là đội giao
+    // đầu set (sau side-out tỉ số vẫn có thể 0-0 nhưng set đã bắt đầu).
+    final atStart = atSetStart;
     serving = team;
     if (team == 'none') {
       serverNumber = 1;
@@ -885,16 +1032,34 @@ class ScoreCore {
       if (number != 1 && number != 2) {
         throw const ScoreboardException(422, 'invalid_server', 'Người giao phải là 1 hoặc 2.');
       }
-      serverNumber = number;
+      // Người giao 2 chỉ có nghĩa với pickleball đánh đôi side-out.
+      serverNumber = usesServerNumbers ? number : 1;
     } else if (changedTeam) {
       serverNumber = 1;
     }
-    if (pointsA == 0 && pointsB == 0 && gamesA == 0 && gamesB == 0 && team != 'none') {
+    if (atStart && team != 'none') {
       setFirstServer = team;
     }
-    if (tiebreak && pointsA == 0 && pointsB == 0 && team != 'none') {
-      tiebreakFirstServer = team;
+    if (tiebreak && team != 'none') {
+      // Sửa người giao giữa tie-break: suy lại người giao đầu để các điểm sau
+      // tiếp tục luân phiên đúng từ người vừa chọn.
+      tiebreakFirstServer = _tiebreakFirstFor(team, pointsA + pointsB);
     }
+  }
+
+  /// Mở lại trận bị kết thúc sớm (lệnh "finish" trước khi có đội đủ số set).
+  void reopen() {
+    if (!finished) return;
+    if (math.max(setsWonA, setsWonB) >= rules.setsToWin) {
+      throw const ScoreboardException(
+        409,
+        'match_decided',
+        'Trận đã có đội thắng đủ số set nên không mở lại được. '
+            'Dùng "Hoàn tác" (undo) để sửa điểm.',
+      );
+    }
+    status = 'playing';
+    winner = null;
   }
 
   /// Kết thúc set hiện tại theo tỉ số đang có (đội cao điểm hơn thắng).
@@ -946,6 +1111,56 @@ class ScoreCore {
     winner = setsWonA == setsWonB ? null : (setsWonA > setsWonB ? 'A' : 'B');
   }
 
+  /// Chuẩn hoá bất biến sau khi nạp JSON hoặc ghi đè (dữ liệu cũ, tablet gửi
+  /// lệch): không đổi trạng thái hợp lệ nên gọi nhiều lần vẫn an toàn.
+  void normalize() {
+    if (serving != 'A' && serving != 'B') serving = 'none';
+    if (serving == 'none' || !usesServerNumbers) serverNumber = 1;
+    if (!isTennis) tiebreak = false;
+    if (!tiebreak) tiebreakFirstServer = null;
+    if (setRallies < 0) setRallies = 0;
+    // Đủ số set thắng thì trận đã kết thúc.
+    if (math.max(setsWonA, setsWonB) >= rules.setsToWin) status = 'finished';
+    winner = finished && setsWonA != setsWonB
+        ? (setsWonA > setsWonB ? 'A' : 'B')
+        : null;
+  }
+
+  /// Giữ danh sách set khớp số set thắng: thiếu thì thêm set đánh dấu
+  /// ([SetScore.synthetic]), thừa thì bỏ set gần nhất của đội đó (ưu tiên set
+  /// đánh dấu).
+  void _reconcileSets() {
+    for (final team in const ['A', 'B']) {
+      final target = team == 'A' ? setsWonA : setsWonB;
+      var count = sets.where((set) => set.winner == team).length;
+      while (count > target) {
+        var index = sets.lastIndexWhere(
+          (set) => set.synthetic && set.winner == team,
+        );
+        if (index < 0) index = sets.lastIndexWhere((set) => set.winner == team);
+        sets.removeAt(index);
+        count -= 1;
+      }
+      while (count < target) {
+        sets.add(SetScore.placeholder(team));
+        count += 1;
+      }
+    }
+  }
+
+  /// Người giao đầu tie-break sao cho [server] giao điểm thứ [pointsPlayed] + 1.
+  static String _tiebreakFirstFor(String server, int pointsPlayed) =>
+      _firstServerServesTiebreakPoint(pointsPlayed)
+      ? server
+      : scoreboardOtherTeam(server);
+
+  /// Tie-break: người giao tính từ người giao đầu và tổng điểm đã đánh.
+  void _syncTiebreakServer() {
+    final first = tiebreakFirstServer;
+    if (!tiebreak || first == null || serving == 'none') return;
+    serving = scoreboardTiebreakServer(first, pointsA + pointsB);
+  }
+
   // ----------------------------------------------------------
   // INTERNAL
   // ----------------------------------------------------------
@@ -966,7 +1181,7 @@ class ScoreCore {
     }
   }
 
-  void _tennisPoint(String team, {required bool switchServeInTiebreak}) {
+  void _tennisPoint(String team) {
     final other = scoreboardOtherTeam(team);
     if (tiebreak) {
       _setPoints(team, _points(team) + 1);
@@ -982,11 +1197,7 @@ class ScoreCore {
         return;
       }
       // Tie-break: đổi giao sau điểm 1, rồi mỗi 2 điểm (sau điểm 3, 5, ...).
-      if (switchServeInTiebreak &&
-          serving != 'none' &&
-          (pointsA + pointsB).isOdd) {
-        serving = scoreboardOtherTeam(serving);
-      }
+      _syncTiebreakServer();
       return;
     }
 
@@ -1028,6 +1239,7 @@ class ScoreCore {
     bool afterTiebreak = false,
   }) {
     sets.add(score);
+    setRallies = 0;
     if (team == 'A') {
       setsWonA += 1;
     } else {
@@ -1182,7 +1394,7 @@ class ScoreboardState {
   Map<String, dynamic> toJson({required int nowMs, String? epoch}) {
     final display = core.display();
     return {
-      'v': 1,
+      'v': scoreboardStateVersion,
       'rev': rev,
       'epoch': ?epoch,
       'matchId': matchId,
@@ -1204,6 +1416,7 @@ class ScoreboardState {
       'tiebreak': core.tiebreak,
       'tiebreakFirstServer': core.tiebreakFirstServer,
       'sidesSwapped': core.sidesSwapped,
+      'setRallies': core.setRallies,
       'status': core.status,
       'winner': core.winner,
       'overlay': overlay.toJson(),
@@ -1235,6 +1448,10 @@ enum ScoreboardChange {
 
   /// Thay đổi tên, thông tin, overlay, đồng hồ: không hoàn tác.
   meta,
+
+  /// Chuyển sang trận mới (`newMatch`, `config` có `reset`): lịch sử hoàn tác
+  /// của trận cũ bị xoá.
+  newMatch,
 }
 
 /// Áp một lệnh lên [state]. Trả về loại thay đổi để service quyết định có
@@ -1245,6 +1462,7 @@ ScoreboardChange applyScoreboardAction(
   required int nowMs,
 }) {
   final name = action['action']?.toString() ?? '';
+  _rejectNonFinite(action);
   final core = state.core;
   switch (name) {
     case 'point':
@@ -1264,16 +1482,11 @@ ScoreboardChange applyScoreboardAction(
       final nextServer = core.serving == 'none'
           ? 'A'
           : scoreboardOtherTeam(core.serving);
-      final atSetStart =
-          core.pointsA == 0 &&
-          core.pointsB == 0 &&
-          core.gamesA == 0 &&
-          core.gamesB == 0;
-      final doublesSideout =
-          core.rules.scoring == 'sideout' &&
-          core.rules.doubles &&
-          !core.isTennis;
-      core.setServe(nextServer, atSetStart && doublesSideout ? 2 : 1);
+      // Đầu set pickleball đánh đôi: đội giao đầu chỉ có người giao 2.
+      core.setServe(
+        nextServer,
+        core.atSetStart && core.usesServerNumbers ? 2 : 1,
+      );
       return ScoreboardChange.score;
     case 'swapSides':
       core.sidesSwapped = !core.sidesSwapped;
@@ -1285,8 +1498,7 @@ ScoreboardChange applyScoreboardAction(
       core.finishMatch();
       return ScoreboardChange.score;
     case 'reopen':
-      core.status = 'playing';
-      core.winner = null;
+      core.reopen();
       return ScoreboardChange.score;
     case 'setScore':
       core.overwrite(action);
@@ -1308,7 +1520,7 @@ ScoreboardChange applyScoreboardAction(
         state.teamB = ScoreTeam.initial('B');
       }
       if (state.overlay.scene == 'result') state.overlay.scene = 'scorebar';
-      return ScoreboardChange.score;
+      return ScoreboardChange.newMatch;
     case 'config':
       final sportValue = action['sport']?.toString() ?? core.sport;
       if (!scoreboardSports.contains(sportValue)) {
@@ -1331,6 +1543,7 @@ ScoreboardChange applyScoreboardAction(
       if (reset) {
         state.matchId = scoreboardMatchId(nowMs);
         state.timer.reset();
+        return ScoreboardChange.newMatch;
       }
       return ScoreboardChange.score;
     case 'setTeam':

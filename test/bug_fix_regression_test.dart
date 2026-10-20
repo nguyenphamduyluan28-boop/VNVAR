@@ -42,18 +42,18 @@ void main() {
   });
 
   group('QR auto-start destinations', () {
-    test('known platforms and local servers start automatically', () {
+    test('public platforms need confirmation; partner and local servers start automatically', () {
       expect(
         isTrustedAutoStartDestination('rtmp://a.rtmp.youtube.com/live2/k'),
-        isTrue,
+        isFalse,
       );
       expect(
         isTrustedAutoStartDestination('rtmps://live-api-s.facebook.com:443/rtmp/k'),
-        isTrue,
+        isFalse,
       );
       expect(
         isTrustedAutoStartDestination('rtmp://push-rtmp-l11.tiktokcdn.com/game/k'),
-        isTrue,
+        isFalse,
       );
       expect(
         isTrustedAutoStartDestination('rtmp://media.aqvision.net:11935/live/cam1'),

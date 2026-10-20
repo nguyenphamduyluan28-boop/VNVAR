@@ -56,6 +56,164 @@ int effectiveWebRtcPeerLimit(String thermalState) {
   }
 }
 
+/// Mọi alias của API Check VAR (mọi method).
+const Set<String> checkVarRoutePaths = {
+  '/checkvar',
+  '/check-var',
+  '/checkpoint',
+  '/recording/checkvar',
+};
+
+final RegExp _segmentDownloadedAckPattern = RegExp(
+  r'^/segments/[^/]+/downloaded$',
+);
+
+/// Bucket giới hạn tần suất cho một request. Check VAR và ACK tải xong có
+/// hạn mức riêng để không tranh hạn mức "control" (30/phút) với trim/stop:
+/// tablet ACK hàng loạt segment không được làm Check VAR bị 429.
+({String bucket, int maximum, Duration window}) cameraServerRateLimitFor({
+  required String path,
+  required String method,
+}) {
+  const minute = Duration(minutes: 1);
+  if (path.startsWith('/api/score') || path == '/control' || path == '/overlay') {
+    // Trọng tài bấm liên tục + nhiều overlay/preview: hạn mức riêng, không
+    // dùng chung hạn mức "control" (30 lệnh/phút) của API ghi hình.
+    return (bucket: 'scoreboard', maximum: 600, window: minute);
+  }
+  if (path == '/webrtc/offer') {
+    return (bucket: 'webrtc-offer', maximum: 30, window: minute);
+  }
+  if (path == '/webrtc/epoch') {
+    return (bucket: 'webrtc-epoch', maximum: 120, window: minute);
+  }
+  if (path == '/webrtc/ice') {
+    return (bucket: 'webrtc-ice', maximum: 120, window: minute);
+  }
+  if (checkVarRoutePaths.contains(path)) {
+    return (bucket: 'checkvar', maximum: 60, window: minute);
+  }
+  if (_segmentDownloadedAckPattern.hasMatch(path)) {
+    return (bucket: 'ack', maximum: 600, window: minute);
+  }
+  if (method != 'GET') {
+    return (bucket: 'control', maximum: 30, window: minute);
+  }
+  return (bucket: 'general', maximum: 240, window: minute);
+}
+
+/// Khoá phiên tải clip của một tablet: header `X-Peer-ID` nếu có, ngược lại
+/// địa chỉ IP của client.
+String exportSessionOwner({
+  required String? peerId,
+  required String remoteAddress,
+}) {
+  final trimmed = peerId?.trim() ?? '';
+  if (trimmed.isNotEmpty) {
+    final safe = trimmed.replaceAll(RegExp(r'[^a-zA-Z0-9._-]'), '_');
+    return 'peer:${safe.length <= 96 ? safe : safe.substring(0, 96)}';
+  }
+  return 'ip:$remoteAddress';
+}
+
+/// Phân loại lỗi Check VAR thành mã lỗi ổn định cho tablet.
+({String errorCode, int httpStatus, bool retryable}) classifyCheckVarFailure(
+  Object error,
+) {
+  if (error is CheckVarSegmentUnavailableException) {
+    final notRecording = error.code == 'NOT_RECORDING';
+    return (
+      errorCode: error.code,
+      httpStatus: HttpStatus.conflict,
+      retryable: notRecording,
+    );
+  }
+  if (error is TrimSegmentNotFoundException) {
+    return (
+      errorCode: 'NO_SEGMENT',
+      httpStatus: HttpStatus.conflict,
+      retryable: false,
+    );
+  }
+  if (error is InvalidTrimRangeException) {
+    return (
+      errorCode: 'TRIM_FAILED',
+      httpStatus: HttpStatus.unprocessableEntity,
+      retryable: false,
+    );
+  }
+  if (error is TrimInProgressException) {
+    return (
+      errorCode: 'TRIM_FAILED',
+      httpStatus: HttpStatus.conflict,
+      retryable: true,
+    );
+  }
+  if (error is TrimProcessingException) {
+    return (
+      errorCode: 'TRIM_FAILED',
+      httpStatus: HttpStatus.internalServerError,
+      retryable: true,
+    );
+  }
+  return (
+    errorCode: 'INTERNAL',
+    httpStatus: HttpStatus.internalServerError,
+    retryable: true,
+  );
+}
+
+/// Kết quả lỗi của một Check VAR, được lưu như kết quả thành công để
+/// `GET /checkvar/jobs/{requestId}` và lần gửi lại trả đúng lỗi.
+Map<String, dynamic> checkVarFailureResult({
+  required String requestId,
+  required DateTime requestedAt,
+  required Object error,
+  DateTime? now,
+}) {
+  final failure = classifyCheckVarFailure(error);
+  return <String, dynamic>{
+    'success': false,
+    'requestId': requestId,
+    'status': 'FAILED',
+    'errorCode': failure.errorCode,
+    'retryable': failure.retryable,
+    'httpStatus': failure.httpStatus,
+    'message': userFacingError(error),
+    'requestedAt': requestedAt.toIso8601String(),
+    'timestamp': (now ?? DateTime.now()).millisecondsSinceEpoch,
+  };
+}
+
+/// HTTP status trả cho một kết quả Check VAR đã lưu.
+int checkVarResponseStatus(Map<String, dynamic> result) {
+  if (result['status'] != 'FAILED') return HttpStatus.ok;
+  final status = result['httpStatus'];
+  return status is int ? status : HttpStatus.internalServerError;
+}
+
+/// Video track của camera chưa sẵn sàng (runtime đang mở lại camera) khi
+/// mở recorder. Là [StateError] để giữ tương thích với nơi bắt lỗi cũ.
+class CameraVideoTrackUnavailableError extends StateError {
+  CameraVideoTrackUnavailableError() : super('Camera video track unavailable.');
+}
+
+/// Số giây gợi ý trong `Retry-After` khi mở recorder lỗi tạm thời.
+const int transientRecorderStartRetryAfterSeconds = 2;
+
+/// Lỗi mở recorder là tạm thời (trả 503 + `Retry-After` thay vì 500).
+bool isTransientRecorderStartError(Object error) =>
+    error is CameraVideoTrackUnavailableError;
+
+/// Nội dung JSON khi xử lý yêu cầu lỗi: lỗi tạm thời (503) ghi
+/// `Service Unavailable` và `retryable: true`; lỗi khác giữ nguyên phản hồi
+/// 500 như trước.
+Map<String, dynamic> transientRequestErrorBody({required bool transient}) => {
+  'error': transient ? 'Service Unavailable' : 'Internal Server Error',
+  'message': 'Camera Station không thể xử lý yêu cầu.',
+  if (transient) 'retryable': true,
+};
+
 /// Trạng thái runtime mà /start không được tự gắn recorder: camera đang được
 /// đổi cấu hình, khôi phục hoặc tạm dừng (track hiện tại sắp bị huỷ). Runtime
 /// sẽ tự gọi ensureRecording() khi camera mở lại.
@@ -626,12 +784,6 @@ class CameraServer {
       // video track đang chạy nên không được đóng camera/peer connection.
       // ========================================================
 
-      const checkVarPaths = {
-        '/checkvar',
-        '/check-var',
-        '/checkpoint',
-        '/recording/checkvar',
-      };
       if (path.startsWith('/checkvar/jobs/') && method == 'GET') {
         final requestId = normalizeCheckVarRequestId(
           Uri.decodeComponent(path.substring('/checkvar/jobs/'.length)),
@@ -642,7 +794,7 @@ class CameraServer {
         await _sendJson(
           request.response,
           result != null
-              ? HttpStatus.ok
+              ? checkVarResponseStatus(result)
               : processing
               ? HttpStatus.accepted
               : HttpStatus.notFound,
@@ -656,7 +808,7 @@ class CameraServer {
         );
         return;
       }
-      if (checkVarPaths.contains(path) &&
+      if (checkVarRoutePaths.contains(path) &&
           (method == 'POST' || method == 'GET')) {
         if (_iosLifecycleSuspended) {
           request.response.headers.set(HttpHeaders.retryAfterHeader, '2');
@@ -686,9 +838,19 @@ class CameraServer {
         );
         final completed = _checkVarResults[requestId];
         if (completed != null) {
-          if (request.contentLength != 0) await request.drain<void>();
-          await _sendJson(request.response, HttpStatus.ok, completed);
-          return;
+          final retryableFailure =
+              completed['status'] == 'FAILED' && completed['retryable'] == true;
+          if (!retryableFailure) {
+            if (request.contentLength != 0) await request.drain<void>();
+            await _sendJson(
+              request.response,
+              checkVarResponseStatus(completed),
+              completed,
+            );
+            return;
+          }
+          // Lỗi tạm thời: lần gửi lại cùng requestId được chạy lại.
+          _checkVarResults.remove(requestId);
         }
         var operation = _checkVarJobs[requestId];
         if (operation == null) {
@@ -703,22 +865,36 @@ class CameraServer {
           // operation. Drain it so the keep-alive connection remains valid.
           await request.drain<void>();
         }
+        Map<String, dynamic> result;
         try {
-          final result = await operation;
-          _checkVarResults[requestId] = result;
-          if (identical(_checkVarJobs[requestId], operation)) {
-            _checkVarJobs.remove(requestId);
-          }
-          while (_checkVarResults.length > 100) {
-            _checkVarResults.remove(_checkVarResults.keys.first);
-          }
-          await _sendJson(request.response, HttpStatus.ok, result);
-        } catch (_) {
-          if (identical(_checkVarJobs[requestId], operation)) {
-            _checkVarJobs.remove(requestId);
-          }
-          rethrow;
+          result = await operation;
+        } catch (error, stackTrace) {
+          developer.log(
+            '[CHECKVAR] Request $requestId failed',
+            error: error,
+            stackTrace: stackTrace,
+            name: 'CameraServer',
+          );
+          // Lưu lỗi như một kết quả (FAILED + mã lỗi) thay vì 500 trơn để
+          // tablet tra cứu được qua /checkvar/jobs/{requestId}.
+          result = checkVarFailureResult(
+            requestId: requestId,
+            requestedAt: requestedAt,
+            error: error,
+          );
         }
+        _checkVarResults[requestId] = result;
+        if (identical(_checkVarJobs[requestId], operation)) {
+          _checkVarJobs.remove(requestId);
+        }
+        while (_checkVarResults.length > 100) {
+          _checkVarResults.remove(_checkVarResults.keys.first);
+        }
+        await _sendJson(
+          request.response,
+          checkVarResponseStatus(result),
+          result,
+        );
         return;
       }
 
@@ -881,10 +1057,22 @@ class CameraServer {
       );
 
       try {
-        await _sendJson(request.response, HttpStatus.internalServerError, {
-          'error': 'Internal Server Error',
-          'message': 'Camera Station không thể xử lý yêu cầu.',
-        });
+        // Mất video track (camera đang mở lại) là lỗi tạm thời: 503 kèm
+        // Retry-After và `retryable: true`; lỗi khác giữ nguyên phản hồi 500.
+        final transient = isTransientRecorderStartError(error);
+        if (transient) {
+          request.response.headers.set(
+            HttpHeaders.retryAfterHeader,
+            '$transientRecorderStartRetryAfterSeconds',
+          );
+        }
+        await _sendJson(
+          request.response,
+          transient
+              ? HttpStatus.serviceUnavailable
+              : HttpStatus.internalServerError,
+          transientRequestErrorBody(transient: transient),
+        );
       } catch (_) {
         // Response có thể đã đóng.
       }
@@ -897,34 +1085,11 @@ class CameraServer {
     required String method,
   }) async {
     final client = request.connectionInfo?.remoteAddress.address ?? 'unknown';
-    var bucket = 'general';
-    var maximum = 240;
-    var window = const Duration(minutes: 1);
-    if (path.startsWith('/api/score') ||
-        path == '/control' ||
-        path == '/overlay') {
-      // Trọng tài bấm liên tục + nhiều overlay/preview: hạn mức riêng, không
-      // dùng chung hạn mức "control" (30 lệnh/phút) của API ghi hình.
-      bucket = 'scoreboard';
-      maximum = 600;
-    } else if (path == '/webrtc/offer') {
-      bucket = 'webrtc-offer';
-      maximum = 30;
-      window = const Duration(minutes: 1);
-    } else if (path == '/webrtc/epoch') {
-      bucket = 'webrtc-epoch';
-      maximum = 120;
-    } else if (path == '/webrtc/ice') {
-      bucket = 'webrtc-ice';
-      maximum = 120;
-    } else if (method != 'GET') {
-      bucket = 'control';
-      maximum = 30;
-    }
+    final limit = cameraServerRateLimitFor(path: path, method: method);
     final allowed = _rateLimiter.allow(
-      '$client:$bucket',
-      maximumRequests: maximum,
-      window: window,
+      '$client:${limit.bucket}',
+      maximumRequests: limit.maximum,
+      window: limit.window,
     );
     if (allowed) return true;
     request.response.headers.set(HttpHeaders.retryAfterHeader, '5');
@@ -1031,6 +1196,9 @@ class CameraServer {
           ?.toIso8601String(),
 
       'recordingAudio': recordingService.currentSegmentHasAudio,
+      // Phiên ghi bật nhưng recorder chưa mở lại được (đang tự thử lại).
+      'recordingSuspended': recordingService.isRecordingSuspended,
+      'recordingSuspendedReason': recordingService.recordingSuspendedReason,
       'storageWarning': recordingService.lowStorageWarning,
       'storageSuspended': recordingService.storageSuspended,
       'captureState':
@@ -1132,6 +1300,8 @@ class CameraServer {
 
         'recording': true,
 
+        'recordingSuspended': recordingService.isRecordingSuspended,
+
         'alreadyRunning': true,
       });
 
@@ -1140,12 +1310,16 @@ class CameraServer {
 
     await resumeRecordingByRequest();
 
+    // Trả trạng thái thật sau khi start xong: /stop có thể chen vào hoặc
+    // recorder không mở được (phiên bị treo, đang tự thử lại).
     await _sendJson(request.response, HttpStatus.ok, {
       'success': true,
 
       'cameraId': cameraId,
 
-      'recording': true,
+      'recording': recordingService.recording,
+
+      'recordingSuspended': recordingService.isRecordingSuspended,
 
       'alreadyRunning': false,
     });
@@ -1182,6 +1356,9 @@ class CameraServer {
       _stoppedByRequest = false;
     }
 
+    // Trả trạng thái thật sau khi start hoàn tất: một /stop chen vào hoặc
+    // recorder không mở được thì không được báo `recording: true`.
+    final nowRecording = recordingService.recording;
     await _sendJson(request.response, HttpStatus.ok, {
       'success': true,
 
@@ -1191,9 +1368,11 @@ class CameraServer {
 
       'deviceId': deviceId,
 
-      'status': 'RECORDING',
+      'status': nowRecording ? 'RECORDING' : 'READY',
 
-      'recording': true,
+      'recording': nowRecording,
+
+      'recordingSuspended': recordingService.isRecordingSuspended,
 
       'alreadyRunning': alreadyRunning,
     });
@@ -1204,17 +1383,25 @@ class CameraServer {
   // ============================================================
 
   Future<void> _startRecorder() async {
+    bool cancelled() => _stoppedByRequest || _stopping;
+    if (cancelled()) return;
     final videoTrack = webRtcService.localVideoTrack;
 
     if (videoTrack == null) {
-      throw StateError('Camera video track unavailable.');
+      throw CameraVideoTrackUnavailableError();
     }
 
+    // /stop có thể đến trong lúc chờ (RecordingService.start chờ lần dừng
+    // trước): kiểm tra lại cờ dừng sau mỗi await, không mở recorder sau /stop.
     await recordingService.start(
       videoTrack: videoTrack,
       audioAvailable: webRtcService.microphoneAvailable,
       facingMode: webRtcService.currentFacingMode,
+      isCancelled: cancelled,
     );
+    // /stop đến trong lúc recorder đang mở: RecordingService.stop() đã chờ
+    // lần mở này rồi chốt lại; không báo trạng thái RECORDING sai.
+    if (cancelled() || !recordingService.recording) return;
 
     recording = true;
 
@@ -1279,6 +1466,7 @@ class CameraServer {
     required String requestId,
     required DateTime requestedAt,
   }) async {
+    final owner = _exportOwnerFor(request);
     int? requestedLookback = int.tryParse(
       request.uri.queryParameters['lookbackSeconds'] ??
           request.uri.queryParameters['lookback'] ??
@@ -1314,6 +1502,7 @@ class CameraServer {
         requestedAt: requestedAt,
         source: source,
         lookbackSeconds: lookbackSeconds,
+        owner: owner,
       ),
     );
   }
@@ -1329,7 +1518,8 @@ class CameraServer {
     if (activeStartedAt != null &&
         requestedAt.isBefore(activeStartedAt) &&
         historical == null) {
-      throw StateError(
+      throw CheckVarSegmentUnavailableException(
+        'NO_SEGMENT',
         'Không còn segment chứa thời điểm CheckVAR '
         '${requestedAt.toIso8601String()}.',
       );
@@ -1364,6 +1554,7 @@ class CameraServer {
     required DateTime requestedAt,
     required ({RecordedSegment segment, bool usedPrevious}) source,
     required int lookbackSeconds,
+    required String owner,
   }) async {
     final segment = source.segment;
     RecordedSegment checkpoint = segment;
@@ -1395,6 +1586,7 @@ class CameraServer {
           streamCopy: true,
           minimumOutputDurationMs: 500,
           precedingSegmentId: preceding?.id,
+          owner: owner,
         );
         try {
           checkpoint = await trim();
@@ -1432,6 +1624,10 @@ class CameraServer {
       'status': 'READY',
       'requestedAt': requestedAt.toIso8601String(),
       'usedPreviousSegment': source.usedPrevious,
+      // Clip đã nối thêm phần cuối segment liền trước (false nếu không cần
+      // hoặc hai file khác codec/kích thước/góc xoay nên không nối được).
+      'joinedPrecedingSegment':
+          autoTrimmed && checkpoint.joinedPrecedingSegment,
       'autoTrimmed': autoTrimmed,
       'lookbackSeconds': lookbackSeconds,
       'trimError': trimError,
@@ -1671,8 +1867,17 @@ class CameraServer {
     await _sendVideoFile(request, file, attachment: true);
   }
 
+  /// Khoá phiên tải clip của request (xem [exportSessionOwner]).
+  String _exportOwnerFor(HttpRequest request) => exportSessionOwner(
+    peerId: request.headers.value('X-Peer-ID'),
+    remoteAddress: request.connectionInfo?.remoteAddress.address ?? 'unknown',
+  );
+
   Future<void> _closeDownloadSession(HttpRequest request) async {
-    await recordingService.cleanupExportDownloads();
+    // Chỉ xoá clip của chính tablet đóng phiên (và clip mồ côi quá hạn);
+    // clip các tablet khác đang dùng được giữ nguyên.
+    final owner = _exportOwnerFor(request);
+    await recordingService.cleanupExportDownloads(owner: owner);
     onStateChanged?.call();
     await _sendJson(request.response, HttpStatus.ok, {
       'success': true,
@@ -1710,6 +1915,7 @@ class CameraServer {
         segmentId: segmentId.trim(),
         startMs: startMs.toInt(),
         endMs: endMs.toInt(),
+        owner: _exportOwnerFor(request),
       );
     } on InvalidTrimRangeException catch (error) {
       await _sendJson(request.response, HttpStatus.badRequest, {
@@ -1889,100 +2095,101 @@ class CameraServer {
       });
       return;
     }
-    // Đọc xong body TRƯỚC khi vào hàng đợi tuần tự: một tablet gửi body chậm
-    // không được chặn lượt kết nối của các tablet khác.
-    final body = await _readJson(request);
+    // Giữ chỗ TRƯỚC khi đọc body (không có await giữa kiểm tra và tăng bộ
+    // đếm), nếu không nhiều offer đến cùng lúc đều vượt qua trần 4.
     _pendingWebRtcOffers++;
-    final previous = _webRtcOfferTail;
-    final turn = Completer<void>();
-    _webRtcOfferTail = turn.future;
     try {
-      try {
-        await previous;
-      } catch (_) {
-        // A failed older offer must not poison the next handover.
+      // Đọc xong body TRƯỚC khi vào hàng đợi tuần tự: một tablet gửi body
+      // chậm không được chặn lượt kết nối của các tablet khác.
+      final body = await _readJsonOrBadRequest(request);
+      if (body == null) return;
+
+      final sdp = body['sdp'];
+      final type = body['type'];
+      if (sdp is! String || sdp.isEmpty || type is! String || type.isEmpty) {
+        await _sendBadRequest(request.response, 'Invalid WebRTC offer');
+        return;
       }
-
-      final sdp = body['sdp'] as String?;
-
-      final type = body['type'] as String?;
-
       final peerId = _peerIdForRequest(request, body);
 
-      if (sdp == null || sdp.isEmpty || type == null || type.isEmpty) {
-        await _sendJson(request.response, HttpStatus.badRequest, {
-          'error': 'Invalid WebRTC offer',
-        });
-
-        return;
-      }
-
-      developer.log('Received WebRTC offer', name: 'CameraServer');
-
-      final peerLimit = effectiveWebRtcPeerLimit(
-        thermalStateProvider?.call() ?? 'normal',
-      );
-      if (!webRtcService.hasPeer(peerId) &&
-          webRtcService.activePeerCount >= peerLimit) {
-        request.response.headers.set(HttpHeaders.retryAfterHeader, '2');
-        await _sendJson(request.response, HttpStatus.serviceUnavailable, {
-          'error': 'WebRTC peer capacity reached',
-          'retryable': true,
-          'peerId': peerId,
-          'activePeers': webRtcService.activePeerCount,
-          'maximumPeers': peerLimit,
-        });
-        return;
-      }
-
-      if (!webRtcService.cameraInitialized) {
-        request.response.headers.set(HttpHeaders.retryAfterHeader, '2');
-        await _sendJson(request.response, HttpStatus.serviceUnavailable, {
-          'error': 'Camera is not ready',
-          'retryable': true,
-          'captureState': captureStateProvider?.call(),
-          'peerId': peerId,
-        });
-        return;
-      }
-
-      late final RTCSessionDescription answer;
+      final previous = _webRtcOfferTail;
+      final turn = Completer<void>();
+      _webRtcOfferTail = turn.future;
       try {
-        answer = await webRtcService.handleOffer(
-          sdp: sdp,
-          type: type,
-          peerId: peerId,
-          maximumPeers: peerLimit,
+        try {
+          await previous;
+        } catch (_) {
+          // A failed older offer must not poison the next handover.
+        }
+
+        developer.log('Received WebRTC offer', name: 'CameraServer');
+
+        final peerLimit = effectiveWebRtcPeerLimit(
+          thermalStateProvider?.call() ?? 'normal',
         );
-      } on CameraNotReadyException {
-        // Camera vừa bị dispose trong lúc chờ hàng đợi offer.
-        await webRtcService.disposePeerConnection(peerId);
-        request.response.headers.set(HttpHeaders.retryAfterHeader, '2');
-        await _sendJson(request.response, HttpStatus.serviceUnavailable, {
-          'error': 'Camera is not ready',
-          'retryable': true,
-          'captureState': captureStateProvider?.call(),
+        if (!webRtcService.hasPeer(peerId) &&
+            webRtcService.activePeerCount >= peerLimit) {
+          request.response.headers.set(HttpHeaders.retryAfterHeader, '2');
+          await _sendJson(request.response, HttpStatus.serviceUnavailable, {
+            'error': 'WebRTC peer capacity reached',
+            'retryable': true,
+            'peerId': peerId,
+            'activePeers': webRtcService.activePeerCount,
+            'maximumPeers': peerLimit,
+          });
+          return;
+        }
+
+        if (!webRtcService.cameraInitialized) {
+          request.response.headers.set(HttpHeaders.retryAfterHeader, '2');
+          await _sendJson(request.response, HttpStatus.serviceUnavailable, {
+            'error': 'Camera is not ready',
+            'retryable': true,
+            'captureState': captureStateProvider?.call(),
+            'peerId': peerId,
+          });
+          return;
+        }
+
+        late final RTCSessionDescription answer;
+        try {
+          answer = await webRtcService.handleOffer(
+            sdp: sdp,
+            type: type,
+            peerId: peerId,
+            maximumPeers: peerLimit,
+          );
+        } on CameraNotReadyException {
+          // Camera vừa bị dispose trong lúc chờ hàng đợi offer.
+          await webRtcService.disposePeerConnection(peerId);
+          request.response.headers.set(HttpHeaders.retryAfterHeader, '2');
+          await _sendJson(request.response, HttpStatus.serviceUnavailable, {
+            'error': 'Camera is not ready',
+            'retryable': true,
+            'captureState': captureStateProvider?.call(),
+            'peerId': peerId,
+          });
+          return;
+        } catch (_) {
+          // A malformed/aborted negotiation must not consume a peer slot.
+          await webRtcService.disposePeerConnection(peerId);
+          rethrow;
+        }
+
+        await _sendJson(request.response, HttpStatus.ok, {
+          'sdp': answer.sdp,
+
+          'type': answer.type,
+
           'peerId': peerId,
         });
-        return;
-      } catch (_) {
-        // A malformed/aborted negotiation must not consume a peer slot.
-        await webRtcService.disposePeerConnection(peerId);
-        rethrow;
+
+        developer.log('WebRTC answer returned', name: 'CameraServer');
+      } finally {
+        if (!turn.isCompleted) turn.complete();
       }
-
-      await _sendJson(request.response, HttpStatus.ok, {
-        'sdp': answer.sdp,
-
-        'type': answer.type,
-
-        'peerId': peerId,
-      });
-
-      developer.log('WebRTC answer returned', name: 'CameraServer');
     } finally {
       _pendingWebRtcOffers--;
-      if (!turn.isCompleted) turn.complete();
     }
   }
 
@@ -1991,19 +2198,21 @@ class CameraServer {
   // ============================================================
 
   Future<void> _handleWebRtcIce(HttpRequest request) async {
-    final body = await _readJson(request);
+    final body = await _readJsonOrBadRequest(request);
+    if (body == null) return;
 
-    final candidate = body['candidate'] as String?;
+    final candidate = body['candidate'];
+    final sdpMid = body['sdpMid'];
 
-    final peerId = _peerIdForRequest(request, body);
-
-    if (candidate == null || candidate.isEmpty) {
-      await _sendJson(request.response, HttpStatus.badRequest, {
-        'error': 'Invalid ICE candidate',
-      });
+    if (candidate is! String ||
+        candidate.isEmpty ||
+        (sdpMid != null && sdpMid is! String)) {
+      await _sendBadRequest(request.response, 'Invalid ICE candidate');
 
       return;
     }
+
+    final peerId = _peerIdForRequest(request, body);
 
     final rawIndex = body['sdpMLineIndex'];
 
@@ -2011,14 +2220,14 @@ class CameraServer {
 
     if (rawIndex is int) {
       index = rawIndex;
-    } else if (rawIndex is num) {
+    } else if (rawIndex is num && rawIndex.isFinite) {
       index = rawIndex.toInt();
     }
 
     await webRtcService.addIceCandidate(
       candidate: candidate,
 
-      sdpMid: body['sdpMid'] as String?,
+      sdpMid: sdpMid is String ? sdpMid : null,
 
       sdpMLineIndex: index,
 
@@ -2032,7 +2241,8 @@ class CameraServer {
   }
 
   Future<void> _handleWebRtcDisconnect(HttpRequest request) async {
-    final body = await _readJson(request);
+    final body = await _readJsonOrBadRequest(request);
+    if (body == null) return;
     final peerId = _peerIdForRequest(request, body);
     final existed = webRtcService.hasPeer(peerId);
     await webRtcService.disposePeerConnection(peerId);
@@ -2340,6 +2550,34 @@ class CameraServer {
 
   /// Thời gian tối đa để nhận xong body JSON của một request.
   static const Duration requestBodyTimeout = Duration(seconds: 10);
+
+  /// Đọc body JSON; body không phải JSON object hợp lệ → trả 400 (không để
+  /// lỗi định dạng của client thành 500) và trả về null.
+  Future<Map<String, dynamic>?> _readJsonOrBadRequest(
+    HttpRequest request,
+  ) async {
+    try {
+      return await _readJson(request);
+    } on FormatException catch (error) {
+      await _sendBadRequest(
+        request.response,
+        'Invalid JSON body',
+        message: error.message,
+      );
+      return null;
+    }
+  }
+
+  Future<void> _sendBadRequest(
+    HttpResponse response,
+    String error, {
+    String? message,
+  }) {
+    return _sendJson(response, HttpStatus.badRequest, {
+      'error': error,
+      'message': ?message,
+    });
+  }
 
   // ============================================================
   // NOT FOUND
