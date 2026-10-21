@@ -1661,7 +1661,6 @@ class _LiveStreamScreenState extends State<LiveStreamScreen> {
           trailing: Text(
             '$resolution · ${fps}fps',
             maxLines: 1,
-            overflow: TextOverflow.ellipsis,
             style: const TextStyle(
               color: BrandColors.textSecondary,
               fontSize: 13,
