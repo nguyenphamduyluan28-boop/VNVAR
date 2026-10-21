@@ -67,7 +67,10 @@ bool _isTiktokHost(String host) =>
 StreamPlatform streamPlatformForHost(String rawHost) {
   final host = rawHost.toLowerCase();
   if (host.isEmpty) return StreamPlatform.custom;
-  if (_hostUnder(host, 'sporto.vn')) return StreamPlatform.sporto;
+  // SportO phát qua máy chủ AQVision (media.aqvision.net).
+  if (_hostUnder(host, 'sporto.vn') || _hostUnder(host, 'aqvision.net')) {
+    return StreamPlatform.sporto;
+  }
   if (_youtubeDomains.any((d) => _hostUnder(host, d))) {
     return StreamPlatform.youtube;
   }
@@ -82,7 +85,7 @@ ParsedStreamUrl parseStreamUrl(String raw) {
   final url = raw.trim();
   // scheme://authority/app/<key...> — key = mọi thứ sau segment app, gồm cả query
   final m = RegExp(
-    r'^(rtmps?://[^/]+/[^/?]+)/(.+)$',
+    r'^((?:rtmps?|rtsps?)://[^/]+/[^/?]+)/(.+)$',
     caseSensitive: false,
   ).firstMatch(url);
   final platform = streamPlatformForHost(_hostOf(url));
@@ -281,10 +284,66 @@ String mergeStreamUrlWithKey(String url, String? key) {
 }
 
 const Map<StreamPlatform, String> kDefaultServers = {
-  StreamPlatform.sporto: 'rtmp://live.sporto.vn/live',
+  StreamPlatform.sporto: 'rtmp://media.aqvision.net:11935/live',
   StreamPlatform.facebook: 'rtmps://live-api-s.facebook.com:443/rtmp',
   StreamPlatform.youtube: 'rtmp://a.rtmp.youtube.com/live2',
   StreamPlatform.tiktok: '', // KHÔNG có mặc định — bắt buộc người dùng dán
   StreamPlatform.obs: '', // RTSP Local
   StreamPlatform.custom: '',
 };
+
+/// Máy chủ SportO cũ (trước 21/10/2026): cấu hình đã lưu với máy chủ này được
+/// chuyển sang máy chủ mặc định mới khi nạp.
+const String kLegacySportoServer = 'rtmp://live.sporto.vn/live';
+
+/// Giao thức đẩy luồng chọn được cho các nền tảng (RTMP gồm cả RTMPS).
+enum StreamProtocol { rtmp, rtsp }
+
+/// Máy chủ RTSP mặc định theo nền tảng (chỉ nền tảng có máy chủ RTSP đã biết).
+const Map<StreamPlatform, String> kDefaultRtspServers = {
+  StreamPlatform.sporto: 'rtsp://media.aqvision.net:18554/live',
+};
+
+/// Giao thức của một URL/máy chủ: rtsp:// hoặc rtsps:// → RTSP, còn lại RTMP.
+StreamProtocol streamProtocolOf(String url) {
+  final lower = url.trim().toLowerCase();
+  return lower.startsWith('rtsp://') || lower.startsWith('rtsps://')
+      ? StreamProtocol.rtsp
+      : StreamProtocol.rtmp;
+}
+
+/// Máy chủ mặc định của [platform] cho [protocol] ('' nếu không có).
+/// RTSP không có mặc định riêng thì suy từ máy chủ RTMP mặc định.
+String defaultServerFor(StreamPlatform platform, StreamProtocol protocol) {
+  final rtmp = kDefaultServers[platform] ?? '';
+  if (protocol == StreamProtocol.rtmp) return rtmp;
+  return kDefaultRtspServers[platform] ?? convertServerScheme(rtmp, protocol);
+}
+
+/// Đổi [server] sang [target]: máy chủ đang là mặc định (của giao thức nào
+/// cũng vậy) hoặc trống → mặc định của giao thức mới; máy chủ tự nhập → đổi
+/// scheme và BỎ cổng (cổng RTMP/RTSP khác nhau; người dùng sửa lại nếu cần).
+String serverForProtocol(
+  StreamPlatform platform,
+  String server,
+  StreamProtocol target,
+) {
+  final current = server.trim();
+  final isDefault = current.isEmpty ||
+      StreamProtocol.values.any((p) => current == defaultServerFor(platform, p));
+  if (isDefault) return defaultServerFor(platform, target);
+  return convertServerScheme(current, target);
+}
+
+/// Đổi scheme của [server] sang [target] và bỏ cổng; giữ host + đường dẫn.
+String convertServerScheme(String server, StreamProtocol target) {
+  final current = server.trim();
+  if (current.isEmpty || streamProtocolOf(current) == target) return current;
+  final m = RegExp(
+    r'^[a-z]+://([^/:]+|\[[^\]]+\])(?::\d+)?(.*)$',
+    caseSensitive: false,
+  ).firstMatch(current);
+  if (m == null) return current;
+  final scheme = target == StreamProtocol.rtsp ? 'rtsp' : 'rtmp';
+  return '$scheme://${m.group(1)}${m.group(2)}';
+}

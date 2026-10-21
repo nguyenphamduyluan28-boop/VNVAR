@@ -116,6 +116,9 @@ class _LiveStreamScreenState extends State<LiveStreamScreen> {
   final TextEditingController _whipTokenController = TextEditingController();
 
   bool _obscureKey = true;
+
+  /// Link Tùy chỉnh hiện rõ mặc định để sửa được.
+  bool _obscureCustomUrl = false;
   bool _obscureWhipToken = true;
   bool _showAdvanced = false;
   bool _showObsGuide = false;
@@ -339,8 +342,13 @@ class _LiveStreamScreenState extends State<LiveStreamScreen> {
     _customUrlController.text = url;
     final parsed = parseStreamUrl(url);
     _platform = parsed.platform;
-    _serverController.text = parsed.server.isNotEmpty
-        ? parsed.server
+    // Cấu hình cũ còn máy chủ SportO trước đây → chuyển sang máy chủ mới.
+    final server = parsed.platform == StreamPlatform.sporto &&
+            parsed.server == kLegacySportoServer
+        ? (kDefaultServers[StreamPlatform.sporto] ?? '')
+        : parsed.server;
+    _serverController.text = server.isNotEmpty
+        ? server
         : (kDefaultServers[parsed.platform] ?? '');
     if (parsed.platform == StreamPlatform.custom) {
       _streamKeyController.clear();
@@ -1211,15 +1219,47 @@ class _LiveStreamScreenState extends State<LiveStreamScreen> {
     return SizedBox(width: size, height: size, child: Center(child: logo));
   }
 
+  /// Đổi giao thức RTMP/RTSP: máy chủ mặc định đổi sang mặc định của giao
+  /// thức mới; máy chủ tự nhập đổi scheme (bỏ cổng) và mở ô sửa để kiểm tra.
+  void _selectProtocol(StreamProtocol protocol) {
+    final current = _serverController.text;
+    if (streamProtocolOf(current) == protocol && current.trim().isNotEmpty) {
+      return;
+    }
+    setState(() {
+      final next = serverForProtocol(_platform, current, protocol);
+      _serverController.text = next;
+      final isDefault = next.isNotEmpty &&
+          next == defaultServerFor(_platform, protocol);
+      // Không có máy chủ mặc định cho giao thức này: mở ô để người dùng nhập.
+      if (!isDefault && _platform != StreamPlatform.tiktok) _editServer = true;
+    });
+  }
+
   void _selectPlatform(StreamPlatform platform) {
     setState(() {
-      final oldDefault = kDefaultServers[_platform] ?? '';
+      final oldPlatform = _platform;
       final currentServer = _serverController.text.trim();
+      final protocol = streamProtocolOf(currentServer);
+      final wasDefault = currentServer.isEmpty ||
+          StreamProtocol.values.any(
+            (p) => currentServer == defaultServerFor(oldPlatform, p),
+          );
+      // Chuyển sang Tùy chỉnh khi ô link còn trống: điền sẵn link đầy đủ của
+      // nền tảng đang chọn để sửa tiếp thay vì gõ lại từ đầu.
+      if (platform == StreamPlatform.custom &&
+          oldPlatform != StreamPlatform.custom &&
+          oldPlatform != StreamPlatform.obs &&
+          _customUrlController.text.trim().isEmpty &&
+          _streamKeyController.text.trim().isNotEmpty) {
+        _customUrlController.text =
+            buildStreamUrl(currentServer, _streamKeyController.text);
+      }
       _platform = platform;
       _editServer = false;
-      final newDefault = kDefaultServers[platform] ?? '';
-      if (currentServer.isEmpty || currentServer == oldDefault) {
-        _serverController.text = newDefault;
+      // Giữ giao thức đang chọn khi đổi nền tảng.
+      if (wasDefault) {
+        _serverController.text = defaultServerFor(platform, protocol);
       }
     });
   }
@@ -1455,8 +1495,13 @@ class _LiveStreamScreenState extends State<LiveStreamScreen> {
   Widget _buildInputContent() {
     final isCustom = _platform == StreamPlatform.custom;
     final isTiktok = _platform == StreamPlatform.tiktok;
-    final defaultServer = kDefaultServers[_platform] ?? '';
+    final protocol = streamProtocolOf(_serverController.text);
+    final defaultServer = defaultServerFor(_platform, protocol);
     final locked = _streamActive;
+    final showProtocol = !isCustom && _platform != StreamPlatform.obs;
+    final publicPlatform = _platform == StreamPlatform.youtube ||
+        _platform == StreamPlatform.facebook ||
+        _platform == StreamPlatform.tiktok;
     const monoStyle = TextStyle(
       color: BrandColors.textPrimary,
       fontSize: 13,
@@ -1467,6 +1512,39 @@ class _LiveStreamScreenState extends State<LiveStreamScreen> {
       crossAxisAlignment: CrossAxisAlignment.stretch,
       mainAxisSize: MainAxisSize.min,
       children: [
+        // Chọn giao thức đẩy luồng (RTMP/RTSP) cho các nền tảng.
+        if (showProtocol) ...[
+          Row(
+            children: [
+              Expanded(
+                child: Text(
+                  appText(context, 'Giao thức', 'Protocol'),
+                  style: BrandText.caption,
+                ),
+              ),
+              BrandSegmented<StreamProtocol>(
+                values: StreamProtocol.values,
+                labelOf: (p) => p == StreamProtocol.rtmp ? 'RTMP' : 'RTSP',
+                selected: protocol,
+                dense: true,
+                onChanged: locked ? null : _selectProtocol,
+              ),
+            ],
+          ),
+          if (protocol == StreamProtocol.rtsp && publicPlatform) ...[
+            const SizedBox(height: BrandSpace.sm),
+            AppNoticeBanner(
+              dense: true,
+              kind: NoticeKind.warning,
+              message: appText(
+                context,
+                'Nền tảng này thường chỉ nhận RTMP. Chỉ dùng RTSP nếu máy chủ hỗ trợ.',
+                'This platform usually accepts RTMP only. Use RTSP only if the server supports it.',
+              ),
+            ),
+          ],
+          const SizedBox(height: BrandSpace.sm),
+        ],
         // TikTok bắt buộc nhập Server URL (mỗi phiên một server khác).
         if (isTiktok) ...[
           TextFormField(
@@ -1554,17 +1632,17 @@ class _LiveStreamScreenState extends State<LiveStreamScreen> {
           ],
         ],
 
+        if (isCustom)
+          _buildCustomUrlEditor(locked: locked, style: monoStyle)
+        else
         TextFormField(
-          controller: isCustom ? _customUrlController : _streamKeyController,
+          controller: _streamKeyController,
           enabled: !locked,
-          // URL tùy chỉnh cũng chứa stream key: che như ô khóa luồng.
           obscureText: _obscureKey,
           style: monoStyle,
           decoration: _inputDecoration(
-            hint: isCustom
-                ? 'rtmp://server/live/key'
-                : appText(context, 'Khóa luồng (Stream Key)', 'Stream key'),
-            prefixIcon: isCustom ? Icons.link_rounded : Icons.key_rounded,
+            hint: appText(context, 'Khóa luồng (Stream Key)', 'Stream key'),
+            prefixIcon: Icons.key_rounded,
             suffixIcon: Row(
               mainAxisSize: MainAxisSize.min,
               children: [
@@ -1598,17 +1676,120 @@ class _LiveStreamScreenState extends State<LiveStreamScreen> {
         Padding(
           padding: const EdgeInsets.symmetric(horizontal: BrandSpace.xs),
           child: Text(
-            appText(
-              context,
-              'Dán khóa hoặc quét mã QR',
-              'Paste the key or scan a QR code',
-            ),
+            isCustom
+                ? appText(
+                    context,
+                    'Nhập/sửa đủ link: rtmp(s):// hoặc rtsp://máy-chủ/app/khóa',
+                    'Full link: rtmp(s):// or rtsp://server/app/key',
+                  )
+                : appText(
+                    context,
+                    'Dán khóa hoặc quét mã QR',
+                    'Paste the key or scan a QR code',
+                  ),
             maxLines: 1,
             overflow: TextOverflow.ellipsis,
             style: BrandText.caption,
           ),
         ),
       ],
+    );
+  }
+
+  /// Ô link Tùy chỉnh: hiện rõ (mặc định) để xem/sửa từng ký tự, tự xuống
+  /// dòng tới 3 dòng; nút Che/Hiện, Dán, Xoá; dòng xem trước máy chủ + khoá
+  /// (khoá che) để kiểm tra nhanh link đã đúng chưa.
+  Widget _buildCustomUrlEditor({
+    required bool locked,
+    required TextStyle style,
+  }) {
+    final hidden = _obscureCustomUrl;
+    return ValueListenableBuilder<TextEditingValue>(
+      valueListenable: _customUrlController,
+      builder: (context, value, _) {
+        final url = value.text.trim();
+        final host = Uri.tryParse(url)?.host ?? '';
+        final key = maskedStreamKeyOf(url);
+        final protocol = url.isEmpty
+            ? ''
+            : (streamProtocolOf(url) == StreamProtocol.rtsp ? 'RTSP' : 'RTMP');
+        return Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            TextFormField(
+              controller: _customUrlController,
+              enabled: !locked,
+              obscureText: hidden,
+              // Che thì chỉ được 1 dòng (giới hạn của Flutter).
+              minLines: 1,
+              maxLines: hidden ? 1 : 3,
+              keyboardType: TextInputType.url,
+              autocorrect: false,
+              enableSuggestions: false,
+              style: style,
+              decoration: _inputDecoration(
+                hint: 'rtmp://server/live/key',
+                prefixIcon: Icons.link_rounded,
+              ),
+            ),
+            const SizedBox(height: BrandSpace.xs),
+            Row(
+              children: [
+                Expanded(
+                  child: Text(
+                    url.isEmpty
+                        ? ''
+                        : [
+                            protocol,
+                            if (host.isNotEmpty) host,
+                            if (key.isNotEmpty)
+                              appText(context, 'khóa $key', 'key $key'),
+                          ].join(' · '),
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: BrandText.caption.copyWith(fontFamily: 'monospace'),
+                  ),
+                ),
+                IconButton(
+                  icon: Icon(
+                    hidden
+                        ? Icons.visibility_off_rounded
+                        : Icons.visibility_rounded,
+                    size: 18,
+                    color: BrandColors.textSecondary,
+                  ),
+                  tooltip: hidden
+                      ? appText(context, 'Hiện link', 'Show link')
+                      : appText(context, 'Che link', 'Hide link'),
+                  onPressed: () =>
+                      setState(() => _obscureCustomUrl = !_obscureCustomUrl),
+                ),
+                IconButton(
+                  icon: const Icon(
+                    Icons.content_paste_rounded,
+                    size: 18,
+                    color: BrandColors.warningSoft,
+                  ),
+                  tooltip: appText(context, 'Dán', 'Paste'),
+                  onPressed: locked ? null : _pasteFromClipboard,
+                ),
+                IconButton(
+                  icon: const Icon(
+                    Icons.backspace_outlined,
+                    size: 18,
+                    color: BrandColors.textSecondary,
+                  ),
+                  tooltip: appText(context, 'Xóa link', 'Clear link'),
+                  onPressed: locked || url.isEmpty
+                      ? null
+                      : _customUrlController.clear,
+                ),
+              ],
+            ),
+          ],
+        );
+      },
     );
   }
 

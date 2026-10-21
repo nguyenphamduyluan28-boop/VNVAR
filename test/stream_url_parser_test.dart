@@ -281,4 +281,71 @@ void main() {
       );
     });
   });
+
+  group('SportO server & protocol', () {
+    test('default SportO server is AQVision RTMP', () {
+      expect(
+        kDefaultServers[StreamPlatform.sporto],
+        'rtmp://media.aqvision.net:11935/live',
+      );
+    });
+
+    test('AQVision RTMP/RTSP urls are detected as SportO', () {
+      final rtmp = parseStreamUrl('rtmp://media.aqvision.net:11935/live/m1');
+      expect(rtmp.platform, StreamPlatform.sporto);
+      expect(rtmp.server, 'rtmp://media.aqvision.net:11935/live');
+      expect(rtmp.key, 'm1');
+
+      const rtspUrl = 'rtsp://media.aqvision.net:18554/live/match_99?key=s1';
+      final rtsp = parseStreamUrl(rtspUrl);
+      expect(rtsp.platform, StreamPlatform.sporto);
+      expect(rtsp.server, 'rtsp://media.aqvision.net:18554/live');
+      expect(buildStreamUrl(rtsp.server, rtsp.key), rtspUrl);
+    });
+
+    test('streamProtocolOf', () {
+      expect(streamProtocolOf('rtsp://h/live'), StreamProtocol.rtsp);
+      expect(streamProtocolOf('RTSPS://h/live'), StreamProtocol.rtsp);
+      expect(streamProtocolOf('rtmps://h:443/rtmp'), StreamProtocol.rtmp);
+      expect(streamProtocolOf(''), StreamProtocol.rtmp);
+    });
+
+    test('switching protocol uses platform defaults', () {
+      expect(
+        serverForProtocol(
+          StreamPlatform.sporto,
+          'rtmp://media.aqvision.net:11935/live',
+          StreamProtocol.rtsp,
+        ),
+        'rtsp://media.aqvision.net:18554/live',
+      );
+      expect(
+        serverForProtocol(
+          StreamPlatform.sporto,
+          'rtsp://media.aqvision.net:18554/live',
+          StreamProtocol.rtmp,
+        ),
+        'rtmp://media.aqvision.net:11935/live',
+      );
+      expect(
+        serverForProtocol(
+          StreamPlatform.youtube,
+          'rtmp://a.rtmp.youtube.com/live2',
+          StreamProtocol.rtsp,
+        ),
+        'rtsp://a.rtmp.youtube.com/live2',
+      );
+    });
+
+    test('custom server keeps host/path and drops port', () {
+      expect(
+        serverForProtocol(
+          StreamPlatform.facebook,
+          'rtmps://my.server.vn:1935/app',
+          StreamProtocol.rtsp,
+        ),
+        'rtsp://my.server.vn/app',
+      );
+    });
+  });
 }
