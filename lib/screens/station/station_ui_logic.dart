@@ -151,3 +151,105 @@ class LatestWinsRunner<T> {
     _pending = null;
   }
 }
+
+// ============================================================
+// BẢNG TỈ SỐ TRÊN LIVESTREAM
+// ============================================================
+
+/// Cờ overlay bảng tỉ số cần cho thanh trạng thái: [burnIn] = tính năng in
+/// bảng tỉ số vào video live đang bật; [visible] = overlay đang hiện.
+typedef ScoreOverlayFlags = ({bool burnIn, bool visible});
+
+/// Mặc định của `ScoreOverlayConfig`: in vào live bật, overlay ẩn.
+const ScoreOverlayFlags defaultScoreOverlayFlags = (
+  burnIn: true,
+  visible: false,
+);
+
+/// Đọc cờ overlay từ JSON trạng thái bảng tỉ số (`ScoreboardService.snapshot()`
+/// hoặc một sự kiện của `changes`). Thiếu/hỏng dữ liệu → mặc định.
+ScoreOverlayFlags readScoreOverlayFlags(Map<String, dynamic>? snapshot) {
+  final overlay = snapshot?['overlay'];
+  if (overlay is! Map) return defaultScoreOverlayFlags;
+  return (
+    burnIn: overlay['burnIn'] != false,
+    visible: overlay['visible'] == true,
+  );
+}
+
+/// Gợi ý trạng thái bảng tỉ số trên thanh trạng thái khi đang LIVE.
+enum ScoreOverlayHint {
+  /// Không hiện gì (không live hoặc tắt tính năng in bảng tỉ số).
+  none,
+
+  /// Đang live, có in bảng tỉ số nhưng overlay đang ẩn → người xem không thấy.
+  hidden,
+
+  /// Đang live và bảng tỉ số đang hiện trên luồng phát.
+  shown,
+}
+
+ScoreOverlayHint scoreOverlayHint({
+  required bool live,
+  required ScoreOverlayFlags flags,
+}) {
+  if (!live || !flags.burnIn) return ScoreOverlayHint.none;
+  return flags.visible ? ScoreOverlayHint.shown : ScoreOverlayHint.hidden;
+}
+
+// ============================================================
+// CHẤT LƯỢNG LUỒNG PHÁT & MENU NHANH
+// ============================================================
+
+/// Số liệu luồng phát cho tooltip: "28 fps · 2450 kbps". Bỏ phần chưa có số
+/// liệu (≤ 0 hoặc không hữu hạn); null nếu cả hai đều chưa có.
+String? formatStreamMetrics(double fps, double bitrateKbps) {
+  final parts = <String>[
+    if (fps.isFinite && fps > 0) '${fps.round()} fps',
+    if (bitrateKbps.isFinite && bitrateKbps > 0)
+      '${bitrateKbps.round()} kbps',
+  ];
+  return parts.isEmpty ? null : parts.join(' · ');
+}
+
+/// Bố cục menu nhanh: số cột và dòng gọn.
+typedef QuickMenuLayout = ({int columns, bool dense});
+
+/// Chiều cao một dòng menu (thường / gọn).
+const double quickMenuRowHeight = 52;
+const double quickMenuDenseRowHeight = 48;
+
+/// Bề rộng tối thiểu một ô menu khi xếp 2 cột.
+const double quickMenuGridTileWidth = 168;
+
+/// Khoảng chiếm thêm theo chiều dọc ngoài các dòng: viền + padding bảng kính
+/// (6 + 1 mỗi phía) và padding trên/dưới của vùng cuộn (4 mỗi phía).
+const double quickMenuVerticalChrome = 22;
+
+/// Khoảng chiếm thêm theo chiều ngang (viền + padding bảng kính).
+const double quickMenuHorizontalChrome = 14;
+
+/// Chọn bố cục menu nhanh vừa vùng [maxWidth]×[maxHeight] (vùng dưới thanh
+/// trạng thái, trên thanh zoom): ưu tiên 1 cột dòng thường; thiếu chỗ thì dòng
+/// gọn; vẫn thiếu mà đủ rộng thì 2 cột (máy ngang). Không vừa nữa thì menu
+/// tự cuộn (bắt đầu từ mục đầu).
+QuickMenuLayout quickMenuLayout({
+  required double maxWidth,
+  required double maxHeight,
+  required int itemCount,
+}) {
+  double heightFor(int rows, double rowHeight) =>
+      rows * rowHeight + quickMenuVerticalChrome;
+  if (maxHeight >= heightFor(itemCount, quickMenuRowHeight)) {
+    return (columns: 1, dense: false);
+  }
+  if (maxHeight >= heightFor(itemCount, quickMenuDenseRowHeight)) {
+    return (columns: 1, dense: true);
+  }
+  final gridWidth =
+      2 * quickMenuGridTileWidth + 8 + quickMenuHorizontalChrome;
+  if (itemCount > 1 && maxWidth >= gridWidth) {
+    return (columns: 2, dense: true);
+  }
+  return (columns: 1, dense: true);
+}

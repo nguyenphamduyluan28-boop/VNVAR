@@ -13,6 +13,7 @@ import 'recording_service.dart';
 import 'request_rate_limiter.dart';
 import 'scoreboard_service.dart';
 import 'scoreboard_web_pages.dart';
+import 'station_errors.dart';
 import 'webrtc_service.dart';
 
 String normalizeCheckVarRequestId(String? value, DateTime receivedAt) {
@@ -395,9 +396,10 @@ class CameraServer {
     try {
       server = await HttpServer.bind(InternetAddress.anyIPv4, apiPort);
     } on SocketException catch (error) {
-      throw StateError(
+      throw BilingualStateError(
         'Không thể mở HTTP port $apiPort. '
         'Port có thể đang được ứng dụng khác sử dụng: ${error.message}',
+        'Cannot open HTTP port $apiPort (in use?): ${error.message}',
       );
     }
 
@@ -440,9 +442,11 @@ class CameraServer {
     } on SocketException catch (error) {
       await server.close(force: true);
       _server = null;
-      throw StateError(
+      throw BilingualStateError(
         'HTTP port $apiPort đã mở nhưng discovery port '
         '${DiscoveryService.discoveryPort} không khả dụng: ${error.message}',
+        'Discovery port ${DiscoveryService.discoveryPort} '
+            'unavailable: ${error.message}',
       );
     }
   }

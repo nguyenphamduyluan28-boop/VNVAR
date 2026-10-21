@@ -1,12 +1,17 @@
 import 'dart:async';
 import 'dart:io';
+import 'dart:math' as math;
 
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:video_player/video_player.dart';
 
 import '../services/recording_service.dart';
 import '../services/app_language_service.dart';
 import '../services/camera_server.dart';
+import '../theme/app_theme.dart';
+import '../widgets/app_notice.dart';
+import '../widgets/brand_widgets.dart';
 
 class VideoStorageScreen extends StatefulWidget {
   final RecordingService recordingService;
@@ -31,6 +36,7 @@ class _VideoStorageScreenState extends State<VideoStorageScreen> {
   StreamSubscription<void>? _videoChangesSubscription;
   bool _refreshing = false;
   bool _refreshPending = false;
+  _StoragePane _pane = _StoragePane.videos;
 
   @override
   void initState() {
@@ -75,20 +81,12 @@ class _VideoStorageScreenState extends State<VideoStorageScreen> {
           _videos = widget.recordingService.segments;
           _loading = false;
         });
-        ScaffoldMessenger.of(context)
-          ..hideCurrentSnackBar()
-          ..showSnackBar(
-            SnackBar(
-              content: Text(
-                appText(
-                  context,
-                  'Không tải lại được danh sách video: '
-                      '${userFacingError(error)}',
-                  'Unable to refresh videos: ${userFacingError(error)}',
-                ),
-              ),
-            ),
-          );
+        showAppNotice(
+          context,
+          vi: 'Không tải lại được danh sách: ${localizedUserFacingError(error, english: false)}',
+          en: 'Unable to refresh list: ${localizedUserFacingError(error, english: true)}',
+          kind: NoticeKind.error,
+        );
       }
     } finally {
       _refreshing = false;
@@ -111,85 +109,19 @@ class _VideoStorageScreenState extends State<VideoStorageScreen> {
       if (path == null || path.trim().isEmpty) return;
       if (!mounted) return;
       final folderName = _selectedFolderName(path);
-      final accepted = await showDialog<bool>(
-        context: context,
-        builder: (context) => AlertDialog(
-          shape: RoundedRectangleBorder(
-            borderRadius: BorderRadius.circular(20),
-          ),
-          title: Text(
-            appText(context, 'Xác nhận thư mục lưu', 'Confirm storage folder'),
-          ),
-          content: Column(
-            mainAxisSize: MainAxisSize.min,
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              Text(
-                appText(
-                  context,
-                  'Video .ts sẽ được lưu tại:',
-                  'The .ts videos will be saved to:',
-                ),
-              ),
-              const SizedBox(height: 10),
-              Container(
-                width: double.infinity,
-                padding: const EdgeInsets.all(12),
-                decoration: BoxDecoration(
-                  color: const Color(0xFFF4F6F9),
-                  borderRadius: BorderRadius.circular(12),
-                ),
-                child: Row(
-                  children: [
-                    const Icon(
-                      Icons.folder_rounded,
-                      color: Color(0xFF1565C0),
-                      size: 30,
-                    ),
-                    const SizedBox(width: 12),
-                    Expanded(
-                      child: Column(
-                        crossAxisAlignment: CrossAxisAlignment.start,
-                        children: [
-                          Text(
-                            folderName,
-                            maxLines: 1,
-                            overflow: TextOverflow.ellipsis,
-                            style: const TextStyle(fontWeight: FontWeight.w800),
-                          ),
-                          const SizedBox(height: 2),
-                          Text(
-                            appText(
-                              context,
-                              'Tự động sắp xếp theo ngày · AUTOMODE',
-                              'Automatically organized by date · AUTOMODE',
-                            ),
-                            style: TextStyle(
-                              color: Colors.black54,
-                              fontSize: 12,
-                            ),
-                          ),
-                        ],
-                      ),
-                    ),
-                  ],
-                ),
-              ),
-            ],
-          ),
-          actions: [
-            TextButton(
-              onPressed: () => Navigator.pop(context, false),
-              child: Text(appText(context, 'CHỌN LẠI', 'CHOOSE AGAIN')),
-            ),
-            FilledButton(
-              onPressed: () => Navigator.pop(context, true),
-              child: Text(appText(context, 'SỬ DỤNG', 'USE')),
-            ),
-          ],
-        ),
+      final accepted = await showAppConfirm(
+        context,
+        titleVi: 'Dùng thư mục này?',
+        titleEn: 'Use this folder?',
+        messageVi: '$folderName\nVideo .ts tự xếp theo ngày',
+        messageEn: '$folderName\n.ts videos sorted by date',
+        confirmVi: 'Sử dụng',
+        confirmEn: 'Use',
+        cancelVi: 'Chọn lại',
+        cancelEn: 'Choose again',
+        icon: Icons.folder_rounded,
       );
-      if (accepted != true) return;
+      if (!accepted) return;
       await widget.recordingService.setStoragePath(path);
       // Giữ clip export tablet đang dùng (chúng vẫn nằm ở thư mục cũ).
       await widget.recordingService.cleanupOldTempFiles(
@@ -198,16 +130,11 @@ class _VideoStorageScreenState extends State<VideoStorageScreen> {
       await _refresh();
     } catch (error) {
       if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(
-          content: Text(
-            appText(
-              context,
-              'Không thể sử dụng thư mục này: $error',
-              'Cannot use this folder: $error',
-            ),
-          ),
-        ),
+      showAppNotice(
+        context,
+        vi: 'Không dùng được thư mục: ${localizedUserFacingError(error, english: false)}',
+        en: 'Cannot use this folder: ${localizedUserFacingError(error, english: true)}',
+        kind: NoticeKind.error,
       );
     }
   }
@@ -217,16 +144,11 @@ class _VideoStorageScreenState extends State<VideoStorageScreen> {
     await widget.recordingService.setSegmentMinutes(minutes);
     if (!mounted) return;
     setState(() => _segmentMinutes = minutes);
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(
-        content: Text(
-          appText(
-            context,
-            'Thời lượng mới áp dụng từ đoạn kế tiếp.',
-            'The new duration applies to the next segment.',
-          ),
-        ),
-      ),
+    showAppNotice(
+      context,
+      vi: 'Áp dụng từ đoạn kế tiếp',
+      en: 'Applies from the next segment',
+      kind: NoticeKind.success,
     );
   }
 
@@ -246,7 +168,9 @@ class _VideoStorageScreenState extends State<VideoStorageScreen> {
         .split('/')
         .where((part) => part.trim().isNotEmpty)
         .toList();
-    return parts.isEmpty ? 'Bộ nhớ thiết bị' : parts.last;
+    return parts.isEmpty
+        ? appText(context, 'Bộ nhớ thiết bị', 'Device storage')
+        : parts.last;
   }
 
   Future<void> _viewVideo(RecordedSegment video) async {
@@ -276,18 +200,70 @@ class _VideoStorageScreenState extends State<VideoStorageScreen> {
     final apiBase = host.isEmpty
         ? appText(context, 'Chưa có kết nối LAN', 'No LAN connection')
         : 'http://$host:$port';
-    return Scaffold(
-      backgroundColor: const Color(0xFFF6F8FB),
-      appBar: AppBar(
-        elevation: 0,
-        scrolledUnderElevation: 1,
-        title: Text(
-          appText(context, 'LƯU VIDEO', 'VIDEO STORAGE'),
-          style: const TextStyle(
-            fontWeight: FontWeight.w900,
-            letterSpacing: 0.4,
+    final service = widget.recordingService;
+    final isRecording =
+        service.currentPath != null && service.currentSegmentStartedAt != null;
+    final capacity = _CapacityCard(
+      usedBytes: _totalBytes,
+      formatSize: _size,
+      stats: [
+        BrandPill(
+          icon: Icons.video_library_rounded,
+          text: appText(
+            context,
+            '${_videos.length} video',
+            '${_videos.length} videos',
           ),
         ),
+        if (isRecording)
+          BrandPill(
+            dot: true,
+            color: BrandColors.live,
+            text: appText(context, 'Đang ghi', 'Recording'),
+          )
+        else
+          BrandPill(
+            icon: Icons.stop_circle_outlined,
+            color: BrandColors.textSecondary,
+            text: appText(context, 'Không ghi', 'Idle'),
+          ),
+        BrandPill(
+          icon: Icons.timer_rounded,
+          color: BrandColors.textSecondary,
+          text: appText(
+            context,
+            '$_segmentMinutes phút',
+            '$_segmentMinutes min',
+          ),
+        ),
+      ],
+    );
+    final settings = _StorageSettings(
+      apiBase: apiBase,
+      hasLan: host.isNotEmpty,
+      segmentMinutes: _segmentMinutes,
+      storagePath: _storagePath,
+      onSegmentChanged: _changeSegmentMinutes,
+      onChooseStorage: service.supportsStorageFolderSelection
+          ? _chooseStorage
+          : null,
+    );
+    VideoList videoList({Widget? header}) => VideoList(
+      loading: _loading,
+      videos: _videos,
+      activeCameraId: service.cameraId,
+      activeRecordingPath: service.currentPath,
+      activeRecordingStartedAt: service.currentSegmentStartedAt,
+      formatSize: _size,
+      formatTime: _time,
+      onView: _viewVideo,
+      header: header,
+    );
+    return Scaffold(
+      appBar: AppBar(
+        elevation: 0,
+        scrolledUnderElevation: 0,
+        title: Text(appText(context, 'Kho video', 'Video storage')),
         actions: [
           const AppLanguageButton(),
           IconButton(
@@ -295,416 +271,395 @@ class _VideoStorageScreenState extends State<VideoStorageScreen> {
             onPressed: _refresh,
             icon: const Icon(Icons.refresh_rounded),
           ),
-          const SizedBox(width: 4),
+          const SizedBox(width: BrandSpace.xs),
         ],
       ),
-      body: DecoratedBox(
-        decoration: const BoxDecoration(
-          image: DecorationImage(
-            image: AssetImage('assets/images/vnvar_logo.png'),
-            fit: BoxFit.contain,
-            opacity: 0.03,
-          ),
-        ),
-        child: SafeArea(
-          child: LayoutBuilder(
-            builder: (context, constraints) {
-              final wide = constraints.maxWidth >= 760;
-              final information = _InformationPanel(
-                totalSize: _size(_totalBytes),
-                videoCount: _videos.length,
-                apiBase: apiBase,
-                segmentMinutes: _segmentMinutes,
-                storagePath: _storagePath,
-                onSegmentChanged: _changeSegmentMinutes,
-                onChooseStorage:
-                    widget.recordingService.supportsStorageFolderSelection
-                    ? _chooseStorage
-                    : null,
-              );
-              final savedVideos = VideoList(
-                loading: _loading,
-                videos: _videos,
-                activeCameraId: widget.recordingService.cameraId,
-                activeRecordingPath: widget.recordingService.currentPath,
-                activeRecordingStartedAt:
-                    widget.recordingService.currentSegmentStartedAt,
-                formatSize: _size,
-                formatTime: _time,
-                onView: _viewVideo,
-              );
+      body: SafeArea(
+        top: false,
+        child: LayoutBuilder(
+          builder: (context, constraints) {
+            // Máy tính bảng / màn rộng: cột trái dung lượng + cài đặt, cột
+            // phải danh sách video.
+            if (constraints.maxWidth >= 900) {
               return Center(
                 child: ConstrainedBox(
-                  constraints: BoxConstraints(maxWidth: wide ? 1180 : 520),
-                  child: Padding(
-                    padding: const EdgeInsets.all(16),
-                    child: wide
-                        ? Row(
+                  constraints: const BoxConstraints(maxWidth: 1240),
+                  child: Row(
+                    crossAxisAlignment: CrossAxisAlignment.stretch,
+                    children: [
+                      SizedBox(
+                        width: 360,
+                        child: SingleChildScrollView(
+                          padding: const EdgeInsets.fromLTRB(
+                            BrandSpace.lg,
+                            BrandSpace.lg,
+                            0,
+                            BrandSpace.xl,
+                          ),
+                          child: Column(
                             crossAxisAlignment: CrossAxisAlignment.stretch,
                             children: [
-                              Expanded(flex: 3, child: information),
-                              const SizedBox(width: 16),
-                              Expanded(flex: 7, child: savedVideos),
-                            ],
-                          )
-                        : Column(
-                            children: [
-                              Expanded(child: information),
-                              const SizedBox(height: 12),
-                              SizedBox(height: 300, child: savedVideos),
+                              capacity,
+                              const SizedBox(height: BrandSpace.xl),
+                              settings,
                             ],
                           ),
+                        ),
+                      ),
+                      Expanded(child: videoList()),
+                    ],
                   ),
                 ),
               );
-            },
-          ),
+            }
+            final header = Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                capacity,
+                const SizedBox(height: BrandSpace.lg),
+                Center(
+                  child: BrandSegmented<_StoragePane>(
+                    values: _StoragePane.values,
+                    selected: _pane,
+                    labelOf: (pane) => switch (pane) {
+                      _StoragePane.videos => appText(context, 'Video', 'Videos'),
+                      _StoragePane.settings => appText(
+                        context,
+                        'Cài đặt',
+                        'Settings',
+                      ),
+                    },
+                    onChanged: (pane) => setState(() => _pane = pane),
+                  ),
+                ),
+              ],
+            );
+            if (_pane == _StoragePane.videos) {
+              return videoList(header: header);
+            }
+            final side = _sideGutter(constraints.maxWidth);
+            return ListView(
+              padding: EdgeInsets.fromLTRB(
+                side,
+                BrandSpace.lg,
+                side,
+                BrandSpace.xl,
+              ),
+              children: [
+                header,
+                const SizedBox(height: BrandSpace.xl),
+                settings,
+              ],
+            );
+          },
         ),
       ),
     );
   }
 }
 
+enum _StoragePane { videos, settings }
+
+/// Lề hai bên để nội dung rộng tối đa [_maxContentWidth] và nằm giữa màn.
+const double _maxContentWidth = 840;
+
+double _sideGutter(double width) =>
+    math.max(BrandSpace.lg, (width - _maxContentWidth) / 2);
+
+String _two(int value) => value.toString().padLeft(2, '0');
+
+/// Giờ trong ngày (HH:mm:ss) cho dòng phụ của thẻ video.
+String _clockOf(DateTime value) =>
+    '${_two(value.hour)}:${_two(value.minute)}:${_two(value.second)}';
+
+/// Thời lượng gọn: mm:ss hoặc h:mm:ss.
+String _durationLabel(Duration value) {
+  final duration = value.isNegative ? Duration.zero : value;
+  final hours = duration.inHours;
+  final minutes = _two(duration.inMinutes % 60);
+  final seconds = _two(duration.inSeconds % 60);
+  return hours > 0 ? '$hours:$minutes:$seconds' : '$minutes:$seconds';
+}
+
+/// Tiêu đề nhóm ngày: Hôm nay / Hôm qua / dd/MM/yyyy.
+String _dayLabel(BuildContext context, DateTime day) {
+  final now = DateTime.now();
+  final today = DateTime(now.year, now.month, now.day);
+  final difference = today.difference(day).inDays;
+  if (difference == 0) return appText(context, 'Hôm nay', 'Today');
+  if (difference == 1) return appText(context, 'Hôm qua', 'Yesterday');
+  return '${_two(day.day)}/${_two(day.month)}/${day.year}';
+}
+
+DateTime _dayOf(DateTime value) => DateTime(value.year, value.month, value.day);
+
 // ============================================================
-// INFORMATION PANEL
+// CAPACITY CARD
 // ============================================================
 
-class _InformationPanel extends StatelessWidget {
-  final String totalSize;
-  final int videoCount;
+class _CapacityCard extends StatelessWidget {
+  const _CapacityCard({
+    required this.usedBytes,
+    required this.formatSize,
+    this.stats = const [],
+  });
+
+  final int usedBytes;
+  final String Function(int) formatSize;
+  final List<Widget> stats;
+
+  @override
+  Widget build(BuildContext context) {
+    const limit = RecordingService.storageLimitBytes;
+    final ratio = (usedBytes / limit).clamp(0.0, 1.0);
+    final Color barColor;
+    if (ratio >= 0.9) {
+      barColor = BrandColors.danger;
+    } else if (ratio >= 0.8) {
+      barColor = BrandColors.warning;
+    } else {
+      barColor = BrandColors.primaryBright;
+    }
+    final limitGb = (limit / (1024 * 1024 * 1024)).round();
+    return Container(
+      padding: const EdgeInsets.all(BrandSpace.lg),
+      decoration: BoxDecoration(
+        color: BrandColors.surface,
+        borderRadius: BorderRadius.circular(BrandRadius.large),
+        border: Border.all(color: BrandColors.border),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Row(
+            children: [
+              const Icon(
+                Icons.sd_storage_rounded,
+                size: 16,
+                color: BrandColors.textSecondary,
+              ),
+              const SizedBox(width: BrandSpace.sm),
+              Expanded(
+                child: Text(
+                  appText(context, 'DUNG LƯỢNG', 'STORAGE'),
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: BrandText.label,
+                ),
+              ),
+              Text(
+                '${(ratio * 100).round()}%',
+                style: BrandText.label.copyWith(color: barColor),
+              ),
+            ],
+          ),
+          const SizedBox(height: BrandSpace.md),
+          Text.rich(
+            TextSpan(
+              children: [
+                TextSpan(text: formatSize(usedBytes)),
+                TextSpan(
+                  text: '  /  $limitGb GB',
+                  style: const TextStyle(
+                    color: BrandColors.textSecondary,
+                    fontWeight: FontWeight.w500,
+                  ),
+                ),
+              ],
+            ),
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+            style: const TextStyle(
+              color: BrandColors.textPrimary,
+              fontSize: 20,
+              fontWeight: FontWeight.w700,
+            ),
+          ),
+          const SizedBox(height: BrandSpace.md),
+          ClipRRect(
+            borderRadius: BorderRadius.circular(999),
+            child: LinearProgressIndicator(
+              value: ratio,
+              minHeight: 8,
+              color: barColor,
+              backgroundColor: BrandColors.surfaceRaised,
+            ),
+          ),
+          if (stats.isNotEmpty) ...[
+            const SizedBox(height: BrandSpace.lg),
+            Wrap(
+              spacing: BrandSpace.sm,
+              runSpacing: BrandSpace.sm,
+              children: stats,
+            ),
+          ],
+        ],
+      ),
+    );
+  }
+}
+
+// ============================================================
+// STORAGE SETTINGS
+// ============================================================
+
+class _StorageSettings extends StatelessWidget {
   final String apiBase;
+  final bool hasLan;
   final int segmentMinutes;
   final String storagePath;
   final ValueChanged<int?> onSegmentChanged;
   final VoidCallback? onChooseStorage;
 
-  const _InformationPanel({
-    required this.totalSize,
-    required this.videoCount,
+  const _StorageSettings({
     required this.apiBase,
+    required this.hasLan,
     required this.segmentMinutes,
     required this.storagePath,
     required this.onSegmentChanged,
     required this.onChooseStorage,
   });
 
-  String get _folderName {
-    if (storagePath.trim().isEmpty) return 'Chưa chọn nơi lưu';
+  static const _segmentOptions = [1, 2, 3, 5, 10, 15, 30];
+
+  String _folderName(BuildContext context) {
+    if (storagePath.trim().isEmpty) {
+      return appText(context, 'Chưa chọn nơi lưu', 'No folder selected');
+    }
     final parts = storagePath
         .replaceAll('\\', '/')
         .split('/')
         .where((part) => part.trim().isNotEmpty)
         .toList();
-    return parts.isEmpty ? 'Bộ nhớ thiết bị' : parts.last;
+    return parts.isEmpty
+        ? appText(context, 'Bộ nhớ thiết bị', 'Device storage')
+        : parts.last;
   }
 
-  @override
-  Widget build(BuildContext context) {
-    return Card(
-      elevation: 0,
-      shape: RoundedRectangleBorder(
-        borderRadius: BorderRadius.circular(18),
-        side: const BorderSide(color: Color(0xFFE3E8EF)),
-      ),
-      child: Padding(
-        padding: const EdgeInsets.all(18),
-        child: SingleChildScrollView(
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              // ------------------------------------------------
-              // SUMMARY
-              // ------------------------------------------------
-              Row(
-                children: [
-                  Container(
-                    padding: const EdgeInsets.all(12),
-                    decoration: BoxDecoration(
-                      color: const Color(0xFF1565C0).withValues(alpha: 0.10),
-                      borderRadius: BorderRadius.circular(14),
-                    ),
-                    child: const Icon(
-                      Icons.video_settings_rounded,
-                      size: 30,
-                      color: Color(0xFF1565C0),
-                    ),
-                  ),
-                  const SizedBox(width: 14),
-                  Expanded(
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        Text(
-                          '$videoCount video',
-                          style: Theme.of(context).textTheme.titleLarge
-                              ?.copyWith(fontWeight: FontWeight.w900),
-                        ),
-                        Text(
-                          totalSize,
-                          style: Theme.of(context).textTheme.bodyMedium
-                              ?.copyWith(color: Colors.black54),
-                        ),
-                      ],
-                    ),
-                  ),
-                ],
+  Widget _urlTile(
+    BuildContext context, {
+    required IconData icon,
+    required String title,
+    required String path,
+  }) {
+    final url = hasLan ? '$apiBase$path' : apiBase;
+    return BrandTile(
+      icon: icon,
+      title: title,
+      subtitle: url,
+      iconColor: hasLan ? BrandColors.primaryBright : BrandColors.textDisabled,
+      trailing: hasLan
+          ? IconButton(
+              tooltip: appText(context, 'Sao chép', 'Copy'),
+              icon: const Icon(
+                Icons.copy_rounded,
+                size: 20,
+                color: BrandColors.textSecondary,
               ),
-
-              const Divider(height: 32),
-
-              // ------------------------------------------------
-              // SEGMENT DURATION
-              // ------------------------------------------------
-              _SectionLabel(
-                icon: Icons.timer_outlined,
-                text: appText(
+              onPressed: () async {
+                await Clipboard.setData(ClipboardData(text: url));
+                if (!context.mounted) return;
+                showAppNotice(
                   context,
-                  'CHIA VIDEO TỰ ĐỘNG',
-                  'AUTOMATIC VIDEO SEGMENTS',
-                ),
-              ),
-              const SizedBox(height: 10),
-              DropdownButtonFormField<int>(
-                initialValue: segmentMinutes,
-                decoration: InputDecoration(
-                  prefixIcon: const Icon(Icons.timer_outlined),
-                  filled: true,
-                  fillColor: const Color(0xFFF6F8FB),
-                  border: OutlineInputBorder(
-                    borderRadius: BorderRadius.circular(12),
-                    borderSide: BorderSide.none,
-                  ),
-                  contentPadding: const EdgeInsets.symmetric(
-                    horizontal: 12,
-                    vertical: 4,
-                  ),
-                ),
-                items: const [1, 2, 3, 5, 10, 15, 30]
-                    .map(
-                      (minutes) => DropdownMenuItem(
-                        value: minutes,
-                        child: Text(
-                          appText(context, '$minutes phút', '$minutes minutes'),
-                        ),
-                      ),
-                    )
-                    .toList(),
-                onChanged: onSegmentChanged,
-              ),
+                  vi: 'Đã sao chép',
+                  en: 'Copied',
+                  kind: NoticeKind.success,
+                );
+              },
+            )
+          : null,
+    );
+  }
 
-              const SizedBox(height: 24),
-
-              // ------------------------------------------------
-              // STORAGE PATH
-              // ------------------------------------------------
-              _SectionLabel(
-                icon: Icons.folder_rounded,
-                text: appText(context, 'THƯ MỤC ĐANG LƯU', 'STORAGE FOLDER'),
-              ),
-              const SizedBox(height: 10),
-              Column(
-                crossAxisAlignment: CrossAxisAlignment.stretch,
-                children: [
-                  Container(
-                    padding: const EdgeInsets.all(12),
-                    decoration: BoxDecoration(
-                      color: const Color(0xFFE8F1FF),
-                      borderRadius: BorderRadius.circular(12),
-                      border: Border.all(color: const Color(0xFF90CAF9)),
-                    ),
-                    child: Row(
+  @override
+  Widget build(BuildContext context) {
+    final choose = onChooseStorage;
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        BrandSection(
+          title: appText(context, 'Lưu trữ', 'Storage'),
+          children: [
+            BrandTile(
+              icon: Icons.folder_rounded,
+              title: _folderName(context),
+              subtitle: storagePath.isEmpty
+                  ? appText(context, 'Chọn thư mục lưu video', 'Pick a folder')
+                  : appText(context, 'Theo ngày · AUTOMODE', 'By date · AUTOMODE'),
+              onTap: choose,
+              trailing: choose == null
+                  ? null
+                  : Row(
+                      mainAxisSize: MainAxisSize.min,
                       children: [
-                        Container(
-                          padding: const EdgeInsets.all(9),
-                          decoration: BoxDecoration(
-                            color: Colors.white,
-                            borderRadius: BorderRadius.circular(10),
-                          ),
-                          child: const Icon(
-                            Icons.sd_storage_rounded,
-                            color: Color(0xFF1565C0),
-                            size: 22,
+                        Text(
+                          storagePath.isEmpty
+                              ? appText(context, 'Chọn', 'Choose')
+                              : appText(context, 'Đổi', 'Change'),
+                          style: BrandText.body.copyWith(
+                            color: BrandColors.primarySoft,
+                            fontWeight: FontWeight.w700,
                           ),
                         ),
-                        const SizedBox(width: 11),
-                        Expanded(
-                          child: Column(
-                            crossAxisAlignment: CrossAxisAlignment.start,
-                            children: [
-                              Text(
-                                _folderName,
-                                maxLines: 1,
-                                overflow: TextOverflow.ellipsis,
-                                style: const TextStyle(
-                                  fontWeight: FontWeight.w800,
-                                ),
-                              ),
-                              const SizedBox(height: 2),
-                              Text(
-                                storagePath.isEmpty
-                                    ? appText(
-                                        context,
-                                        'Chọn thư mục để bắt đầu lưu video',
-                                        'Choose a folder to start saving videos',
-                                      )
-                                    : appText(
-                                        context,
-                                        'Theo ngày · AUTOMODE',
-                                        'By date · AUTOMODE',
-                                      ),
-                                style: const TextStyle(
-                                  color: Colors.black54,
-                                  fontSize: 12,
-                                ),
-                              ),
-                            ],
-                          ),
+                        const Icon(
+                          Icons.chevron_right_rounded,
+                          color: BrandColors.textDisabled,
                         ),
                       ],
                     ),
-                  ),
-                  if (onChooseStorage != null) ...[
-                    const SizedBox(height: 8),
-                    OutlinedButton.icon(
-                      style: OutlinedButton.styleFrom(
-                        padding: const EdgeInsets.symmetric(
-                          horizontal: 10,
-                          vertical: 11,
-                        ),
-                        visualDensity: VisualDensity.compact,
-                      ),
-                      onPressed: onChooseStorage,
-                      icon: const Icon(Icons.folder_open_rounded, size: 18),
-                      label: Text(
-                        storagePath.isEmpty
-                            ? appText(context, 'CHỌN THƯ MỤC', 'CHOOSE FOLDER')
-                            : appText(context, 'ĐỔI THƯ MỤC', 'CHANGE FOLDER'),
-                        style: const TextStyle(
-                          fontSize: 11,
-                          fontWeight: FontWeight.w900,
-                        ),
-                      ),
-                    ),
-                  ],
-                ],
-              ),
-
-              const SizedBox(height: 24),
-
-              // ------------------------------------------------
-              // API ENDPOINTS
-              // ------------------------------------------------
-              _SectionLabel(
-                icon: Icons.api_rounded,
-                text: appText(context, 'KẾT NỐI MẠNG', 'NETWORK CONNECTION'),
-              ),
-              const SizedBox(height: 10),
-              _SettingLine(
-                icon: Icons.lan_rounded,
-                title: appText(context, 'Danh sách qua IP', 'List via IP'),
-                value: '$apiBase/segments',
-              ),
-              _SettingLine(
-                icon: Icons.content_cut_rounded,
-                title: appText(context, 'API cắt video', 'Video clipping API'),
-                value: '$apiBase/trim',
-                last: true,
-              ),
-            ],
-          ),
-        ),
-      ),
-    );
-  }
-}
-
-// ============================================================
-// SECTION LABEL
-// ============================================================
-
-class _SectionLabel extends StatelessWidget {
-  final IconData icon;
-  final String text;
-
-  const _SectionLabel({required this.icon, required this.text});
-
-  @override
-  Widget build(BuildContext context) {
-    return Row(
-      children: [
-        Icon(icon, size: 15, color: Colors.black45),
-        const SizedBox(width: 6),
-        Expanded(
-          child: Text(
-            text,
-            softWrap: true,
-            style: const TextStyle(
-              fontWeight: FontWeight.w900,
-              fontSize: 12,
-              letterSpacing: 0.4,
-              color: Colors.black54,
             ),
-          ),
-        ),
-      ],
-    );
-  }
-}
-
-// ============================================================
-// SETTING LINE
-// ============================================================
-
-class _SettingLine extends StatelessWidget {
-  final IconData icon;
-  final String title;
-  final String value;
-  final bool last;
-
-  const _SettingLine({
-    required this.icon,
-    required this.title,
-    required this.value,
-    this.last = false,
-  });
-
-  @override
-  Widget build(BuildContext context) {
-    return Padding(
-      padding: EdgeInsets.only(bottom: last ? 0 : 14),
-      child: Row(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Container(
-            padding: const EdgeInsets.all(7),
-            decoration: BoxDecoration(
-              color: const Color(0xFF1565C0).withValues(alpha: 0.10),
-              borderRadius: BorderRadius.circular(9),
-            ),
-            child: Icon(icon, size: 16, color: const Color(0xFF1565C0)),
-          ),
-          const SizedBox(width: 10),
-          Expanded(
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
+            Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              mainAxisSize: MainAxisSize.min,
               children: [
-                Text(
-                  title,
-                  style: const TextStyle(
-                    fontWeight: FontWeight.w800,
-                    fontSize: 13,
-                  ),
+                BrandTile(
+                  icon: Icons.timer_rounded,
+                  title: appText(context, 'Độ dài đoạn', 'Segment length'),
+                  subtitle: appText(context, 'Phút', 'Minutes'),
                 ),
-                const SizedBox(height: 2),
-                SelectableText(
-                  value,
-                  style: const TextStyle(fontSize: 12, color: Colors.black54),
+                Padding(
+                  padding: const EdgeInsets.fromLTRB(
+                    BrandSpace.lg,
+                    0,
+                    BrandSpace.lg,
+                    BrandSpace.md,
+                  ),
+                  child: SingleChildScrollView(
+                    scrollDirection: Axis.horizontal,
+                    child: BrandSegmented<int>(
+                      values: _segmentOptions,
+                      selected: segmentMinutes,
+                      labelOf: (minutes) => '$minutes',
+                      onChanged: (minutes) => onSegmentChanged(minutes),
+                      dense: true,
+                    ),
+                  ),
                 ),
               ],
             ),
-          ),
-        ],
-      ),
+          ],
+        ),
+        const SizedBox(height: BrandSpace.xl),
+        BrandSection(
+          title: appText(context, 'Kết nối mạng', 'Network'),
+          children: [
+            _urlTile(
+              context,
+              icon: Icons.lan_rounded,
+              title: appText(context, 'Danh sách qua IP', 'List via IP'),
+              path: '/segments',
+            ),
+            _urlTile(
+              context,
+              icon: Icons.content_cut_rounded,
+              title: appText(context, 'API cắt video', 'Clip API'),
+              path: '/trim',
+            ),
+          ],
+        ),
+      ],
     );
   }
 }
@@ -713,7 +668,7 @@ class _SettingLine extends StatelessWidget {
 // VIDEO LIST
 // ============================================================
 
-class VideoList extends StatelessWidget {
+class VideoList extends StatefulWidget {
   final bool loading;
   final List<RecordedSegment> videos;
   final String activeCameraId;
@@ -722,6 +677,9 @@ class VideoList extends StatelessWidget {
   final String Function(int) formatSize;
   final String Function(DateTime) formatTime;
   final ValueChanged<RecordedSegment> onView;
+
+  /// Khối đầu trang cuộn cùng danh sách (thẻ dung lượng, bộ chọn tab).
+  final Widget? header;
 
   const VideoList({
     super.key,
@@ -733,19 +691,73 @@ class VideoList extends StatelessWidget {
     required this.formatSize,
     required this.formatTime,
     required this.onView,
+    this.header,
   });
 
   @override
+  State<VideoList> createState() => _VideoListState();
+}
+
+/// Một dòng trong danh sách phẳng: tiêu đề ngày, đoạn đang ghi hoặc video.
+class _ListEntry {
+  const _ListEntry.day(this.day) : video = null, active = false;
+  const _ListEntry.active() : day = null, video = null, active = true;
+  const _ListEntry.video(this.video) : day = null, active = false;
+
+  final DateTime? day;
+  final RecordedSegment? video;
+  final bool active;
+}
+
+class _VideoListState extends State<VideoList> {
+  String? _camera;
+
+  String _cameraLabel(String cameraId) {
+    final number = RegExp(r'\d+').firstMatch(cameraId)?.group(0);
+    return number == null ? cameraId.toUpperCase() : 'CAM $number';
+  }
+
+  String _cameraKey(String cameraId) {
+    final number = RegExp(r'\d+').firstMatch(cameraId)?.group(0);
+    return number == null ? cameraId.toUpperCase() : 'CAM${int.parse(number)}';
+  }
+
+  @override
   Widget build(BuildContext context) {
-    if (loading) {
-      return const Center(child: CircularProgressIndicator());
-    }
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        final side = _sideGutter(constraints.maxWidth);
+        final header = widget.header;
+        return CustomScrollView(
+          slivers: [
+            if (header != null)
+              SliverPadding(
+                padding: EdgeInsets.fromLTRB(side, BrandSpace.lg, side, 0),
+                sliver: SliverToBoxAdapter(child: header),
+              ),
+            if (widget.loading)
+              const SliverFillRemaining(
+                hasScrollBody: false,
+                child: Padding(
+                  padding: EdgeInsets.all(BrandSpace.xl),
+                  child: Center(child: CircularProgressIndicator()),
+                ),
+              )
+            else
+              ..._buildContent(context, side),
+          ],
+        );
+      },
+    );
+  }
+
+  List<Widget> _buildContent(BuildContext context, double side) {
     final videosByCamera = <String, List<RecordedSegment>>{
       'CAM1': <RecordedSegment>[],
       'CAM2': <RecordedSegment>[],
       'CAM3': <RecordedSegment>[],
     };
-    for (final video in videos) {
+    for (final video in widget.videos) {
       final cameraKey = _cameraKey(video.cameraId);
       videosByCamera.putIfAbsent(cameraKey, () => []).add(video);
     }
@@ -762,182 +774,303 @@ class VideoList extends StatelessWidget {
         }
         return a.compareTo(b);
       });
+    final activeKey = _cameraKey(widget.activeCameraId);
+    final selected = cameraIds.contains(_camera)
+        ? _camera!
+        : (cameraIds.contains(activeKey) ? activeKey : cameraIds.first);
+    final cameraVideos = videosByCamera[selected]!;
+    final startedAt = widget.activeRecordingStartedAt;
+    final isActivelyRecording =
+        activeKey == selected &&
+        widget.activeRecordingPath != null &&
+        startedAt != null;
 
-    return DefaultTabController(
-      length: cameraIds.length,
-      child: Card(
-        elevation: 0,
-        clipBehavior: Clip.antiAlias,
-        shape: RoundedRectangleBorder(
-          borderRadius: BorderRadius.circular(18),
-          side: const BorderSide(color: Color(0xFFE3E8EF)),
+    final entries = <_ListEntry>[];
+    DateTime? currentDay;
+    void addDay(DateTime value) {
+      final day = _dayOf(value);
+      if (day != currentDay) {
+        currentDay = day;
+        entries.add(_ListEntry.day(day));
+      }
+    }
+
+    if (isActivelyRecording && startedAt != null) {
+      addDay(startedAt);
+      entries.add(const _ListEntry.active());
+    }
+    for (final video in cameraVideos) {
+      addDay(video.startedAt);
+      entries.add(_ListEntry.video(video));
+    }
+
+    final count = cameraVideos.length;
+    return [
+      SliverPadding(
+        padding: EdgeInsets.fromLTRB(side, BrandSpace.lg, side, 0),
+        sliver: SliverToBoxAdapter(
+          child: Row(
+            children: [
+              Expanded(
+                child: Align(
+                  alignment: AlignmentDirectional.centerStart,
+                  child: SingleChildScrollView(
+                    scrollDirection: Axis.horizontal,
+                    child: BrandSegmented<String>(
+                      values: cameraIds,
+                      selected: selected,
+                      labelOf: _cameraLabel,
+                      onChanged: (camera) => setState(() => _camera = camera),
+                      dense: true,
+                    ),
+                  ),
+                ),
+              ),
+              const SizedBox(width: BrandSpace.sm),
+              Text(
+                appText(context, '$count video', '$count videos'),
+                style: BrandText.caption,
+              ),
+            ],
+          ),
         ),
-        child: Column(
-          children: [
-            Material(
-              color: const Color(0xFFF4F7FB),
-              child: TabBar(
-                isScrollable: cameraIds.length > 3,
-                tabs: cameraIds
-                    .map(
-                      (cameraId) => Tab(
-                        text: _cameraLabel(cameraId),
-                        icon: const Icon(Icons.videocam_rounded, size: 18),
-                      ),
-                    )
-                    .toList(),
-              ),
+      ),
+      if (entries.isEmpty)
+        SliverFillRemaining(
+          hasScrollBody: false,
+          child: BrandEmptyState(
+            icon: Icons.videocam_off_rounded,
+            message: appText(context, 'Chưa có video', 'No videos yet'),
+          ),
+        )
+      else
+        SliverPadding(
+          padding: EdgeInsets.fromLTRB(side, BrandSpace.sm, side, BrandSpace.xl),
+          sliver: SliverList(
+            delegate: SliverChildBuilderDelegate(
+              (context, index) => _buildEntry(context, entries[index]),
+              childCount: entries.length,
             ),
-            Expanded(
-              child: TabBarView(
-                children: cameraIds
-                    .map(
-                      (cameraId) => _buildCameraList(
-                        context,
-                        cameraId,
-                        videosByCamera[cameraId]!,
-                      ),
-                    )
-                    .toList(),
-              ),
-            ),
-          ],
+          ),
+        ),
+    ];
+  }
+
+  Widget _buildEntry(BuildContext context, _ListEntry entry) {
+    final day = entry.day;
+    if (day != null) {
+      return Padding(
+        padding: const EdgeInsets.fromLTRB(
+          BrandSpace.xs,
+          BrandSpace.lg,
+          BrandSpace.xs,
+          BrandSpace.sm,
+        ),
+        child: Text(
+          _dayLabel(context, day).toUpperCase(),
+          style: BrandText.label,
+        ),
+      );
+    }
+    if (entry.active) {
+      return Padding(
+        padding: const EdgeInsets.only(bottom: BrandSpace.sm),
+        child: _ActiveRecordingTile(
+          startedAt: widget.activeRecordingStartedAt!,
+          formatTime: widget.formatTime,
+        ),
+      );
+    }
+    final video = entry.video!;
+    return Padding(
+      padding: const EdgeInsets.only(bottom: BrandSpace.sm),
+      child: _SegmentCard(
+        key: ValueKey(video.path),
+        video: video,
+        formatSize: widget.formatSize,
+        formatTime: widget.formatTime,
+        onTap: () => widget.onView(video),
+        trailing: IconButton(
+          tooltip: appText(context, 'Xem video', 'Play video'),
+          onPressed: () => widget.onView(video),
+          icon: const Icon(
+            Icons.play_circle_outline_rounded,
+            color: BrandColors.primarySoft,
+          ),
         ),
       ),
     );
   }
+}
 
-  String _cameraLabel(String cameraId) {
-    final number = RegExp(r'\d+').firstMatch(cameraId)?.group(0);
-    return number == null ? cameraId.toUpperCase() : 'CAM $number';
-  }
+// ============================================================
+// VIDEO CARDS
+// ============================================================
 
-  String _cameraKey(String cameraId) {
-    final number = RegExp(r'\d+').firstMatch(cameraId)?.group(0);
-    return number == null ? cameraId.toUpperCase() : 'CAM${int.parse(number)}';
-  }
+/// Thẻ một video: ô thumbnail bo góc + tên + dòng phụ + badge + hành động.
+class _MediaCard extends StatelessWidget {
+  const _MediaCard({
+    required this.icon,
+    required this.accent,
+    required this.title,
+    required this.meta,
+    this.badge,
+    this.trailing,
+    this.onTap,
+    this.tint,
+    this.thumbTooltip,
+  });
 
-  Widget _buildCameraList(
-    BuildContext context,
-    String cameraId,
-    List<RecordedSegment> cameraVideos,
-  ) {
-    final isActivelyRecording =
-        _cameraKey(activeCameraId) == cameraId &&
-        activeRecordingPath != null &&
-        activeRecordingStartedAt != null;
-    if (cameraVideos.isEmpty && !isActivelyRecording) {
-      return Center(
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            const Icon(
-              Icons.videocam_off_rounded,
-              size: 44,
-              color: Colors.black26,
-            ),
-            const SizedBox(height: 10),
-            Text(
-              appText(
-                context,
-                'Camera này chưa có video',
-                'This camera has no videos',
-              ),
-              style: const TextStyle(
-                color: Colors.black45,
-                fontWeight: FontWeight.w700,
-              ),
-            ),
-          ],
+  final IconData icon;
+  final Color accent;
+  final String title;
+  final String meta;
+  final Widget? badge;
+  final Widget? trailing;
+  final VoidCallback? onTap;
+  final Color? tint;
+  final String? thumbTooltip;
+
+  @override
+  Widget build(BuildContext context) {
+    Widget thumb = Container(
+      width: 64,
+      height: 48,
+      decoration: BoxDecoration(
+        color: tint ?? BrandColors.surfaceRaised,
+        borderRadius: BorderRadius.circular(BrandRadius.small),
+        border: Border.all(color: BrandColors.border),
+      ),
+      child: Icon(icon, color: accent, size: 24),
+    );
+    final tip = thumbTooltip;
+    if (tip != null) thumb = Tooltip(message: tip, child: thumb);
+    final badgeWidget = badge;
+    return Material(
+      color: BrandColors.surface,
+      clipBehavior: Clip.antiAlias,
+      shape: RoundedRectangleBorder(
+        borderRadius: BorderRadius.circular(BrandRadius.medium),
+        side: BorderSide(
+          color: tint == null ? BrandColors.border : accent.withValues(alpha: 0.4),
         ),
-      );
-    }
-    return ListView.separated(
-      padding: const EdgeInsets.symmetric(vertical: 4),
-      itemCount: cameraVideos.length + (isActivelyRecording ? 1 : 0),
-      separatorBuilder: (_, _) =>
-          const Divider(height: 1, indent: 70, endIndent: 16),
-      itemBuilder: (context, index) {
-        if (isActivelyRecording && index == cameraVideos.length) {
-          return _ActiveRecordingTile(
-            startedAt: activeRecordingStartedAt!,
-            formatTime: formatTime,
-          );
-        }
-        final video = cameraVideos[index];
-        final isClip = video.type == 'CLIP';
-        final accent = isClip
-            ? const Color(0xFF7B1FA2)
-            : const Color(0xFF1565C0);
-        return FutureBuilder<int>(
-          future: File(video.path).length(),
-          builder: (context, snapshot) => ListTile(
-            contentPadding: const EdgeInsets.symmetric(
-              horizontal: 16,
-              vertical: 6,
-            ),
-            leading: CircleAvatar(
-              backgroundColor: accent.withValues(alpha: 0.12),
-              child: Icon(
-                isClip ? Icons.content_cut_rounded : Icons.videocam_rounded,
-                color: accent,
-                size: 20,
-              ),
-            ),
-            title: Text(
-              video.fileName,
-              maxLines: 1,
-              overflow: TextOverflow.ellipsis,
-              style: const TextStyle(fontWeight: FontWeight.w700),
-            ),
-            subtitle: Padding(
-              padding: const EdgeInsets.only(top: 3),
-              child: Row(
-                children: [
-                  Flexible(
-                    child: Text(
-                      '${formatTime(video.startedAt)} · '
-                      '${formatSize(snapshot.data ?? 0)}',
-                      overflow: TextOverflow.ellipsis,
-                      style: const TextStyle(
-                        fontSize: 12,
-                        color: Colors.black54,
-                      ),
-                    ),
-                  ),
-                  const SizedBox(width: 6),
-                  Container(
-                    padding: const EdgeInsets.symmetric(
-                      horizontal: 7,
-                      vertical: 2,
-                    ),
-                    decoration: BoxDecoration(
-                      color: accent.withValues(alpha: 0.12),
-                      borderRadius: BorderRadius.circular(20),
-                    ),
-                    child: Text(
-                      video.type,
-                      style: TextStyle(
-                        fontSize: 9.5,
-                        fontWeight: FontWeight.w900,
-                        color: accent,
-                      ),
-                    ),
-                  ),
-                ],
-              ),
-            ),
-            trailing: IconButton(
-              tooltip: appText(context, 'Xem video', 'Play video'),
-              onPressed: () => onView(video),
-              icon: const Icon(
-                Icons.visibility_rounded,
-                color: Color(0xFF1565C0),
-              ),
-            ),
+      ),
+      child: InkWell(
+        onTap: onTap,
+        child: Padding(
+          padding: EdgeInsets.fromLTRB(
+            BrandSpace.sm + 2,
+            BrandSpace.sm + 2,
+            trailing == null ? BrandSpace.md : BrandSpace.xs,
+            BrandSpace.sm + 2,
           ),
-        );
-      },
+          child: Row(
+            children: [
+              thumb,
+              const SizedBox(width: BrandSpace.md),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Row(
+                      children: [
+                        Flexible(
+                          child: Text(
+                            title,
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                            style: BrandText.body.copyWith(
+                              fontWeight: FontWeight.w600,
+                            ),
+                          ),
+                        ),
+                        if (badgeWidget != null) ...[
+                          const SizedBox(width: BrandSpace.sm),
+                          badgeWidget,
+                        ],
+                      ],
+                    ),
+                    const SizedBox(height: 2),
+                    Text(
+                      meta,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: BrandText.caption,
+                    ),
+                  ],
+                ),
+              ),
+              ?trailing,
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _SegmentCard extends StatefulWidget {
+  const _SegmentCard({
+    super.key,
+    required this.video,
+    required this.formatSize,
+    required this.formatTime,
+    this.onTap,
+    this.trailing,
+  });
+
+  final RecordedSegment video;
+  final String Function(int) formatSize;
+  final String Function(DateTime) formatTime;
+  final VoidCallback? onTap;
+  final Widget? trailing;
+
+  @override
+  State<_SegmentCard> createState() => _SegmentCardState();
+}
+
+class _SegmentCardState extends State<_SegmentCard> {
+  late Future<int> _sizeFuture;
+
+  @override
+  void initState() {
+    super.initState();
+    _sizeFuture = File(widget.video.path).length();
+  }
+
+  @override
+  void didUpdateWidget(covariant _SegmentCard oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.video.path != widget.video.path) {
+      _sizeFuture = File(widget.video.path).length();
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final video = widget.video;
+    final isClip = video.type == 'CLIP';
+    final accent = isClip ? BrandColors.warningSoft : BrandColors.primarySoft;
+    final duration = video.duration;
+    return FutureBuilder<int>(
+      future: _sizeFuture,
+      builder: (context, snapshot) => _MediaCard(
+        icon: isClip ? Icons.content_cut_rounded : Icons.play_arrow_rounded,
+        accent: accent,
+        title: video.fileName,
+        thumbTooltip: widget.formatTime(video.startedAt),
+        meta: [
+          _clockOf(video.startedAt),
+          if (duration > Duration.zero) _durationLabel(duration),
+          widget.formatSize(snapshot.data ?? 0),
+        ].join('  ·  '),
+        badge: isClip
+            ? const BrandPill(text: 'CLIP', color: BrandColors.warningSoft)
+            : null,
+        onTap: widget.onTap,
+        trailing: widget.trailing,
+      ),
     );
   }
 }
@@ -981,42 +1114,22 @@ class _ActiveRecordingTileState extends State<_ActiveRecordingTile> {
 
   @override
   Widget build(BuildContext context) {
-    String two(int value) => value.toString().padLeft(2, '0');
     final fileName =
-        '${two(widget.startedAt.hour)}-'
-        '${two(widget.startedAt.minute)}-'
-        '${two(widget.startedAt.second)}.ts';
-    return ListTile(
-      tileColor: const Color(0xFFFFEBEE),
-      contentPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 6),
-      leading: const CircleAvatar(
-        backgroundColor: Color(0xFFFFCDD2),
-        child: Icon(Icons.fiber_manual_record_rounded, color: Colors.red),
-      ),
-      title: Text(
-        fileName,
-        maxLines: 1,
-        overflow: TextOverflow.ellipsis,
-        style: const TextStyle(fontWeight: FontWeight.w800),
-      ),
-      subtitle: Text(
-        '${widget.formatTime(widget.startedAt)} · ${_elapsed()}',
-        style: const TextStyle(color: Colors.black54, fontSize: 12),
-      ),
-      trailing: Container(
-        padding: const EdgeInsets.symmetric(horizontal: 9, vertical: 5),
-        decoration: BoxDecoration(
-          color: Colors.red.withValues(alpha: 0.12),
-          borderRadius: BorderRadius.circular(20),
-        ),
-        child: Text(
-          appText(context, 'ĐANG GHI', 'RECORDING'),
-          style: const TextStyle(
-            color: Colors.red,
-            fontSize: 10,
-            fontWeight: FontWeight.w900,
-          ),
-        ),
+        '${_two(widget.startedAt.hour)}-'
+        '${_two(widget.startedAt.minute)}-'
+        '${_two(widget.startedAt.second)}.ts';
+    return _MediaCard(
+      icon: Icons.fiber_manual_record_rounded,
+      accent: BrandColors.live,
+      tint: BrandColors.live.withValues(alpha: 0.14),
+      title: fileName,
+      thumbTooltip: widget.formatTime(widget.startedAt),
+      meta: '${_clockOf(widget.startedAt)}  ·  ${_elapsed()}',
+      badge: BrandPill(
+        dot: true,
+        filled: true,
+        color: BrandColors.live,
+        text: appText(context, 'ĐANG GHI', 'REC'),
       ),
     );
   }
@@ -1112,24 +1225,28 @@ class _VideoPlayerScreenState extends State<_VideoPlayerScreen> {
       appBar: AppBar(
         backgroundColor: Colors.black,
         foregroundColor: Colors.white,
-        title: Text(widget.video.fileName, overflow: TextOverflow.ellipsis),
+        scrolledUnderElevation: 0,
+        title: Text(
+          widget.video.fileName,
+          maxLines: 1,
+          overflow: TextOverflow.ellipsis,
+          style: const TextStyle(
+            color: Colors.white,
+            fontSize: 15,
+            fontWeight: FontWeight.w600,
+          ),
+        ),
       ),
       body: FutureBuilder<void>(
         future: _initialization,
         builder: (context, snapshot) {
           if (snapshot.hasError) {
-            return Center(
-              child: Padding(
-                padding: const EdgeInsets.all(24),
-                child: Text(
-                  appText(
-                    context,
-                    'Không thể phát video: ${userFacingError(snapshot.error!)}',
-                    'Cannot play video: ${userFacingError(snapshot.error!)}',
-                  ),
-                  textAlign: TextAlign.center,
-                  style: const TextStyle(color: Colors.white),
-                ),
+            return BrandEmptyState(
+              icon: Icons.error_outline_rounded,
+              message: appText(
+                context,
+                'Không thể phát video: ${localizedUserFacingError(snapshot.error!, english: false)}',
+                'Cannot play video: ${localizedUserFacingError(snapshot.error!, english: true)}',
               ),
             );
           }
@@ -1137,49 +1254,128 @@ class _VideoPlayerScreenState extends State<_VideoPlayerScreen> {
             return const Center(child: CircularProgressIndicator());
           }
           final controller = _controller!;
-          final aspectRatio = controller.value.aspectRatio > 0
-              ? controller.value.aspectRatio
-              : 16 / 9;
-          return Column(
-            children: [
-              Expanded(
-                child: Center(
-                  child: GestureDetector(
-                    onTap: _togglePlayback,
-                    child: Stack(
-                      alignment: Alignment.center,
-                      children: [
-                        AspectRatio(
-                          aspectRatio: aspectRatio,
-                          child: VideoPlayer(controller),
-                        ),
-                        if (!controller.value.isPlaying)
-                          const Icon(
-                            Icons.play_circle_fill_rounded,
-                            color: Colors.white70,
-                            size: 72,
+          return ValueListenableBuilder<VideoPlayerValue>(
+            valueListenable: controller,
+            builder: (context, value, _) {
+              final aspectRatio = value.aspectRatio > 0
+                  ? value.aspectRatio
+                  : 16 / 9;
+              final playing = value.isPlaying;
+              return Column(
+                children: [
+                  Expanded(
+                    child: GestureDetector(
+                      behavior: HitTestBehavior.opaque,
+                      onTap: _togglePlayback,
+                      child: Stack(
+                        alignment: Alignment.center,
+                        children: [
+                          Center(
+                            child: AspectRatio(
+                              aspectRatio: aspectRatio,
+                              child: VideoPlayer(controller),
+                            ),
                           ),
-                      ],
+                          if (!playing)
+                            _RoundPlayButton(
+                              tooltip: appText(context, 'Phát', 'Play'),
+                              onPressed: _togglePlayback,
+                            ),
+                        ],
+                      ),
                     ),
                   ),
-                ),
-              ),
-              SafeArea(
-                top: false,
-                child: VideoProgressIndicator(
-                  controller,
-                  allowScrubbing: true,
-                  padding: const EdgeInsets.all(16),
-                  colors: const VideoProgressColors(
-                    playedColor: Color(0xFF42A5F5),
-                    bufferedColor: Colors.white38,
-                    backgroundColor: Colors.white24,
+                  SafeArea(
+                    top: false,
+                    child: Padding(
+                      padding: const EdgeInsets.fromLTRB(
+                        BrandSpace.xs,
+                        BrandSpace.xs,
+                        BrandSpace.lg,
+                        BrandSpace.sm,
+                      ),
+                      child: Row(
+                        children: [
+                          IconButton(
+                            tooltip: playing
+                                ? appText(context, 'Tạm dừng', 'Pause')
+                                : appText(context, 'Phát', 'Play'),
+                            onPressed: _togglePlayback,
+                            icon: Icon(
+                              playing
+                                  ? Icons.pause_rounded
+                                  : Icons.play_arrow_rounded,
+                              color: Colors.white,
+                            ),
+                          ),
+                          Text(
+                            _durationLabel(value.position),
+                            style: _playerTimeStyle,
+                          ),
+                          Expanded(
+                            child: VideoProgressIndicator(
+                              controller,
+                              allowScrubbing: true,
+                              padding: const EdgeInsets.symmetric(
+                                horizontal: BrandSpace.md,
+                                vertical: BrandSpace.lg,
+                              ),
+                              colors: const VideoProgressColors(
+                                playedColor: BrandColors.primaryBright,
+                                bufferedColor: Colors.white38,
+                                backgroundColor: Colors.white24,
+                              ),
+                            ),
+                          ),
+                          Text(
+                            _durationLabel(value.duration),
+                            style: _playerTimeStyle.copyWith(
+                              color: Colors.white60,
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
                   ),
-                ),
-              ),
-            ],
+                ],
+              );
+            },
           );
         },
+      ),
+    );
+  }
+}
+
+const _playerTimeStyle = TextStyle(
+  color: Colors.white,
+  fontSize: 12,
+  fontWeight: FontWeight.w600,
+);
+
+/// Nút phát tròn lớn giữa khung hình khi đang tạm dừng.
+class _RoundPlayButton extends StatelessWidget {
+  const _RoundPlayButton({required this.tooltip, required this.onPressed});
+
+  final String tooltip;
+  final VoidCallback onPressed;
+
+  @override
+  Widget build(BuildContext context) {
+    return Tooltip(
+      message: tooltip,
+      child: Material(
+        color: const Color(0x99000000),
+        shape: const CircleBorder(side: BorderSide(color: Color(0x33FFFFFF))),
+        clipBehavior: Clip.antiAlias,
+        child: InkWell(
+          onTap: onPressed,
+          child: const SizedBox(
+            width: 72,
+            height: 72,
+            child: Icon(Icons.play_arrow_rounded, color: Colors.white, size: 44),
+          ),
+        ),
       ),
     );
   }

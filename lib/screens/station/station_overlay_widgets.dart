@@ -1,53 +1,83 @@
 part of '../station_screen.dart';
 
 // ============================================================
-// HEADER
+// THANH TRẠNG THÁI, RAIL & MENU (màn hình camera)
+//
+// Ngôn ngữ chung: nền kính tối (BrandGlass / viên 0x8C080D18), viền mảnh,
+// chữ trắng; màu nhấn duy nhất là xanh thương hiệu (trạng thái đang bật),
+// đỏ chỉ cho REC/LIVE/nguy hiểm, cam cho cảnh báo.
 // ============================================================
 
-// ============================================================
-// THANH TRẠNG THÁI & MENU (màn hình camera)
-// ============================================================
+/// Dải tối mờ dần (đen → trong suốt) sau thanh trạng thái/thanh zoom: chữ
+/// trắng dễ đọc mà không có khối nền nặng che hình camera. Không bắt chạm.
+class _Scrim extends StatelessWidget {
+  const _Scrim({required this.fromTop});
 
-const Color _glassColor = Color(0xA60E1116);
-const Color _glassBorder = Color(0x1FFFFFFF);
-const Color _accentBlue = Color(0xFF1E88E5);
-
-/// Nền tối dùng chung cho thanh trạng thái, menu và các viên.
-class _GlassSurface extends StatelessWidget {
-  const _GlassSurface({
-    required this.child,
-    this.radius = 16,
-    this.padding = EdgeInsets.zero,
-    this.color = _glassColor,
-    this.borderColor = _glassBorder,
-  });
-
-  final Widget child;
-  final double radius;
-  final EdgeInsetsGeometry padding;
-  final Color color;
-  final Color borderColor;
+  final bool fromTop;
 
   @override
   Widget build(BuildContext context) {
-    // Không dùng làm mờ nền (BackdropFilter): vẽ lại mỗi khung hình camera
-    // tốn GPU và làm máy nóng thêm. Nền tối bán trong suốt là đủ đọc rõ.
-    return ClipRRect(
-      borderRadius: BorderRadius.circular(radius),
-      child: Container(
-        padding: padding,
+    return IgnorePointer(
+      child: DecoratedBox(
         decoration: BoxDecoration(
-          color: color,
-          borderRadius: BorderRadius.circular(radius),
-          border: Border.all(color: borderColor),
+          gradient: LinearGradient(
+            begin: fromTop ? Alignment.topCenter : Alignment.bottomCenter,
+            end: fromTop ? Alignment.bottomCenter : Alignment.topCenter,
+            colors: const [Color(0x99000000), Color(0x00000000)],
+          ),
         ),
-        child: child,
       ),
     );
   }
 }
 
-/// Một viên trạng thái: cùng chiều cao, cùng kiểu chữ cho mọi thông tin.
+/// Logo nhỏ ở góc trái thanh trạng thái.
+class _StationLogo extends StatelessWidget {
+  const _StationLogo({required this.compact});
+
+  final bool compact;
+
+  @override
+  Widget build(BuildContext context) {
+    return SizedBox(
+      width: compact ? 76 : 92,
+      height: compact ? 24 : 28,
+      child: Image.asset(
+        'assets/images/vnvar_logo.png',
+        fit: BoxFit.contain,
+        alignment: Alignment.centerLeft,
+      ),
+    );
+  }
+}
+
+/// Hàng viên trạng thái một dòng; thiếu chỗ thì cuộn ngang (không xuống
+/// dòng, không đẩy nút Menu).
+class _PillStrip extends StatelessWidget {
+  const _PillStrip({required this.pills});
+
+  final List<Widget> pills;
+
+  @override
+  Widget build(BuildContext context) {
+    return SingleChildScrollView(
+      scrollDirection: Axis.horizontal,
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          for (var i = 0; i < pills.length; i++) ...[
+            if (i > 0) const SizedBox(width: 6),
+            pills[i],
+          ],
+        ],
+      ),
+    );
+  }
+}
+
+/// Viên trạng thái cùng kiểu [BrandPill] (cao 32, bo tròn, nền kính), thêm
+/// các biến thể BrandPill chưa có: vòng xoay đang xử lý, icon đuôi (chất
+/// lượng luồng phát), nút đóng và mũi tên "chạm để mở".
 class _StatusPill extends StatelessWidget {
   const _StatusPill({
     required this.label,
@@ -63,14 +93,14 @@ class _StatusPill extends StatelessWidget {
     this.onClose,
   });
 
-  static const double height = 26;
-
   final String label;
   final Color color;
   final String tooltip;
   final IconData? icon;
   final Color? dotColor;
   final bool loading;
+
+  /// Nền đặc (vd đỏ LIVE); null = nền kính tối.
   final Color? background;
   final IconData? trailingIcon;
   final Color? trailingColor;
@@ -79,6 +109,7 @@ class _StatusPill extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final filled = background != null;
     final leading = loading
         ? SizedBox(
             width: 12,
@@ -92,11 +123,18 @@ class _StatusPill extends StatelessWidget {
             decoration: BoxDecoration(color: dotColor, shape: BoxShape.circle),
           )
         : icon != null
-        ? Icon(icon, size: 13, color: color)
+        ? Icon(icon, size: 16, color: color)
         : null;
-    final content = Container(
-      height: height,
-      padding: EdgeInsets.only(left: 9, right: onClose != null ? 3 : 10),
+    Widget pill = Container(
+      constraints: const BoxConstraints(minHeight: 32),
+      padding: EdgeInsets.only(left: 12, right: onClose != null ? 4 : 12),
+      decoration: BoxDecoration(
+        color: background ?? const Color(0x8C080D18),
+        borderRadius: BorderRadius.circular(999),
+        border: Border.all(
+          color: filled ? Colors.transparent : const Color(0x24FFFFFF),
+        ),
+      ),
       child: Row(
         mainAxisSize: MainAxisSize.min,
         children: [
@@ -106,22 +144,38 @@ class _StatusPill extends StatelessWidget {
             maxLines: 1,
             style: TextStyle(
               color: color,
-              fontSize: 11,
-              fontWeight: FontWeight.w800,
-              letterSpacing: 0.2,
-              height: 1.1,
+              fontSize: 13,
+              fontWeight: FontWeight.w700,
             ),
           ),
           if (trailingIcon != null) ...[
             const SizedBox(width: 6),
-            Icon(trailingIcon, size: 14, color: trailingColor ?? color),
+            // Trên nền đặc (đỏ LIVE) icon màu đặt trong vòng tối để vẫn đọc
+            // được màu xanh/cam/đỏ.
+            if (filled)
+              Container(
+                width: 22,
+                height: 22,
+                alignment: Alignment.center,
+                decoration: const BoxDecoration(
+                  color: Color(0x66000000),
+                  shape: BoxShape.circle,
+                ),
+                child: Icon(
+                  trailingIcon,
+                  size: 14,
+                  color: trailingColor ?? color,
+                ),
+              )
+            else
+              Icon(trailingIcon, size: 15, color: trailingColor ?? color),
           ],
           if (onTap != null && onClose == null) ...[
-            const SizedBox(width: 3),
+            const SizedBox(width: 2),
             Icon(
               Icons.expand_more_rounded,
-              size: 15,
-              color: color.withValues(alpha: 0.75),
+              size: 16,
+              color: color.withValues(alpha: 0.7),
             ),
           ],
           if (onClose != null)
@@ -129,10 +183,10 @@ class _StatusPill extends StatelessWidget {
               onTap: onClose,
               radius: 14,
               child: Padding(
-                padding: const EdgeInsets.all(4),
+                padding: const EdgeInsets.all(5),
                 child: Icon(
                   Icons.close_rounded,
-                  size: 14,
+                  size: 15,
                   color: color.withValues(alpha: 0.8),
                 ),
               ),
@@ -140,20 +194,17 @@ class _StatusPill extends StatelessWidget {
         ],
       ),
     );
-    return Tooltip(
-      message: tooltip,
-      child: _GlassSurface(
-        radius: height / 2,
-        color: background ?? _glassColor,
-        borderColor: background != null
-            ? Colors.transparent
-            : color.withValues(alpha: 0.30),
-        child: Material(
-          type: MaterialType.transparency,
-          child: InkWell(onTap: onTap, child: content),
+    if (onTap != null) {
+      pill = Material(
+        type: MaterialType.transparency,
+        child: InkWell(
+          borderRadius: BorderRadius.circular(999),
+          onTap: onTap,
+          child: pill,
         ),
-      ),
-    );
+      );
+    }
+    return Tooltip(message: tooltip, child: pill);
   }
 }
 
@@ -255,20 +306,20 @@ class _ThermalPillState extends State<_ThermalPill> {
     late final String label;
     late final String tooltip;
     if (isCooledDown) {
-      color = const Color(0xFF69F0AE);
+      color = BrandColors.successSoft;
       icon = Icons.ac_unit_rounded;
       label = appText(context, 'Đã mát · nâng chất lượng', 'Cool · raise quality');
       tooltip = appText(
         context,
-        'Máy đã mát. Chạm để chọn lại chất lượng video.',
-        'Device has cooled down. Tap to choose video quality.',
+        'Máy đã mát. Chạm để chọn lại chất lượng.',
+        'Device cooled down. Tap to choose quality.',
       );
     } else if (targetProfile != null) {
       final secs = (secondsUntil(widget.pendingAt, DateTime.now()) ?? 0).clamp(
         0,
         999,
       );
-      color = const Color(0xFFFFB74D);
+      color = BrandColors.warning;
       icon = Icons.timer_outlined;
       label = withTemp(
         secs < 5
@@ -285,46 +336,46 @@ class _ThermalPillState extends State<_ThermalPill> {
       );
       tooltip = appText(
         context,
-        'Máy nóng: sẽ tự hạ xuống ${full(targetProfile)} để giảm nhiệt. Chạm để chọn chất lượng khác.',
-        'Device is hot: lowering to ${full(targetProfile)} to cool down. Tap to choose another quality.',
+        'Máy nóng: sẽ tự hạ xuống ${full(targetProfile)}. Chạm để chọn khác.',
+        'Hot: lowering to ${full(targetProfile)}. Tap to choose another.',
       );
     } else if (isThrottled) {
-      color = const Color(0xFFFFB74D);
+      color = BrandColors.warning;
       icon = Icons.whatshot_rounded;
       label = withTemp(
         appText(context, 'giảm nhiệt', 'cooling'),
       );
       tooltip = appText(
         context,
-        'Đã hạ xuống ${full(profile)} để giữ máy mát. Chạm để chọn chất lượng khác.',
-        'Lowered to ${full(profile)} to keep the device cool. Tap to choose another quality.',
+        'Đã hạ xuống ${full(profile)} để giảm nhiệt. Chạm để chọn khác.',
+        'Lowered to ${full(profile)} to cool down. Tap to choose another.',
       );
     } else if (userOverride || isLocked) {
-      color = const Color(0xFFFF8A65);
+      color = BrandColors.dangerSoft;
       icon = isLocked ? Icons.lock_rounded : Icons.thermostat_rounded;
       label = withTemp(appText(context, 'máy nóng', 'hot'));
       tooltip = appText(
         context,
-        'Máy nóng nhưng đang giữ ${full(profile)} theo lựa chọn của bạn.',
-        'Device is hot but keeping ${full(profile)} as you selected.',
+        'Máy nóng, vẫn giữ ${full(profile)} theo lựa chọn của bạn.',
+        'Hot, keeping ${full(profile)} as you chose.',
       );
     } else if (loadLevel >= 2) {
-      color = const Color(0xFFFFB74D);
+      color = BrandColors.warning;
       icon = Icons.whatshot_rounded;
       label = withTemp(appText(context, 'giảm tải', 'reducing load'));
       tooltip = appText(
         context,
-        'Máy nóng: đã giảm FPS/bitrate và làm tối màn hình. Giữ nguyên độ phân giải để Tablet và livestream không mất hình.',
-        'Device is hot: FPS/bitrate reduced and screen dimmed. Resolution is kept so the tablet and livestream are not interrupted.',
+        'Máy nóng: đã giảm FPS/bitrate, làm tối màn hình; giữ độ phân giải để Tablet và live không mất hình.',
+        'Hot: FPS/bitrate reduced, screen dimmed; resolution kept so tablet and live stay on.',
       );
     } else {
-      color = const Color(0xFFFFE082);
+      color = BrandColors.warningSoft;
       icon = Icons.thermostat_rounded;
       label = withTemp(appText(context, 'máy ấm', 'warm'));
       tooltip = appText(
         context,
-        'Máy hơi ấm, app đang theo dõi nhiệt độ.',
-        'Device is warm; temperature is being monitored.',
+        'Máy hơi ấm, đang theo dõi nhiệt độ.',
+        'Device is warm; monitoring temperature.',
       );
     }
     return _StatusPill(
@@ -338,226 +389,171 @@ class _ThermalPillState extends State<_ThermalPill> {
   }
 }
 
-/// Thanh trên: viên trạng thái + nút "Menu" có chữ.
-class _StationHeader extends StatelessWidget {
-  const _StationHeader({
-    required this.compact,
-    required this.landscape,
-    required this.statusPills,
-    required this.menuOpen,
-    required this.onToggleMenu,
+/// Viền đỏ quanh nút tròn của rail cho hành động nguy hiểm (tắt camera):
+/// báo hiệu rõ mà không thành khối đỏ lớn. Viền chỉ bao hình tròn (không bao
+/// nhãn bên dưới) và không bắt chạm.
+class _DangerRing extends StatelessWidget {
+  const _DangerRing({
+    required this.enabled,
+    required this.size,
+    required this.child,
   });
 
-  final bool compact;
-  final bool landscape;
-  final List<Widget> statusPills;
-  final bool menuOpen;
-  final VoidCallback onToggleMenu;
+  final bool enabled;
+  final double size;
+  final Widget child;
 
   @override
   Widget build(BuildContext context) {
-    final menuButton = _MenuButton(open: menuOpen, onTap: onToggleMenu);
-    if (landscape) {
-      return Row(
-        children: [
-          Expanded(
-            child: Align(
-              alignment: Alignment.centerLeft,
-              // Máy hẹp: hàng trạng thái tự cuộn ngang, không đẩy nút Menu.
-              child: SingleChildScrollView(
-                scrollDirection: Axis.horizontal,
-                child: Row(
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    for (var i = 0; i < statusPills.length; i++) ...[
-                      if (i > 0) const SizedBox(width: 6),
-                      statusPills[i],
-                    ],
-                  ],
-                ),
+    if (!enabled) return child;
+    return Stack(
+      alignment: Alignment.topCenter,
+      children: [
+        child,
+        IgnorePointer(
+          child: Container(
+            width: size,
+            height: size,
+            decoration: BoxDecoration(
+              shape: BoxShape.circle,
+              border: Border.all(
+                color: BrandColors.danger.withValues(alpha: 0.9),
+                width: 1.5,
               ),
             ),
           ),
-          const SizedBox(width: 10),
-          menuButton,
-        ],
-      );
-    }
-    return Column(
-      mainAxisSize: MainAxisSize.min,
-      crossAxisAlignment: CrossAxisAlignment.stretch,
-      children: [
-        Row(
-          children: [
-            _GlassSurface(
-              radius: 10,
-              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
-              child: SizedBox(
-                width: compact ? 70 : 84,
-                height: compact ? 22 : 26,
-                child: Image.asset(
-                  'assets/images/vnvar_logo.png',
-                  fit: BoxFit.contain,
-                ),
-              ),
-            ),
-            const Spacer(),
-            menuButton,
-          ],
         ),
-        SizedBox(height: compact ? 6 : 8),
-        Wrap(spacing: 6, runSpacing: 6, children: statusPills),
       ],
     );
   }
 }
 
-/// Nút mở/đóng menu: có chữ để người dùng nhìn là biết.
-class _MenuButton extends StatelessWidget {
-  const _MenuButton({required this.open, required this.onTap});
-
-  final bool open;
-  final VoidCallback onTap;
-
-  @override
-  Widget build(BuildContext context) {
-    return Tooltip(
-      message: open
-          ? appText(context, 'Đóng menu', 'Close menu')
-          : appText(context, 'Mở menu chức năng', 'Open menu'),
-      child: _GlassSurface(
-        radius: 15,
-        color: open ? _accentBlue : _glassColor,
-        borderColor: open ? Colors.transparent : const Color(0x33FFFFFF),
-        child: Material(
-          type: MaterialType.transparency,
-          child: InkWell(
-            onTap: onTap,
-            child: SizedBox(
-              height: 30,
-              child: Padding(
-                padding: const EdgeInsets.symmetric(horizontal: 11),
-                child: Row(
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    Icon(
-                      open ? Icons.close_rounded : Icons.menu_rounded,
-                      size: 16,
-                      color: Colors.white,
-                    ),
-                    const SizedBox(width: 5),
-                    Text(
-                      open
-                          ? appText(context, 'Đóng', 'Close')
-                          : appText(context, 'Menu', 'Menu'),
-                      style: const TextStyle(
-                        color: Colors.white,
-                        fontSize: 12,
-                        fontWeight: FontWeight.w800,
-                      ),
-                    ),
-                  ],
-                ),
-              ),
-            ),
-          ),
-        ),
-      ),
-    );
-  }
-}
-
-/// Menu chức năng: một hàng nút nhỏ, gọn.
+/// Menu chức năng: bảng kính nổi, mỗi ô một icon + nhãn ngắn. [columns] = 2
+/// khi máy ngang thấp (xếp lưới 2 cột để không phải cuộn); [maxWidth] là bề
+/// rộng vùng đặt menu (bảng không bao giờ rộng hơn).
 class _QuickMenuPanel extends StatelessWidget {
-  const _QuickMenuPanel({required this.tiles});
-
-  final List<Widget> tiles;
-
-  @override
-  Widget build(BuildContext context) {
-    return _GlassSurface(
-      radius: 14,
-      padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 4),
-      child: Row(mainAxisSize: MainAxisSize.min, children: tiles),
-    );
-  }
-}
-
-/// Một nút trong menu: biểu tượng nhỏ + nhãn ngắn bên dưới.
-class _MenuTile extends StatelessWidget {
-  const _MenuTile({
-    required this.label,
-    required this.tooltip,
-    this.icon,
-    this.custom,
-    this.onTap,
-    this.active = false,
-    this.activeColor = _accentBlue,
+  const _QuickMenuPanel({
+    required this.tiles,
+    this.columns = 1,
+    this.maxWidth = double.infinity,
   });
 
-  static const double width = 52;
+  final List<Widget> tiles;
+  final int columns;
+  final double maxWidth;
 
+  @override
+  Widget build(BuildContext context) {
+    const gap = BrandSpace.sm;
+    final desired = columns <= 1
+        ? 224.0
+        : columns * quickMenuGridTileWidth + (columns - 1) * gap;
+    final width = math.max(
+      0.0,
+      math.min(desired, maxWidth - quickMenuHorizontalChrome),
+    );
+    final Widget content;
+    if (columns <= 1) {
+      content = Column(
+        mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: tiles,
+      );
+    } else {
+      final rows = (tiles.length + columns - 1) ~/ columns;
+      content = Column(
+        mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          for (var r = 0; r < rows; r++)
+            Row(
+              children: [
+                for (var c = 0; c < columns; c++) ...[
+                  if (c > 0) const SizedBox(width: gap),
+                  Expanded(
+                    child: r * columns + c < tiles.length
+                        ? tiles[r * columns + c]
+                        : const SizedBox.shrink(),
+                  ),
+                ],
+              ],
+            ),
+        ],
+      );
+    }
+    return BrandGlass(
+      radius: BrandRadius.medium,
+      padding: const EdgeInsets.all(6),
+      child: SizedBox(width: width, child: content),
+    );
+  }
+}
+
+/// Một dòng trong menu: icon tròn nhỏ + nhãn; [trailing] tự xử lý chạm
+/// (ví dụ nút chọn ngôn ngữ) thì cả dòng không bắt chạm. [dense] = dòng gọn
+/// (cao 48) cho màn hình thấp.
+class _MenuTile extends StatelessWidget {
+  const _MenuTile({
+    required this.icon,
+    required this.label,
+    required this.tooltip,
+    this.trailing,
+    this.onTap,
+    this.active = false,
+    this.activeColor = BrandColors.primary,
+    this.dense = false,
+  });
+
+  final IconData icon;
   final String label;
   final String tooltip;
-  final IconData? icon;
-
-  /// Nút tự xử lý chạm (ví dụ chọn ngôn ngữ).
-  final Widget? custom;
+  final Widget? trailing;
   final VoidCallback? onTap;
   final bool active;
   final Color activeColor;
+  final bool dense;
 
   @override
   Widget build(BuildContext context) {
-    final body = SizedBox(
-      width: width,
+    final circle = dense ? 32.0 : 36.0;
+    final row = SizedBox(
+      height: dense ? quickMenuDenseRowHeight : quickMenuRowHeight,
       child: Padding(
-        padding: const EdgeInsets.symmetric(vertical: 4),
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
+        padding: const EdgeInsets.symmetric(horizontal: BrandSpace.sm),
+        child: Row(
           children: [
-            SizedBox(
-              height: 30,
-              child: Center(
-                child: custom ??
-                    Container(
-                      width: 30,
-                      height: 30,
-                      decoration: BoxDecoration(
-                        color: active
-                            ? activeColor.withValues(alpha: 0.9)
-                            : Colors.white.withValues(alpha: 0.10),
-                        shape: BoxShape.circle,
-                      ),
-                      child: Icon(icon, size: 17, color: Colors.white),
-                    ),
+            Container(
+              width: circle,
+              height: circle,
+              decoration: BoxDecoration(
+                color: active ? activeColor : const Color(0x1FFFFFFF),
+                shape: BoxShape.circle,
+              ),
+              child: Icon(icon, size: 20, color: Colors.white),
+            ),
+            SizedBox(width: dense ? BrandSpace.sm : BrandSpace.md),
+            Expanded(
+              child: Text(
+                label,
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: BrandText.body,
               ),
             ),
-            const SizedBox(height: 3),
-            Text(
-              label,
-              maxLines: 1,
-              overflow: TextOverflow.ellipsis,
-              textAlign: TextAlign.center,
-              style: const TextStyle(
-                color: Colors.white70,
-                fontSize: 9.5,
-                fontWeight: FontWeight.w700,
-              ),
-            ),
+            if (trailing != null) trailing!,
           ],
         ),
       ),
     );
-    if (custom != null) return body;
+    if (trailing != null) return row;
     return Tooltip(
       message: tooltip,
       child: Material(
         type: MaterialType.transparency,
         child: InkWell(
-          borderRadius: BorderRadius.circular(10),
+          borderRadius: BorderRadius.circular(BrandRadius.small),
           onTap: onTap,
-          child: body,
+          child: row,
         ),
       ),
     );
@@ -581,7 +577,7 @@ class _PreviewRestOverlay extends StatelessWidget {
         color: Colors.black,
         child: SafeArea(
           child: Padding(
-            padding: const EdgeInsets.all(12),
+            padding: const EdgeInsets.all(BrandSpace.md),
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
@@ -591,37 +587,36 @@ class _PreviewRestOverlay extends StatelessWidget {
                 ),
                 Expanded(
                   child: Center(
-                    child: Column(
-                      mainAxisSize: MainAxisSize.min,
-                      children: [
-                        const Icon(
-                          Icons.touch_app_rounded,
-                          color: Colors.white38,
-                          size: 30,
-                        ),
-                        const SizedBox(height: 8),
-                        Text(
-                          appText(context, 'Chạm để xem hình', 'Tap to view'),
-                          style: const TextStyle(
-                            color: Colors.white60,
-                            fontSize: 14,
-                            fontWeight: FontWeight.w700,
+                    child: SingleChildScrollView(
+                      padding: const EdgeInsets.all(BrandSpace.lg),
+                      child: Column(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          const AppNoticeIcon(
+                            icon: Icons.touch_app_rounded,
+                            color: BrandColors.textSecondary,
+                            size: 26,
                           ),
-                        ),
-                        const SizedBox(height: 4),
-                        Text(
-                          appText(
-                            context,
-                            'Tạm tắt hình xem trước để giảm nhiệt. Ghi hình, Tablet và livestream vẫn chạy.',
-                            'Preview paused to reduce heat. Recording, tablet and livestream keep running.',
+                          const SizedBox(height: BrandSpace.md),
+                          Text(
+                            appText(context, 'Chạm để xem hình', 'Tap to view'),
+                            textAlign: TextAlign.center,
+                            style: BrandText.title,
                           ),
-                          textAlign: TextAlign.center,
-                          style: const TextStyle(
-                            color: Colors.white38,
-                            fontSize: 11.5,
+                          const SizedBox(height: BrandSpace.xs),
+                          Text(
+                            appText(
+                              context,
+                              'Tạm ẩn hình để giảm nhiệt. Ghi hình, Tablet, live vẫn chạy.',
+                              'Preview paused to cool down. Recording, tablet, live keep running.',
+                            ),
+                            textAlign: TextAlign.center,
+                            maxLines: 2,
+                            overflow: TextOverflow.ellipsis,
+                            style: BrandText.caption,
                           ),
-                        ),
-                      ],
+                        ],
+                      ),
                     ),
                   ),
                 ),
@@ -654,50 +649,97 @@ class _NetworkStatusBanner extends StatelessWidget {
     final message = recovering
         ? appText(
             context,
-            'Đang khởi động lại kết nối live…',
-            'Restarting live connection…',
+            'Đang kết nối lại live…',
+            'Reconnecting live…',
           )
         : connectedAddress == null
         ? appText(
             context,
-            'Chưa có Wi-Fi. Camera vẫn ghi hình bình thường; Tablet sẽ kết nối được khi điện thoại vào Wi-Fi.',
-            'No Wi-Fi. Recording continues; tablets can connect once the phone joins Wi-Fi.',
+            'Chưa có Wi-Fi. Vẫn ghi hình; Tablet cần Wi-Fi để kết nối.',
+            'No Wi-Fi. Still recording; tablets need Wi-Fi to connect.',
           )
         : appText(
             context,
             hasError
-                ? 'Kết nối live gặp lỗi. Camera vẫn tiếp tục ghi hình.'
-                : 'Kết nối live cần được làm mới.',
+                ? 'Kết nối live lỗi. Vẫn đang ghi hình.'
+                : 'Kết nối live cần làm mới.',
             hasError
-                ? 'Live connection has an error. Recording is still active.'
-                : 'Live connection needs to be refreshed.',
+                ? 'Live connection error. Still recording.'
+                : 'Live connection needs a refresh.',
           );
+    return _CameraNotice(
+      compact: compact,
+      message: message,
+      kind: recovering
+          ? NoticeKind.info
+          : hasError
+          ? NoticeKind.error
+          : NoticeKind.warning,
+      icon: recovering ? null : Icons.wifi_off_rounded,
+      loading: recovering,
+      action: TextButton.icon(
+        onPressed: onReconnect,
+        icon: const Icon(Icons.sync_rounded, size: 17),
+        label: Text(appText(context, 'Kết nối lại', 'Reconnect')),
+      ),
+    );
+  }
+}
+
+/// Thông báo trạng thái trên khung camera (mạng, bộ nhớ, iOS…): cùng một
+/// kiểu cho mọi thông báo: nền tối đặc, viền mảnh, icon theo loại.
+class _CameraNotice extends StatelessWidget {
+  const _CameraNotice({
+    required this.compact,
+    required this.message,
+    this.kind = NoticeKind.info,
+    this.icon,
+    this.loading = false,
+    this.action,
+  });
+
+  final bool compact;
+
+  /// Nội dung đã dịch (dùng `appText`).
+  final String message;
+  final NoticeKind kind;
+  final IconData? icon;
+
+  /// Hiện vòng xoay thay cho icon (đang xử lý).
+  final bool loading;
+  final Widget? action;
+
+  @override
+  Widget build(BuildContext context) {
+    final color = kind.color;
+    final horizontal = compact ? 10.0 : 12.0;
+    final vertical = compact ? 6.0 : 8.0;
     return Container(
       width: double.infinity,
       margin: EdgeInsets.only(bottom: compact ? 6 : 8),
       padding: EdgeInsets.fromLTRB(
-        compact ? 10 : 12,
-        compact ? 6 : 8,
-        6,
-        compact ? 6 : 8,
+        horizontal,
+        vertical,
+        action != null ? 6 : horizontal,
+        vertical,
       ),
       decoration: BoxDecoration(
-        color: const Color(0xFF37474F).withValues(alpha: 0.95),
-        borderRadius: BorderRadius.circular(compact ? 10 : 12),
+        color: BrandColors.surfaceOverlay,
+        borderRadius: BorderRadius.circular(
+          compact ? BrandRadius.small : 12,
+        ),
+        border: Border.all(color: BrandColors.border),
       ),
       child: Row(
         children: [
-          if (recovering)
-            const SizedBox(
+          if (loading)
+            SizedBox(
               width: 16,
               height: 16,
-              child: CircularProgressIndicator(
-                strokeWidth: 2,
-                color: Colors.white,
-              ),
+              child: CircularProgressIndicator(strokeWidth: 2, color: color),
             )
           else
-            const Icon(Icons.wifi_off_rounded, color: Colors.white, size: 18),
+            Icon(icon ?? kind.icon, color: color, size: 18),
           const SizedBox(width: 8),
           Expanded(
             child: Text(
@@ -705,20 +747,13 @@ class _NetworkStatusBanner extends StatelessWidget {
               maxLines: compact ? 2 : 1,
               overflow: TextOverflow.ellipsis,
               style: TextStyle(
-                color: Colors.white,
+                color: BrandColors.textPrimary,
                 fontSize: compact ? 11 : 12,
                 fontWeight: FontWeight.w700,
               ),
             ),
           ),
-          TextButton.icon(
-            onPressed: onReconnect,
-            icon: const Icon(Icons.sync_rounded, size: 17),
-            label: Text(
-              appText(context, 'KẾT NỐI LẠI', 'RECONNECT'),
-              style: const TextStyle(fontWeight: FontWeight.w900),
-            ),
-          ),
+          if (action != null) action!,
         ],
       ),
     );
@@ -738,29 +773,20 @@ class _ConfigLine extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return Padding(
-      padding: const EdgeInsets.symmetric(vertical: 4),
+      padding: const EdgeInsets.symmetric(vertical: BrandSpace.xs),
       child: Row(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
           SizedBox(
             width: 72,
-            child: Text(
-              title,
-              style: const TextStyle(
-                color: Colors.black54,
-                fontSize: 12,
-                fontWeight: FontWeight.w700,
-              ),
-            ),
+            child: Text(title, style: BrandText.caption),
           ),
           Expanded(
             child: Text(
               value,
-              style: const TextStyle(
-                color: Color(0xFF112341),
-                fontSize: 12,
-                fontWeight: FontWeight.w900,
-              ),
+              maxLines: 2,
+              overflow: TextOverflow.ellipsis,
+              style: BrandText.body.copyWith(fontSize: 13),
             ),
           ),
         ],
@@ -800,36 +826,21 @@ class _RetryCountdownTextState extends State<_RetryCountdownText> {
   @override
   Widget build(BuildContext context) {
     final seconds = secondsUntil(widget.target, DateTime.now()) ?? 0;
-    return Row(
-      mainAxisAlignment: MainAxisAlignment.center,
-      children: [
-        const SizedBox(
-          width: 14,
-          height: 14,
-          child: CircularProgressIndicator(
-            strokeWidth: 2,
-            color: Colors.white54,
-          ),
-        ),
-        const SizedBox(width: 8),
-        Flexible(
-          child: Text(
-            seconds > 0
-                ? appText(
-                    context,
-                    'Tự thử lại sau ${seconds}s',
-                    'Retrying automatically in ${seconds}s',
-                  )
-                : appText(context, 'Đang tự thử lại…', 'Retrying…'),
-            textAlign: TextAlign.center,
-            style: const TextStyle(
-              color: Colors.white70,
-              fontSize: 12.5,
-              fontWeight: FontWeight.w700,
-            ),
-          ),
-        ),
-      ],
+    return _StatusPill(
+      loading: true,
+      color: BrandColors.textSecondary,
+      label: seconds > 0
+          ? appText(
+              context,
+              'Tự thử lại sau ${seconds}s',
+              'Auto-retry in ${seconds}s',
+            )
+          : appText(context, 'Đang tự thử lại…', 'Retrying…'),
+      tooltip: appText(
+        context,
+        'Camera Station tự thử khởi động lại',
+        'Camera Station retries automatically',
+      ),
     );
   }
 }
@@ -852,6 +863,15 @@ class _ApplyConfigDialog extends StatelessWidget {
     final media = MediaQuery.of(context);
     final landscape = media.orientation == Orientation.landscape;
     final compactHeight = media.size.height < 480;
+    final nameLine = _ConfigLine(
+      title: appText(context, 'Tên', 'Name'),
+      value: identity.cameraName,
+    );
+    final cameraLine = _ConfigLine(title: 'Camera', value: identity.cameraId);
+    final courtLine = _ConfigLine(
+      title: appText(context, 'Sân', 'Court'),
+      value: courtLabel,
+    );
     final identityDetails = landscape
         ? Row(
             crossAxisAlignment: CrossAxisAlignment.start,
@@ -859,45 +879,21 @@ class _ApplyConfigDialog extends StatelessWidget {
               Expanded(
                 child: Column(
                   mainAxisSize: MainAxisSize.min,
-                  children: [
-                    _ConfigLine(
-                      title: appText(context, 'Tên', 'Name'),
-                      value: identity.cameraName,
-                    ),
-                    _ConfigLine(
-                      title: 'Camera',
-                      value: identity.cameraId,
-                    ),
-                  ],
+                  children: [nameLine, cameraLine],
                 ),
               ),
-              const SizedBox(width: 16),
+              const SizedBox(width: BrandSpace.lg),
               Expanded(
                 child: Column(
                   mainAxisSize: MainAxisSize.min,
-                  children: [
-                    _ConfigLine(
-                      title: appText(context, 'Sân', 'Court'),
-                      value: courtLabel,
-                    ),
-                  ],
+                  children: [courtLine],
                 ),
               ),
             ],
           )
         : Column(
             mainAxisSize: MainAxisSize.min,
-            children: [
-              _ConfigLine(
-                title: appText(context, 'Tên', 'Name'),
-                value: identity.cameraName,
-              ),
-              _ConfigLine(title: 'Camera', value: identity.cameraId),
-              _ConfigLine(
-                title: appText(context, 'Sân', 'Court'),
-                value: courtLabel,
-              ),
-            ],
+            children: [nameLine, cameraLine, courtLine],
           );
     return AlertDialog(
       scrollable: true,
@@ -919,16 +915,13 @@ class _ApplyConfigDialog extends StatelessWidget {
         16,
         compactHeight ? 10 : 16,
       ),
-      shape: RoundedRectangleBorder(
-        borderRadius: BorderRadius.circular(20),
-      ),
-      icon: Icon(
-        Icons.settings_rounded,
-        color: const Color(0xFF1565C0),
-        size: compactHeight ? 30 : 38,
+      icon: AppNoticeIcon(
+        icon: Icons.settings_rounded,
+        color: BrandColors.info,
+        size: compactHeight ? 22 : 28,
       ),
       title: Text(
-        appText(context, 'ÁP DỤNG CẤU HÌNH MỚI?', 'APPLY NEW SETTINGS?'),
+        appText(context, 'Áp dụng cấu hình mới?', 'Apply new settings?'),
         textAlign: TextAlign.center,
       ),
       content: Column(
@@ -937,55 +930,35 @@ class _ApplyConfigDialog extends StatelessWidget {
           Text(
             appText(
               context,
-              'Camera Station sẽ khởi động lại dịch vụ với cấu hình mới.',
-              'Camera Station will restart its services with the new settings.',
+              'Camera Station sẽ khởi động lại.',
+              'Camera Station will restart.',
             ),
             textAlign: TextAlign.center,
+            style: BrandText.caption.copyWith(fontSize: 14),
           ),
           if (interruptsCapture) ...[
             SizedBox(height: compactHeight ? 6 : 10),
-            Container(
-              width: double.infinity,
-              padding: EdgeInsets.all(compactHeight ? 8 : 10),
-              decoration: BoxDecoration(
-                color: const Color(0xFFFFF3E0),
-                borderRadius: BorderRadius.circular(12),
-                border: Border.all(color: const Color(0xFFFFB74D)),
-              ),
-              child: Row(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  const Icon(
-                    Icons.warning_amber_rounded,
-                    color: Color(0xFFE65100),
-                    size: 20,
-                  ),
-                  const SizedBox(width: 8),
-                  Expanded(
-                    child: Text(
-                      appText(
-                        context,
-                        'Đang ghi hình/phát trực tiếp: ghi hình và livestream sẽ bị gián đoạn vài giây trong lúc khởi động lại.',
-                        'Recording/live streaming is active: recording and the livestream will be interrupted for a few seconds while restarting.',
-                      ),
-                      style: const TextStyle(
-                        color: Color(0xFF8D3B00),
-                        fontSize: 12.5,
-                        fontWeight: FontWeight.w700,
-                      ),
-                    ),
-                  ),
-                ],
+            AppNoticeBanner(
+              dense: compactHeight,
+              kind: NoticeKind.warning,
+              message: appText(
+                context,
+                'Ghi hình và live sẽ gián đoạn vài giây khi khởi động lại.',
+                'Recording and live will pause for a few seconds.',
               ),
             ),
           ],
           SizedBox(height: compactHeight ? 8 : 14),
           Container(
             width: double.infinity,
-            padding: EdgeInsets.all(compactHeight ? 9 : 12),
+            padding: EdgeInsets.symmetric(
+              horizontal: BrandSpace.md,
+              vertical: compactHeight ? 6 : 10,
+            ),
             decoration: BoxDecoration(
-              color: const Color(0xFFF4F6F9),
-              borderRadius: BorderRadius.circular(14),
+              color: BrandColors.surfaceRaised,
+              borderRadius: BorderRadius.circular(BrandRadius.medium),
+              border: Border.all(color: BrandColors.border),
             ),
             child: identityDetails,
           ),
@@ -993,63 +966,70 @@ class _ApplyConfigDialog extends StatelessWidget {
       ),
       actionsAlignment: MainAxisAlignment.center,
       actions: [
-        OutlinedButton(
+        TextButton(
           onPressed: () {
             Navigator.pop(context, false);
           },
-          child: Text(appText(context, 'HỦY', 'CANCEL')),
+          style: TextButton.styleFrom(
+            foregroundColor: BrandColors.textSecondary,
+          ),
+          child: Text(appText(context, 'Huỷ', 'Cancel')),
         ),
         FilledButton.icon(
           onPressed: () {
             Navigator.pop(context, true);
           },
           icon: const Icon(Icons.check_rounded),
-          label: Text(appText(context, 'ÁP DỤNG', 'APPLY')),
+          label: Text(appText(context, 'Áp dụng', 'Apply')),
         ),
       ],
     );
   }
 }
 
-/// Màn hình chờ khi Camera Station đang khởi động.
+/// Màn hình chờ khi Camera Station đang khởi động: logo, vòng xoay mảnh,
+/// một dòng chữ.
 class _StationLoadingView extends StatelessWidget {
   const _StationLoadingView();
 
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      backgroundColor: const Color(0xFF05070A),
+      backgroundColor: BrandColors.background,
       body: SafeArea(
         child: Center(
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              Image.asset(
-                'assets/images/vnvar_logo.png',
-                width: 240,
-                height: 54,
-                fit: BoxFit.contain,
-              ),
-              const SizedBox(height: 28),
-              const CircularProgressIndicator(
-                color: Colors.white,
-                strokeWidth: 2.6,
-              ),
-              const SizedBox(height: 18),
-              Text(
-                appText(
-                  context,
-                  'ĐANG KHỞI ĐỘNG CAMERA STATION...',
-                  'STARTING CAMERA STATION...',
+          child: SingleChildScrollView(
+            padding: const EdgeInsets.all(BrandSpace.xl),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Image.asset(
+                  'assets/images/vnvar_logo.png',
+                  width: 200,
+                  height: 48,
+                  fit: BoxFit.contain,
                 ),
-                style: const TextStyle(
-                  color: Colors.white70,
-                  fontSize: 13,
-                  fontWeight: FontWeight.w800,
-                  letterSpacing: 0.4,
+                const SizedBox(height: BrandSpace.xl),
+                const SizedBox(
+                  width: 28,
+                  height: 28,
+                  child: CircularProgressIndicator(
+                    color: BrandColors.primaryBright,
+                    strokeWidth: 2.4,
+                  ),
                 ),
-              ),
-            ],
+                const SizedBox(height: BrandSpace.lg),
+                Text(
+                  appText(
+                    context,
+                    'Đang khởi động camera…',
+                    'Starting camera…',
+                  ),
+                  textAlign: TextAlign.center,
+                  style: BrandText.caption.copyWith(fontSize: 13),
+                ),
+              ],
+            ),
           ),
         ),
       ),
@@ -1057,8 +1037,9 @@ class _StationLoadingView extends StatelessWidget {
   }
 }
 
-/// Màn lỗi khởi động. Thiếu quyền: nút "Mở Cài đặt" + "Thử lại". Lỗi khác:
-/// đếm ngược tới lần runtime tự thử lại + nút "Thử lại ngay".
+/// Màn lỗi khởi động: icon lớn, tiêu đề 1 dòng, mô tả ngắn, nút chính
+/// "Thử lại" (+ "Mở Cài đặt" khi thiếu quyền). Lỗi khác có lịch tự thử lại
+/// thì hiện đếm ngược và nút "Thử lại ngay".
 class _StationErrorView extends StatelessWidget {
   const _StationErrorView({
     required this.message,
@@ -1079,144 +1060,140 @@ class _StationErrorView extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final retryAt = this.retryAt;
-    final buttonStyle = FilledButton.styleFrom(
-      padding: const EdgeInsets.symmetric(vertical: 14),
-      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
+    final buttonShape = RoundedRectangleBorder(
+      borderRadius: BorderRadius.circular(BrandRadius.medium),
     );
-    final outlinedStyle = OutlinedButton.styleFrom(
-      foregroundColor: Colors.white,
-      side: const BorderSide(color: Colors.white38),
-      padding: const EdgeInsets.symmetric(vertical: 14),
-      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
+    final retryButton = FilledButton.icon(
+      style: FilledButton.styleFrom(
+        minimumSize: const Size.fromHeight(48),
+        shape: buttonShape,
+      ),
+      onPressed: onRetry,
+      icon: const Icon(Icons.refresh_rounded),
+      label: Text(
+        retryAt != null && !permissionError
+            ? appText(context, 'Thử lại ngay', 'Retry now')
+            : appText(context, 'Thử lại', 'Try again'),
+        maxLines: 1,
+        overflow: TextOverflow.ellipsis,
+      ),
+    );
+    final settingsButton = OutlinedButton.icon(
+      style: OutlinedButton.styleFrom(
+        foregroundColor: BrandColors.textPrimary,
+        minimumSize: const Size.fromHeight(48),
+        side: const BorderSide(color: BrandColors.border),
+        shape: buttonShape,
+      ),
+      onPressed: onOpenSettings,
+      icon: const Icon(Icons.settings_rounded),
+      label: Text(
+        appText(context, 'Mở Cài đặt', 'Open Settings'),
+        maxLines: 1,
+        overflow: TextOverflow.ellipsis,
+      ),
     );
     return Scaffold(
-      backgroundColor: const Color(0xFF05070A),
+      backgroundColor: BrandColors.background,
       body: SafeArea(
-        child: Center(
-          child: SingleChildScrollView(
-            padding: const EdgeInsets.all(28),
-            child: Container(
-              width: double.infinity,
-              constraints: const BoxConstraints(maxWidth: 460),
-              padding: const EdgeInsets.all(28),
-              decoration: BoxDecoration(
-                color: const Color(0xFF11161D),
-                borderRadius: BorderRadius.circular(24),
-                border: Border.all(color: Colors.white.withValues(alpha: 0.06)),
-              ),
-              child: Column(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  Container(
-                    padding: const EdgeInsets.all(18),
-                    decoration: BoxDecoration(
-                      color: Colors.redAccent.withValues(alpha: 0.12),
-                      shape: BoxShape.circle,
-                    ),
-                    child: Icon(
-                      permissionError
-                          ? Icons.no_photography_rounded
-                          : Icons.videocam_off_rounded,
-                      color: Colors.redAccent,
-                      size: 48,
-                    ),
-                  ),
-                  const SizedBox(height: 22),
-                  Text(
-                    permissionError
-                        ? appText(
-                            context,
-                            'CHƯA CẤP QUYỀN CAMERA/MICRO',
-                            'CAMERA/MICROPHONE PERMISSION NEEDED',
-                          )
-                        : appText(
-                            context,
-                            'LỖI KHỞI ĐỘNG CAMERA',
-                            'CAMERA STATION ERROR',
+        child: LayoutBuilder(
+          builder: (context, constraints) {
+            // Màn ngang/rộng: hai nút cạnh nhau cho đỡ cao.
+            final sideBySide = constraints.maxWidth >= 520;
+            return Center(
+              child: SingleChildScrollView(
+                padding: const EdgeInsets.symmetric(
+                  horizontal: BrandSpace.xl,
+                  vertical: BrandSpace.lg,
+                ),
+                child: ConstrainedBox(
+                  constraints: const BoxConstraints(maxWidth: 420),
+                  child: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      AppNoticeIcon(
+                        icon: permissionError
+                            ? Icons.no_photography_rounded
+                            : Icons.videocam_off_rounded,
+                        color: BrandColors.danger,
+                        size: 36,
+                      ),
+                      const SizedBox(height: BrandSpace.lg),
+                      Text(
+                        permissionError
+                            ? appText(
+                                context,
+                                'Cần quyền Camera/Micro',
+                                'Camera/Mic permission needed',
+                              )
+                            : appText(
+                                context,
+                                'Không khởi động được camera',
+                                'Camera failed to start',
+                              ),
+                        textAlign: TextAlign.center,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: BrandText.title,
+                      ),
+                      const SizedBox(height: BrandSpace.sm),
+                      Text(
+                        permissionError
+                            ? appText(
+                                context,
+                                'Bật Camera và Micro trong Cài đặt rồi quay lại.',
+                                'Allow Camera and Mic in Settings, then come back.',
+                              )
+                            : message,
+                        textAlign: TextAlign.center,
+                        maxLines: 3,
+                        overflow: TextOverflow.ellipsis,
+                        style: BrandText.caption.copyWith(
+                          fontSize: 13,
+                          height: 1.4,
+                        ),
+                      ),
+                      if (permissionError) ...[
+                        const SizedBox(height: BrandSpace.xs),
+                        // Lý do gốc (đã dịch) ở dạng phụ, một dòng.
+                        Tooltip(
+                          message: message,
+                          child: Text(
+                            message,
+                            textAlign: TextAlign.center,
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                            style: BrandText.caption.copyWith(
+                              color: BrandColors.textDisabled,
+                            ),
                           ),
-                    textAlign: TextAlign.center,
-                    style: const TextStyle(
-                      color: Colors.white,
-                      fontSize: 19,
-                      fontWeight: FontWeight.w900,
-                      letterSpacing: 0.3,
-                    ),
+                        ),
+                      ] else if (retryAt != null) ...[
+                        const SizedBox(height: BrandSpace.md),
+                        _RetryCountdownText(target: retryAt),
+                      ],
+                      const SizedBox(height: BrandSpace.xl),
+                      if (!permissionError)
+                        retryButton
+                      else if (sideBySide)
+                        Row(
+                          children: [
+                            Expanded(child: retryButton),
+                            const SizedBox(width: BrandSpace.md),
+                            Expanded(child: settingsButton),
+                          ],
+                        )
+                      else ...[
+                        retryButton,
+                        const SizedBox(height: BrandSpace.sm),
+                        settingsButton,
+                      ],
+                    ],
                   ),
-                  const SizedBox(height: 10),
-                  Text(
-                    message,
-                    textAlign: TextAlign.center,
-                    style: const TextStyle(
-                      color: Colors.white60,
-                      fontSize: 13,
-                      height: 1.4,
-                    ),
-                  ),
-                  if (permissionError) ...[
-                    const SizedBox(height: 8),
-                    Text(
-                      appText(
-                        context,
-                        'Bấm "Mở Cài đặt", bật quyền Camera và Micro rồi quay lại: ứng dụng sẽ tự thử lại.',
-                        'Tap "Open Settings", allow Camera and Microphone, then come back: the app will retry automatically.',
-                      ),
-                      textAlign: TextAlign.center,
-                      style: const TextStyle(
-                        color: Colors.white38,
-                        fontSize: 12,
-                        height: 1.4,
-                      ),
-                    ),
-                  ] else if (retryAt != null) ...[
-                    const SizedBox(height: 10),
-                    _RetryCountdownText(target: retryAt),
-                  ],
-                  const SizedBox(height: 26),
-                  if (permissionError) ...[
-                    SizedBox(
-                      width: double.infinity,
-                      child: FilledButton.icon(
-                        style: buttonStyle,
-                        onPressed: onOpenSettings,
-                        icon: const Icon(Icons.settings_rounded),
-                        label: Text(
-                          appText(context, 'MỞ CÀI ĐẶT', 'OPEN SETTINGS'),
-                          style: const TextStyle(fontWeight: FontWeight.w800),
-                        ),
-                      ),
-                    ),
-                    const SizedBox(height: 10),
-                    SizedBox(
-                      width: double.infinity,
-                      child: OutlinedButton.icon(
-                        style: outlinedStyle,
-                        onPressed: onRetry,
-                        icon: const Icon(Icons.refresh_rounded),
-                        label: Text(
-                          appText(context, 'THỬ LẠI', 'TRY AGAIN'),
-                          style: const TextStyle(fontWeight: FontWeight.w800),
-                        ),
-                      ),
-                    ),
-                  ] else
-                    SizedBox(
-                      width: double.infinity,
-                      child: FilledButton.icon(
-                        style: buttonStyle,
-                        onPressed: onRetry,
-                        icon: const Icon(Icons.refresh_rounded),
-                        label: Text(
-                          retryAt != null
-                              ? appText(context, 'THỬ LẠI NGAY', 'RETRY NOW')
-                              : appText(context, 'THỬ LẠI', 'TRY AGAIN'),
-                          style: const TextStyle(fontWeight: FontWeight.w800),
-                        ),
-                      ),
-                    ),
-                ],
+                ),
               ),
-            ),
-          ),
+            );
+          },
         ),
       ),
     );
@@ -1237,8 +1214,30 @@ class _PipStatusOverlay extends StatelessWidget {
   final bool thermalWarning;
   final String profileText;
 
+  static Widget _badge({
+    required Widget child,
+    Color? background,
+    Color? border,
+  }) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+      decoration: BoxDecoration(
+        color: background ?? const Color(0x8C080D18),
+        borderRadius: BorderRadius.circular(999),
+        border: border == null ? null : Border.all(color: border),
+      ),
+      child: child,
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
+    const badgeText = TextStyle(
+      color: Colors.white,
+      fontSize: 9,
+      fontWeight: FontWeight.w800,
+      letterSpacing: 0.4,
+    );
     return Row(
       mainAxisAlignment: MainAxisAlignment.spaceBetween,
       children: [
@@ -1246,84 +1245,40 @@ class _PipStatusOverlay extends StatelessWidget {
           mainAxisSize: MainAxisSize.min,
           children: [
             if (recording)
-              Container(
-                padding: const EdgeInsets.symmetric(
-                  horizontal: 5,
-                  vertical: 2,
-                ),
-                margin: const EdgeInsets.only(right: 4),
-                decoration: BoxDecoration(
-                  color: Colors.red.withValues(alpha: 0.85),
-                  borderRadius: BorderRadius.circular(6),
-                ),
+              _badge(
+                background: BrandColors.live,
                 child: const Row(
                   mainAxisSize: MainAxisSize.min,
                   children: [
                     Icon(Icons.circle, color: Colors.white, size: 6),
                     SizedBox(width: 3),
-                    Text(
-                      'REC',
-                      style: TextStyle(
-                        color: Colors.white,
-                        fontSize: 9,
-                        fontWeight: FontWeight.w900,
-                        letterSpacing: 0.5,
-                      ),
-                    ),
+                    Text('REC', style: badgeText),
                   ],
                 ),
               ),
+            if (recording && live) const SizedBox(width: 4),
             if (live)
-              Container(
-                padding: const EdgeInsets.symmetric(
-                  horizontal: 5,
-                  vertical: 2,
-                ),
-                decoration: BoxDecoration(
-                  color: Colors.blue.withValues(alpha: 0.85),
-                  borderRadius: BorderRadius.circular(6),
-                ),
-                child: const Text(
-                  'LIVE',
-                  style: TextStyle(
-                    color: Colors.white,
-                    fontSize: 9,
-                    fontWeight: FontWeight.w900,
-                    letterSpacing: 0.5,
-                  ),
-                ),
+              _badge(
+                background: BrandColors.live,
+                child: const Text('LIVE', style: badgeText),
               ),
           ],
         ),
         if (thermalWarning)
-          Container(
-            padding: const EdgeInsets.symmetric(
-              horizontal: 5,
-              vertical: 2,
-            ),
-            decoration: BoxDecoration(
-              color: const Color(0xFF2A1C08).withValues(alpha: 0.85),
-              borderRadius: BorderRadius.circular(6),
-              border: Border.all(
-                color: Colors.amber.withValues(alpha: 0.7),
-              ),
-            ),
+          _badge(
+            border: BrandColors.warning.withValues(alpha: 0.7),
             child: Row(
               mainAxisSize: MainAxisSize.min,
               children: [
                 const Icon(
-                  Icons.warning_amber_rounded,
-                  color: Colors.amber,
+                  Icons.thermostat_rounded,
+                  color: BrandColors.warning,
                   size: 10,
                 ),
                 const SizedBox(width: 3),
                 Text(
                   profileText,
-                  style: const TextStyle(
-                    color: Colors.amber,
-                    fontSize: 9,
-                    fontWeight: FontWeight.w800,
-                  ),
+                  style: badgeText.copyWith(color: BrandColors.warning),
                 ),
               ],
             ),

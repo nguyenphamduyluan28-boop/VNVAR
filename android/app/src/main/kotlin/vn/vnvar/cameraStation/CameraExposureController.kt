@@ -44,6 +44,21 @@ object CameraExposureController {
     private const val METERING_REGION_FRACTION = 0.3
     /** AE/AF phải ổn định liên tục chừng này trước khi tự khoá. */
     private const val STABLE_LOCK_AFTER_MS = 2_000L
+    /** Không khoá trong chừng này sau khi phiên chụp mở (AF/AE còn đang chạy lần đầu). */
+    private const val MIN_LOCK_AFTER_SESSION_MS = 3_000L
+    /**
+     * AF không báo "đã nét" sau chừng này (cảnh quá tối/phẳng) thì vẫn khoá AE/AWB
+     * nhưng KHÔNG khoá tiêu cự: AF liên tục tiếp tục chạy, tránh đóng băng hình mờ.
+     */
+    private const val AF_FOCUS_TIMEOUT_MS = 8_000L
+    /** AF báo nét (sau khi đã quét) liên tục chừng này thì khoá tiêu cự. */
+    private const val FOCUS_LOCK_AFTER_MS = 1_000L
+    /**
+     * AE không bao giờ báo CONVERGED (đèn LED/màn hình nhấp nháy, cảnh rất
+     * tương phản) thì sau chừng này vẫn khoá AE/AWB để hình hết "thở" sáng/màu;
+     * bộ đo độ lệch sáng vẫn mở khoá đo lại khi ánh sáng thật sự đổi.
+     */
+    private const val AE_SETTLE_TIMEOUT_MS = 8_000L
     /** Độ sáng khung hình lệch khỏi lúc khoá quá ngưỡng này... */
     private const val RELOCK_LUMA_DRIFT = 0.20
     /** ...liên tục chừng này (ánh sáng thật sự đổi, không phải người đi ngang) thì đo lại. */
@@ -96,6 +111,35 @@ object CameraExposureController {
     private var lockPending = false
     @Volatile
     private var lockedFocusDistance: Float? = null
+    /** Ống kính hiện tại có lấy nét tự động (không phải ống fixed-focus). */
+    @Volatile
+    private var activeHasAutoFocus = false
+    /** Capture session đang theo dõi và thời điểm nó bắt đầu (elapsedRealtime). */
+    @Volatile
+    private var sessionStartHash = 0
+    @Volatile
+    private var sessionStartedMs = 0L
+    /**
+     * AF đã thật sự quét (PASSIVE_SCAN/ACTIVE_SCAN) kể từ lần mở phiên / nhả
+     * khoá tiêu cự gần nhất. Một số máy (Samsung) báo PASSIVE_FOCUSED ngay khi
+     * vừa thay request dù ống kính chưa quét → khoá nhầm tiêu cự mờ, phải zoom
+     * vào/ra mới nét. Chỉ tin trạng thái "đã nét" sau khi đã thấy quét.
+     */
+    @Volatile
+    private var afScanSeen = false
+    /** Cần "đá" AF quét lại (START rồi CANCEL) ở request kế tiếp. */
+    @Volatile
+    private var afRestartPending = true
+    /** Khoá tiêu cự tách khỏi khoá AE (xem observeConvergence). */
+    @Volatile
+    private var focusLockPending = false
+    @Volatile
+    private var focusedSinceMs = 0L
+    /** Lần nhả khoá tiêu cự / khoá AE gần nhất (elapsedRealtime). */
+    @Volatile
+    private var focusReleasedAtMs = 0L
+    @Volatile
+    private var aeReleasedAtMs = 0L
     @Volatile
     private var convergedSinceMs = 0L
     @Volatile
@@ -139,6 +183,12 @@ object CameraExposureController {
             lastCaptureHeartbeatMs = 0L
             releaseAutoLock()
             lumaMeter.attach(trackId)
+        }
+        if (autoLocked && abs(targetEv - activeTargetEv) > 1e-6) {
+            // Người dùng đổi độ sáng (EV) khi đang khoá: đo lại NGAY với mức mới
+            // rồi khoá lại. Trước đây vẫn giữ khoá + mốc sáng cũ nên ~5 s sau bộ
+            // đo độ lệch sáng coi là "cảnh đổi" và đo lại, làm hình nhảy sáng/tối.
+            releaseAutoLock(keepFocus = true)
         }
         activeTrackId = trackId
         activeTargetEv = targetEv
@@ -237,7 +287,16 @@ object CameraExposureController {
     private fun releaseAutoLock(keepFocus: Boolean = false) {
         autoLocked = false
         lockPending = false
-        if (!keepFocus) lockedFocusDistance = null
+        val now = SystemClock.elapsedRealtime()
+        if (!keepFocus) {
+            lockedFocusDistance = null
+            afScanSeen = false
+            afRestartPending = true
+            focusLockPending = false
+            focusedSinceMs = 0L
+            focusReleasedAtMs = now
+        }
+        aeReleasedAtMs = now
         convergedSinceMs = 0L
         lumaRefAtLock = null
         lumaDriftSinceMs = 0L
@@ -245,21 +304,85 @@ object CameraExposureController {
         lockedSessionHash = null
     }
 
-    /** Gọi trên camera thread với mỗi kết quả của request hiện tại. */
+    /**
+     * Gọi trên camera thread với mỗi kết quả của request hiện tại.
+     *
+     * Hai khoá ĐỘC LẬP (máy đặt cố định trên chân):
+     * 1. Tiêu cự: AF đã quét rồi báo nét ~1 s (ống kính đứng yên) → khoá đúng
+     *    tiêu cự đó (AF OFF). AF quét mãi không nét (cảnh phẳng/tối) thì sau
+     *    [AF_FOCUS_TIMEOUT_MS] khoá ở vị trí tốt nhất AF tìm được. Trước đây
+     *    tiêu cự chỉ khoá CÙNG lúc khoá AE: cảnh có màn hình/đèn LED làm AE không
+     *    bao giờ "hội tụ" nên AF chạy liên tục → ống kính săn nét, hình như
+     *    zoom ra/vào (focus breathing) và mờ/nét liên tục.
+     * 2. AE/AWB: hội tụ ổn định 2 s, hoặc sau [AE_SETTLE_TIMEOUT_MS] dù AE chưa
+     *    báo hội tụ → khoá để hết nhảy sáng/màu.
+     */
     private fun observeConvergence(trackId: String, generation: Int, result: TotalCaptureResult) {
-        if (!stableExposureEnabled || autoLocked || activeCameraLock || lockPending) return
-        // Không có bộ đo sáng thì không thể phát hiện ánh sáng đổi: giữ AE tự động.
+        if (!stableExposureEnabled || activeCameraLock) return
+        // Không có bộ đo sáng thì không thể phát hiện ánh sáng đổi: giữ tự động.
         if (!lumaMeter.isAttachedTo(trackId)) return
-        val ae = result.get(CaptureResult.CONTROL_AE_STATE) ?: return
-        val af = result.get(CaptureResult.CONTROL_AF_STATE)
-        val aeSettled = ae == CaptureResult.CONTROL_AE_STATE_CONVERGED ||
-            ae == CaptureResult.CONTROL_AE_STATE_FLASH_REQUIRED
-        val afSettled = af == null ||
-            af == CaptureResult.CONTROL_AF_STATE_INACTIVE ||
-            af == CaptureResult.CONTROL_AF_STATE_PASSIVE_FOCUSED ||
-            af == CaptureResult.CONTROL_AF_STATE_FOCUSED_LOCKED
         val now = SystemClock.elapsedRealtime()
-        if (!aeSettled || !afSettled) {
+        val af = result.get(CaptureResult.CONTROL_AF_STATE)
+        // Chỉ coi là "đã nét" khi AF thật sự báo nét SAU khi đã quét: INACTIVE lúc
+        // mới mở camera nghĩa là AF chưa chạy; vài máy (Samsung) báo
+        // PASSIVE_FOCUSED ngay khi vừa thay request dù ống kính chưa quét.
+        val afFocused = af == CaptureResult.CONTROL_AF_STATE_PASSIVE_FOCUSED ||
+            af == CaptureResult.CONTROL_AF_STATE_FOCUSED_LOCKED
+        val afScanning = af == CaptureResult.CONTROL_AF_STATE_PASSIVE_SCAN ||
+            af == CaptureResult.CONTROL_AF_STATE_ACTIVE_SCAN
+        if (afScanning) afScanSeen = true
+        val afFocusTrusted = afFocused && afScanSeen
+        val sinceSessionMs = if (sessionStartedMs > 0L) now - sessionStartedMs else 0L
+        val sinceFocusReleaseMs =
+            if (focusReleasedAtMs > 0L) now - focusReleasedAtMs else sinceSessionMs
+        val afTimedOut = min(sinceSessionMs, sinceFocusReleaseMs) >= AF_FOCUS_TIMEOUT_MS
+
+        // ---- 1. Khoá tiêu cự ----
+        if (lockedFocusDistance == null && activeHasAutoFocus && !focusLockPending &&
+            sinceSessionMs >= MIN_LOCK_AFTER_SESSION_MS
+        ) {
+            val lensStill = result.get(CaptureResult.LENS_STATE) !=
+                CaptureResult.LENS_STATE_MOVING
+            if (afFocusTrusted && lensStill) {
+                if (focusedSinceMs == 0L) focusedSinceMs = now
+            } else {
+                focusedSinceMs = 0L
+            }
+            val focusedLongEnough = focusedSinceMs > 0L &&
+                now - focusedSinceMs >= FOCUS_LOCK_AFTER_MS
+            val gaveUp = afTimedOut && afScanSeen && !afScanning && lensStill
+            val distance = result.get(CaptureResult.LENS_FOCUS_DISTANCE)
+            if ((focusedLongEnough || gaveUp) && distance != null) {
+                focusLockPending = true
+                lifecycleHandler.post {
+                    focusLockPending = false
+                    if (activeTrackId != trackId || requestGeneration != generation ||
+                        activeCameraLock || !stableExposureEnabled ||
+                        lockedFocusDistance != null
+                    ) return@post
+                    lockedFocusDistance = distance
+                    Log.i(TAG, "Focus " + (if (focusedLongEnough) "settled" else "search timed out") +
+                        "; locking focus at $distance dpt")
+                    apply(trackId, activeTargetEv) {}
+                }
+                return
+            }
+        }
+
+        // ---- 2. Khoá AE/AWB ----
+        if (autoLocked || lockPending) return
+        val ae = result.get(CaptureResult.CONTROL_AE_STATE) ?: return
+        val sinceAeReleaseMs =
+            if (aeReleasedAtMs > 0L) now - aeReleasedAtMs else sinceSessionMs
+        val aeSettled = ae == CaptureResult.CONTROL_AE_STATE_CONVERGED ||
+            ae == CaptureResult.CONTROL_AE_STATE_FLASH_REQUIRED ||
+            (min(sinceSessionMs, sinceAeReleaseMs) >= AE_SETTLE_TIMEOUT_MS &&
+                ae != CaptureResult.CONTROL_AE_STATE_PRECAPTURE)
+        // Chờ tiêu cự khoá trước (hoặc hết hạn) để lần khoá AE không bị request
+        // khoá tiêu cự thay ngay sau đó.
+        val focusReady = !activeHasAutoFocus || af == null ||
+            lockedFocusDistance != null || afTimedOut
+        if (!aeSettled || !focusReady || sinceSessionMs < MIN_LOCK_AFTER_SESSION_MS) {
             convergedSinceMs = 0L
             return
         }
@@ -269,20 +392,17 @@ object CameraExposureController {
         }
         if (now - convergedSinceMs < STABLE_LOCK_AFTER_MS) return
         lockPending = true
-        val focusDistance = result.get(CaptureResult.LENS_FOCUS_DISTANCE)
         lifecycleHandler.post {
             lockPending = false
             if (activeTrackId != trackId || requestGeneration != generation ||
                 autoLocked || activeCameraLock || !stableExposureEnabled
             ) return@post
             autoLocked = true
-            lockedFocusDistance = focusDistance
             lumaRefAtLock = lumaMeter.current
             lumaDriftSinceMs = 0L
             lockedAtMs = SystemClock.elapsedRealtime()
             lockedSessionHash = currentSessionHash
-            Log.i(TAG, "Exposure settled; locking AE/AWB" +
-                if (focusDistance != null) " and focus ($focusDistance dpt)" else "")
+            Log.i(TAG, "Exposure settled; locking AE/AWB")
             apply(trackId, activeTargetEv) {}
         }
     }
@@ -641,16 +761,31 @@ object CameraExposureController {
         val fpsUnitFactor = readField(session, "fpsUnitFactor") as Int
         val sessionHash = System.identityHashCode(captureSession)
         currentSessionHash = sessionHash
+        if (sessionStartHash != sessionHash) {
+            sessionStartHash = sessionHash
+            sessionStartedMs = SystemClock.elapsedRealtime()
+            afScanSeen = false
+            afRestartPending = true
+            focusedSinceMs = 0L
+        }
         val lockedOn = lockedSessionHash
         if (autoLocked && lockedOn != null && lockedOn != sessionHash) {
             // Camera vừa dựng lại phiên chụp (lỗi camera, hệ thống, đổi định
-            // dạng...): khoá phơi sáng cũ sẽ "đóng băng" mức sáng lúc phiên mới
-            // vừa mở (thường quá sáng/tối). Đo lại trước, hội tụ xong mới khoá.
+            // dạng, đổi ống kính...): khoá phơi sáng cũ sẽ "đóng băng" mức sáng lúc
+            // phiên mới vừa mở. Đo sáng VÀ lấy nét lại (tiêu cự cũ có thể thuộc
+            // ống kính khác), hội tụ xong mới khoá.
             Log.i(TAG, "Capture session rebuilt while exposure locked; re-metering")
-            releaseAutoLock(keepFocus = true)
+            releaseAutoLock()
         }
         val cameraManager = readField(capturer, "cameraManager") as CameraManager
         val characteristics = cameraManager.getCameraCharacteristics(cameraDevice.id)
+        val availableAfModes = characteristics.get(CameraCharacteristics.CONTROL_AF_AVAILABLE_MODES)
+        activeHasAutoFocus = (characteristics.get(
+            CameraCharacteristics.LENS_INFO_MINIMUM_FOCUS_DISTANCE,
+        ) ?: 0f) > 0f && availableAfModes?.any {
+            it == CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_VIDEO ||
+                it == CaptureRequest.CONTROL_AF_MODE_AUTO
+        } == true
         val compensationRange = characteristics.get(
             CameraCharacteristics.CONTROL_AE_COMPENSATION_RANGE,
         )
@@ -723,6 +858,12 @@ object CameraExposureController {
                         // người chơi đi gần/xa (máy đặt cố định trên chân).
                         set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_OFF)
                         set(CaptureRequest.LENS_FOCUS_DISTANCE, focusDistance)
+                    } else if (focusDistance != null && !activeCameraLock &&
+                        afModes?.contains(CaptureRequest.CONTROL_AF_MODE_AUTO) == true
+                    ) {
+                        // Máy không cho chỉnh tay tiêu cự: AF_MODE_AUTO không kèm
+                        // trigger giữ ống kính đứng yên ở vị trí vừa quét được.
+                        set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_AUTO)
                     } else if (activeCameraLock) {
                         if (afModes?.contains(CaptureRequest.CONTROL_AF_MODE_AUTO) == true) {
                             set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_AUTO)
@@ -780,10 +921,15 @@ object CameraExposureController {
                     ) {
                         val mirror = characteristics.get(CameraCharacteristics.LENS_FACING) ==
                             CameraCharacteristics.LENS_FACING_FRONT
-                        set(
-                            CaptureRequest.CONTROL_AE_REGIONS,
-                            arrayOf(meteringRectFor(point.first, point.second, activeRotationDegrees, mirror, bounds)),
-                        )
+                        val region = meteringRectFor(point.first, point.second, activeRotationDegrees, mirror, bounds)
+                        set(CaptureRequest.CONTROL_AE_REGIONS, arrayOf(region))
+                        // Chạm vào hình: lấy nét luôn tại điểm đó (khi AF đang tự động).
+                        val maxAfRegions = characteristics.get(CameraCharacteristics.CONTROL_MAX_REGIONS_AF) ?: 0
+                        if (maxAfRegions > 0 && get(CaptureRequest.CONTROL_AF_MODE) !=
+                            CaptureRequest.CONTROL_AF_MODE_OFF
+                        ) {
+                            set(CaptureRequest.CONTROL_AF_REGIONS, arrayOf(region))
+                        }
                     }
                     setFirstSupportedMode(
                         this,
@@ -825,6 +971,24 @@ object CameraExposureController {
                 )
                 lastCaptureHeartbeatMs = SystemClock.elapsedRealtime()
                 lastAppliedKey = appliedKey
+                if (afRestartPending && activeHasAutoFocus &&
+                    request.get(CaptureRequest.CONTROL_AF_MODE) ==
+                    CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_VIDEO
+                ) {
+                    afRestartPending = false
+                    // Ép AF liên tục quét lại từ đầu: ở CONTINUOUS_VIDEO, START khoá
+                    // tức thì (không di chuyển ống kính), CANCEL sau đó nhả khoá và
+                    // "Restart AF scan" theo bảng trạng thái Camera2. Không dùng thì
+                    // vài máy giữ ống kính đứng yên tới khi khung hình đổi (zoom).
+                    try {
+                        request.set(CaptureRequest.CONTROL_AF_TRIGGER, CaptureRequest.CONTROL_AF_TRIGGER_START)
+                        captureSession.capture(request.build(), null, cameraThread)
+                        request.set(CaptureRequest.CONTROL_AF_TRIGGER, CaptureRequest.CONTROL_AF_TRIGGER_CANCEL)
+                        captureSession.capture(request.build(), null, cameraThread)
+                    } catch (error: Throwable) {
+                        Log.w(TAG, "Cannot restart autofocus scan", error)
+                    }
+                }
                 callback(result(true, compensation, compensation * compensationStep))
             } catch (error: Throwable) {
                 lastAppliedKey = null

@@ -7,6 +7,7 @@ import 'package:flutter/services.dart';
 import 'package:flutter_webrtc/flutter_webrtc.dart';
 
 import '../models/camera_resolution_profile.dart';
+import 'station_errors.dart';
 import 'station_platform_events.dart';
 
 Map<String, dynamic> buildCameraVideoConstraints({
@@ -633,7 +634,10 @@ class WebRtcService {
         );
         return;
       }
-      throw StateError('Micro chưa sẵn sàng.');
+      throw BilingualStateError(
+        'Micro chưa sẵn sàng.',
+        'The microphone is not ready.',
+      );
     }
     track.enabled = true;
     developer.log(
@@ -846,6 +850,11 @@ class WebRtcService {
     // OPEN CAMERA
     // ==========================================================
 
+    // Xin quyền trước, KHÔNG giới hạn thời gian: hộp thoại quyền lần cài đầu
+    // tiên không còn rơi vào timeout 12 s của getUserMedia bên dưới.
+    await _ensureCapturePermissions();
+    if (cameraGeneration != _cameraLifecycleGeneration) return;
+
     _isEmulator ??= await _detectEmulator();
     if (cameraGeneration != _cameraLifecycleGeneration) return;
     if (_availableCameras.isEmpty) {
@@ -915,7 +924,10 @@ class WebRtcService {
 
       _localStream = null;
 
-      throw Exception('Camera Station không tạo được video track.');
+      throw const BilingualException(
+        'Camera Station không tạo được video track.',
+        'Camera Station could not create a video track.',
+      );
     }
 
     final videoTrack = videoTracks.first;
@@ -1048,6 +1060,37 @@ class WebRtcService {
         'Station video track: '
         '${track.id}, '
         'enabled=${track.enabled}',
+        name: 'WebRtcService',
+      );
+    }
+  }
+
+  /// Hỏi quyền camera/micro qua native và chờ người dùng trả lời. Thiếu quyền
+  /// camera → [StationException] permissionDenied (màn lỗi có nút Mở Cài đặt,
+  /// không tự thử lại). Thiếu micro vẫn chạy (ghi hình không tiếng như cũ).
+  Future<void> _ensureCapturePermissions() async {
+    if (!Platform.isAndroid && !Platform.isIOS) return;
+    Map<Object?, Object?>? status;
+    try {
+      status = await _platformChannel.invokeMapMethod<Object?, Object?>(
+        'ensureCapturePermissions',
+      );
+    } on MissingPluginException {
+      return;
+    } on PlatformException catch (error) {
+      developer.log(
+        '[CAMERA] Unable to pre-request capture permissions: $error',
+        name: 'WebRtcService',
+      );
+      return;
+    }
+    if (status == null) return;
+    if (status['camera'] == false) {
+      throw StationException.fromCode(StationErrorCode.permissionDenied);
+    }
+    if (status['microphone'] == false) {
+      developer.log(
+        '[MICROPHONE] Permission denied; recording continues without audio',
         name: 'WebRtcService',
       );
     }
@@ -1522,10 +1565,16 @@ class WebRtcService {
   Future<void> switchCameraToId(String? deviceId) async {
     final track = localVideoTrack;
     if (!_cameraInitialized || track == null) {
-      throw StateError('Camera chưa sẵn sàng.');
+      throw BilingualStateError(
+        'Camera chưa sẵn sàng.',
+        'The camera is not ready.',
+      );
     }
     if (_switchingCamera) {
-      throw StateError('Đang đổi camera, vui lòng đợi.');
+      throw BilingualStateError(
+        'Đang đổi camera, vui lòng đợi.',
+        'Switching camera, please wait.',
+      );
     }
     _switchingCamera = true;
     try {
@@ -1566,7 +1615,10 @@ class WebRtcService {
           ).timeout(const Duration(seconds: 8));
 
           if (!Platform.isIOS && !switchResult) {
-            throw StateError('Thiết bị không có camera khác để chuyển.');
+            throw BilingualStateError(
+              'Thiết bị không có camera khác để chuyển.',
+              'No other camera to switch to.',
+            );
           }
         } else {
           developer.log(
@@ -1578,7 +1630,10 @@ class WebRtcService {
 
       await Future<void>.delayed(const Duration(milliseconds: 100));
       if (_localStream == null || localVideoTrack != track) {
-        throw StateError('Camera stream không còn tồn tại.');
+        throw BilingualStateError(
+          'Camera stream không còn tồn tại.',
+          'The camera stream is no longer available.',
+        );
       }
       _currentFacingMode = targetFacing;
       if (deviceId != null) {

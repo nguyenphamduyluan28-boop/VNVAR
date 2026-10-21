@@ -3,6 +3,8 @@ import 'dart:async';
 import 'package:flutter/material.dart';
 
 import '../services/app_language_service.dart';
+import '../theme/app_theme.dart';
+import '../widgets/brand_widgets.dart';
 
 class StationSplashScreen extends StatefulWidget {
   final VoidCallback onFinished;
@@ -31,14 +33,14 @@ class _StationSplashScreenState extends State<StationSplashScreen> {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      backgroundColor: Color(0xFFF3F6FA),
+      backgroundColor: BrandColors.background,
       body: SafeArea(
         child: LayoutBuilder(
           builder: (context, constraints) => SingleChildScrollView(
-            padding: const EdgeInsets.all(24),
+            padding: const EdgeInsets.all(BrandSpace.xl),
             child: ConstrainedBox(
               constraints: BoxConstraints(
-                minHeight: (constraints.maxHeight - 48).clamp(
+                minHeight: (constraints.maxHeight - 2 * BrandSpace.xl).clamp(
                   0,
                   double.infinity,
                 ),
@@ -49,41 +51,34 @@ class _StationSplashScreenState extends State<StationSplashScreen> {
                   children: [
                     const Image(
                       image: AssetImage('assets/images/vnvar_logo.png'),
-                      width: 290,
-                      height: 70,
+                      width: 240,
+                      height: 58,
                       fit: BoxFit.contain,
                     ),
-                    const SizedBox(height: 24),
+                    const SizedBox(height: BrandSpace.xl),
                     const SizedBox(
-                      width: 34,
-                      height: 34,
-                      child: CircularProgressIndicator(strokeWidth: 3),
+                      width: 28,
+                      height: 28,
+                      child: CircularProgressIndicator(
+                        strokeWidth: 2.4,
+                        color: BrandColors.primaryBright,
+                      ),
                     ),
-                    const SizedBox(height: 18),
+                    const SizedBox(height: BrandSpace.lg),
                     Text(
                       appText(
                         context,
-                        'CAMERA ĐANG KHỞI TẠO...',
-                        'INITIALIZING CAMERA...',
+                        'Đang khởi tạo camera...',
+                        'Starting camera...',
                       ),
-                      style: const TextStyle(
-                        color: Color(0xFF12223F),
-                        fontSize: 18,
-                        fontWeight: FontWeight.w900,
-                        letterSpacing: 1.2,
-                      ),
+                      textAlign: TextAlign.center,
+                      style: BrandText.body,
                     ),
-                    const SizedBox(height: 6),
-                    Text(
-                      appText(
-                        context,
-                        'VNVAR Camera Station đang chuẩn bị',
-                        'VNVAR Camera Station is getting ready',
-                      ),
-                      style: const TextStyle(
-                        color: Colors.black54,
-                        fontSize: 13,
-                      ),
+                    const SizedBox(height: BrandSpace.xs),
+                    const Text(
+                      'VNVAR Camera Station',
+                      textAlign: TextAlign.center,
+                      style: BrandText.caption,
                     ),
                   ],
                 ),

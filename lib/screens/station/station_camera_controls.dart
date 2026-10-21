@@ -1,10 +1,16 @@
 part of '../station_screen.dart';
 
-class _BottomControlPanel extends StatelessWidget {
-  const _BottomControlPanel({
+/// Khay mở rộng phía trên thanh điều khiển đáy (chỉ một khay mỗi lúc).
+enum _ControlTray { none, zoom, exposure }
+
+/// Thanh điều khiển nhỏ ở đáy màn camera:
+/// `[0.5× 1× 2× 5×] (zoom chi tiết) (độ sáng)`.
+/// Thanh trượt zoom và bước độ sáng chỉ hiện khi bấm mở khay tương ứng, để
+/// chừa tối đa diện tích cho hình camera.
+class _CameraControlBar extends StatefulWidget {
+  const _CameraControlBar({
     required this.compact,
     required this.cameraReady,
-    required this.recording,
     required this.zoomSupported,
     required this.zoomValue,
     required this.minimumZoom,
@@ -23,7 +29,6 @@ class _BottomControlPanel extends StatelessWidget {
   final double exposureEv;
   final ValueChanged<double> onExposureChanged;
   final bool cameraReady;
-  final bool recording;
   final bool zoomSupported;
   final double zoomValue;
   final double minimumZoom;
@@ -38,71 +43,230 @@ class _BottomControlPanel extends StatelessWidget {
   final bool zoomEnabled;
 
   @override
+  State<_CameraControlBar> createState() => _CameraControlBarState();
+}
+
+class _CameraControlBarState extends State<_CameraControlBar> {
+  _ControlTray _tray = _ControlTray.none;
+
+  void _toggleTray(_ControlTray tray) {
+    setState(() => _tray = _tray == tray ? _ControlTray.none : tray);
+  }
+
+  @override
   Widget build(BuildContext context) {
-    // Camera chưa sẵn sàng: không có zoom hay độ sáng để chỉnh, ẩn hẳn khung.
-    if (!cameraReady && !zoomSupported) return const SizedBox.shrink();
-    // Cùng kiểu nền với thanh trạng thái/menu; không làm mờ nền (đỡ tốn GPU).
-    return ClipRRect(
-      borderRadius: BorderRadius.circular(compact ? 18 : 20),
-      child: Container(
-          padding: EdgeInsets.symmetric(
-            horizontal: compact ? 8 : 10,
-            vertical: compact ? 4 : 6,
+    final w = widget;
+    // Camera chưa sẵn sàng: không có zoom hay độ sáng để chỉnh, ẩn hẳn.
+    if (!w.cameraReady && !w.zoomSupported) return const SizedBox.shrink();
+
+    var tray = _tray;
+    if (tray == _ControlTray.zoom && !w.zoomSupported) {
+      tray = _ControlTray.none;
+    }
+    if (tray == _ControlTray.exposure && !w.cameraReady) {
+      tray = _ControlTray.none;
+    }
+
+    final effectiveMin = w.hasUltraWide
+        ? math.min(w.ultraWideRatio, w.minimumZoom)
+        : w.minimumZoom.clamp(1.0, 5.0);
+    // max(...) thay vì clamp(min + 0.1, 5.0): clamp ném lỗi khi cận dưới > 5
+    // (thiết bị báo minimumZoom = 5).
+    final effectiveMax = math.max(
+      math.min(w.maximumZoom, 5.0),
+      effectiveMin + 0.1,
+    );
+    final safeValue = w.zoomValue.clamp(effectiveMin, effectiveMax).toDouble();
+
+    // Mức zoom nhanh: [siêu rộng], 1×, 2×, 5×.
+    final presets = <double>[
+      if (w.hasUltraWide) w.ultraWideRatio,
+      1.0,
+      2.0,
+      5.0,
+    ];
+    String presetLabel(int index) => w.hasUltraWide && index == 0
+        ? w.ultraWideLabel
+        : '${presets[index].toStringAsFixed(0)}×';
+    int? selectedPreset;
+    for (var i = 0; i < presets.length; i++) {
+      if ((safeValue - presets[i]).abs() < 0.08) {
+        selectedPreset = i;
+        break;
+      }
+    }
+
+    final evAuto = w.exposureEv.abs() < 0.01;
+    final bar = Row(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        if (w.zoomSupported) ...[
+          Semantics(
+            container: true,
+            label: appText(context, 'Thu phóng', 'Zoom'),
+            child: BrandSegmented<int>(
+              values: List<int>.generate(presets.length, (i) => i),
+              labelOf: presetLabel,
+              selected: selectedPreset,
+              dense: w.compact,
+              onChanged: w.zoomEnabled
+                  ? (index) => w.onQuickSelectZoom(presets[index])
+                  : null,
+            ),
           ),
-          decoration: BoxDecoration(
-            color: _glassColor,
-            borderRadius: BorderRadius.circular(compact ? 18 : 20),
-            border: Border.all(color: _glassBorder),
+          const SizedBox(width: BrandSpace.sm),
+          BrandIconButton(
+            icon: Icons.zoom_in_rounded,
+            tooltip: appText(
+              context,
+              'Zoom chi tiết (${safeValue.toStringAsFixed(1)}×)',
+              'Fine zoom (${safeValue.toStringAsFixed(1)}×)',
+            ),
+            size: 48,
+            active: tray == _ControlTray.zoom,
+            onPressed: () => _toggleTray(_ControlTray.zoom),
           ),
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              if (zoomSupported) ...[
-                _CameraZoomSlider(
-                  compact: compact,
-                  value: zoomValue,
-                  minimum: minimumZoom,
-                  maximum: maximumZoom,
-                  hasUltraWide: hasUltraWide,
-                  ultraWideRatio: ultraWideRatio,
-                  ultraWideLabel: ultraWideLabel,
-                  enabled: zoomEnabled,
-                  onChanged: onZoomChanged,
-                  onQuickSelect: onQuickSelectZoom,
-                ),
-                Container(
-                  height: 1,
-                  margin: const EdgeInsets.symmetric(horizontal: 8),
-                  color: Colors.white.withValues(alpha: 0.09),
-                ),
-              ],
-              if (cameraReady)
-                _BrightnessControl(
-                  compact: compact,
-                  ev: exposureEv,
-                  onChanged: onExposureChanged,
-                ),
-            ],
+        ],
+        if (w.cameraReady) ...[
+          if (w.zoomSupported) const SizedBox(width: BrandSpace.sm),
+          BrandIconButton(
+            icon: evAuto
+                ? Icons.brightness_auto_rounded
+                : Icons.exposure_rounded,
+            tooltip: appText(context, 'Độ sáng hình', 'Image brightness'),
+            size: 48,
+            active: tray == _ControlTray.exposure,
+            onPressed: () => _toggleTray(_ControlTray.exposure),
           ),
-        ),
+        ],
+      ],
+    );
+
+    final Widget? trayContent = switch (tray) {
+      _ControlTray.zoom => _ZoomFineControl(
+        value: safeValue,
+        minimum: effectiveMin,
+        maximum: effectiveMax,
+        enabled: w.zoomEnabled,
+        onChanged: w.onZoomChanged,
+      ),
+      _ControlTray.exposure => _ExposureStepper(
+        ev: w.exposureEv,
+        onChanged: w.onExposureChanged,
+      ),
+      _ControlTray.none => null,
+    };
+
+    return Column(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        if (trayContent != null) ...[
+          ConstrainedBox(
+            constraints: const BoxConstraints(maxWidth: 420),
+            child: BrandGlass(
+              radius: BrandRadius.large,
+              padding: const EdgeInsets.symmetric(horizontal: BrandSpace.xs),
+              child: trayContent,
+            ),
+          ),
+          const SizedBox(height: BrandSpace.sm),
+        ],
+        // Chữ hệ thống phóng to trên máy hẹp: thu nhỏ cả thanh thay vì tràn.
+        FittedBox(fit: BoxFit.scaleDown, child: bar),
+      ],
     );
   }
 }
 
-/// Nút chỉnh độ sáng hình cho người dùng phổ thông: "Tối hơn / Tự động /
-/// Sáng hơn", mỗi bước 0,5 EV, từ −1 tới +2.
-class _BrightnessControl extends StatelessWidget {
-  const _BrightnessControl({
-    required this.compact,
-    required this.ev,
+/// Khay zoom chi tiết: `[−] thanh trượt [+] 1.3×`, bước 0,1×.
+class _ZoomFineControl extends StatelessWidget {
+  const _ZoomFineControl({
+    required this.value,
+    required this.minimum,
+    required this.maximum,
+    required this.enabled,
     required this.onChanged,
   });
+
+  final double value;
+  final double minimum;
+  final double maximum;
+  final bool enabled;
+  final ValueChanged<double> onChanged;
+
+  @override
+  Widget build(BuildContext context) {
+    void stepZoom(double delta) {
+      final raw = value + delta;
+      final stepped = (raw * 10).round() / 10.0;
+      final clamped = stepped.clamp(minimum, maximum).toDouble();
+      onChanged(clamped);
+    }
+
+    final canDecrease = enabled && value > (minimum + 0.04);
+    final canIncrease = enabled && value < (maximum - 0.04);
+
+    return Row(
+      children: [
+        _TrayStepButton(
+          icon: Icons.remove_rounded,
+          tooltip: appText(context, 'Thu nhỏ', 'Zoom out'),
+          onTap: canDecrease ? () => stepZoom(-0.1) : null,
+        ),
+        Expanded(
+          child: SliderTheme(
+            data: SliderTheme.of(context).copyWith(
+              trackHeight: 3,
+              thumbShape: const RoundSliderThumbShape(
+                enabledThumbRadius: 8,
+                elevation: 0,
+                pressedElevation: 0,
+              ),
+              overlayShape: const RoundSliderOverlayShape(overlayRadius: 16),
+              activeTrackColor: BrandColors.primaryBright,
+              inactiveTrackColor: Colors.white.withValues(alpha: 0.20),
+              thumbColor: Colors.white,
+            ),
+            child: Slider(
+              value: value,
+              min: minimum,
+              max: maximum,
+              divisions: ((maximum - minimum) * 10).round().clamp(1, 100),
+              onChanged: enabled ? onChanged : null,
+            ),
+          ),
+        ),
+        _TrayStepButton(
+          icon: Icons.add_rounded,
+          tooltip: appText(context, 'Phóng to', 'Zoom in'),
+          onTap: canIncrease ? () => stepZoom(0.1) : null,
+        ),
+        SizedBox(
+          width: 44,
+          child: Text(
+            '${value.toStringAsFixed(1)}×',
+            textAlign: TextAlign.center,
+            maxLines: 1,
+            style: const TextStyle(
+              color: Colors.white,
+              fontSize: 13,
+              fontWeight: FontWeight.w700,
+            ),
+          ),
+        ),
+      ],
+    );
+  }
+}
+
+/// Khay độ sáng hình: `☀ [−] Tự động [+]`, mỗi bước 0,5 EV, từ −1 tới +2.
+class _ExposureStepper extends StatelessWidget {
+  const _ExposureStepper({required this.ev, required this.onChanged});
 
   static const double _step = 0.5;
   static const double _min = -1.0;
   static const double _max = 2.0;
 
-  final bool compact;
   final double ev;
   final ValueChanged<double> onChanged;
 
@@ -110,462 +274,93 @@ class _BrightnessControl extends StatelessWidget {
   Widget build(BuildContext context) {
     final label = ev.abs() < 0.01
         ? appText(context, 'Tự động', 'Auto')
-        : ev > 0
-        ? appText(
-            context,
-            'Sáng hơn +${ev.toStringAsFixed(1)}',
-            'Brighter +${ev.toStringAsFixed(1)}',
-          )
-        : appText(
-            context,
-            'Tối hơn ${ev.toStringAsFixed(1)}',
-            'Darker ${ev.toStringAsFixed(1)}',
-          );
-    Widget button(IconData icon, double next, bool enabled, String tooltip) {
-      // Vùng chạm tối thiểu 48dp; biểu tượng giữ nguyên kích thước.
-      return Tooltip(
-        message: tooltip,
-        child: InkResponse(
-          radius: 20,
-          onTap: enabled ? () => onChanged(next) : null,
-          child: SizedBox(
-            width: kMinInteractiveDimension,
-            height: kMinInteractiveDimension,
-            child: Icon(
-              icon,
-              size: 17,
-              color: enabled ? Colors.white : Colors.white24,
-            ),
-          ),
-        ),
-      );
-    }
-
-    return Padding(
-      padding: const EdgeInsets.symmetric(horizontal: 6),
-      child: Row(
-        children: [
-          const Icon(
+        : '${ev > 0 ? '+' : ''}${ev.toStringAsFixed(1)} EV';
+    return Row(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        const SizedBox(width: BrandSpace.sm),
+        Tooltip(
+          message: appText(context, 'Độ sáng hình', 'Image brightness'),
+          child: const Icon(
             Icons.wb_sunny_rounded,
-            size: 15,
-            color: Colors.amberAccent,
+            size: 18,
+            color: BrandColors.warningSoft,
           ),
-          const SizedBox(width: 6),
-          Text(
-            appText(context, 'Độ sáng', 'Brightness'),
+        ),
+        const SizedBox(width: BrandSpace.xs),
+        _TrayStepButton(
+          icon: Icons.remove_rounded,
+          tooltip: appText(context, 'Tối hơn', 'Darker'),
+          onTap: ev > _min + 0.01 ? () => onChanged(ev - _step) : null,
+        ),
+        SizedBox(
+          width: 84,
+          child: Text(
+            label,
+            textAlign: TextAlign.center,
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
             style: const TextStyle(
-              color: Colors.white70,
-              fontSize: 11.5,
-              fontWeight: FontWeight.w600,
-            ),
-          ),
-          const Spacer(),
-          button(
-            Icons.remove_rounded,
-            ev - _step,
-            ev > _min + 0.01,
-            appText(context, 'Tối hơn', 'Darker'),
-          ),
-          SizedBox(
-            width: 92,
-            child: Text(
-              label,
-              textAlign: TextAlign.center,
-              style: const TextStyle(
-                color: Colors.white,
-                fontSize: 11.5,
-                fontWeight: FontWeight.w800,
-              ),
-            ),
-          ),
-          button(
-            Icons.add_rounded,
-            ev + _step,
-            ev < _max - 0.01,
-            appText(context, 'Sáng hơn', 'Brighter'),
-          ),
-        ],
-      ),
-    );
-  }
-}
-
-class _CameraZoomSlider extends StatelessWidget {
-  const _CameraZoomSlider({
-    required this.compact,
-    required this.value,
-    required this.minimum,
-    required this.maximum,
-    required this.hasUltraWide,
-    required this.ultraWideRatio,
-    required this.ultraWideLabel,
-    required this.onChanged,
-    required this.onQuickSelect,
-    this.enabled = true,
-  });
-
-  final bool compact;
-  final double value;
-  final double minimum;
-  final double maximum;
-  final bool hasUltraWide;
-  final double ultraWideRatio;
-  final String ultraWideLabel;
-  final ValueChanged<double> onChanged;
-  final ValueChanged<double> onQuickSelect;
-  final bool enabled;
-
-  /// Bề rộng tối thiểu dành cho thanh trượt khi tính vùng chạm nút nhanh.
-  static const double _minSliderWidth = 96;
-
-  @override
-  Widget build(BuildContext context) {
-    final effectiveMin = hasUltraWide
-        ? math.min(ultraWideRatio, minimum)
-        : minimum.clamp(1.0, 5.0);
-    final effectiveMax = math.min(maximum, 5.0).clamp(effectiveMin + 0.1, 5.0);
-    final safeValue = value.clamp(effectiveMin, effectiveMax).toDouble();
-
-    void stepZoom(double delta) {
-      final raw = safeValue + delta;
-      final stepped = (raw * 10).round() / 10.0;
-      final clamped = stepped.clamp(effectiveMin, effectiveMax).toDouble();
-      onChanged(clamped);
-    }
-
-    final canDecrease = enabled && safeValue > (effectiveMin + 0.04);
-    final canIncrease = enabled && safeValue < (effectiveMax - 0.04);
-
-    VoidCallback? quickSelect(double target) =>
-        enabled ? () => onQuickSelect(target) : null;
-
-    Widget buildStepButton({
-      required IconData icon,
-      required String tooltip,
-      required VoidCallback? onTap,
-    }) {
-      final enabled = onTap != null;
-      // Vùng chạm 48dp, hình tròn hiển thị vẫn 28dp.
-      return Tooltip(
-        message: tooltip,
-        child: Material(
-          color: Colors.transparent,
-          child: InkWell(
-            onTap: onTap,
-            customBorder: const CircleBorder(),
-            child: SizedBox(
-              width: kMinInteractiveDimension,
-              height: kMinInteractiveDimension,
-              child: Center(
-                child: Container(
-                  width: 28,
-                  height: 28,
-                  alignment: Alignment.center,
-                  decoration: BoxDecoration(
-                    color: enabled
-                        ? Colors.white.withValues(alpha: 0.12)
-                        : Colors.white.withValues(alpha: 0.04),
-                    shape: BoxShape.circle,
-                    border: Border.all(
-                      color: enabled
-                          ? Colors.white.withValues(alpha: 0.22)
-                          : Colors.white.withValues(alpha: 0.06),
-                      width: 1,
-                    ),
-                  ),
-                  child: Icon(
-                    icon,
-                    color: enabled ? Colors.white : Colors.white24,
-                    size: 16,
-                  ),
-                ),
-              ),
+              color: Colors.white,
+              fontSize: 13,
+              fontWeight: FontWeight.w700,
             ),
           ),
         ),
-      );
-    }
-
-    // Một hàng gọn: [nút nhanh] [−] [thanh trượt] [+] [giá trị]. Máy hẹp
-    // (dọc ~360px) bỏ ô giá trị để thanh trượt đủ dài.
-    return LayoutBuilder(
-      builder: (context, constraints) {
-        final showValue = constraints.maxWidth >= 360;
-        // Vùng chạm nút nhanh: cao 48dp; rộng 48dp khi đủ chỗ, máy hẹp thì
-        // co lại (không nhỏ hơn hình hiển thị) để thanh trượt vẫn còn
-        // ≥ [_minSliderWidth]. Các vùng chạm sát nhau nên không có khe chết.
-        final presetCount = hasUltraWide ? 4 : 3;
-        final presetBudget =
-            constraints.maxWidth -
-            4 - // padding ngang của hàng
-            2 - // khoảng cách trước nút [−]
-            2 * kMinInteractiveDimension - // nút [−] và [+]
-            (showValue ? 38 : 0) -
-            _minSliderWidth;
-        final presetTapWidth = (presetBudget / presetCount)
-            .clamp(0.0, kMinInteractiveDimension)
-            .toDouble();
-        return Padding(
-          padding: const EdgeInsets.symmetric(horizontal: 2, vertical: 2),
-          child: Row(
-            children: [
-              if (hasUltraWide)
-                _ZoomPresetButton(
-                  label: ultraWideLabel,
-                  selected: (safeValue - ultraWideRatio).abs() < 0.08,
-                  compact: true,
-                  minTapWidth: presetTapWidth,
-                  onTap: quickSelect(ultraWideRatio),
-                ),
-              _ZoomPresetButton(
-                label: '1×',
-                selected: (safeValue - 1.0).abs() < 0.08,
-                compact: true,
-                minTapWidth: presetTapWidth,
-                onTap: quickSelect(1.0),
-              ),
-              _ZoomPresetButton(
-                label: '2×',
-                selected: (safeValue - 2.0).abs() < 0.08,
-                compact: true,
-                minTapWidth: presetTapWidth,
-                onTap: quickSelect(2.0),
-              ),
-              _ZoomPresetButton(
-                label: '5×',
-                selected: (safeValue - 5.0).abs() < 0.08,
-                compact: true,
-                minTapWidth: presetTapWidth,
-                onTap: quickSelect(5.0),
-              ),
-              const SizedBox(width: 2),
-              buildStepButton(
-                icon: Icons.remove_rounded,
-                tooltip: appText(context, 'Thu nhỏ', 'Zoom out'),
-                onTap: canDecrease ? () => stepZoom(-0.1) : null,
-              ),
-              Expanded(
-                child: SliderTheme(
-                  data: SliderTheme.of(context).copyWith(
-                    trackHeight: 4,
-                    thumbShape: const RoundSliderThumbShape(
-                      enabledThumbRadius: 8,
-                      elevation: 2.0,
-                      pressedElevation: 4.0,
-                    ),
-                    overlayShape: const RoundSliderOverlayShape(overlayRadius: 14),
-                    activeTrackColor: const Color(0xFF22C55E),
-                    inactiveTrackColor: Colors.white.withValues(alpha: 0.20),
-                    thumbColor: Colors.white,
-                  ),
-                  child: Slider(
-                    value: safeValue,
-                    min: effectiveMin,
-                    max: effectiveMax,
-                    divisions: ((effectiveMax - effectiveMin) * 10)
-                        .round()
-                        .clamp(1, 100),
-                    onChanged: enabled ? onChanged : null,
-                  ),
-                ),
-              ),
-              buildStepButton(
-                icon: Icons.add_rounded,
-                tooltip: appText(context, 'Phóng to', 'Zoom in'),
-                onTap: canIncrease ? () => stepZoom(0.1) : null,
-              ),
-              if (showValue)
-                SizedBox(
-                  width: 38,
-                  child: Text(
-                    '${safeValue.toStringAsFixed(1)}×',
-                    textAlign: TextAlign.right,
-                    style: const TextStyle(
-                      color: Colors.white,
-                      fontSize: 12,
-                      fontWeight: FontWeight.w800,
-                    ),
-                  ),
-                ),
-            ],
-          ),
-        );
-      },
-    );
-  }
-}
-
-class _ZoomPresetButton extends StatelessWidget {
-  final String label;
-  final bool selected;
-  final bool compact;
-
-  /// Bề rộng tối thiểu của vùng chạm (≤ 48dp). Chiều cao vùng chạm luôn
-  /// [kMinInteractiveDimension]; hình hiển thị giữ kích thước cũ.
-  final double minTapWidth;
-
-  /// null: nút bị khoá (đang đổi camera).
-  final VoidCallback? onTap;
-
-  const _ZoomPresetButton({
-    required this.label,
-    required this.selected,
-    required this.compact,
-    required this.onTap,
-    this.minTapWidth = kMinInteractiveDimension,
-  });
-
-  @override
-  Widget build(BuildContext context) {
-    return Semantics(
-      button: true,
-      selected: selected,
-      enabled: onTap != null,
-      label: appText(context, 'Thu phóng $label', 'Zoom $label'),
-      onTap: onTap,
-      excludeSemantics: true,
-      child: GestureDetector(
-        // Chạm vào phần trong suốt quanh hình cũng kích hoạt.
-        behavior: HitTestBehavior.opaque,
-        onTap: onTap,
-        child: ConstrainedBox(
-          constraints: BoxConstraints(
-            minWidth: minTapWidth,
-            minHeight: kMinInteractiveDimension,
-          ),
-          child: Center(
-            widthFactor: 1,
-            heightFactor: 1,
-            child: Padding(
-              // Khoảng hở giữa các nút nằm trong vùng chạm (không có khe chết).
-              padding: const EdgeInsets.symmetric(horizontal: 1.5),
-              child: Container(
-                padding: EdgeInsets.symmetric(
-                  horizontal: compact ? 8 : 10,
-                  vertical: compact ? 2 : 3,
-                ),
-                decoration: BoxDecoration(
-                  color: selected
-                      ? const Color(0xFF1565C0)
-                      : Colors.white.withValues(alpha: 0.12),
-                  borderRadius: BorderRadius.circular(12),
-                  border: Border.all(
-                    color: selected
-                        ? const Color(0xFF64B5F6)
-                        : Colors.white.withValues(alpha: 0.15),
-                    width: selected ? 1.5 : 1,
-                  ),
-                  boxShadow: selected
-                      ? [
-                          BoxShadow(
-                            color: const Color(
-                              0xFF1565C0,
-                            ).withValues(alpha: 0.4),
-                            blurRadius: 6,
-                            offset: const Offset(0, 2),
-                          ),
-                        ]
-                      : null,
-                ),
-                child: Text(
-                  label,
-                  style: TextStyle(
-                    color: onTap == null ? Colors.white38 : Colors.white,
-                    fontWeight: selected ? FontWeight.w900 : FontWeight.w600,
-                    fontSize: compact ? 11 : 12,
-                  ),
-                ),
-              ),
-            ),
-          ),
+        _TrayStepButton(
+          icon: Icons.add_rounded,
+          tooltip: appText(context, 'Sáng hơn', 'Brighter'),
+          onTap: ev < _max - 0.01 ? () => onChanged(ev + _step) : null,
         ),
-      ),
+      ],
     );
   }
 }
 
-class _CameraDock extends StatelessWidget {
-  const _CameraDock({required this.buttons});
-
-  final List<Widget> buttons;
-
-  @override
-  Widget build(BuildContext context) {
-    return _GlassSurface(
-      radius: 22,
-      padding: const EdgeInsets.all(5),
-      // Màn hình rất thấp (menu đang mở): cụm nút tự cuộn, không tràn.
-      child: SingleChildScrollView(
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            // Mỗi nút đã có vùng chạm 48dp (hình 36dp) nên không cần khoảng
-            // cách thêm giữa các nút.
-            for (var i = 0; i < buttons.length; i++) buttons[i],
-          ],
-        ),
-      ),
-    );
-  }
-}
-
-class _DockButton extends StatelessWidget {
-  const _DockButton({
+/// Nút bước trong khay: vùng chạm 48dp, hình tròn hiển thị 30dp.
+class _TrayStepButton extends StatelessWidget {
+  const _TrayStepButton({
     required this.icon,
     required this.tooltip,
     required this.onTap,
-    this.loading = false,
-    this.background,
   });
-
-  static const double size = 36;
 
   final IconData icon;
   final String tooltip;
   final VoidCallback? onTap;
-  final bool loading;
-  final Color? background;
 
   @override
   Widget build(BuildContext context) {
-    // Vùng chạm tối thiểu 48dp (kMinInteractiveDimension); hình tròn hiển thị
-    // vẫn [size]. Chạm vào phần viền trong suốt quanh hình cũng kích hoạt.
+    final enabled = onTap != null;
     return Tooltip(
       message: tooltip,
-      child: GestureDetector(
-        behavior: HitTestBehavior.opaque,
-        // Ngữ nghĩa (nút bấm) do InkWell bên trong cung cấp.
-        excludeFromSemantics: true,
-        onTap: onTap,
-        child: SizedBox(
-          width: kMinInteractiveDimension,
-          height: kMinInteractiveDimension,
-          child: Center(
-            child: Material(
-              color: background ?? Colors.white.withValues(alpha: 0.10),
-              shape: const CircleBorder(),
-              child: InkWell(
-                customBorder: const CircleBorder(),
-                onTap: onTap,
-                child: SizedBox(
-                  width: size,
-                  height: size,
-                  child: Center(
-                    child: loading
-                        ? const SizedBox(
-                            width: 14,
-                            height: 14,
-                            child: CircularProgressIndicator(
-                              strokeWidth: 2,
-                              color: Colors.white,
-                            ),
-                          )
-                        : Icon(
-                            icon,
-                            size: 18,
-                            color: onTap == null ? Colors.white30 : Colors.white,
-                          ),
+      child: Material(
+        type: MaterialType.transparency,
+        child: InkWell(
+          onTap: onTap,
+          customBorder: const CircleBorder(),
+          child: SizedBox(
+            width: kMinInteractiveDimension,
+            height: kMinInteractiveDimension,
+            child: Center(
+              child: Container(
+                width: 30,
+                height: 30,
+                decoration: BoxDecoration(
+                  color: enabled
+                      ? const Color(0x1FFFFFFF)
+                      : const Color(0x0AFFFFFF),
+                  shape: BoxShape.circle,
+                  border: Border.all(
+                    color: enabled
+                        ? const Color(0x33FFFFFF)
+                        : const Color(0x0FFFFFFF),
                   ),
+                ),
+                child: Icon(
+                  icon,
+                  size: 16,
+                  color: enabled ? Colors.white : BrandColors.textDisabled,
                 ),
               ),
             ),

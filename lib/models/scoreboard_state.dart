@@ -9,9 +9,39 @@ class ScoreboardException implements Exception {
 
   const ScoreboardException(this.statusCode, this.code, this.message);
 
+  /// Thông báo theo ngôn ngữ giao diện app. [message] (tiếng Việt) vẫn là nội
+  /// dung trả cho tablet qua HTTP; bản tiếng Anh là câu ngắn theo [code].
+  String localizedMessage({required bool english}) =>
+      english ? (scoreboardErrorMessagesEn[code] ?? message) : message;
+
   @override
   String toString() => 'ScoreboardException($code): $message';
 }
+
+/// Câu tiếng Anh ngắn cho từng mã lỗi bảng tỉ số (dùng cho UI app).
+const Map<String, String> scoreboardErrorMessagesEn = {
+  'nothing_to_undo': 'Nothing to undo.',
+  'invalid_number': 'Invalid number.',
+  'invalid_team': 'Team must be "A" or "B".',
+  'invalid_rules': 'Invalid scoring rules.',
+  'invalid_name': 'Team name cannot be empty.',
+  'invalid_color': 'Color must be in #RRGGBB format.',
+  'invalid_players': 'Invalid player list.',
+  'invalid_overlay': 'Invalid overlay setting.',
+  'invalid_delta': 'Score change must be from -5 to 5.',
+  'invalid_score': 'Invalid score value.',
+  'invalid_server': 'Server must be 1 or 2.',
+  'invalid_sport': 'Invalid sport.',
+  'invalid_seconds': 'Display time must be 0-3600 seconds.',
+  'invalid_timer_op': 'Timer command must be start, pause or reset.',
+  'unknown_action': 'Unsupported command.',
+  'invalid_logo_size': 'Logo must be smaller than 512 KB.',
+  'invalid_logo_type': 'Logo must be a PNG, JPG or WebP image.',
+  'match_finished': 'Match finished. Tap "New match" to restart.',
+  'match_decided': 'Match already decided. Use Undo to fix scores.',
+  'match_in_progress': 'Match in progress. Reset to change rules.',
+  'set_tied': 'Scores are tied; cannot end the set yet.',
+};
 
 /// Các môn hỗ trợ.
 const List<String> scoreboardSports = [

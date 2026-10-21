@@ -474,6 +474,18 @@ class CameraStationRuntime {
   // true khi chính runtime làm tối màn hình vì nhiệt độ (không phải người dùng),
   // để chỉ tự bật sáng lại những lần do runtime gây ra.
   bool _screenDimmedByThermal = false;
+
+  /// Người dùng vừa tự bật sáng lại màn hình: nhiệt độ không được tự làm tối
+  /// lại cho tới mốc này (trước đây lần đo nhiệt kế tiếp ~10 s sau đã làm tối
+  /// lại ngay, như thể nút không có tác dụng).
+  DateTime? _userScreenBrightUntil;
+  static const Duration _userScreenBrightHold = Duration(minutes: 10);
+
+  bool get _thermalAutoDimAllowed {
+    if (!_stationDisplayAttached || _autoScreenDimmed) return false;
+    final until = _userScreenBrightUntil;
+    return until == null || DateTime.now().isAfter(until);
+  }
   // Chỉ tự làm tối khi màn hình Station đang hiển thị.
   bool _stationDisplayAttached = false;
   double? _thermalRiseRatePerMin;
@@ -679,8 +691,11 @@ class CameraStationRuntime {
 
   /// Màn hình Station báo trạng thái tối/sáng do người dùng chọn.
   void setAutoScreenDimmed(bool dimmed) {
-    // Người dùng đã tự chọn: runtime không tự bật sáng lại nữa.
+    // Người dùng đã tự chọn: runtime không tự bật sáng lại nữa, và nếu người
+    // dùng bật sáng thì nhiệt độ không tự làm tối lại trong một khoảng.
     _screenDimmedByThermal = false;
+    _userScreenBrightUntil =
+        dimmed ? null : DateTime.now().add(_userScreenBrightHold);
     if (_autoScreenDimmed == dimmed) return;
     _autoScreenDimmed = dimmed;
     _emitState();
@@ -3677,7 +3692,7 @@ class CameraStationRuntime {
         _autoScreenDimmed = false;
         unawaited(_setScreenDimmedSafely(false));
         _emitState();
-      } else if (hot && !_autoScreenDimmed && _stationDisplayAttached) {
+      } else if (hot && _thermalAutoDimAllowed) {
         _autoScreenDimmed = true;
         _screenDimmedByThermal = true;
         developer.log(
@@ -3719,8 +3734,7 @@ class CameraStationRuntime {
 
     if (riseRate > _thermalRiseDimRatePerMin &&
         temperature >= _thermalAutoDimMinimumC &&
-        !_autoScreenDimmed &&
-        _stationDisplayAttached) {
+        _thermalAutoDimAllowed) {
       _autoScreenDimmed = true;
       _screenDimmedByThermal = true;
       developer.log(
@@ -3862,7 +3876,7 @@ class CameraStationRuntime {
       _thermalLoadPlan = plan;
       _emitState();
     }
-    if (plan.dimScreen && !_autoScreenDimmed && _stationDisplayAttached) {
+    if (plan.dimScreen && _thermalAutoDimAllowed) {
       _autoScreenDimmed = true;
       _screenDimmedByThermal = true;
       unawaited(_setScreenDimmedSafely(true));

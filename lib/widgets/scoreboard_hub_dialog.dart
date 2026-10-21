@@ -8,6 +8,9 @@ import 'package:shared_preferences/shared_preferences.dart';
 import '../models/scoreboard_state.dart';
 import '../services/app_language_service.dart';
 import '../services/scoreboard_service.dart';
+import '../theme/app_theme.dart';
+import 'app_notice.dart';
+import 'brand_widgets.dart';
 
 /// Mở Hub bảng tỉ số: mã QR + link điều khiển, link overlay cho OBS. Mọi thao
 /// tác tỉ số/overlay làm trên trang web nội bộ (dễ bấm hơn trên app camera).
@@ -22,9 +25,11 @@ Future<void> showScoreboardHub(
     context: context,
     isScrollControlled: true,
     useSafeArea: true,
-    backgroundColor: const Color(0xFF0E1726),
+    backgroundColor: BrandColors.surface,
     shape: const RoundedRectangleBorder(
-      borderRadius: BorderRadius.vertical(top: Radius.circular(22)),
+      borderRadius: BorderRadius.vertical(
+        top: Radius.circular(BrandRadius.large),
+      ),
     ),
     builder: (_) => ScoreboardHubSheet(
       lanAddress: lanAddress,
@@ -60,7 +65,8 @@ class _ScoreboardHubSheetState extends State<ScoreboardHubSheet> {
   /// Overlay đang hiện (trường `overlay.visible` của bảng tỉ số).
   bool _overlayVisible = false;
   String? _address;
-  String? _message;
+  /// Thông báo trong Hub, lưu cả hai ngôn ngữ để đổi ngôn ngữ vẫn đúng.
+  ({String vi, String en})? _message;
   bool _messageIsError = false;
   Timer? _messageTimer;
 
@@ -93,7 +99,11 @@ class _ScoreboardHubSheetState extends State<ScoreboardHubSheet> {
       widget.service.apply({'action': 'overlay', 'visible': visible});
       setState(() => _overlayVisible = visible);
     } on ScoreboardException catch (error) {
-      _showMessage(error.message, error: true);
+      _showMessage(
+        error.localizedMessage(english: false),
+        error.localizedMessage(english: true),
+        error: true,
+      );
     }
   }
 
@@ -123,11 +133,11 @@ class _ScoreboardHubSheetState extends State<ScoreboardHubSheet> {
 
   /// Thông báo hiện ngay trong Hub (SnackBar của màn hình chính bị bottom
   /// sheet che mất).
-  void _showMessage(String message, {bool error = false}) {
+  void _showMessage(String vi, String en, {bool error = false}) {
     if (!mounted) return;
     _messageTimer?.cancel();
     setState(() {
-      _message = message;
+      _message = (vi: vi, en: en);
       _messageIsError = error;
     });
     _messageTimer = Timer(const Duration(seconds: 3), () {
@@ -138,39 +148,20 @@ class _ScoreboardHubSheetState extends State<ScoreboardHubSheet> {
   Future<void> _copy(String text) async {
     await Clipboard.setData(ClipboardData(text: text));
     if (!mounted) return;
-    _showMessage(appText(context, 'Đã sao chép', 'Copied'));
-  }
-
-  Future<bool> _confirm(String title, String message, String confirm) async {
-    final result = await showDialog<bool>(
-      context: context,
-      builder: (dialogContext) => AlertDialog(
-        title: Text(title),
-        content: Text(message),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(dialogContext, false),
-            child: Text(appText(dialogContext, 'HỦY', 'CANCEL')),
-          ),
-          FilledButton(
-            onPressed: () => Navigator.pop(dialogContext, true),
-            child: Text(confirm),
-          ),
-        ],
-      ),
-    );
-    return result == true;
+    _showMessage('Đã sao chép', 'Copied');
   }
 
   Future<void> _regenerateKey() async {
-    final ok = await _confirm(
-      appText(context, 'Đổi mã điều khiển?', 'Change control code?'),
-      appText(
-        context,
-        'Mọi điện thoại đang dùng mã cũ sẽ mất quyền chỉnh tỉ số và phải quét lại mã QR mới.',
-        'Every phone using the old code loses control and must scan the new QR code.',
-      ),
-      appText(context, 'ĐỔI MÃ', 'CHANGE'),
+    final ok = await showAppConfirm(
+      context,
+      titleVi: 'Đổi mã điều khiển?',
+      titleEn: 'Change control code?',
+      messageVi: 'Máy đang dùng mã cũ sẽ mất quyền và phải quét lại QR.',
+      messageEn: 'Phones using the old code lose access and must rescan.',
+      confirmVi: 'Đổi mã',
+      confirmEn: 'Change',
+      icon: Icons.key_rounded,
+      kind: NoticeKind.warning,
     );
     if (!ok) return;
     final String newKey;
@@ -179,11 +170,8 @@ class _ScoreboardHubSheetState extends State<ScoreboardHubSheet> {
     } catch (error) {
       if (!mounted) return;
       _showMessage(
-        appText(
-          context,
-          'Không tạo được mã mới. Vui lòng thử lại.',
-          'Unable to create a new code. Please try again.',
-        ),
+        'Không tạo được mã mới. Thử lại.',
+        'Could not create a new code. Try again.',
         error: true,
       );
       return;
@@ -196,14 +184,11 @@ class _ScoreboardHubSheetState extends State<ScoreboardHubSheet> {
     if (!mounted) return;
     setState(() {});
     if (saved) {
-      _showMessage(appText(context, 'Đã tạo mã mới', 'New code created'));
+      _showMessage('Đã tạo mã mới', 'New code created');
     } else {
       _showMessage(
-        appText(
-          context,
-          'Đã đổi mã nhưng chưa lưu được vào máy. Mã có thể quay về mã cũ khi mở lại ứng dụng.',
-          'Code changed but could not be saved. It may revert after the app restarts.',
-        ),
+        'Đã đổi mã nhưng chưa lưu; có thể quay về mã cũ khi mở lại app.',
+        'Code changed but not saved; may revert after restart.',
         error: true,
       );
     }
@@ -225,63 +210,71 @@ class _ScoreboardHubSheetState extends State<ScoreboardHubSheet> {
     final message = _message;
     final controlUrl = base == null ? null : '$base/control?k=$key';
 
+    // Mã QR giữ nền trắng + viền trắng để mọi máy quét được.
     final qr = controlUrl == null
         ? null
-        : Container(
-            padding: const EdgeInsets.all(12),
-            decoration: BoxDecoration(
-              color: Colors.white,
-              borderRadius: BorderRadius.circular(16),
-            ),
-            child: QrImageView(
-              data: controlUrl,
-              version: QrVersions.auto,
-              size: 170,
-              backgroundColor: Colors.white,
-            ),
+        : Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Container(
+                padding: const EdgeInsets.all(BrandSpace.md),
+                decoration: BoxDecoration(
+                  color: Colors.white,
+                  borderRadius: BorderRadius.circular(BrandRadius.medium),
+                ),
+                child: QrImageView(
+                  data: controlUrl,
+                  version: QrVersions.auto,
+                  size: 170,
+                  backgroundColor: Colors.white,
+                ),
+              ),
+              const SizedBox(height: BrandSpace.sm),
+              Text(
+                appText(context, 'Quét để điều khiển', 'Scan to control'),
+                style: BrandText.caption,
+              ),
+            ],
           );
 
     final details = <Widget>[
-      if (controlUrl == null)
-        _InfoCard(
+      if (controlUrl == null) ...[
+        AppNoticeBanner(
           icon: Icons.wifi_off_rounded,
-          color: const Color(0xFFFFC107),
-          text: appText(
+          kind: NoticeKind.warning,
+          message: appText(
             context,
-            'Chưa có Wi-Fi. Kết nối Wi-Fi để dùng mã QR.',
-            'No Wi-Fi. Connect to Wi-Fi to use the QR code.',
+            'Chưa có Wi-Fi. Kết nối để dùng mã QR.',
+            'No Wi-Fi. Connect to use the QR code.',
           ),
-        )
-      else ...[
-        _LinkRow(
-          label: appText(context, 'Link điều khiển', 'Control link'),
-          value: controlUrl,
-          onCopy: () => _copy(controlUrl),
         ),
-        const SizedBox(height: 8),
-        _LinkRow(
-          label: appText(context, 'Link OBS (1920×1080)', 'OBS link (1920×1080)'),
-          value: '$base/overlay',
-          onCopy: () => _copy('$base/overlay'),
-        ),
+        const SizedBox(height: BrandSpace.lg),
       ],
-      const SizedBox(height: 8),
-      Row(
+      BrandSection(
+        title: appText(context, 'Kết nối', 'Access'),
         children: [
-          Expanded(
-            child: Text(
-              '${appText(context, 'Mã', 'Code')}: $key',
-              style: const TextStyle(
-                color: Colors.white,
-                fontWeight: FontWeight.w700,
-                letterSpacing: 1,
-              ),
+          if (controlUrl != null) ...[
+            _linkTile(
+              icon: Icons.tune_rounded,
+              title: appText(context, 'Điều khiển', 'Control'),
+              value: controlUrl,
             ),
-          ),
-          TextButton.icon(
-            onPressed: _regenerateKey,
-            icon: const Icon(Icons.refresh_rounded),
-            label: Text(appText(context, 'Đổi mã', 'New code')),
+            _linkTile(
+              icon: Icons.cast_rounded,
+              title: 'OBS 1920×1080',
+              value: '$base/overlay',
+            ),
+          ],
+          BrandTile(
+            icon: Icons.key_rounded,
+            iconColor: BrandColors.warning,
+            title: appText(context, 'Mã', 'Code'),
+            subtitle: key,
+            trailing: TextButton.icon(
+              onPressed: _regenerateKey,
+              icon: const Icon(Icons.refresh_rounded, size: 18),
+              label: Text(appText(context, 'Đổi mã', 'New code')),
+            ),
           ),
         ],
       ),
@@ -289,10 +282,10 @@ class _ScoreboardHubSheetState extends State<ScoreboardHubSheet> {
 
     return Padding(
       padding: EdgeInsets.only(
-        left: 16,
-        right: 16,
-        top: 12,
-        bottom: MediaQuery.of(context).viewInsets.bottom + 16,
+        left: BrandSpace.lg,
+        right: BrandSpace.lg,
+        top: BrandSpace.md,
+        bottom: MediaQuery.of(context).viewInsets.bottom + BrandSpace.lg,
       ),
       child: SingleChildScrollView(
         child: Column(
@@ -301,214 +294,140 @@ class _ScoreboardHubSheetState extends State<ScoreboardHubSheet> {
           children: [
             Row(
               children: [
-                const Icon(Icons.scoreboard_rounded, color: Colors.white),
-                const SizedBox(width: 10),
+                Container(
+                  width: 40,
+                  height: 40,
+                  decoration: BoxDecoration(
+                    color: BrandColors.primary.withValues(alpha: 0.18),
+                    borderRadius: BorderRadius.circular(BrandRadius.small),
+                  ),
+                  child: const Icon(
+                    Icons.scoreboard_rounded,
+                    color: BrandColors.primaryBright,
+                    size: 22,
+                  ),
+                ),
+                const SizedBox(width: BrandSpace.md),
                 Expanded(
                   child: Text(
-                    appText(context, 'Overlay', 'Overlay'),
-                    style: const TextStyle(
-                      color: Colors.white,
-                      fontSize: 18,
-                      fontWeight: FontWeight.w800,
-                    ),
+                    appText(context, 'Bảng tỉ số', 'Scoreboard'),
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: BrandText.title,
                   ),
                 ),
                 IconButton(
                   tooltip: appText(context, 'Đóng', 'Close'),
                   onPressed: () => Navigator.of(context).maybePop(),
-                  icon: const Icon(Icons.close_rounded, color: Colors.white70),
+                  icon: const Icon(
+                    Icons.close_rounded,
+                    color: BrandColors.textSecondary,
+                  ),
                 ),
               ],
             ),
-            const SizedBox(height: 8),
+            const SizedBox(height: BrandSpace.md),
             if (message != null)
-              Container(
-                margin: const EdgeInsets.only(bottom: 8),
-                padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
-                decoration: BoxDecoration(
-                  color: _messageIsError
-                      ? const Color(0xFF7A2430)
-                      : const Color(0xFF1E5631),
-                  borderRadius: BorderRadius.circular(12),
-                ),
-                child: Text(
-                  message,
-                  style: const TextStyle(
-                    color: Colors.white,
-                    fontWeight: FontWeight.w700,
-                  ),
+              Padding(
+                padding: const EdgeInsets.only(bottom: BrandSpace.md),
+                child: AppNoticeBanner(
+                  dense: true,
+                  kind: _messageIsError ? NoticeKind.error : NoticeKind.success,
+                  message: appText(context, message.vi, message.en),
                 ),
               ),
-            _OverlaySwitch(
-              visible: _overlayVisible,
-              onChanged: _setOverlayVisible,
+            BrandSection(
+              children: [
+                BrandTile(
+                  icon: _overlayVisible
+                      ? Icons.visibility_rounded
+                      : Icons.visibility_off_rounded,
+                  iconColor: _overlayVisible
+                      ? BrandColors.success
+                      : BrandColors.textSecondary,
+                  title: 'Overlay',
+                  trailing: BrandSegmented<bool>(
+                    dense: true,
+                    values: const [false, true],
+                    selected: _overlayVisible,
+                    labelOf: (visible) => visible
+                        ? appText(context, 'Hiện', 'Show')
+                        : appText(context, 'Ẩn', 'Hide'),
+                    onChanged: (visible) {
+                      if (visible != _overlayVisible) {
+                        _setOverlayVisible(visible);
+                      }
+                    },
+                  ),
+                ),
+              ],
             ),
-            const SizedBox(height: 12),
-            // Chỉ khi chọn "Hiện overlay" mới mở mã QR và link điều khiển.
+            const SizedBox(height: BrandSpace.xl),
+            // Chỉ khi chọn "Hiện" mới mở mã QR và link điều khiển.
             if (!_overlayVisible)
               Padding(
-                padding: const EdgeInsets.symmetric(vertical: 4),
-                child: Text(
-                  appText(context, 'Bật để hiện mã QR', 'Turn on to show the QR code'),
-                  textAlign: TextAlign.center,
-                  style: const TextStyle(color: Colors.white54, fontSize: 13),
+                padding: const EdgeInsets.only(bottom: BrandSpace.sm),
+                child: BrandEmptyState(
+                  icon: Icons.qr_code_2_rounded,
+                  message: appText(
+                    context,
+                    'Bật để hiện mã QR',
+                    'Turn on to show the QR code',
+                  ),
                 ),
               )
             else
               LayoutBuilder(
-              builder: (context, constraints) {
-                // Máy camera thường để ngang: mã QR bên trái, link bên phải.
-                if (qr != null && constraints.maxWidth >= 560) {
-                  return Row(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      qr,
-                      const SizedBox(width: 16),
-                      Expanded(
-                        child: Column(
-                          crossAxisAlignment: CrossAxisAlignment.stretch,
-                          children: details,
+                builder: (context, constraints) {
+                  // Máy camera thường để ngang: mã QR bên trái, link bên phải.
+                  if (qr != null && constraints.maxWidth >= 560) {
+                    return Row(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        qr,
+                        const SizedBox(width: BrandSpace.xl),
+                        Expanded(
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.stretch,
+                            children: details,
+                          ),
                         ),
-                      ),
+                      ],
+                    );
+                  }
+                  return Column(
+                    crossAxisAlignment: CrossAxisAlignment.stretch,
+                    children: [
+                      if (qr != null) ...[
+                        Center(child: qr),
+                        const SizedBox(height: BrandSpace.xl),
+                      ],
+                      ...details,
                     ],
                   );
-                }
-                return Column(
-                  crossAxisAlignment: CrossAxisAlignment.stretch,
-                  children: [
-                    if (qr != null) ...[
-                      Center(child: qr),
-                      const SizedBox(height: 12),
-                    ],
-                    ...details,
-                  ],
-                );
-              },
-            ),
+                },
+              ),
           ],
         ),
       ),
     );
   }
-}
 
-/// Công tắc lớn "Hiện overlay" ở đầu Hub.
-class _OverlaySwitch extends StatelessWidget {
-  const _OverlaySwitch({required this.visible, required this.onChanged});
-
-  final bool visible;
-  final ValueChanged<bool> onChanged;
-
-  @override
-  Widget build(BuildContext context) {
-    return Material(
-      color: visible ? const Color(0xFF1E3A5F) : const Color(0xFF16223A),
-      borderRadius: BorderRadius.circular(14),
-      child: InkWell(
-        borderRadius: BorderRadius.circular(14),
-        onTap: () => onChanged(!visible),
-        child: Padding(
-          padding: const EdgeInsets.fromLTRB(14, 10, 8, 10),
-          child: Row(
-            children: [
-              Icon(
-                visible ? Icons.visibility_rounded : Icons.visibility_off_rounded,
-                color: visible ? const Color(0xFF69F0AE) : Colors.white54,
-              ),
-              const SizedBox(width: 12),
-              Expanded(
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Text(
-                      appText(context, 'Hiện overlay', 'Show overlay'),
-                      style: const TextStyle(
-                        color: Colors.white,
-                        fontSize: 15,
-                        fontWeight: FontWeight.w800,
-                      ),
-                    ),
-                  ],
-                ),
-              ),
-              Switch.adaptive(value: visible, onChanged: onChanged),
-            ],
-          ),
-        ),
-      ),
-    );
-  }
-}
-
-class _InfoCard extends StatelessWidget {
-  const _InfoCard({required this.icon, required this.color, required this.text});
-
-  final IconData icon;
-  final Color color;
-  final String text;
-
-  @override
-  Widget build(BuildContext context) {
-    return Container(
-      padding: const EdgeInsets.all(12),
-      decoration: BoxDecoration(
-        color: color.withValues(alpha: 0.12),
-        borderRadius: BorderRadius.circular(14),
-        border: Border.all(color: color.withValues(alpha: 0.4)),
-      ),
-      child: Row(
-        children: [
-          Icon(icon, color: color),
-          const SizedBox(width: 10),
-          Expanded(
-            child: Text(text, style: const TextStyle(color: Colors.white)),
-          ),
-        ],
-      ),
-    );
-  }
-}
-
-class _LinkRow extends StatelessWidget {
-  const _LinkRow({required this.label, required this.value, required this.onCopy});
-
-  final String label;
-  final String value;
-  final VoidCallback onCopy;
-
-  @override
-  Widget build(BuildContext context) {
-    return Container(
-      padding: const EdgeInsets.fromLTRB(12, 8, 4, 8),
-      decoration: BoxDecoration(
-        color: const Color(0xFF16223A),
-        borderRadius: BorderRadius.circular(12),
-      ),
-      child: Row(
-        children: [
-          Expanded(
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Text(label, style: const TextStyle(color: Colors.white60, fontSize: 12)),
-                const SizedBox(height: 2),
-                SelectableText(
-                  value,
-                  style: const TextStyle(
-                    color: Colors.white,
-                    fontSize: 13,
-                    fontWeight: FontWeight.w600,
-                  ),
-                ),
-              ],
-            ),
-          ),
-          IconButton(
-            tooltip: appText(context, 'Sao chép', 'Copy'),
-            onPressed: onCopy,
-            icon: const Icon(Icons.copy_rounded, color: Colors.white),
-          ),
-        ],
+  /// Dòng link: chạm cả dòng hoặc nút để sao chép.
+  Widget _linkTile({
+    required IconData icon,
+    required String title,
+    required String value,
+  }) {
+    return BrandTile(
+      icon: icon,
+      title: title,
+      subtitle: value,
+      onTap: () => _copy(value),
+      trailing: IconButton(
+        tooltip: appText(context, 'Sao chép', 'Copy'),
+        onPressed: () => _copy(value),
+        icon: const Icon(Icons.copy_rounded, color: BrandColors.primarySoft),
       ),
     );
   }

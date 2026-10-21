@@ -18,6 +18,10 @@ import '../services/station_errors.dart';
 import '../services/station_platform_events.dart';
 import '../services/whip_publisher_service.dart';
 import '../services/rtsp_publisher_service.dart';
+import '../services/scoreboard_service.dart' show ScoreboardService;
+import '../theme/app_theme.dart';
+import '../widgets/app_notice.dart';
+import '../widgets/brand_widgets.dart';
 import '../widgets/scoreboard_hub_dialog.dart';
 import 'station/station_ui_logic.dart';
 import 'setup_screen.dart';
@@ -123,6 +127,12 @@ class _StationScreenState extends State<StationScreen>
   StreamSubscription<void>? _runtimeSubscription;
   StreamSubscription<WhipPublishState>? _whipSubscription;
   StreamSubscription<RtspPublishState>? _rtspSubscription;
+
+  /// Cờ overlay bảng tỉ số (in vào live / đang hiện) cho viên "Tỉ số ẩn":
+  /// chỉ viên đó dựng lại khi bảng tỉ số đổi, không dựng lại cả màn hình.
+  final ValueNotifier<ScoreOverlayFlags> _scoreOverlay =
+      ValueNotifier<ScoreOverlayFlags>(defaultScoreOverlayFlags);
+  StreamSubscription<Map<String, dynamic>>? _scoreboardSubscription;
 
   /// Trạng thái RTSP/WHIP đã hiển thị lần trước: onStateChanged phát mỗi giây
   /// (thời lượng live), chỉ dựng lại màn hình khi trạng thái/lỗi/ý định phát
@@ -245,6 +255,10 @@ class _StationScreenState extends State<StationScreen>
   String _errorText(Object error) =>
       compactErrorText(stationErrorMessage(error, english: _english));
 
+  /// Lý do lỗi đã rút gọn theo ngôn ngữ chỉ định (không cần context).
+  String _errorReason(Object error, {required bool english}) =>
+      compactErrorText(stationErrorMessage(error, english: english));
+
   /// Cấu hình mà "Thử lại" sẽ khởi động.
   StationIdentity get _targetIdentity => _pendingIdentity ?? widget.identity;
 
@@ -259,52 +273,29 @@ class _StationScreenState extends State<StationScreen>
     );
   }
 
-  void _showStationToast(
-    String message, {
-    bool isError = false,
-    bool isSuccess = false,
-    Duration duration = const Duration(seconds: 2),
-    IconData? icon,
+  /// Thông báo nổi chuẩn của app (song ngữ, icon theo loại). Bỏ qua khi màn
+  /// hình Station không còn hiển thị.
+  void _showStationToast({
+    required String vi,
+    required String en,
+    NoticeKind kind = NoticeKind.info,
+    Duration? duration,
   }) {
     if (!mounted) return;
-    final Color bg = isError
-        ? const Color(0xFFC62828)
-        : isSuccess
-            ? const Color(0xFF2E7D32)
-            : const Color(0xFF1565C0);
-    final IconData defaultIcon = isError
-        ? Icons.error_outline_rounded
-        : isSuccess
-            ? Icons.check_circle_outline_rounded
-            : Icons.info_outline_rounded;
+    showAppNotice(context, vi: vi, en: en, kind: kind, duration: duration);
+  }
 
-    ScaffoldMessenger.of(context)
-      ..hideCurrentSnackBar()
-      ..showSnackBar(
-        SnackBar(
-          behavior: SnackBarBehavior.floating,
-          margin: const EdgeInsets.symmetric(horizontal: 20, vertical: 14),
-          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
-          backgroundColor: bg,
-          duration: duration,
-          content: Row(
-            children: [
-              Icon(icon ?? defaultIcon, color: Colors.white, size: 20),
-              const SizedBox(width: 10),
-              Expanded(
-                child: Text(
-                  message,
-                  style: const TextStyle(
-                    color: Colors.white,
-                    fontSize: 13,
-                    fontWeight: FontWeight.w600,
-                  ),
-                ),
-              ),
-            ],
-          ),
-        ),
-      );
+  /// Thông báo lỗi kèm lý do (song ngữ).
+  void _showErrorToast(
+    Object error, {
+    required String vi,
+    required String en,
+  }) {
+    _showStationToast(
+      vi: '$vi: ${_errorReason(error, english: false)}',
+      en: '$en: ${_errorReason(error, english: true)}',
+      kind: NoticeKind.error,
+    );
   }
 
   Future<void> _toggleCamera() async {
@@ -340,12 +331,9 @@ class _StationScreenState extends State<StationScreen>
       }
       if (mounted) {
         _showStationToast(
-          appText(
-            context,
-            'Không thể chuyển đổi trạng thái camera lúc này. Vui lòng thử lại sau.',
-            'Cannot switch camera state right now. Please try again shortly.',
-          ),
-          isError: true,
+          vi: 'Không bật/tắt được camera. Thử lại sau.',
+          en: "Couldn't toggle the camera. Try again.",
+          kind: NoticeKind.error,
         );
       }
     } finally {
@@ -367,12 +355,9 @@ class _StationScreenState extends State<StationScreen>
     } catch (error) {
       if (mounted) {
         _showStationToast(
-          appText(
-            context,
-            'Không thể điều chỉnh độ sáng màn hình. Vui lòng kiểm tra quyền hệ thống.',
-            'Cannot adjust screen brightness. Please check system permissions.',
-          ),
-          isError: true,
+          vi: 'Không chỉnh được độ sáng màn hình.',
+          en: "Couldn't adjust screen brightness.",
+          kind: NoticeKind.error,
         );
       }
     } finally {
@@ -502,14 +487,10 @@ class _StationScreenState extends State<StationScreen>
     // Hiển thị lại mức zoom thật của camera thay vì giá trị vừa chọn (trừ khi
     // còn yêu cầu mới hơn đang chờ áp dụng).
     _showZoomResult(_runtime.webRtcService?.cameraZoom);
-    final reason = _errorText(error);
-    _showStationToast(
-      appText(
-        context,
-        'Không đổi được zoom/ống kính: $reason',
-        'Unable to change zoom/lens: $reason',
-      ),
-      isError: true,
+    _showErrorToast(
+      error,
+      vi: 'Không đổi được zoom',
+      en: "Couldn't change zoom",
     );
   }
 
@@ -522,14 +503,10 @@ class _StationScreenState extends State<StationScreen>
   void _handleExposureError(Object error, StackTrace stackTrace) {
     debugPrint('[CAMERA] Không chỉnh được độ sáng: $error');
     if (!mounted) return;
-    final reason = _errorText(error);
-    _showStationToast(
-      appText(
-        context,
-        'Không chỉnh được độ sáng: $reason',
-        'Unable to adjust exposure: $reason',
-      ),
-      isError: true,
+    _showErrorToast(
+      error,
+      vi: 'Không chỉnh được độ sáng',
+      en: "Couldn't adjust exposure",
     );
   }
 
@@ -540,12 +517,9 @@ class _StationScreenState extends State<StationScreen>
     if (!mounted || error == null || error == _lastShownRtspError) return;
     _lastShownRtspError = error;
     _showStationToast(
-      appText(
-        context,
-        'Camera vẫn ghi hình bình thường. Đường truyền live đang thử kết nối lại.',
-        'Camera is recording normally. Live stream is attempting to reconnect.',
-      ),
-      icon: Icons.info_outline_rounded,
+      vi: 'Vẫn đang ghi hình. Live đang kết nối lại.',
+      en: 'Still recording. Live is reconnecting.',
+      kind: NoticeKind.warning,
     );
   }
 
@@ -558,26 +532,20 @@ class _StationScreenState extends State<StationScreen>
       if (mounted) {
         final webRtc = _runtime.webRtcService;
         final isUser = webRtc?.currentFacingMode == 'user';
-        final msg = isUser
-            ? appText(context, 'Đã chuyển sang Camera trước', 'Switched to front camera')
-            : appText(context, 'Đã chuyển sang Camera sau', 'Switched to rear camera');
         _showStationToast(
-          msg,
-          icon: isUser ? Icons.person_rounded : Icons.camera_rear_rounded,
+          vi: isUser ? 'Đã chuyển camera trước' : 'Đã chuyển camera sau',
+          en: isUser ? 'Switched to front camera' : 'Switched to rear camera',
+          kind: NoticeKind.success,
           duration: const Duration(seconds: 1),
         );
       }
     } catch (error) {
       debugPrint('[CAMERA] Bỏ qua yêu cầu đổi camera: $error');
       if (mounted) {
-        final reason = _errorText(error);
-        _showStationToast(
-          appText(
-            context,
-            'Không đổi được camera: $reason',
-            'Unable to switch camera: $reason',
-          ),
-          isError: true,
+        _showErrorToast(
+          error,
+          vi: 'Không đổi được camera',
+          en: "Couldn't switch camera",
         );
       }
     } finally {
@@ -621,6 +589,14 @@ class _StationScreenState extends State<StationScreen>
       _showRtspWarningIfNeeded();
       _syncInitErrorFromRuntime();
     });
+
+    _scoreboardSubscription = ScoreboardService.instance.changes.listen(
+      (json) {
+        if (!mounted) return;
+        _scoreOverlay.value = readScoreOverlayFlags(json);
+      },
+    );
+    unawaited(_syncScoreOverlay());
 
     // Wakelock do runtime quản lý (bật khi khởi tạo xong, tắt khi dừng).
     unawaited(_initScreenOrientation());
@@ -790,12 +766,9 @@ class _StationScreenState extends State<StationScreen>
       await _commitPendingIdentity(identity);
       if (!mounted) return;
       _showStationToast(
-        appText(
-          context,
-          'Camera Station đã tự khởi động lại thành công.',
-          'Camera Station restarted automatically.',
-        ),
-        isSuccess: true,
+        vi: 'Camera Station đã tự khởi động lại.',
+        en: 'Camera Station restarted automatically.',
+        kind: NoticeKind.success,
       );
     } finally {
       _handlingRuntimeRecovery = false;
@@ -879,30 +852,18 @@ class _StationScreenState extends State<StationScreen>
     }
 
     if (!mounted) return;
-    final msg = mode == 'landscape'
-        ? appText(
-            context,
-            'Đã khóa hướng màn hình ngang',
-            'Locked landscape orientation',
-          )
-        : mode == 'portrait'
-            ? appText(
-                context,
-                'Đã khóa hướng màn hình dọc',
-                'Locked portrait orientation',
-              )
-            : appText(
-                context,
-                'Đã bật tự động xoay màn hình',
-                'Auto-rotate screen enabled',
-              );
     _showStationToast(
-      msg,
-      icon: mode == 'landscape'
-          ? Icons.screen_lock_landscape_rounded
+      vi: mode == 'landscape'
+          ? 'Đã khoá xoay ngang'
           : mode == 'portrait'
-              ? Icons.screen_lock_portrait_rounded
-              : Icons.screen_rotation_rounded,
+              ? 'Đã khoá xoay dọc'
+              : 'Đã bật tự xoay màn hình',
+      en: mode == 'landscape'
+          ? 'Landscape locked'
+          : mode == 'portrait'
+              ? 'Portrait locked'
+              : 'Auto-rotate on',
+      kind: NoticeKind.success,
       duration: const Duration(seconds: 2),
     );
   }
@@ -936,7 +897,7 @@ class _StationScreenState extends State<StationScreen>
       return appText(
         context,
         'Không đọc được địa chỉ IP',
-        'Unable to read the IP address',
+        "Couldn't read the IP address",
       );
     }
     return appText(context, 'Chưa kết nối Wi-Fi', 'No Wi-Fi connection');
@@ -947,27 +908,22 @@ class _StationScreenState extends State<StationScreen>
     try {
       await _runtime.reconnectNetworkServices();
       if (!mounted) return;
+      final noAddress = _runtime.lanAddress == null;
       _showStationToast(
-        appText(
-          context,
-          _runtime.lanAddress == null
-              ? 'Chưa nhận diện IP mạng. Quá trình ghi hình vẫn an toàn và sẽ tự kết nối khi có Wi-Fi.'
-              : 'Đã làm mới kết nối mạng thành công. Quá trình ghi hình vẫn an toàn.',
-          _runtime.lanAddress == null
-              ? 'No network IP yet. Recording continues and will reconnect automatically.'
-              : 'Network connection refreshed successfully. Recording is safe.',
-        ),
-        isSuccess: _runtime.lanAddress != null,
+        vi: noAddress
+            ? 'Chưa có IP mạng. Vẫn ghi hình, sẽ tự kết nối lại.'
+            : 'Đã làm mới kết nối mạng.',
+        en: noAddress
+            ? 'No network IP yet. Still recording; will reconnect.'
+            : 'Network connection refreshed.',
+        kind: noAddress ? NoticeKind.warning : NoticeKind.success,
       );
     } catch (error) {
       if (!mounted) return;
       _showStationToast(
-        appText(
-          context,
-          'Không thể làm mới kết nối mạng. Vui lòng kiểm tra lại sóng Wi-Fi hoặc dây mạng.',
-          'Cannot refresh network. Please check Wi-Fi or LAN connection.',
-        ),
-        isError: true,
+        vi: 'Không làm mới được mạng. Kiểm tra Wi-Fi/LAN.',
+        en: "Couldn't refresh network. Check Wi-Fi/LAN.",
+        kind: NoticeKind.error,
       );
     }
   }
@@ -991,12 +947,9 @@ class _StationScreenState extends State<StationScreen>
       debugPrint('[STATION] Không thể bật foreground service: $error');
       if (!mounted) return;
       _showStationToast(
-        appText(
-          context,
-          'Không bật được chế độ chạy nền. Giữ màn hình mở để camera không bị ngắt.',
-          'Background mode unavailable. Keep the screen on so the camera is not cut off.',
-        ),
-        isError: true,
+        vi: 'Không bật được chạy nền. Hãy giữ màn hình mở.',
+        en: 'Background mode unavailable. Keep the screen on.',
+        kind: NoticeKind.error,
         duration: const Duration(seconds: 5),
       );
     }
@@ -1140,14 +1093,24 @@ class _StationScreenState extends State<StationScreen>
     }
     if (opened || !mounted) return;
     _showStationToast(
-      appText(
-        context,
-        'Không mở được Cài đặt. Hãy vào Cài đặt > Ứng dụng > VNVAR Camera Station để cấp quyền Camera và Micro.',
-        'Cannot open Settings. Go to Settings > Apps > VNVAR Camera Station and allow Camera and Microphone.',
-      ),
-      isError: true,
+      vi: 'Không mở được Cài đặt. Hãy cấp quyền Camera, Micro thủ công.',
+      en: "Couldn't open Settings. Allow Camera and Mic manually.",
+      kind: NoticeKind.error,
       duration: const Duration(seconds: 5),
     );
+  }
+
+  /// Đọc cờ overlay bảng tỉ số hiện tại (chờ service nạp trạng thái đã lưu;
+  /// gọi nhiều lần vẫn an toàn). Thay đổi sau đó đến qua `changes`.
+  Future<void> _syncScoreOverlay() async {
+    final scoreboard = ScoreboardService.instance;
+    try {
+      await scoreboard.load();
+    } catch (_) {
+      // Không đọc được trạng thái đã lưu: dùng trạng thái hiện có.
+    }
+    if (!mounted) return;
+    _scoreOverlay.value = readScoreOverlayFlags(scoreboard.snapshot());
   }
 
   void _openScoreboardHub() {
@@ -1332,20 +1295,18 @@ class _StationScreenState extends State<StationScreen>
       debugPrint('[CONFIG] Không thể lưu cấu hình: $error');
       if (!mounted) return;
       _showStationToast(
-        appText(
-          context,
-          'Không thể lưu cấu hình. Vui lòng thử lại sau.',
-          'Cannot save settings. Please try again later.',
-        ),
-        isError: true,
+        vi: 'Không lưu được cấu hình. Thử lại sau.',
+        en: "Couldn't save settings. Try again.",
+        kind: NoticeKind.error,
       );
       return;
     }
     if (!mounted) return;
     widget.onIdentityChanged(identity);
     _showStationToast(
-      appText(context, 'Đã lưu cấu hình.', 'Settings saved.'),
-      isSuccess: true,
+      vi: 'Đã lưu cấu hình',
+      en: 'Settings saved',
+      kind: NoticeKind.success,
     );
   }
 
@@ -1375,7 +1336,7 @@ class _StationScreenState extends State<StationScreen>
     if (!mounted || !_cameraReady || _runtime.profileSwitching) return;
     final selected = await showModalBottomSheet<CameraResolutionProfile>(
       context: context,
-      backgroundColor: const Color(0xFF11161D),
+      backgroundColor: BrandColors.surface,
       showDragHandle: true,
       isScrollControlled: true,
       constraints: const BoxConstraints(maxWidth: 560),
@@ -1403,22 +1364,16 @@ class _StationScreenState extends State<StationScreen>
             _runtime.thermalTargetProfile == selected;
         if (deferredForThermal) {
           _showStationToast(
-            appText(
-              context,
-              'Máy đang quá nóng: đã ghi nhận ${selected.title}. Sẽ áp dụng khi máy nguội.',
-              'Device is too hot: ${selected.title} saved. It will be applied once the device cools down.',
-            ),
-            icon: Icons.thermostat_rounded,
+            vi: 'Máy quá nóng: sẽ áp dụng ${selected.title} khi nguội.',
+            en: 'Too hot: ${selected.title} will apply once cool.',
+            kind: NoticeKind.warning,
             duration: const Duration(seconds: 4),
           );
         } else if (_runtime.thermalUserOverride) {
           _showStationToast(
-            appText(
-              context,
-              'Đã áp dụng ${selected.title}. Chế độ chất lượng được duy trì theo lựa chọn của bạn.',
-              'Applied ${selected.title}. Quality maintained per your selection.',
-            ),
-            icon: Icons.check_circle_rounded,
+            vi: 'Đã áp dụng ${selected.title}',
+            en: 'Applied ${selected.title}',
+            kind: NoticeKind.success,
           );
         }
       }
@@ -1426,14 +1381,13 @@ class _StationScreenState extends State<StationScreen>
       debugPrint('[CAMERA] Không đổi được chất lượng camera: $error');
       if (mounted) {
         _showStationToast(
-          error is StationException
-              ? error.message(english: _english)
-              : appText(
-                  context,
-                  'Không thể đổi chất lượng camera lúc này. Vui lòng thử lại sau vài giây.',
-                  'Cannot change camera quality right now. Please try again shortly.',
-                ),
-          isError: true,
+          vi: error is StationException
+              ? error.message(english: false)
+              : 'Không đổi được chất lượng. Thử lại sau.',
+          en: error is StationException
+              ? error.message(english: true)
+              : "Couldn't change quality. Try again shortly.",
+          kind: NoticeKind.error,
         );
       }
     }
@@ -1460,7 +1414,7 @@ class _StationScreenState extends State<StationScreen>
       return courtId;
     }
 
-    return appText(context, 'SÂN $number', 'COURT $number');
+    return appText(context, 'Sân $number', 'Court $number');
   }
 
   // ============================================================
@@ -1490,6 +1444,8 @@ class _StationScreenState extends State<StationScreen>
     _runtimeSubscription?.cancel();
     _whipSubscription?.cancel();
     _rtspSubscription?.cancel();
+    _scoreboardSubscription?.cancel();
+    _scoreOverlay.dispose();
     _zoomDebounce?.cancel();
     _zoomRunner.dispose();
     _exposureRunner.dispose();
@@ -1542,8 +1498,8 @@ class _StationScreenState extends State<StationScreen>
     if (error == null || error.toString().trim().isEmpty) {
       return appText(
         context,
-        'Không thể khởi động hệ thống camera. Vui lòng kiểm tra quyền truy cập camera và thử lại.',
-        'Unable to initialize camera system. Please check camera permissions and try again.',
+        'Không khởi động được camera. Kiểm tra quyền camera rồi thử lại.',
+        "Couldn't start the camera. Check camera permission and retry.",
       );
     }
     // Lỗi có mã (gồm thiếu quyền) đã có thông báo hai ngôn ngữ.
@@ -1558,8 +1514,8 @@ class _StationScreenState extends State<StationScreen>
             lower.contains('locked'))) {
       return appText(
         context,
-        'Camera đang bị ứng dụng khác sử dụng hoặc chưa sẵn sàng. Vui lòng thử lại sau vài giây.',
-        'Camera is busy or in use by another app. Please try again shortly.',
+        'Camera đang bận hoặc app khác đang dùng. Thử lại sau giây lát.',
+        'Camera is busy or used by another app. Try again shortly.',
       );
     }
     if (lower.contains('đã xảy ra lỗi không xác định') ||
@@ -1567,8 +1523,8 @@ class _StationScreenState extends State<StationScreen>
         lower.contains('bad state')) {
       return appText(
         context,
-        'Đã xảy ra sự cố khi kết nối camera. Vui lòng bấm Thử lại để khôi phục.',
-        'An issue occurred while connecting the camera. Please tap Try Again to recover.',
+        'Kết nối camera gặp sự cố. Bấm Thử lại để khôi phục.',
+        'Camera connection failed. Tap Try again to recover.',
       );
     }
     return _errorText(error);
@@ -1591,30 +1547,31 @@ class _StationScreenState extends State<StationScreen>
   // ============================================================
 
   // ============================================================
-  // BỐ CỤC ĐIỀU KHIỂN TRÊN MÀN HÌNH CAMERA
+  // BỐ CỤC ĐIỀU KHIỂN TRÊN MÀN HÌNH CAMERA (kiểu bảng điều khiển phát sóng)
   //
-  // Một thanh trạng thái (REC · chất lượng · nhiệt độ · LIVE) cùng kiểu viên
-  // thuốc, một nút "Menu" có chữ. Menu mở ra bảng nút có nhãn chia 2 nhóm:
-  // Chức năng và Camera. Không còn cụm nút rời bên phải.
-  //
-  // Dọc:   [logo .................... Menu]
-  //        [REC][1080p30][46°C · …][LIVE]
-  //        [bảng menu (khi mở)]
+  // Dọc:   [logo ........................ (≡)]
+  //        [REC][1080p·30][38°C][LIVE]   (cuộn ngang)
   //        [thông báo mạng/bộ nhớ]
-  //        ...
-  //        [zoom + độ sáng]
-  // Ngang: [REC][1080p30][46°C · …][LIVE] ............... [Menu]
-  //        [thông báo]                        [bảng menu (khi mở)]
-  //        [            zoom + độ sáng            ]
+  //        ..................................(rail)
+  //        [ 0.5× 1× 2× 5× ] (zoom) (độ sáng)
+  // Ngang: [logo][REC][1080p·30]…                (≡)
+  //        [thông báo]                          (rail)
+  //             [ 0.5× 1× 2× 5× ] (zoom) (sáng)
+  //
+  // Menu mở thành bảng nổi ở góc phải, đè lên hình (không đẩy bố cục).
+  // Nền thanh trên/dưới là dải gradient đen → trong suốt (xem _Scrim).
   // ============================================================
 
-  Widget _buildStationHeader(bool compact, bool landscape) {
-    return _StationHeader(
-      compact: compact,
-      landscape: landscape,
-      statusPills: _buildStatusPills(compact),
-      menuOpen: _controlsExpanded,
-      onToggleMenu: () =>
+  /// Nút tròn mở/đóng menu chức năng (chỉ icon, có tooltip).
+  Widget _buildMenuButton() {
+    return BrandIconButton(
+      icon: _controlsExpanded ? Icons.close_rounded : Icons.menu_rounded,
+      tooltip: _controlsExpanded
+          ? appText(context, 'Đóng menu', 'Close menu')
+          : appText(context, 'Mở menu chức năng', 'Open menu'),
+      active: _controlsExpanded,
+      size: 48,
+      onPressed: () =>
           setState(() => _controlsExpanded = !_controlsExpanded),
     );
   }
@@ -1623,15 +1580,23 @@ class _StationScreenState extends State<StationScreen>
   List<Widget> _buildStatusPills(bool compact) {
     final rtsp = _runtime.rtspPublisherService;
     final whip = _runtime.whipPublisherService;
+    final profile = _runtime.resolutionProfile;
     return [
-      _StatusPill(
-        dotColor: _recording ? const Color(0xFFFF5252) : const Color(0xFF69F0AE),
-        label: _recording ? 'REC' : 'READY',
-        color: _recording ? const Color(0xFFFF8A80) : const Color(0xFFB9F6CA),
-        tooltip: _recording
-            ? appText(context, 'Đang ghi hình', 'Recording')
-            : appText(context, 'Sẵn sàng ghi', 'Ready'),
-      ),
+      if (_recording)
+        BrandPill(
+          text: 'REC',
+          dot: true,
+          filled: true,
+          color: BrandColors.live,
+          tooltip: appText(context, 'Đang ghi hình', 'Recording'),
+        )
+      else
+        BrandPill(
+          text: appText(context, 'Sẵn sàng', 'Ready'),
+          dot: true,
+          color: BrandColors.successSoft,
+          tooltip: appText(context, 'Sẵn sàng ghi', 'Ready'),
+        ),
       _StatusPill(
         icon: _runtime.profileSwitching
             ? null
@@ -1639,11 +1604,10 @@ class _StationScreenState extends State<StationScreen>
                   ? Icons.lock_rounded
                   : Icons.high_quality_rounded),
         loading: _runtime.profileSwitching,
-        label:
-            '${_runtime.resolutionProfile.shortLabel} ${_runtime.resolutionProfile.fps} FPS',
+        label: '${profile.shortLabel}·${profile.fps}',
         color: _runtime.resolutionLocked
-            ? const Color(0xFFFFCC80)
-            : const Color(0xFF90CAF9),
+            ? BrandColors.warningSoft
+            : BrandColors.textPrimary,
         tooltip: appText(
           context,
           'Chất lượng video (chạm để đổi)',
@@ -1674,28 +1638,93 @@ class _StationScreenState extends State<StationScreen>
             rtsp.metricsListenable,
             whip.durationListenable,
           ]),
-          builder: (context, _) => _StatusPill(
-            dotColor: Colors.white,
-            label:
-                'LIVE ${formatLiveDuration(rtsp.isLive ? rtsp.liveDuration : whip.liveDuration)}',
-            color: Colors.white,
-            background: const Color(0xFFD32F2F),
-            trailingIcon:
-                rtsp.isLive &&
-                    rtsp.networkQuality != StreamNetworkQuality.unknown
-                ? (rtsp.networkQuality == StreamNetworkQuality.good
-                      ? Icons.wifi
-                      : Icons.wifi_off)
-                : null,
-            trailingColor: switch (rtsp.networkQuality) {
-              StreamNetworkQuality.good => Colors.lightGreenAccent,
-              StreamNetworkQuality.warning => Colors.orangeAccent,
-              StreamNetworkQuality.poor => Colors.yellowAccent,
-              _ => Colors.white70,
-            },
-            tooltip: appText(context, 'Đang phát trực tiếp', 'Live streaming'),
-            onTap: _openLiveStreamScreen,
-          ),
+          builder: (context, _) {
+            // Chất lượng LUỒNG PHÁT (FPS/bitrate đẩy lên máy chủ), không phải
+            // sóng Wi-Fi: dùng icon cột sóng thay vì icon Wi-Fi.
+            final quality = rtsp.isLive
+                ? rtsp.networkQuality
+                : StreamNetworkQuality.unknown;
+            final IconData? qualityIcon = switch (quality) {
+              StreamNetworkQuality.good => Icons.signal_cellular_alt_rounded,
+              StreamNetworkQuality.warning =>
+                Icons.signal_cellular_alt_2_bar_rounded,
+              StreamNetworkQuality.poor =>
+                Icons.signal_cellular_alt_1_bar_rounded,
+              StreamNetworkQuality.unknown => null,
+            };
+            final String? qualityText = switch (quality) {
+              StreamNetworkQuality.good => appText(context, 'Tốt', 'Good'),
+              StreamNetworkQuality.warning => appText(
+                context,
+                'Trung bình',
+                'Fair',
+              ),
+              StreamNetworkQuality.poor => appText(context, 'Kém', 'Poor'),
+              StreamNetworkQuality.unknown => null,
+            };
+            final metrics = rtsp.isLive
+                ? formatStreamMetrics(
+                    rtsp.currentFps,
+                    rtsp.currentBitrateKbps,
+                  )
+                : null;
+            final tooltip = qualityText == null
+                ? appText(context, 'Đang phát trực tiếp', 'Live streaming')
+                : '${appText(context, 'Chất lượng phát', 'Stream quality')}: '
+                      '$qualityText${metrics == null ? '' : ' · $metrics'}';
+            return _StatusPill(
+              dotColor: Colors.white,
+              label:
+                  'LIVE ${formatLiveDuration(rtsp.isLive ? rtsp.liveDuration : whip.liveDuration)}',
+              color: Colors.white,
+              background: BrandColors.live,
+              trailingIcon: qualityIcon,
+              trailingColor: switch (quality) {
+                StreamNetworkQuality.good => BrandColors.successSoft,
+                StreamNetworkQuality.warning => BrandColors.warning,
+                StreamNetworkQuality.poor => BrandColors.dangerSoft,
+                StreamNetworkQuality.unknown => Colors.white70,
+              },
+              tooltip: tooltip,
+              onTap: _openLiveStreamScreen,
+            );
+          },
+        ),
+      if (_runtime.isLiveStreaming)
+        // Bảng tỉ số in vào live nhưng overlay đang ẩn: người xem không thấy
+        // tỉ số. Nhắc bằng viên cam, chạm để mở Hub bật lại.
+        ValueListenableBuilder<ScoreOverlayFlags>(
+          valueListenable: _scoreOverlay,
+          builder: (context, flags, _) {
+            switch (scoreOverlayHint(live: true, flags: flags)) {
+              case ScoreOverlayHint.none:
+                return const SizedBox.shrink();
+              case ScoreOverlayHint.hidden:
+                return _StatusPill(
+                  icon: Icons.scoreboard_rounded,
+                  label: appText(context, 'Tỉ số ẩn', 'Score hidden'),
+                  color: BrandColors.warning,
+                  tooltip: appText(
+                    context,
+                    'Bảng tỉ số đang ẩn trên live. Chạm để bật',
+                    'Scoreboard hidden on live. Tap to show',
+                  ),
+                  onTap: _openScoreboardHub,
+                );
+              case ScoreOverlayHint.shown:
+                return _StatusPill(
+                  icon: Icons.scoreboard_rounded,
+                  label: appText(context, 'Tỉ số', 'Score'),
+                  color: BrandColors.successSoft,
+                  tooltip: appText(
+                    context,
+                    'Bảng tỉ số đang hiện trên live',
+                    'Scoreboard shown on live',
+                  ),
+                  onTap: _openScoreboardHub,
+                );
+            }
+          },
         ),
     ];
   }
@@ -1718,233 +1747,244 @@ class _StationScreenState extends State<StationScreen>
           (_runtime.lifecycleSuspended ||
               _runtime.lifecycleResuming ||
               _runtime.captureState == 'recovering'))
-        Container(
-          width: double.infinity,
-          margin: EdgeInsets.only(bottom: compact ? 6 : 8),
-          padding: EdgeInsets.symmetric(
-            horizontal: compact ? 10 : 12,
-            vertical: compact ? 6 : 8,
-          ),
-          decoration: BoxDecoration(
-            color: const Color(
-              0xFF1565C0,
-            ).withValues(alpha: 0.94),
-            borderRadius: BorderRadius.circular(
-              compact ? 10 : 12,
-            ),
-          ),
-          child: Text(
-            _runtime.lifecycleResuming ||
-                    _runtime.captureState == 'recovering'
-                ? appText(
-                    context,
-                    'Đang khôi phục camera và ghi hình sau khi quay lại ứng dụng…',
-                    'Restoring camera and recording…',
-                  )
-                : appText(
-                    context,
-                    'iOS đã tạm dừng camera khi ứng dụng ở nền. Hãy giữ Camera Station trên màn hình để ghi liên tục.',
-                    'iOS paused the camera in the background. Keep Camera Station visible for continuous recording.',
-                  ),
-            maxLines: compact ? 2 : 1,
-            overflow: TextOverflow.ellipsis,
-            textAlign: TextAlign.center,
-            style: TextStyle(
-              color: Colors.white,
-              fontSize: compact ? 11 : 12,
-              fontWeight: FontWeight.w700,
-            ),
-          ),
-        ),
+        _buildIosCaptureNotice(compact),
       if (_runtime.storageWarning)
-        Container(
-          width: double.infinity,
-          margin: EdgeInsets.only(bottom: compact ? 6 : 8),
-          padding: EdgeInsets.symmetric(
-            horizontal: compact ? 10 : 12,
-            vertical: compact ? 6 : 8,
-          ),
-          decoration: BoxDecoration(
-            color: Colors.orange.withValues(alpha: 0.92),
-            borderRadius: BorderRadius.circular(
-              compact ? 10 : 12,
-            ),
-          ),
-          child: Text(
-            appText(
-              context,
-              'Dung lượng lưu trữ thấp. Hệ thống sẽ dọn video cũ theo chính sách lưu trữ.',
-              'Storage is low. Old videos will be cleaned according to the retention policy.',
-            ),
-            maxLines: compact ? 2 : 1,
-            overflow: TextOverflow.ellipsis,
-            textAlign: TextAlign.center,
-            style: TextStyle(
-              color: Colors.black,
-              fontSize: compact ? 11 : 12,
-              fontWeight: FontWeight.w700,
-            ),
+        _CameraNotice(
+          compact: compact,
+          kind: NoticeKind.warning,
+          icon: Icons.sd_card_alert_rounded,
+          message: appText(
+            context,
+            'Bộ nhớ sắp đầy. Video cũ sẽ được tự dọn.',
+            'Storage low. Old videos will be auto-cleaned.',
           ),
         ),
     ];
   }
 
-  /// Menu chức năng: một hàng nút nhỏ có nhãn, mở dưới nút Menu.
-  Widget _buildQuickMenu() {
-    return _QuickMenuPanel(
-      tiles: [
-        _MenuTile(
-          icon: Icons.video_library_rounded,
-          label: appText(context, 'Video', 'Videos'),
-          tooltip: appText(context, 'Kho video', 'Video storage'),
-          onTap: _openVideoStorage,
-        ),
-        _MenuTile(
-          icon: Icons.podcasts_rounded,
-          label: appText(context, 'Live', 'Live'),
-          tooltip: _runtime.isLiveStreaming
-              ? appText(context, 'Đang phát trực tiếp', 'Live streaming')
-              : appText(
-                  context,
-                  'Phát trực tiếp lên máy chủ',
-                  'Live stream to server',
-                ),
-          active: _runtime.isLiveStreaming,
-          activeColor: const Color(0xFFD32F2F),
-          onTap: _openLiveStreamScreen,
-        ),
-        _MenuTile(
-          icon: Icons.scoreboard_rounded,
-          label: appText(context, 'Tỉ số', 'Score'),
-          tooltip: appText(
-            context,
-            'Bảng tỉ số & Overlay',
-            'Scoreboard & Overlay',
-          ),
-          onTap: _openScoreboardHub,
-        ),
-        _MenuTile(
-          label: appText(context, 'Ngôn ngữ', 'Language'),
-          tooltip: appText(context, 'Ngôn ngữ', 'Language'),
-          custom: const AppLanguageButton(
-            foregroundColor: Colors.white,
-            size: 22,
-          ),
-        ),
-        _MenuTile(
-          icon: Icons.settings_rounded,
-          label: appText(context, 'Cài đặt', 'Settings'),
-          tooltip: appText(
-            context,
-            'Cấu hình Camera Station',
-            'Camera Station settings',
-          ),
-          onTap: _openSettings,
-        ),
-      ],
+  /// iOS tạm dừng/khôi phục camera khi app ra/vào nền.
+  Widget _buildIosCaptureNotice(bool compact) {
+    final restoring =
+        _runtime.lifecycleResuming || _runtime.captureState == 'recovering';
+    return _CameraNotice(
+      compact: compact,
+      kind: restoring ? NoticeKind.info : NoticeKind.warning,
+      icon: restoring ? null : Icons.pause_circle_rounded,
+      loading: restoring,
+      message: restoring
+          ? appText(
+              context,
+              'Đang khôi phục camera và ghi hình…',
+              'Restoring camera and recording…',
+            )
+          : appText(
+              context,
+              'iOS đã tạm dừng camera. Giữ app trên màn hình để ghi liên tục.',
+              'iOS paused the camera. Keep the app open to keep recording.',
+            ),
     );
   }
 
-  /// Cụm nút camera luôn hiện ở mép phải (đổi camera, bật/tắt, làm tối,
-  /// khoá xoay). Chạm giữ để xem tên nút.
-  Widget _buildCameraDock() {
-    return _CameraDock(
-      buttons: [
-        _DockButton(
-          icon: Icons.cameraswitch_rounded,
-          tooltip: appText(
-            context,
-            'Đổi camera trước/sau',
-            'Switch front/rear camera',
+  /// Menu chức năng: bảng nổi ở góc phải, nằm trọn trong vùng dưới thanh
+  /// trạng thái và trên thanh zoom. Màn hình thấp: dòng gọn, máy ngang đủ
+  /// rộng thì xếp lưới 2 cột; vẫn thiếu chỗ thì cuộn, bắt đầu từ mục đầu.
+  Widget _buildQuickMenu() {
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        const itemCount = 5;
+        final layout = quickMenuLayout(
+          maxWidth: constraints.maxWidth,
+          maxHeight: constraints.maxHeight,
+          itemCount: itemCount,
+        );
+        final dense = layout.dense;
+        final tiles = <Widget>[
+          _MenuTile(
+            icon: Icons.video_library_rounded,
+            label: appText(context, 'Video', 'Videos'),
+            tooltip: appText(context, 'Kho video', 'Video storage'),
+            dense: dense,
+            onTap: _openVideoStorage,
           ),
-          loading: _lensSwitching,
-          onTap: _cameraReady && !_lensSwitching ? _switchCameraLens : null,
+          _MenuTile(
+            icon: Icons.podcasts_rounded,
+            label: appText(context, 'Live', 'Live'),
+            tooltip: _runtime.isLiveStreaming
+                ? appText(context, 'Đang phát trực tiếp', 'Live streaming')
+                : appText(
+                    context,
+                    'Phát trực tiếp lên máy chủ',
+                    'Live stream to server',
+                  ),
+            active: _runtime.isLiveStreaming,
+            activeColor: BrandColors.live,
+            dense: dense,
+            onTap: _openLiveStreamScreen,
+          ),
+          _MenuTile(
+            icon: Icons.scoreboard_rounded,
+            label: appText(context, 'Tỉ số', 'Score'),
+            tooltip: appText(
+              context,
+              'Bảng tỉ số & Overlay',
+              'Scoreboard & Overlay',
+            ),
+            dense: dense,
+            onTap: _openScoreboardHub,
+          ),
+          _MenuTile(
+            icon: Icons.translate_rounded,
+            label: appText(context, 'Ngôn ngữ', 'Language'),
+            tooltip: appText(context, 'Ngôn ngữ', 'Language'),
+            dense: dense,
+            trailing: const AppLanguageButton(
+              foregroundColor: BrandColors.textPrimary,
+              size: 36,
+            ),
+          ),
+          _MenuTile(
+            icon: Icons.settings_rounded,
+            label: appText(context, 'Cài đặt', 'Settings'),
+            tooltip: appText(
+              context,
+              'Cấu hình Camera Station',
+              'Camera Station settings',
+            ),
+            dense: dense,
+            onTap: _openSettings,
+          ),
+        ];
+        assert(tiles.length == itemCount);
+        return Align(
+          alignment: Alignment.topRight,
+          child: SingleChildScrollView(
+            // Không dùng PrimaryScrollController chung: menu luôn mở ở đầu
+            // danh sách (offset 0), mục đầu không bị cắt.
+            primary: false,
+            padding: const EdgeInsets.symmetric(vertical: BrandSpace.xs),
+            child: _QuickMenuPanel(
+              columns: layout.columns,
+              maxWidth: constraints.maxWidth,
+              tiles: tiles,
+            ),
+          ),
+        );
+      },
+    );
+  }
+
+  /// Rail nút camera (đổi camera, bật/tắt, làm tối, khoá xoay): cùng kích
+  /// thước, cùng kiểu kính; chỉ trạng thái đang bật mới có màu xanh. Màn
+  /// hình đủ chỗ thì có nhãn ngắn, máy nhỏ chỉ icon (chạm giữ xem tooltip).
+  Widget _buildActionRail(bool compact) {
+    final size = compact ? 48.0 : 52.0;
+    final showLabels = !compact;
+    String? label(String vi, String en) =>
+        showLabels ? appText(context, vi, en) : null;
+    final cameraOn = _runtime.cameraEnabled;
+    final buttons = <Widget>[
+      BrandIconButton(
+        icon: Icons.cameraswitch_rounded,
+        tooltip: appText(
+          context,
+          'Đổi camera trước/sau',
+          'Switch front/rear camera',
         ),
-        _DockButton(
-          icon: _runtime.cameraEnabled
-              ? Icons.videocam_off_rounded
-              : Icons.videocam_rounded,
-          tooltip: _runtime.cameraEnabled
+        label: label('Đổi cam', 'Flip'),
+        size: size,
+        loading: _lensSwitching,
+        onPressed: _cameraReady && !_lensSwitching ? _switchCameraLens : null,
+      ),
+      // Tắt camera là hành động nguy hiểm (ngừng ghi): viền đỏ, không khối
+      // đỏ lớn.
+      _DangerRing(
+        enabled: cameraOn,
+        size: size,
+        child: BrandIconButton(
+          icon: cameraOn ? Icons.videocam_off_rounded : Icons.videocam_rounded,
+          tooltip: cameraOn
               ? appText(context, 'Tắt camera', 'Turn camera off')
               : appText(context, 'Bật camera', 'Turn camera on'),
+          label: cameraOn
+              ? label('Tắt cam', 'Cam off')
+              : label('Bật cam', 'Cam on'),
+          size: size,
           loading: _cameraSwitching,
-          background: _runtime.cameraEnabled
-              ? const Color(0xCCC62828)
-              : const Color(0xCC2E7D32),
-          onTap: _cameraSwitching ? null : _toggleCamera,
+          onPressed: _cameraSwitching ? null : _toggleCamera,
         ),
-        _DockButton(
-          icon: _screenDimmed
-              ? Icons.brightness_7_rounded
-              : Icons.dark_mode_rounded,
-          tooltip: _screenDimmed
-              ? appText(
-                  context,
-                  'Khôi phục độ sáng màn hình',
-                  'Restore screen brightness',
-                )
-              : appText(
-                  context,
-                  'Làm mờ màn hình để giảm nhiệt',
-                  'Dim screen to reduce heat',
-                ),
-          loading: _screenDimSwitching,
-          background: _screenDimmed ? _accentBlue : null,
-          onTap: _screenDimSwitching ? null : _toggleScreenDim,
-        ),
-        _DockButton(
-          icon: _screenOrientation == 'landscape'
-              ? Icons.screen_lock_landscape_rounded
-              : _screenOrientation == 'portrait'
-              ? Icons.screen_lock_portrait_rounded
-              : Icons.screen_rotation_rounded,
-          tooltip: _screenOrientation == 'landscape'
-              ? appText(
-                  context,
-                  'Đang khóa xoay ngang (chạm để đổi)',
-                  'Locked landscape (tap to change)',
-                )
-              : _screenOrientation == 'portrait'
-              ? appText(
-                  context,
-                  'Đang khóa xoay dọc (chạm để đổi)',
-                  'Locked portrait (tap to change)',
-                )
-              : appText(
-                  context,
-                  'Tự động xoay màn hình (chạm để khóa)',
-                  'Auto-rotate screen (tap to lock)',
-                ),
-          background: _screenOrientation != 'auto' ? _accentBlue : null,
-          onTap: _toggleScreenOrientation,
-        ),
-      ],
+      ),
+      BrandIconButton(
+        icon: _screenDimmed
+            ? Icons.brightness_7_rounded
+            : Icons.dark_mode_rounded,
+        tooltip: _screenDimmed
+            ? appText(
+                context,
+                'Khôi phục độ sáng màn hình',
+                'Restore screen brightness',
+              )
+            : appText(
+                context,
+                'Làm tối màn hình (giảm nhiệt)',
+                'Dim screen (reduce heat)',
+              ),
+        label: label('Làm tối', 'Dim'),
+        size: size,
+        active: _screenDimmed,
+        loading: _screenDimSwitching,
+        onPressed: _screenDimSwitching ? null : _toggleScreenDim,
+      ),
+      BrandIconButton(
+        icon: _screenOrientation == 'landscape'
+            ? Icons.screen_lock_landscape_rounded
+            : _screenOrientation == 'portrait'
+            ? Icons.screen_lock_portrait_rounded
+            : Icons.screen_rotation_rounded,
+        tooltip: _screenOrientation == 'landscape'
+            ? appText(context, 'Đang khoá xoay ngang', 'Landscape locked')
+            : _screenOrientation == 'portrait'
+            ? appText(context, 'Đang khoá xoay dọc', 'Portrait locked')
+            : appText(context, 'Tự xoay màn hình', 'Auto-rotate'),
+        label: _screenOrientation == 'auto'
+            ? label('Tự xoay', 'Rotate')
+            : label('Khoá xoay', 'Locked'),
+        size: size,
+        active: _screenOrientation != 'auto',
+        onPressed: _toggleScreenOrientation,
+      ),
+    ];
+    // Màn hình rất thấp: rail tự cuộn, không tràn.
+    return SingleChildScrollView(
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          for (var i = 0; i < buttons.length; i++) ...[
+            if (i > 0)
+              SizedBox(height: showLabels ? BrandSpace.sm : BrandSpace.md),
+            buttons[i],
+          ],
+        ],
+      ),
     );
   }
 
-  Widget _buildBottomPanel(bool compact) {
-    return _BottomControlPanel(
+  /// Thanh nhỏ ở đáy: zoom nhanh + nút zoom chi tiết + nút độ sáng.
+  Widget _buildControlBar(bool compact) {
+    return _CameraControlBar(
       compact: compact,
       cameraReady: _cameraReady,
-      recording: _recording,
       zoomSupported:
           _cameraReady &&
-          (_runtime.webRtcService?.cameraZoomSupported ??
-              false),
-      zoomValue:
-          _zoomValue ??
-          _runtime.webRtcService?.cameraZoom ??
-          1,
-      minimumZoom:
-          _runtime.webRtcService?.minimumCameraZoom ?? 1.0,
-      maximumZoom:
-          math.min(_runtime.webRtcService?.maximumCameraZoom ?? 5.0, 5.0),
-      hasUltraWide:
-          _runtime.webRtcService?.hasUltraWideCamera ?? false,
-      ultraWideRatio:
-          _runtime.webRtcService?.ultraWideZoomRatio ?? 0.5,
-      ultraWideLabel:
-          _runtime.webRtcService?.ultraWideLabel ?? '0.5×',
+          (_runtime.webRtcService?.cameraZoomSupported ?? false),
+      zoomValue: _zoomValue ?? _runtime.webRtcService?.cameraZoom ?? 1,
+      minimumZoom: _runtime.webRtcService?.minimumCameraZoom ?? 1.0,
+      maximumZoom: math.min(
+        _runtime.webRtcService?.maximumCameraZoom ?? 5.0,
+        5.0,
+      ),
+      hasUltraWide: _runtime.webRtcService?.hasUltraWideCamera ?? false,
+      ultraWideRatio: _runtime.webRtcService?.ultraWideZoomRatio ?? 0.5,
+      ultraWideLabel: _runtime.webRtcService?.ultraWideLabel ?? '0.5×',
       // Đang đổi camera trước/sau: khoá zoom (ống kính sắp thay đổi).
       zoomEnabled: !_facingSwitching,
       onZoomChanged: _changeZoom,
@@ -1954,105 +1994,149 @@ class _StationScreenState extends State<StationScreen>
     );
   }
 
-  /// Màn dọc: thanh trên, menu (khi mở), thông báo; cụm nút camera ở mép
-  /// phải; zoom ở đáy.
-  Widget _buildPortraitControls(bool compact) {
-    final notices = _buildNotices(compact);
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.stretch,
-      children: [
-        _buildStationHeader(compact, false),
-        if (_controlsExpanded) ...[
-          const SizedBox(height: 6),
-          Align(alignment: Alignment.topRight, child: _buildQuickMenu()),
-        ],
-        if (notices.isNotEmpty) ...[
-          const SizedBox(height: 6),
-          ConstrainedBox(
-            constraints: BoxConstraints(maxHeight: compact ? 120 : 180),
-            child: SingleChildScrollView(
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.stretch,
-                children: notices,
-              ),
-            ),
-          ),
-        ],
-        Expanded(
-          child: Align(
-            alignment: Alignment.centerRight,
-            child: Padding(
-              padding: const EdgeInsets.symmetric(vertical: 6),
-              child: _buildCameraDock(),
-            ),
-          ),
-        ),
-        Center(
-          child: ConstrainedBox(
-            constraints: const BoxConstraints(maxWidth: 460),
-            child: _buildBottomPanel(compact),
-          ),
-        ),
-      ],
+  /// Danh sách thông báo (tự cuộn khi nhiều).
+  Widget _buildNoticeList(List<Widget> notices) {
+    return SingleChildScrollView(
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: notices,
+      ),
     );
   }
 
-  /// Màn ngang: thanh trên một hàng, menu (khi mở) ngay dưới nút Menu;
-  /// thông báo bên trái, cụm nút camera ở mép phải; zoom ở đáy.
-  Widget _buildLandscapeControls(bool compact) {
+  /// Màn dọc: thanh trạng thái trên (2 hàng khi máy hẹp), thông báo, rail
+  /// nút ở mép phải, thanh zoom/độ sáng ở đáy.
+  Widget _buildPortraitControls(bool compact, bool singleRowHeader) {
     final notices = _buildNotices(compact);
+    final pills = _buildStatusPills(compact);
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
-        _buildStationHeader(compact, true),
-        const SizedBox(height: 6),
-        Expanded(
-          child: Row(
-            crossAxisAlignment: CrossAxisAlignment.stretch,
+        if (singleRowHeader)
+          Row(
             children: [
+              _StationLogo(compact: compact),
+              const SizedBox(width: BrandSpace.md),
               Expanded(
                 child: Align(
-                  alignment: Alignment.topLeft,
-                  child: notices.isEmpty
-                      ? const SizedBox.shrink()
-                      : ConstrainedBox(
-                          constraints: BoxConstraints(
-                            maxWidth: compact ? 360 : 420,
-                          ),
-                          child: SingleChildScrollView(
-                            child: Column(
-                              mainAxisSize: MainAxisSize.min,
-                              crossAxisAlignment: CrossAxisAlignment.stretch,
-                              children: notices,
-                            ),
-                          ),
-                        ),
+                  alignment: Alignment.centerLeft,
+                  child: _PillStrip(pills: pills),
                 ),
               ),
-              const SizedBox(width: 8),
+              const SizedBox(width: BrandSpace.sm),
+              _buildMenuButton(),
+            ],
+          )
+        else ...[
+          Row(
+            children: [
+              _StationLogo(compact: compact),
+              const Spacer(),
+              _buildMenuButton(),
+            ],
+          ),
+          const SizedBox(height: BrandSpace.sm),
+          Align(
+            alignment: Alignment.centerLeft,
+            child: _PillStrip(pills: pills),
+          ),
+        ],
+        const SizedBox(height: BrandSpace.sm),
+        Expanded(
+          child: Stack(
+            fit: StackFit.expand,
+            children: [
               Column(
-                crossAxisAlignment: CrossAxisAlignment.end,
+                crossAxisAlignment: CrossAxisAlignment.stretch,
                 children: [
-                  if (_controlsExpanded) _buildQuickMenu(),
+                  if (notices.isNotEmpty)
+                    ConstrainedBox(
+                      constraints: BoxConstraints(
+                        maxHeight: compact ? 120 : 180,
+                      ),
+                      child: _buildNoticeList(notices),
+                    ),
                   Expanded(
                     child: Align(
                       alignment: Alignment.centerRight,
-                      child: Padding(
-                        padding: const EdgeInsets.symmetric(vertical: 6),
-                        child: _buildCameraDock(),
-                      ),
+                      child: _buildActionRail(compact),
                     ),
                   ),
                 ],
               ),
+              if (_controlsExpanded) _buildQuickMenu(),
             ],
           ),
         ),
-        const SizedBox(height: 6),
-        Center(
-          child: ConstrainedBox(
-            constraints: const BoxConstraints(maxWidth: 420),
-            child: _buildBottomPanel(compact),
+        const SizedBox(height: BrandSpace.sm),
+        Center(child: _buildControlBar(compact)),
+      ],
+    );
+  }
+
+  /// Màn ngang: cột trái (logo + trạng thái, thông báo, thanh zoom ở đáy);
+  /// cột phải (nút Menu, rail nút camera ở giữa).
+  Widget _buildLandscapeControls(bool compact) {
+    final notices = _buildNotices(compact);
+    return Row(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        Expanded(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              SizedBox(
+                height: 48,
+                child: Row(
+                  children: [
+                    _StationLogo(compact: compact),
+                    const SizedBox(width: BrandSpace.md),
+                    Expanded(
+                      child: Align(
+                        alignment: Alignment.centerLeft,
+                        child: _PillStrip(pills: _buildStatusPills(compact)),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+              const SizedBox(height: BrandSpace.sm),
+              Expanded(
+                child: Stack(
+                  fit: StackFit.expand,
+                  children: [
+                    Align(
+                      alignment: Alignment.topLeft,
+                      child: notices.isEmpty
+                          ? const SizedBox.shrink()
+                          : ConstrainedBox(
+                              constraints: BoxConstraints(
+                                maxWidth: compact ? 360 : 420,
+                              ),
+                              child: _buildNoticeList(notices),
+                            ),
+                    ),
+                    if (_controlsExpanded) _buildQuickMenu(),
+                  ],
+                ),
+              ),
+              const SizedBox(height: BrandSpace.sm),
+              Center(child: _buildControlBar(compact)),
+            ],
+          ),
+        ),
+        const SizedBox(width: BrandSpace.md),
+        // Cột cố định bề rộng: nhãn dưới nút tự cắt (ellipsis), không đẩy
+        // cột trái.
+        SizedBox(
+          width: compact ? 52 : 76,
+          child: Column(
+            children: [
+              _buildMenuButton(),
+              const SizedBox(height: BrandSpace.md),
+              Expanded(child: Center(child: _buildActionRail(compact))),
+            ],
           ),
         ),
       ],
@@ -2098,11 +2182,14 @@ class _StationScreenState extends State<StationScreen>
               _lastActiveOrientationLandscape = landscape;
             }
           }
-          // Scrim height scales with the viewport instead of being a
-          // fixed 180px — on short screens a fixed height made the
-          // top + bottom scrims overlap and blanket the whole preview
-          // in black. Capped so it never exceeds ~22% of the height
-          // and top+bottom together leave the middle clear.
+          // Thanh trạng thái dọc máy hẹp có 2 hàng; máy rộng gộp 1 hàng.
+          final singleRowHeader = landscape || constraints.maxWidth >= 560;
+          final viewPadding = MediaQuery.paddingOf(context);
+          // Dải tối trên/dưới vừa đủ cao để chữ/nút dễ đọc, giữa màn hình
+          // để trống cho hình camera.
+          final topScrim =
+              viewPadding.top + (singleRowHeader ? 88.0 : 128.0);
+          final bottomScrim = viewPadding.bottom + (landscape ? 88.0 : 112.0);
           return Stack(
             fit: StackFit.expand,
             children: [
@@ -2185,22 +2272,37 @@ class _StationScreenState extends State<StationScreen>
                     onWake: _wakePreview,
                   ),
                 ),
-              if (!isPip && !_previewResting)
+              if (!isPip && !_previewResting) ...[
+                Positioned(
+                  top: 0,
+                  left: 0,
+                  right: 0,
+                  height: topScrim,
+                  child: const _Scrim(fromTop: true),
+                ),
+                Positioned(
+                  bottom: 0,
+                  left: 0,
+                  right: 0,
+                  height: bottomScrim,
+                  child: const _Scrim(fromTop: false),
+                ),
                 Positioned.fill(
                   child: SafeArea(
                     child: Padding(
                       padding: EdgeInsets.fromLTRB(
-                        compact ? 8 : 14,
-                        compact ? 8 : 12,
-                        compact ? 8 : 14,
-                        compact ? 10 : 14,
+                        compact ? BrandSpace.sm : BrandSpace.lg,
+                        compact ? BrandSpace.sm : BrandSpace.md,
+                        compact ? BrandSpace.sm : BrandSpace.lg,
+                        compact ? BrandSpace.sm : BrandSpace.md,
                       ),
                       child: landscape
                           ? _buildLandscapeControls(compact)
-                          : _buildPortraitControls(compact),
+                          : _buildPortraitControls(compact, singleRowHeader),
                     ),
                   ),
                 ),
+              ],
 
               // ==============================================
               // PIP MODE MINIMAL STATUS OVERLAY

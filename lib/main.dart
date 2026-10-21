@@ -9,6 +9,8 @@ import 'screens/station_screen.dart';
 import 'screens/station_splash_screen.dart';
 import 'services/app_language_service.dart';
 import 'services/station_config_service.dart';
+import 'theme/app_theme.dart';
+import 'widgets/app_notice.dart';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -92,29 +94,18 @@ class _VnvarCameraStationAppState extends State<VnvarCameraStationApp> {
     _exitDialogOpen = true;
     bool? confirmed;
     try {
-      confirmed = await showDialog<bool>(
-        context: dialogContext,
-        builder: (context) => AlertDialog(
-          title: Text(appText(context, 'Thoát Camera Station?', 'Exit Camera Station?')),
-          content: Text(
-            appText(
-              context,
-              'Camera sẽ ngừng ghi hình và ngừng phát cho Tablet.',
-              'The camera will stop recording and streaming to tablets.',
-            ),
-          ),
-          actions: [
-            TextButton(
-              onPressed: () => Navigator.pop(context, false),
-              child: Text(appText(context, 'Ở LẠI', 'STAY')),
-            ),
-            FilledButton(
-              style: FilledButton.styleFrom(backgroundColor: Colors.redAccent),
-              onPressed: () => Navigator.pop(context, true),
-              child: Text(appText(context, 'THOÁT', 'EXIT')),
-            ),
-          ],
-        ),
+      confirmed = await showAppConfirm(
+        dialogContext,
+        icon: Icons.power_settings_new_rounded,
+        titleVi: 'Thoát Camera Station?',
+        titleEn: 'Exit Camera Station?',
+        messageVi: 'Camera sẽ ngừng ghi và ngừng phát cho Tablet.',
+        messageEn: 'Recording and tablet streaming will stop.',
+        confirmVi: 'Thoát',
+        confirmEn: 'Exit',
+        cancelVi: 'Ở lại',
+        cancelEn: 'Stay',
+        destructive: true,
       );
     } finally {
       _exitDialogOpen = false;
@@ -144,10 +135,9 @@ class _VnvarCameraStationAppState extends State<VnvarCameraStationApp> {
         navigatorKey: _navigatorKey,
         title: 'VNVAR Camera Station',
         debugShowCheckedModeBanner: false,
-        theme: ThemeData(
-          colorScheme: ColorScheme.fromSeed(seedColor: const Color(0xFF1565C0)),
-          useMaterial3: true,
-        ),
+        theme: buildAppTheme(),
+        darkTheme: buildAppTheme(),
+        themeMode: ThemeMode.dark,
         home: PopScope(
           canPop: _step == _StartupStep.splash,
           onPopInvokedWithResult: (didPop, _) => _handleSystemBack(didPop),

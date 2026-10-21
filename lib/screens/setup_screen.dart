@@ -8,6 +8,9 @@ import 'package:shared_preferences/shared_preferences.dart';
 import '../models/station_identity.dart';
 import '../services/app_language_service.dart';
 import '../services/station_config_service.dart';
+import '../theme/app_theme.dart';
+import '../widgets/app_notice.dart';
+import '../widgets/brand_widgets.dart';
 
 class SetupScreen extends StatefulWidget {
   final ValueChanged<StationIdentity> onConfigured;
@@ -155,48 +158,6 @@ class _SetupScreenState extends State<SetupScreen> {
     return 'PHONE-$suffix';
   }
 
-
-
-  void _showSetupToast(
-    String message, {
-    bool isError = false,
-    Duration duration = const Duration(seconds: 2),
-    IconData? icon,
-  }) {
-    if (!mounted) return;
-    final bg = isError ? const Color(0xFFC62828) : const Color(0xFF1565C0);
-    final defIcon = isError
-        ? Icons.error_outline_rounded
-        : Icons.check_circle_outline_rounded;
-    ScaffoldMessenger.of(context)
-      ..hideCurrentSnackBar()
-      ..showSnackBar(
-        SnackBar(
-          behavior: SnackBarBehavior.floating,
-          margin: const EdgeInsets.symmetric(horizontal: 20, vertical: 14),
-          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
-          backgroundColor: bg,
-          duration: duration,
-          content: Row(
-            children: [
-              Icon(icon ?? defIcon, color: Colors.white, size: 20),
-              const SizedBox(width: 10),
-              Expanded(
-                child: Text(
-                  message,
-                  style: const TextStyle(
-                    color: Colors.white,
-                    fontSize: 13,
-                    fontWeight: FontWeight.w600,
-                  ),
-                ),
-              ),
-            ],
-          ),
-        ),
-      );
-  }
-
   Future<void> _save() async {
     if (_saving || !(_formKey.currentState?.validate() ?? false)) return;
 
@@ -222,292 +183,340 @@ class _SetupScreenState extends State<SetupScreen> {
       widget.onConfigured(identity);
     } catch (error) {
       if (!mounted) return;
-      _showSetupToast(
-        appText(
-          context,
-          'Không thể lưu cấu hình. Vui lòng thử lại sau.',
-          'Cannot save settings. Please try again later.',
-        ),
-        isError: true,
+      showAppNotice(
+        context,
+        vi: 'Không lưu được cấu hình. Thử lại sau.',
+        en: 'Could not save settings. Try again later.',
+        kind: NoticeKind.error,
       );
     } finally {
       if (mounted) setState(() => _saving = false);
     }
   }
 
-  Widget _buildSectionHeader({
-    required IconData icon,
-    required String title,
-    String? subtitle,
-  }) {
-    return Row(
-      children: [
-        Icon(icon, size: 17, color: const Color(0xFF1565C0)),
-        const SizedBox(width: 8),
-        Text(
-          title,
-          style: const TextStyle(
-            fontSize: 12.5,
-            fontWeight: FontWeight.w800,
-            letterSpacing: 0.5,
-            color: Color(0xFF1E293B),
-          ),
-        ),
-        if (subtitle != null) ...[
-          const SizedBox(width: 8),
-          Expanded(
-            child: Text(
-              subtitle,
-              maxLines: 1,
-              overflow: TextOverflow.ellipsis,
-              style: const TextStyle(
-                fontSize: 11.5,
-                color: Color(0xFF64748B),
-                fontWeight: FontWeight.w500,
-              ),
-            ),
-          ),
-        ],
-      ],
+  void _goBack() {
+    final onBack = widget.onBack;
+    if (onBack != null) {
+      onBack();
+    } else {
+      Navigator.of(context).pop();
+    }
+  }
+
+  void _copyDeviceId() {
+    Clipboard.setData(ClipboardData(text: _deviceId));
+    showAppNotice(
+      context,
+      vi: 'Đã sao chép mã thiết bị',
+      en: 'Device ID copied',
+      kind: NoticeKind.success,
     );
   }
 
-  Widget _buildCourtSelector() {
-    final courtNumber = _selectedCourtNumber;
+  String get _cameraNumberLabel {
+    final number = int.tryParse(_cameraId.replaceAll('CAM-', ''));
+    return (number ?? 1).toString();
+  }
 
+  /// Khối nhận diện đầu trang: icon camera + "Sân X · Camera Y" + mã thiết bị.
+  Widget _buildIdentityHeader() {
+    final title =
+        '${appText(context, 'Sân', 'Court')} $_selectedCourtNumber'
+        ' · Camera $_cameraNumberLabel';
     return Container(
-      decoration: BoxDecoration(
-        color: const Color(0xFFF8FAFC),
-        borderRadius: BorderRadius.circular(16),
-        border: Border.all(color: const Color(0xFFE2E8F0)),
+      padding: const EdgeInsets.fromLTRB(
+        BrandSpace.lg,
+        BrandSpace.md,
+        BrandSpace.xs,
+        BrandSpace.md,
       ),
-      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.stretch,
+      decoration: BoxDecoration(
+        color: BrandColors.surface,
+        borderRadius: BorderRadius.circular(BrandRadius.large),
+        border: Border.all(color: BrandColors.border),
+      ),
+      child: Row(
         children: [
-          _buildSectionHeader(
-            icon: Icons.stadium_rounded,
-            title: appText(context, 'SÂN THI ĐẤU', 'COURT'),
-          ),
-          const SizedBox(height: 10),
-          // Stepper bar: [-]  SÂN X  [+] (từ 1 tới _maxCourtNumber)
           Container(
-            padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+            width: 52,
+            height: 52,
             decoration: BoxDecoration(
-              color: Colors.white,
-              borderRadius: BorderRadius.circular(12),
-              border: Border.all(color: const Color(0xFFE2E8F0)),
+              color: BrandColors.primary.withValues(alpha: 0.18),
+              borderRadius: BorderRadius.circular(BrandRadius.medium),
+              border: Border.all(
+                color: BrandColors.primaryBright.withValues(alpha: 0.35),
+              ),
             ),
-            child: Row(
-              mainAxisAlignment: MainAxisAlignment.spaceBetween,
+            child: const Icon(
+              Icons.videocam_rounded,
+              color: BrandColors.primaryBright,
+              size: 28,
+            ),
+          ),
+          const SizedBox(width: BrandSpace.md),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              mainAxisSize: MainAxisSize.min,
               children: [
-                IconButton(
-                  onPressed: courtNumber > 1
-                      ? () => _selectCourtNumber(courtNumber - 1)
-                      : null,
-                  icon: const Icon(Icons.remove_circle_outline_rounded),
-                  color: const Color(0xFF1565C0),
-                  iconSize: 28,
-                  tooltip: appText(context, 'Giảm sân', 'Decrease court'),
+                Text(
+                  title,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: BrandText.title.copyWith(fontSize: 20),
                 ),
-                InkWell(
-                  onTap: () => _showCourtNumberInputDialog(courtNumber),
-                  borderRadius: BorderRadius.circular(8),
-                  child: Padding(
-                    padding: const EdgeInsets.symmetric(
-                      horizontal: 12,
-                      vertical: 4,
-                    ),
-                    child: Text(
-                      '${appText(context, "SÂN", "COURT")} $courtNumber',
-                      style: const TextStyle(
-                        fontSize: 20,
-                        fontWeight: FontWeight.w900,
-                        color: Color(0xFF0F172A),
-                        letterSpacing: 0.5,
-                      ),
-                    ),
+                const SizedBox(height: 2),
+                Text(
+                  _deviceId,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: BrandText.caption.copyWith(
+                    fontFamily: 'monospace',
+                    letterSpacing: 0.4,
                   ),
-                ),
-                IconButton(
-                  onPressed: courtNumber < _maxCourtNumber
-                      ? () => _selectCourtNumber(courtNumber + 1)
-                      : null,
-                  icon: const Icon(Icons.add_circle_outline_rounded),
-                  color: const Color(0xFF1565C0),
-                  iconSize: 28,
-                  tooltip: appText(context, 'Tăng sân', 'Increase court'),
                 ),
               ],
             ),
           ),
+          IconButton(
+            onPressed: _copyDeviceId,
+            tooltip: appText(context, 'Sao chép mã thiết bị', 'Copy device ID'),
+            icon: const Icon(
+              Icons.copy_rounded,
+              size: 20,
+              color: BrandColors.textSecondary,
+            ),
+          ),
         ],
       ),
     );
   }
 
-  Widget _buildCameraIdSelector() {
-    return Container(
-      decoration: BoxDecoration(
-        color: const Color(0xFFF8FAFC),
-        borderRadius: BorderRadius.circular(16),
-        border: Border.all(color: const Color(0xFFE2E8F0)),
+  /// Bộ đếm sân: [−]  số lớn (chạm để nhập)  [+], từ 1 tới _maxCourtNumber.
+  Widget _buildCourtSection() {
+    final courtNumber = _selectedCourtNumber;
+    return BrandSection(
+      title: appText(context, 'Sân', 'Court'),
+      padding: const EdgeInsets.symmetric(
+        horizontal: BrandSpace.md,
+        vertical: BrandSpace.md,
       ),
-      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.stretch,
-        children: [
-          _buildSectionHeader(
-            icon: Icons.videocam_rounded,
-            title: appText(context, 'CAMERA ID', 'CAMERA ID'),
-          ),
-          const SizedBox(height: 10),
-          Row(
-            children: _cameraIds.map((id) {
-              final isSelected = id == _cameraId;
-              final label = switch (id) {
-                'CAM-01' => appText(context, 'Góc trái', 'Left corner'),
-                'CAM-02' => appText(context, 'Góc phải', 'Right corner'),
-                'CAM-03' => appText(context, 'Giữa sân', 'Center'),
-                _ => id,
-              };
-              return Expanded(
-                child: Padding(
-                  padding: const EdgeInsets.symmetric(horizontal: 4),
+      children: [
+        Row(
+          children: [
+            BrandIconButton(
+              icon: Icons.remove_rounded,
+              glass: false,
+              tooltip: appText(context, 'Giảm sân', 'Decrease court'),
+              onPressed: courtNumber > 1
+                  ? () => _selectCourtNumber(courtNumber - 1)
+                  : null,
+            ),
+            const SizedBox(width: BrandSpace.sm),
+            Expanded(
+              child: Tooltip(
+                message: appText(context, 'Nhập số sân', 'Enter court number'),
+                // Material trong suốt: nền BrandSection (DecoratedBox) che
+                // hiệu ứng chạm vẽ trên Material của Scaffold.
+                child: Material(
+                  type: MaterialType.transparency,
                   child: InkWell(
-                    onTap: () => _onCameraIdSelected(id),
-                    borderRadius: BorderRadius.circular(12),
-                    child: AnimatedContainer(
-                      duration: const Duration(milliseconds: 200),
-                      padding: const EdgeInsets.symmetric(vertical: 8),
-                      decoration: BoxDecoration(
-                        color: isSelected
-                            ? const Color(0xFF1565C0)
-                            : Colors.white,
-                        borderRadius: BorderRadius.circular(12),
-                        border: Border.all(
-                          color: isSelected
-                              ? const Color(0xFF1565C0)
-                              : const Color(0xFFCBD5E1),
-                          width: isSelected ? 1.5 : 1,
-                        ),
-                        boxShadow: isSelected
-                            ? [
-                                BoxShadow(
-                                  color: const Color(0xFF1565C0).withValues(alpha: 0.22),
-                                  blurRadius: 4,
-                                  offset: const Offset(0, 2),
-                                ),
-                              ]
-                            : null,
-                      ),
-                      child: Column(
-                        mainAxisSize: MainAxisSize.min,
-                        children: [
-                          Icon(
-                            Icons.videocam_rounded,
-                            size: 19,
-                            color: isSelected
-                                ? Colors.white
-                                : const Color(0xFF64748B),
-                          ),
-                          const SizedBox(height: 3),
-                          Text(
-                            id,
-                            style: TextStyle(
-                              fontSize: 13.5,
+                    onTap: () => _showCourtNumberInputDialog(courtNumber),
+                    borderRadius: BorderRadius.circular(BrandRadius.small),
+                    child: ConstrainedBox(
+                      constraints: const BoxConstraints(minHeight: 64),
+                      child: Center(
+                        child: FittedBox(
+                          fit: BoxFit.scaleDown,
+                          child: Text(
+                            courtNumber.toString().padLeft(2, '0'),
+                            style: const TextStyle(
+                              color: BrandColors.textPrimary,
+                              fontSize: 40,
                               fontWeight: FontWeight.w800,
-                              color: isSelected
-                                  ? Colors.white
-                                  : const Color(0xFF0F172A),
+                              letterSpacing: 1,
                             ),
                           ),
-                          Text(
-                            label,
-                            style: TextStyle(
-                              fontSize: 10,
-                              fontWeight: FontWeight.w500,
-                              color: isSelected
-                                  ? Colors.white.withValues(alpha: 0.85)
-                                  : const Color(0xFF64748B),
-                            ),
-                          ),
-                        ],
+                        ),
                       ),
                     ),
                   ),
                 ),
-              );
-            }).toList(),
+              ),
+            ),
+            const SizedBox(width: BrandSpace.sm),
+            BrandIconButton(
+              icon: Icons.add_rounded,
+              glass: false,
+              tooltip: appText(context, 'Tăng sân', 'Increase court'),
+              onPressed: courtNumber < _maxCourtNumber
+                  ? () => _selectCourtNumber(courtNumber + 1)
+                  : null,
+            ),
+          ],
+        ),
+      ],
+    );
+  }
+
+  /// Chọn camera: lưới 3 ô đồng kích thước (số lớn + vị trí ngắn).
+  Widget _buildCameraSection() {
+    return BrandSection(
+      title: 'Camera',
+      padding: const EdgeInsets.all(BrandSpace.sm),
+      children: [
+        Row(
+          children: [
+            for (var i = 0; i < _cameraIds.length; i++) ...[
+              if (i > 0) const SizedBox(width: BrandSpace.sm),
+              Expanded(child: _buildCameraChip(_cameraIds[i])),
+            ],
+          ],
+        ),
+      ],
+    );
+  }
+
+  Widget _buildCameraChip(String id) {
+    final isSelected = id == _cameraId;
+    final position = switch (id) {
+      'CAM-01' => appText(context, 'Góc trái', 'Left'),
+      'CAM-02' => appText(context, 'Góc phải', 'Right'),
+      'CAM-03' => appText(context, 'Giữa sân', 'Center'),
+      _ => id,
+    };
+    final number = id.replaceAll('CAM-', '');
+    return Tooltip(
+      message: id,
+      child: Material(
+        color: isSelected ? BrandColors.primary : BrandColors.surfaceRaised,
+        shape: RoundedRectangleBorder(
+          borderRadius: BorderRadius.circular(BrandRadius.small),
+          side: BorderSide(
+            color: isSelected ? BrandColors.primaryBright : BrandColors.border,
           ),
-        ],
+        ),
+        clipBehavior: Clip.antiAlias,
+        child: InkWell(
+          onTap: () => _onCameraIdSelected(id),
+          child: ConstrainedBox(
+            constraints: const BoxConstraints(minHeight: 72),
+            child: Padding(
+              padding: const EdgeInsets.symmetric(
+                horizontal: BrandSpace.xs,
+                vertical: BrandSpace.sm,
+              ),
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                mainAxisAlignment: MainAxisAlignment.center,
+                children: [
+                  Text(
+                    number,
+                    maxLines: 1,
+                    style: TextStyle(
+                      color: isSelected ? Colors.white : BrandColors.textPrimary,
+                      fontSize: 22,
+                      fontWeight: FontWeight.w800,
+                    ),
+                  ),
+                  const SizedBox(height: 2),
+                  Text(
+                    position,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: BrandText.caption.copyWith(
+                      color: isSelected
+                          ? Colors.white.withValues(alpha: 0.85)
+                          : BrandColors.textSecondary,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+        ),
       ),
     );
   }
 
-
-
-  Widget _buildDeviceIdFooter() {
-    return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 9),
-      decoration: BoxDecoration(
-        color: const Color(0xFFF1F5F9),
-        borderRadius: BorderRadius.circular(12),
-        border: Border.all(color: const Color(0xFFE2E8F0)),
-      ),
-      child: Row(
-        children: [
-          const Icon(
-            Icons.perm_device_information_rounded,
-            size: 17,
-            color: Color(0xFF64748B),
-          ),
-          const SizedBox(width: 8),
-          Text(
-            appText(context, 'Mã thiết bị: ', 'Device ID: '),
-            style: const TextStyle(
-              fontSize: 11.5,
-              fontWeight: FontWeight.w600,
-              color: Color(0xFF64748B),
+  /// Mã kỹ thuật (tablet/server dùng): chỉ hiển thị.
+  Widget _buildIdsSection() {
+    const valueStyle = TextStyle(
+      color: BrandColors.textSecondary,
+      fontFamily: 'monospace',
+      fontSize: 13,
+      fontWeight: FontWeight.w600,
+    );
+    return BrandSection(
+      title: appText(context, 'Mã', 'IDs'),
+      children: [
+        BrandTile(
+          icon: Icons.stadium_rounded,
+          title: 'Court ID',
+          trailing: Flexible(
+            child: Text(
+              _courtId,
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: valueStyle,
             ),
           ),
-          Expanded(
-            child: SelectableText(
-              _deviceId,
-              style: const TextStyle(
-                fontFamily: 'monospace',
-                fontSize: 12.5,
-                fontWeight: FontWeight.w700,
-                color: Color(0xFF1E293B),
+        ),
+        BrandTile(
+          icon: Icons.videocam_rounded,
+          title: 'Camera ID',
+          trailing: Flexible(
+            child: Text(
+              _cameraId,
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: valueStyle,
+            ),
+          ),
+        ),
+      ],
+    );
+  }
+
+  /// Thanh hành động cố định đáy: nút phụ dạng chữ + nút chính full-width.
+  Widget _buildBottomBar(bool canGoBack) {
+    return DecoratedBox(
+      decoration: const BoxDecoration(
+        color: BrandColors.background,
+        border: Border(top: BorderSide(color: BrandColors.border)),
+      ),
+      child: SafeArea(
+        top: false,
+        child: Center(
+          heightFactor: 1,
+          child: ConstrainedBox(
+            constraints: const BoxConstraints(maxWidth: 960),
+            child: Padding(
+              padding: const EdgeInsets.fromLTRB(
+                BrandSpace.lg,
+                BrandSpace.md,
+                BrandSpace.lg,
+                BrandSpace.md,
+              ),
+              child: Row(
+                children: [
+                  if (canGoBack) ...[
+                    TextButton(
+                      onPressed: _saving ? null : _goBack,
+                      style: TextButton.styleFrom(
+                        foregroundColor: BrandColors.textSecondary,
+                        minimumSize: const Size(64, 52),
+                      ),
+                      child: Text(appText(context, 'Huỷ', 'Cancel')),
+                    ),
+                    const SizedBox(width: BrandSpace.sm),
+                  ],
+                  Expanded(child: _buildSaveButton()),
+                ],
               ),
             ),
           ),
-          IconButton(
-            padding: EdgeInsets.zero,
-            constraints: const BoxConstraints(),
-            icon: const Icon(
-              Icons.copy_rounded,
-              size: 15,
-              color: Color(0xFF64748B),
-            ),
-            tooltip: appText(
-              context,
-              'Sao chép Device ID',
-              'Copy Device ID',
-            ),
-            onPressed: () {
-              Clipboard.setData(ClipboardData(text: _deviceId));
-              _showSetupToast(
-                appText(
-                  context,
-                  'Đã sao chép Device ID vào bộ nhớ tạm.',
-                  'Device ID copied to clipboard.',
-                ),
-                icon: Icons.copy_rounded,
-              );
-            },
-          ),
-        ],
+        ),
       ),
     );
   }
@@ -516,17 +525,8 @@ class _SetupScreenState extends State<SetupScreen> {
     return FilledButton.icon(
       onPressed: _saving ? null : _save,
       style: FilledButton.styleFrom(
-        backgroundColor: const Color(0xFF1565C0),
-        foregroundColor: Colors.white,
-        minimumSize: const Size.fromHeight(48),
-        shape: RoundedRectangleBorder(
-          borderRadius: BorderRadius.circular(12),
-        ),
-        textStyle: const TextStyle(
-          fontSize: 15.5,
-          fontWeight: FontWeight.w900,
-          letterSpacing: 0.5,
-        ),
+        minimumSize: const Size.fromHeight(52),
+        textStyle: const TextStyle(fontSize: 15, fontWeight: FontWeight.w700),
       ),
       icon: _saving
           ? const SizedBox(
@@ -537,26 +537,15 @@ class _SetupScreenState extends State<SetupScreen> {
                 color: Colors.white,
               ),
             )
-          : const Icon(Icons.check_circle_outline_rounded, size: 20),
+          : const Icon(Icons.check_rounded, size: 20),
       label: Text(
         _saving
-            ? appText(context, 'ĐANG LƯU...', 'SAVING...')
+            ? appText(context, 'Đang lưu...', 'Saving...')
             : (widget.persistOnSave
-                ? appText(context, 'LƯU & KHỞI ĐỘNG', 'SAVE & START')
-                : appText(context, 'ÁP DỤNG CẤU HÌNH', 'APPLY SETTINGS')),
-      ),
-    );
-  }
-
-  Widget _buildBrandLogo() {
-    return Center(
-      child: Padding(
-        padding: const EdgeInsets.only(bottom: 12),
-        child: Image.asset(
-          'assets/images/vnvar_logo.png',
-          height: 32,
-          fit: BoxFit.contain,
-        ),
+                  ? appText(context, 'Lưu & khởi động', 'Save & start')
+                  : appText(context, 'Áp dụng', 'Apply')),
+        maxLines: 1,
+        overflow: TextOverflow.ellipsis,
       ),
     );
   }
@@ -567,127 +556,99 @@ class _SetupScreenState extends State<SetupScreen> {
       return const Scaffold(body: Center(child: CircularProgressIndicator()));
     }
 
-    final media = MediaQuery.sizeOf(context);
-    final isLandscape =
-        widget.isLandscape || (media.width > media.height && media.width >= 560);
     final canGoBack = widget.onBack != null || Navigator.of(context).canPop();
 
     return Scaffold(
-      backgroundColor: const Color(0xFFF1F5F9),
       appBar: AppBar(
         automaticallyImplyLeading: false,
-        backgroundColor: Colors.white,
-        elevation: 0.5,
         centerTitle: true,
         leading: canGoBack
             ? IconButton(
-                onPressed: () {
-                  if (widget.onBack != null) {
-                    widget.onBack!();
-                  } else {
-                    Navigator.of(context).pop();
-                  }
-                },
+                onPressed: _goBack,
                 tooltip: appText(context, 'Quay lại', 'Back'),
-                icon: const Icon(
-                  Icons.arrow_back_rounded,
-                  color: Color(0xFF0F172A),
-                ),
+                icon: const Icon(Icons.arrow_back_rounded),
               )
             : null,
         title: Text(
-          appText(context, 'THIẾT LẬP CAMERA', 'CAMERA SETUP'),
-          style: const TextStyle(
-            fontSize: 16,
-            fontWeight: FontWeight.w800,
-            color: Color(0xFF0F172A),
-          ),
+          appText(context, 'Thiết lập', 'Setup'),
+          style: BrandText.title,
         ),
-        actions: const [
-          AppLanguageButton(),
-          SizedBox(width: 8),
-        ],
+        actions: const [AppLanguageButton(), SizedBox(width: BrandSpace.sm)],
       ),
-      body: SafeArea(
-        child: Center(
-          child: SingleChildScrollView(
-            padding: EdgeInsets.symmetric(
-              horizontal: isLandscape ? 24 : 16,
-              vertical: isLandscape ? 12 : 16,
-            ),
-            child: ConstrainedBox(
-              constraints: BoxConstraints(
-                maxWidth: isLandscape ? 960 : 520,
-              ),
-              child: Card(
-                elevation: 1.5,
-                shape: RoundedRectangleBorder(
-                  borderRadius: BorderRadius.circular(20),
-                  side: const BorderSide(color: Color(0xFFE2E8F0)),
-                ),
-                color: Colors.white,
-                child: Padding(
-                  padding: EdgeInsets.all(isLandscape ? 18 : 18),
-                  child: Form(
-                    key: _formKey,
-                    child: isLandscape
-                        ? _buildLandscapeLayout()
-                        : _buildPortraitLayout(),
-                  ),
-                ),
+      body: Column(
+        children: [
+          Expanded(
+            child: SafeArea(
+              bottom: false,
+              child: LayoutBuilder(
+                builder: (context, constraints) {
+                  final wide = constraints.maxWidth >= 720;
+                  return SingleChildScrollView(
+                    padding: EdgeInsets.symmetric(
+                      horizontal: wide ? BrandSpace.xl : BrandSpace.lg,
+                      vertical: BrandSpace.lg,
+                    ),
+                    child: Center(
+                      child: ConstrainedBox(
+                        constraints: BoxConstraints(
+                          maxWidth: wide ? 960 : 560,
+                        ),
+                        child: Form(
+                          key: _formKey,
+                          child: wide
+                              ? _buildWideLayout()
+                              : _buildNarrowLayout(),
+                        ),
+                      ),
+                    ),
+                  );
+                },
               ),
             ),
           ),
-        ),
+          _buildBottomBar(canGoBack),
+        ],
       ),
     );
   }
 
-  Widget _buildPortraitLayout() {
+  Widget _buildNarrowLayout() {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
-        _buildBrandLogo(),
-        _buildCourtSelector(),
-        const SizedBox(height: 12),
-        _buildCameraIdSelector(),
-        const SizedBox(height: 14),
-        _buildDeviceIdFooter(),
-        const SizedBox(height: 18),
-        _buildSaveButton(),
+        _buildIdentityHeader(),
+        const SizedBox(height: BrandSpace.xl),
+        _buildCourtSection(),
+        const SizedBox(height: BrandSpace.xl),
+        _buildCameraSection(),
+        const SizedBox(height: BrandSpace.xl),
+        _buildIdsSection(),
       ],
     );
   }
 
-  Widget _buildLandscapeLayout() {
-    return Row(
-      crossAxisAlignment: CrossAxisAlignment.start,
+  Widget _buildWideLayout() {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
-        // Cột trái: Logo, Sân
-        Expanded(
-          flex: 5,
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.stretch,
-            children: [
-              _buildBrandLogo(),
-              _buildCourtSelector(),
-            ],
-          ),
-        ),
-        const SizedBox(width: 18),
-        // Cột phải: Camera ID, Device ID, Nút lưu
-        Expanded(
-          flex: 5,
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.stretch,
-            children: [
-              _buildCameraIdSelector(),
-              const SizedBox(height: 12),
-              _buildDeviceIdFooter(),
-              const SizedBox(height: 14),
-              _buildSaveButton(),
-            ],
-          ),
+        _buildIdentityHeader(),
+        const SizedBox(height: BrandSpace.xl),
+        Row(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Expanded(child: _buildCourtSection()),
+            const SizedBox(width: BrandSpace.xl),
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: [
+                  _buildCameraSection(),
+                  const SizedBox(height: BrandSpace.xl),
+                  _buildIdsSection(),
+                ],
+              ),
+            ),
+          ],
         ),
       ],
     );
@@ -754,27 +715,29 @@ class _CourtNumberDialogState extends State<_CourtNumberDialog> {
         decoration: InputDecoration(
           hintText: appText(
             context,
-            'Ví dụ: 1, 2, 25...',
-            'Example: 1, 2, 25...',
+            'VD: 1, 2, 25',
+            'e.g. 1, 2, 25',
           ),
           errorText: _invalid
               ? appText(
                   context,
                   'Số sân từ 1 đến $maxCourt',
-                  'Court number must be 1 to $maxCourt',
+                  'Court 1 to $maxCourt',
                 )
               : null,
-          border: const OutlineInputBorder(),
         ),
       ),
       actions: [
         TextButton(
           onPressed: () => Navigator.of(context).pop(),
-          child: Text(appText(context, 'HỦY', 'CANCEL')),
+          style: TextButton.styleFrom(
+            foregroundColor: BrandColors.textSecondary,
+          ),
+          child: Text(appText(context, 'Huỷ', 'Cancel')),
         ),
         FilledButton(
           onPressed: _submit,
-          child: Text(appText(context, 'XÁC NHẬN', 'CONFIRM')),
+          child: Text(appText(context, 'Xác nhận', 'Confirm')),
         ),
       ],
     );

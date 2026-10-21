@@ -1,7 +1,12 @@
 part of '../station_screen.dart';
 
 typedef _StationToast =
-    void Function(String message, {bool isError, IconData? icon});
+    void Function({
+      required String vi,
+      required String en,
+      NoticeKind kind,
+      Duration? duration,
+    });
 
 /// Bảng chọn chất lượng camera. Nghe [CameraStationRuntime.stateChanges] khi
 /// đang mở để không hiển thị dữ liệu cũ (nhiệt độ, profile, khoá…).
@@ -47,31 +52,17 @@ class _ResolutionPickerSheetState extends State<_ResolutionPickerSheet> {
     final runtime = widget.runtime;
     final nextLock = !runtime.resolutionLocked;
     final currentTitle = runtime.resolutionProfile.title;
-    final english = AppLanguageScope.of(context).isEnglish;
-    final lockMsg = nextLock
-        ? appText(
-            context,
-            'Đã khóa chế độ $currentTitle. Camera sẽ giữ nguyên chất lượng này kể cả khi máy nóng.',
-            'Locked $currentTitle. Camera will remain at this quality even when device is hot.',
-          )
-        : appText(
-            context,
-            'Đã mở khóa chế độ phân giải. Camera sẽ tự động điều chỉnh khi máy nóng.',
-            'Resolution mode unlocked. Camera will automatically adjust when hot.',
-          );
     _lockChanging = true;
     try {
       await runtime.setResolutionLocked(nextLock);
     } catch (error) {
-      final reason = compactErrorText(
-        stationErrorMessage(error, english: english),
-      );
+      String reason(bool english) =>
+          compactErrorText(stationErrorMessage(error, english: english));
       // Toast của màn hình Station tự kiểm tra màn hình còn hiển thị.
       widget.showToast(
-        english
-            ? 'Unable to change lock mode: $reason'
-            : 'Không đổi được chế độ khóa: $reason',
-        isError: true,
+        vi: 'Không đổi được chế độ khoá: ${reason(false)}',
+        en: "Couldn't change lock mode: ${reason(true)}",
+        kind: NoticeKind.error,
       );
       return;
     } finally {
@@ -81,8 +72,13 @@ class _ResolutionPickerSheetState extends State<_ResolutionPickerSheet> {
     if (!mounted) return;
     setState(() {});
     widget.showToast(
-      lockMsg,
-      icon: nextLock ? Icons.lock_rounded : Icons.lock_open_rounded,
+      vi: nextLock
+          ? 'Đã khoá $currentTitle. Không tự hạ khi máy nóng.'
+          : 'Đã mở khoá. Tự chỉnh chất lượng khi máy nóng.',
+      en: nextLock
+          ? 'Locked $currentTitle. No auto-downgrade when hot.'
+          : 'Unlocked. Quality auto-adjusts when hot.',
+      kind: NoticeKind.success,
     );
   }
 
@@ -97,10 +93,11 @@ class _ResolutionPickerSheetState extends State<_ResolutionPickerSheet> {
     final hasThermalBanner =
         (runtime.temperatureC != null && runtime.temperatureC! >= 38.0) ||
         runtime.justCooledDown;
-    final contentHeight = 58.0 +
-        (rows * 88.0) +
-        ((rows - 1) * 10.0) +
-        (hasThermalBanner ? 52.0 : 16.0);
+    const tileExtent = 72.0;
+    final contentHeight = 56.0 +
+        (rows * tileExtent) +
+        ((rows - 1) * BrandSpace.sm) +
+        (hasThermalBanner ? 58.0 : 16.0);
     final maximumHeight = (media.size.height * (landscape ? 0.85 : 0.65)).clamp(
       240.0,
       480.0,
@@ -109,323 +106,235 @@ class _ResolutionPickerSheetState extends State<_ResolutionPickerSheet> {
         ? contentHeight
         : maximumHeight;
     final isLocked = runtime.resolutionLocked;
+    final temperature = runtime.temperatureC?.toStringAsFixed(0) ?? '';
 
     return SafeArea(
       child: SizedBox(
         height: sheetHeight,
         child: Padding(
-          padding: const EdgeInsets.fromLTRB(16, 0, 16, 16),
+          padding: const EdgeInsets.fromLTRB(
+            BrandSpace.lg,
+            0,
+            BrandSpace.lg,
+            BrandSpace.lg,
+          ),
           child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
+            crossAxisAlignment: CrossAxisAlignment.stretch,
             children: [
               Row(
                 children: [
                   Expanded(
                     child: Text(
-                      appText(context, 'CHẤT LƯỢNG CAMERA', 'CAMERA QUALITY'),
-                      style: const TextStyle(
-                        color: Colors.white,
-                        fontSize: 16,
-                        fontWeight: FontWeight.w900,
-                      ),
+                      appText(context, 'Chất lượng camera', 'Camera quality'),
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: BrandText.title,
                     ),
                   ),
-                  Material(
-                    color: Colors.transparent,
-                    child: InkWell(
-                      borderRadius: BorderRadius.circular(20),
-                      onTap: _toggleLock,
-                      child: Container(
-                        padding: const EdgeInsets.symmetric(
-                          horizontal: 10,
-                          vertical: 5,
-                        ),
-                        decoration: BoxDecoration(
-                          color: isLocked
-                              ? const Color(0xFFE65100).withValues(alpha: 0.25)
-                              : Colors.white.withValues(alpha: 0.08),
-                          borderRadius: BorderRadius.circular(20),
-                          border: Border.all(
-                            color: isLocked
-                                ? const Color(0xFFFF9800)
-                                : Colors.white24,
-                            width: 1.2,
+                  const SizedBox(width: BrandSpace.sm),
+                  BrandPill(
+                    icon: isLocked
+                        ? Icons.lock_rounded
+                        : Icons.lock_open_rounded,
+                    text: isLocked
+                        ? appText(context, 'Đã khoá', 'Locked')
+                        : appText(context, 'Khoá', 'Lock'),
+                    color: isLocked
+                        ? BrandColors.warningSoft
+                        : BrandColors.textSecondary,
+                    tooltip: isLocked
+                        ? appText(
+                            context,
+                            'Mở khoá: tự chỉnh khi máy nóng',
+                            'Unlock: auto-adjust when hot',
+                          )
+                        : appText(
+                            context,
+                            'Khoá: không tự hạ khi máy nóng',
+                            'Lock: no auto-downgrade when hot',
                           ),
-                        ),
-                        child: Row(
-                          mainAxisSize: MainAxisSize.min,
-                          children: [
-                            Icon(
-                              isLocked
-                                  ? Icons.lock_rounded
-                                  : Icons.lock_open_rounded,
-                              size: 14,
-                              color: isLocked
-                                  ? const Color(0xFFFFB74D)
-                                  : Colors.white70,
-                            ),
-                            const SizedBox(width: 5),
-                            Text(
-                              isLocked
-                                  ? appText(context, 'Đã khóa', 'Locked')
-                                  : appText(context, 'Khóa chế độ', 'Lock mode'),
-                              style: TextStyle(
-                                color: isLocked
-                                    ? const Color(0xFFFFB74D)
-                                    : Colors.white70,
-                                fontSize: 12,
-                                fontWeight: FontWeight.w700,
-                              ),
-                            ),
-                          ],
-                        ),
-                      ),
-                    ),
+                    onTap: _toggleLock,
                   ),
                 ],
               ),
               if (hasThermalBanner) ...[
-                const SizedBox(height: 8),
-                Container(
-                  padding: const EdgeInsets.symmetric(
-                    horizontal: 10,
-                    vertical: 6,
-                  ),
-                  decoration: BoxDecoration(
-                    color: runtime.justCooledDown
-                        ? const Color(0xFF00C853).withValues(alpha: 0.15)
-                        : runtime.thermalWarning
-                            ? const Color(0xFFC62828).withValues(alpha: 0.18)
-                            : const Color(0xFFE65100).withValues(alpha: 0.15),
-                    borderRadius: BorderRadius.circular(8),
-                    border: Border.all(
-                      color: runtime.justCooledDown
-                          ? const Color(0xFF00E676).withValues(alpha: 0.35)
-                          : runtime.thermalWarning
-                              ? const Color(0xFFEF5350).withValues(alpha: 0.35)
-                              : const Color(0xFFFF9800).withValues(alpha: 0.3),
-                    ),
-                  ),
-                  child: Row(
-                    children: [
-                      Icon(
-                        runtime.justCooledDown
-                            ? Icons.ac_unit_rounded
-                            : runtime.thermalWarning
-                                ? Icons.whatshot_rounded
-                                : Icons.thermostat_rounded,
-                        size: 15,
-                        color: runtime.justCooledDown
-                            ? const Color(0xFF69F0AE)
-                            : runtime.thermalWarning
-                                ? const Color(0xFFFF8A80)
-                                : const Color(0xFFFFB74D),
-                      ),
-                      const SizedBox(width: 8),
-                      Expanded(
-                        child: Text(
-                          runtime.justCooledDown
-                              ? appText(
-                                  context,
-                                  'Thiết bị đã hạ nhiệt an toàn (${runtime.temperatureC?.toStringAsFixed(0) ?? ''}°C). Bạn có thể chọn lại độ phân giải mong muốn.',
-                                  'Device has cooled down (${runtime.temperatureC?.toStringAsFixed(0) ?? ''}°C). You can re-select your preferred quality.',
-                                )
-                              : runtime.thermalWarning
-                                  ? appText(
-                                      context,
-                                      'Thiết bị đang nóng (${runtime.temperatureC?.toStringAsFixed(0)}°C). Bạn vẫn có thể chủ động chọn độ phân giải theo ý muốn.',
-                                      'Device is warm (${runtime.temperatureC?.toStringAsFixed(0)}°C). You can still choose your preferred quality.',
-                                    )
-                                  : appText(
-                                      context,
-                                      'Nhiệt độ hiện tại: ${runtime.temperatureC?.toStringAsFixed(0)}°C.',
-                                      'Current temperature: ${runtime.temperatureC?.toStringAsFixed(0)}°C.',
-                                    ),
-                          style: TextStyle(
-                            color: runtime.justCooledDown
-                                ? const Color(0xFFB9F6CA)
-                                : runtime.thermalWarning
-                                    ? const Color(0xFFFFCDD2)
-                                    : const Color(0xFFFFE0B2),
-                            fontSize: 11.5,
-                          ),
-                        ),
-                      ),
-                    ],
-                  ),
+                const SizedBox(height: BrandSpace.sm),
+                AppNoticeBanner(
+                  dense: true,
+                  kind: runtime.justCooledDown
+                      ? NoticeKind.success
+                      : runtime.thermalWarning
+                          ? NoticeKind.warning
+                          : NoticeKind.info,
+                  icon: runtime.justCooledDown
+                      ? Icons.ac_unit_rounded
+                      : runtime.thermalWarning
+                          ? Icons.whatshot_rounded
+                          : Icons.thermostat_rounded,
+                  message: runtime.justCooledDown
+                      ? appText(
+                          context,
+                          'Máy đã mát ($temperature°C). Có thể nâng chất lượng.',
+                          'Cooled down ($temperature°C). You can raise quality.',
+                        )
+                      : runtime.thermalWarning
+                          ? appText(
+                              context,
+                              'Máy đang nóng ($temperature°C). Vẫn chọn được chất lượng.',
+                              'Device is hot ($temperature°C). You can still choose.',
+                            )
+                          : appText(
+                              context,
+                              'Nhiệt độ: $temperature°C',
+                              'Temperature: $temperature°C',
+                            ),
                 ),
               ],
-              const SizedBox(height: 10),
+              const SizedBox(height: BrandSpace.md),
               Expanded(
                 child: GridView.builder(
                   padding: EdgeInsets.zero,
                   itemCount: profiles.length,
                   gridDelegate: SliverGridDelegateWithFixedCrossAxisCount(
                     crossAxisCount: columns,
-                    crossAxisSpacing: 10,
-                    mainAxisSpacing: 10,
-                    mainAxisExtent: 88,
+                    crossAxisSpacing: BrandSpace.sm,
+                    mainAxisSpacing: BrandSpace.sm,
+                    mainAxisExtent: tileExtent,
                   ),
                   itemBuilder: (context, index) {
                     final profile = profiles[index];
-                    final active = profile == runtime.resolutionProfile;
-                    final displayProfile = profile;
-                    return Material(
-                      color: active
-                          ? const Color(0xFF1565C0)
-                          : isLocked
-                              ? const Color(0xFF15181E)
-                              : const Color(0xFF1A2028),
-                      borderRadius: BorderRadius.circular(14),
-                      child: InkWell(
-                        borderRadius: BorderRadius.circular(14),
-                        onTap: active
-                            ? null
-                            : () {
-                                if (isLocked) {
-                                  widget.showToast(
-                                    appText(
-                                      context,
-                                      'Chế độ phân giải đang khóa. Vui lòng bấm nút mở khóa ở góc trên để đổi.',
-                                      'Resolution mode is locked. Please unlock using the top button to change.',
-                                    ),
-                                    icon: Icons.lock_rounded,
-                                  );
-                                  return;
-                                }
-                                Navigator.pop(context, profile);
-                              },
-                        child: Container(
-                          decoration: BoxDecoration(
-                            borderRadius: BorderRadius.circular(14),
-                            border: Border.all(
-                              color: active
-                                  ? const Color(0xFF64B5F6)
-                                  : Colors.white.withValues(alpha: 0.08),
-                              width: active ? 1.5 : 1.0,
-                            ),
-                            boxShadow: active
-                                ? [
-                                    BoxShadow(
-                                      color: const Color(0xFF1565C0)
-                                          .withValues(alpha: 0.35),
-                                      blurRadius: 8,
-                                      offset: const Offset(0, 2),
-                                    ),
-                                  ]
-                                : null,
-                          ),
-                          child: Padding(
-                            padding: const EdgeInsets.symmetric(
-                              horizontal: 12,
-                              vertical: 10,
-                            ),
-                            child: Row(
-                              children: [
-                                Icon(
-                                  active
-                                      ? Icons.check_circle_rounded
-                                      : isLocked
-                                          ? Icons.lock_outline_rounded
-                                          : Icons.radio_button_unchecked_rounded,
-                                  color: active
-                                      ? Colors.white
-                                      : isLocked
-                                          ? Colors.white24
-                                          : Colors.white38,
-                                ),
-                                const SizedBox(width: 10),
-                                Expanded(
-                                  child: Column(
-                                    mainAxisAlignment:
-                                        MainAxisAlignment.center,
-                                    crossAxisAlignment:
-                                        CrossAxisAlignment.start,
-                                    children: [
-                                      Row(
-                                        children: [
-                                          Expanded(
-                                            child: Text(
-                                              displayProfile.title,
-                                              maxLines: 1,
-                                              overflow:
-                                                  TextOverflow.ellipsis,
-                                              style: TextStyle(
-                                                color: isLocked && !active
-                                                    ? Colors.white54
-                                                    : Colors.white,
-                                                fontWeight: FontWeight.w800,
-                                              ),
-                                            ),
-                                          ),
-                                          const SizedBox(width: 6),
-                                          Container(
-                                            padding:
-                                                const EdgeInsets.symmetric(
-                                              horizontal: 6,
-                                              vertical: 2,
-                                            ),
-                                            decoration: BoxDecoration(
-                                              color: displayProfile.fps >=
-                                                      50
-                                                  ? const Color(0xFF00E676)
-                                                      .withValues(
-                                                          alpha: 0.18)
-                                                  : Colors.white
-                                                      .withValues(
-                                                          alpha: 0.08),
-                                              borderRadius:
-                                                  BorderRadius.circular(6),
-                                              border: Border.all(
-                                                color: displayProfile.fps >=
-                                                        50
-                                                    ? const Color(
-                                                            0xFF00E676)
-                                                        .withValues(
-                                                            alpha: 0.5)
-                                                    : Colors.white24,
-                                                width: 0.8,
-                                              ),
-                                            ),
-                                            child: Text(
-                                              '${displayProfile.fps} FPS',
-                                              style: TextStyle(
-                                                color: displayProfile.fps >=
-                                                        50
-                                                    ? const Color(
-                                                        0xFF69F0AE)
-                                                    : Colors.white70,
-                                                fontSize: 10.5,
-                                                fontWeight:
-                                                    FontWeight.w800,
-                                              ),
-                                            ),
-                                          ),
-                                        ],
-                                      ),
-                                      const SizedBox(height: 4),
-                                      Text(
-                                        '${displayProfile.width} × ${displayProfile.height}  •  '
-                                        '${(displayProfile.bitrate / 1000000).toStringAsFixed(1)} Mbps',
-                                        maxLines: 1,
-                                        overflow: TextOverflow.ellipsis,
-                                        style: TextStyle(
-                                          color: isLocked && !active
-                                              ? Colors.white30
-                                              : Colors.white60,
-                                          fontSize: 12,
-                                        ),
-                                      ),
-                                    ],
-                                  ),
-                                ),
-                              ],
-                            ),
-                          ),
-                        ),
-                      ),
+                    return _ResolutionTile(
+                      profile: profile,
+                      active: profile == runtime.resolutionProfile,
+                      locked: isLocked,
+                      onTap: () {
+                        if (isLocked) {
+                          widget.showToast(
+                            vi: 'Đang khoá chất lượng. Mở khoá ở góc trên để đổi.',
+                            en: 'Quality is locked. Unlock at the top to change.',
+                            kind: NoticeKind.warning,
+                          );
+                          return;
+                        }
+                        Navigator.pop(context, profile);
+                      },
                     );
                   },
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+/// Một lựa chọn chất lượng: dấu chọn + tên + thông số phụ + viên FPS.
+class _ResolutionTile extends StatelessWidget {
+  const _ResolutionTile({
+    required this.profile,
+    required this.active,
+    required this.locked,
+    required this.onTap,
+  });
+
+  final CameraResolutionProfile profile;
+  final bool active;
+  final bool locked;
+  final VoidCallback onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    final dimmed = locked && !active;
+    final highFps = profile.fps >= 50;
+    return Material(
+      color: active ? BrandColors.primary : BrandColors.surfaceRaised,
+      shape: RoundedRectangleBorder(
+        borderRadius: BorderRadius.circular(BrandRadius.medium),
+        side: BorderSide(
+          color: active ? BrandColors.primaryBright : BrandColors.border,
+        ),
+      ),
+      clipBehavior: Clip.antiAlias,
+      child: InkWell(
+        onTap: active ? null : onTap,
+        child: Padding(
+          padding: const EdgeInsets.symmetric(
+            horizontal: BrandSpace.md,
+            vertical: BrandSpace.sm,
+          ),
+          child: Row(
+            children: [
+              Icon(
+                active
+                    ? Icons.check_circle_rounded
+                    : locked
+                        ? Icons.lock_outline_rounded
+                        : Icons.radio_button_unchecked_rounded,
+                color: active
+                    ? Colors.white
+                    : locked
+                        ? BrandColors.textDisabled
+                        : BrandColors.textSecondary,
+              ),
+              const SizedBox(width: BrandSpace.md),
+              Expanded(
+                child: Column(
+                  mainAxisAlignment: MainAxisAlignment.center,
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      profile.title,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: BrandText.body.copyWith(
+                        color: dimmed
+                            ? BrandColors.textDisabled
+                            : BrandColors.textPrimary,
+                        fontWeight: FontWeight.w700,
+                      ),
+                    ),
+                    const SizedBox(height: 2),
+                    Text(
+                      '${profile.width} × ${profile.height} · '
+                      '${(profile.bitrate / 1000000).toStringAsFixed(1)} Mbps',
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: BrandText.caption.copyWith(
+                        color: dimmed
+                            ? BrandColors.textDisabled
+                            : active
+                                ? Colors.white70
+                                : BrandColors.textSecondary,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+              const SizedBox(width: BrandSpace.sm),
+              Container(
+                padding: const EdgeInsets.symmetric(
+                  horizontal: BrandSpace.sm,
+                  vertical: 3,
+                ),
+                decoration: BoxDecoration(
+                  color: highFps
+                      ? BrandColors.success.withValues(alpha: 0.18)
+                      : const Color(0x14FFFFFF),
+                  borderRadius: BorderRadius.circular(999),
+                ),
+                child: Text(
+                  '${profile.fps} FPS',
+                  style: TextStyle(
+                    color: highFps
+                        ? BrandColors.successSoft
+                        : active
+                            ? Colors.white
+                            : BrandColors.textSecondary,
+                    fontSize: 11,
+                    fontWeight: FontWeight.w700,
+                  ),
                 ),
               ),
             ],

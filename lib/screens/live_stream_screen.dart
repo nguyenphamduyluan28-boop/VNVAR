@@ -4,14 +4,19 @@ import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
+import '../models/scoreboard_state.dart' show ScoreboardException;
 import '../services/app_language_service.dart';
 import '../services/camera_station_runtime.dart';
 import '../services/station_config_service.dart';
 import '../services/whip_publisher_service.dart';
 import '../services/rtsp_publisher_service.dart';
 import '../services/scoreboard_service.dart';
+import '../theme/app_theme.dart';
 import '../utils/stream_url_parser.dart';
+import '../widgets/app_notice.dart';
+import '../widgets/brand_widgets.dart';
 import '../widgets/qr_stream_scanner_dialog.dart';
+import '../services/station_errors.dart';
 
 /// Cách quét mã QR: bằng camera (phải tạm dừng camera trạm) hoặc từ ảnh.
 enum _QrScanSource { camera, gallery }
@@ -66,12 +71,12 @@ const Map<StreamPlatform, _PlatformMeta> _platformMeta = {
     name: 'OBS',
     asset: 'assets/images/logo_obs.png',
     icon: Icons.desktop_windows_rounded,
-    color: Color(0xFF90CAF9),
+    color: BrandColors.primarySoft,
   ),
   StreamPlatform.custom: _PlatformMeta(
     name: null,
     icon: Icons.tune_rounded,
-    color: Color(0xFF00E676),
+    color: BrandColors.success,
   ),
 };
 
@@ -136,6 +141,12 @@ class _LiveStreamScreenState extends State<LiveStreamScreen> {
 
   StreamSubscription<WhipPublishState>? _whipSubscription;
   StreamSubscription<RtspPublishState>? _rtspSubscription;
+  StreamSubscription<Map<String, dynamic>>? _scoreSubscription;
+
+  // Cấu hình overlay bảng tỉ số (đọc từ ScoreboardService). Mặc định overlay
+  // ẩn nên ảnh in vào video trong suốt dù "In vào video" bật.
+  bool _overlayVisible = false;
+  bool _overlayBurnIn = true;
 
   WhipPublisherService get _whipService => widget.runtime.whipPublisherService;
   RtspPublisherService get _rtspService => widget.runtime.rtspPublisherService;
@@ -178,6 +189,56 @@ class _LiveStreamScreenState extends State<LiveStreamScreen> {
     _rtspSubscription = _rtspService.onStateChanged.listen(
       (_) => _onPublisherChanged(),
     );
+
+    final scoreboard = ScoreboardService.instance;
+    final (visible, burnIn) = _overlayFlags(scoreboard.snapshot());
+    _overlayVisible = visible;
+    _overlayBurnIn = burnIn;
+    _scoreSubscription = scoreboard.changes.listen(_onScoreboardChanged);
+    unawaited(_loadScoreboard());
+  }
+
+  /// (overlay.visible, overlay.burnIn) trong JSON trạng thái bảng tỉ số.
+  static (bool, bool) _overlayFlags(Map<String, dynamic> json) {
+    final overlay = json['overlay'];
+    if (overlay is! Map) return (false, false);
+    return (overlay['visible'] != false, overlay['burnIn'] != false);
+  }
+
+  void _onScoreboardChanged(Map<String, dynamic> json) {
+    if (!mounted) return;
+    final (visible, burnIn) = _overlayFlags(json);
+    if (visible == _overlayVisible && burnIn == _overlayBurnIn) return;
+    setState(() {
+      _overlayVisible = visible;
+      _overlayBurnIn = burnIn;
+    });
+  }
+
+  Future<void> _loadScoreboard() async {
+    try {
+      await ScoreboardService.instance.load();
+    } catch (_) {
+      // load() tự xử lý lỗi; dùng trạng thái mặc định.
+    }
+    _onScoreboardChanged(ScoreboardService.instance.snapshot());
+  }
+
+  void _setOverlayVisible(bool visible) {
+    try {
+      ScoreboardService.instance.apply({
+        'action': 'overlay',
+        'visible': visible,
+      });
+      setState(() => _overlayVisible = visible);
+    } on ScoreboardException catch (error) {
+      showAppNotice(
+        context,
+        vi: error.localizedMessage(english: false),
+        en: error.localizedMessage(english: true),
+        kind: NoticeKind.error,
+      );
+    }
   }
 
   void _updateWhipWasLive() {
@@ -249,26 +310,22 @@ class _LiveStreamScreenState extends State<LiveStreamScreen> {
           }
         });
         if (partialFailure) {
-          _showToast(
-            appText(
-              context,
-              'Không nạp được một phần cấu hình livestream.',
-              'Some stream settings could not be loaded.',
-            ),
-            isError: true,
+          showAppNotice(
+            context,
+            vi: 'Không nạp được một phần cấu hình.',
+            en: 'Some stream settings failed to load.',
+            kind: NoticeKind.warning,
           );
         }
       }
     } catch (e, st) {
       debugPrint('[LIVESTREAM] Initial config load error: $e\n$st');
       if (mounted) {
-        _showToast(
-          appText(
-            context,
-            'Lỗi nạp cấu hình livestream.',
-            'Failed to load stream config.',
-          ),
-          isError: true,
+        showAppNotice(
+          context,
+          vi: 'Lỗi nạp cấu hình livestream.',
+          en: 'Failed to load stream settings.',
+          kind: NoticeKind.error,
         );
       }
     } finally {
@@ -296,6 +353,7 @@ class _LiveStreamScreenState extends State<LiveStreamScreen> {
   void dispose() {
     _whipSubscription?.cancel();
     _rtspSubscription?.cancel();
+    _scoreSubscription?.cancel();
     _streamKeyController.dispose();
     _customUrlController.dispose();
     _serverController.dispose();
@@ -316,37 +374,32 @@ class _LiveStreamScreenState extends State<LiveStreamScreen> {
 
     if (_platform == StreamPlatform.obs) {
       Clipboard.setData(ClipboardData(text: _localRtspUrl));
-      _showToast(
-        appText(
-          context,
-          '📋 Đã sao chép link RTSP cho OBS!',
-          '📋 Copied RTSP link for OBS!',
-        ),
+      showAppNotice(
+        context,
+        vi: 'Đã sao chép link RTSP cho OBS',
+        en: 'RTSP link copied for OBS',
+        kind: NoticeKind.success,
       );
       return;
     }
 
     if (_isWhipActive) {
-      _showToast(
-        appText(
-          context,
-          'Đang phát trực tiếp qua WHIP. Vui lòng dừng WHIP trước.',
-          'Currently live via WHIP. Please stop WHIP first.',
-        ),
-        isError: true,
+      showAppNotice(
+        context,
+        vi: 'Đang phát qua WHIP. Hãy dừng WHIP trước.',
+        en: 'Live via WHIP. Stop WHIP first.',
+        kind: NoticeKind.warning,
       );
       return;
     }
 
     if (_platform == StreamPlatform.tiktok &&
         _serverController.text.trim().isEmpty) {
-      _showToast(
-        appText(
-          context,
-          'Vui lòng nhập Server URL của TikTok.',
-          'Please enter TikTok Server URL.',
-        ),
-        isError: true,
+      showAppNotice(
+        context,
+        vi: 'Nhập Server URL của TikTok.',
+        en: 'Enter the TikTok Server URL.',
+        kind: NoticeKind.warning,
       );
       return;
     }
@@ -355,13 +408,11 @@ class _LiveStreamScreenState extends State<LiveStreamScreen> {
     if (url.isEmpty ||
         (_platform != StreamPlatform.custom &&
             _streamKeyController.text.trim().isEmpty)) {
-      _showToast(
-        appText(
-          context,
-          'Vui lòng nhập Khóa luồng (Stream Key).',
-          'Please enter your Stream Key.',
-        ),
-        isError: true,
+      showAppNotice(
+        context,
+        vi: 'Nhập khóa luồng (Stream Key).',
+        en: 'Enter your Stream Key.',
+        kind: NoticeKind.warning,
       );
       return;
     }
@@ -370,26 +421,22 @@ class _LiveStreamScreenState extends State<LiveStreamScreen> {
     if (!lowerUrl.startsWith('rtmp://') &&
         !lowerUrl.startsWith('rtmps://') &&
         !lowerUrl.startsWith('rtsp://')) {
-      _showToast(
-        appText(
-          context,
-          'URL phải bắt đầu bằng rtmp://, rtmps:// hoặc rtsp://.',
-          'URL must start with rtmp://, rtmps:// or rtsp://.',
-        ),
-        isError: true,
+      showAppNotice(
+        context,
+        vi: 'URL phải bắt đầu bằng rtmp://, rtmps:// hoặc rtsp://',
+        en: 'URL must start with rtmp://, rtmps:// or rtsp://',
+        kind: NoticeKind.error,
       );
       return;
     }
 
     final webRtc = widget.runtime.webRtcService;
     if (webRtc == null || !webRtc.cameraInitialized) {
-      _showToast(
-        appText(
-          context,
-          'Camera đang khởi động, vui lòng chờ giây lát.',
-          'Camera is starting up, please wait a moment.',
-        ),
-        isError: true,
+      showAppNotice(
+        context,
+        vi: 'Camera đang khởi động, thử lại sau giây lát.',
+        en: 'Camera is starting, try again shortly.',
+        kind: NoticeKind.warning,
       );
       return;
     }
@@ -405,9 +452,11 @@ class _LiveStreamScreenState extends State<LiveStreamScreen> {
       await _rtspService.startPublish(targetUrl: url);
     } catch (e) {
       if (mounted && generation == _actionGeneration) {
-        _showToast(
-          appText(context, 'Lỗi bắt đầu phát: $e', 'Failed to start stream: $e'),
-          isError: true,
+        showAppNotice(
+          context,
+          vi: 'Lỗi bắt đầu phát: ${_streamErrorText(e, english: false)}',
+          en: 'Failed to start stream: ${_streamErrorText(e, english: true)}',
+          kind: NoticeKind.error,
         );
       }
     } finally {
@@ -440,9 +489,11 @@ class _LiveStreamScreenState extends State<LiveStreamScreen> {
       }
     } catch (e) {
       if (mounted) {
-        _showToast(
-          appText(context, 'Lỗi dừng phát: $e', 'Stop publish error: $e'),
-          isError: true,
+        showAppNotice(
+          context,
+          vi: 'Lỗi dừng phát: ${_streamErrorText(e, english: false)}',
+          en: 'Failed to stop stream: ${_streamErrorText(e, english: true)}',
+          kind: NoticeKind.error,
         );
       }
     } finally {
@@ -468,34 +519,16 @@ class _LiveStreamScreenState extends State<LiveStreamScreen> {
     }
   }
 
-  Future<bool> _confirmStop() async {
-    final confirmed = await showDialog<bool>(
-      context: context,
-      builder: (dialogContext) => AlertDialog(
-        title: Text(
-          appText(
-            dialogContext,
-            'Dừng phát trực tiếp?',
-            'Stop the live stream?',
-          ),
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(dialogContext, false),
-            child: Text(appText(dialogContext, 'Hủy', 'Cancel')),
-          ),
-          FilledButton(
-            style: FilledButton.styleFrom(
-              backgroundColor: Colors.redAccent.shade700,
-              foregroundColor: Colors.white,
-            ),
-            onPressed: () => Navigator.pop(dialogContext, true),
-            child: Text(appText(dialogContext, 'Dừng', 'Stop')),
-          ),
-        ],
-      ),
+  Future<bool> _confirmStop() {
+    return showAppConfirm(
+      context,
+      titleVi: 'Dừng phát trực tiếp?',
+      titleEn: 'Stop the live stream?',
+      confirmVi: 'Dừng',
+      confirmEn: 'Stop',
+      icon: Icons.stop_circle_rounded,
+      destructive: true,
     );
-    return confirmed == true;
   }
 
   // ============================================================
@@ -506,26 +539,22 @@ class _LiveStreamScreenState extends State<LiveStreamScreen> {
     if (_actionInFlight || _isBusy) return;
 
     if (_isRtspActive) {
-      _showToast(
-        appText(
-          context,
-          'Đang phát trực tiếp qua RTMP/RTSP. Vui lòng dừng phát trước.',
-          'Currently live via RTMP/RTSP. Please stop streaming first.',
-        ),
-        isError: true,
+      showAppNotice(
+        context,
+        vi: 'Đang phát qua RTMP/RTSP. Hãy dừng phát trước.',
+        en: 'Live via RTMP/RTSP. Stop streaming first.',
+        kind: NoticeKind.warning,
       );
       return;
     }
 
     final url = _whipUrlController.text.trim();
     if (url.isEmpty) {
-      _showToast(
-        appText(
-          context,
-          'Vui lòng nhập địa chỉ phát trực tiếp WHIP.',
-          'Please enter WHIP stream link.',
-        ),
-        isError: true,
+      showAppNotice(
+        context,
+        vi: 'Nhập địa chỉ WHIP.',
+        en: 'Enter the WHIP link.',
+        kind: NoticeKind.warning,
       );
       return;
     }
@@ -534,13 +563,11 @@ class _LiveStreamScreenState extends State<LiveStreamScreen> {
 
     final webRtc = widget.runtime.webRtcService;
     if (webRtc == null || !webRtc.cameraInitialized) {
-      _showToast(
-        appText(
-          context,
-          'Camera đang khởi động, vui lòng thử lại sau vài giây.',
-          'Camera is starting up, please try again in a few seconds.',
-        ),
-        isError: true,
+      showAppNotice(
+        context,
+        vi: 'Camera đang khởi động, thử lại sau giây lát.',
+        en: 'Camera is starting, try again shortly.',
+        kind: NoticeKind.warning,
       );
       return;
     }
@@ -564,9 +591,11 @@ class _LiveStreamScreenState extends State<LiveStreamScreen> {
       );
     } catch (e) {
       if (mounted && generation == _actionGeneration) {
-        _showToast(
-          appText(context, 'Lỗi phát WHIP: $e', 'WHIP publish error: $e'),
-          isError: true,
+        showAppNotice(
+          context,
+          vi: 'Lỗi phát WHIP: ${_streamErrorText(e, english: false)}',
+          en: 'WHIP error: ${_streamErrorText(e, english: true)}',
+          kind: NoticeKind.error,
         );
       }
     } finally {
@@ -584,9 +613,11 @@ class _LiveStreamScreenState extends State<LiveStreamScreen> {
       await _whipService.stopPublish();
     } catch (e) {
       if (mounted) {
-        _showToast(
-          appText(context, 'Lỗi dừng WHIP: $e', 'Stop WHIP error: $e'),
-          isError: true,
+        showAppNotice(
+          context,
+          vi: 'Lỗi dừng WHIP: ${_streamErrorText(e, english: false)}',
+          en: 'Failed to stop WHIP: ${_streamErrorText(e, english: true)}',
+          kind: NoticeKind.error,
         );
       }
     } finally {
@@ -600,12 +631,11 @@ class _LiveStreamScreenState extends State<LiveStreamScreen> {
     if (!mounted) return;
     final text = data?.text?.trim() ?? '';
     if (text.isEmpty) {
-      _showToast(
-        appText(
-          context,
-          'Bộ nhớ tạm trống.',
-          'Clipboard is empty.',
-        ),
+      showAppNotice(
+        context,
+        vi: 'Bộ nhớ tạm trống',
+        en: 'Clipboard is empty',
+        kind: NoticeKind.warning,
       );
       return;
     }
@@ -624,21 +654,22 @@ class _LiveStreamScreenState extends State<LiveStreamScreen> {
       }
     });
 
-    _showToast(
-      appText(context, 'Đã dán thành công.', 'Pasted successfully.'),
+    showAppNotice(
+      context,
+      vi: 'Đã dán',
+      en: 'Pasted',
+      kind: NoticeKind.success,
     );
   }
 
   Future<void> _handleScanQrCode() async {
     if (_actionInFlight) return;
     if (_isRtspActive || _isWhipActive) {
-      _showToast(
-        appText(
-          context,
-          'Vui lòng dừng phát trước khi quét mã mới.',
-          'Please stop stream before scanning new QR code.',
-        ),
-        isError: true,
+      showAppNotice(
+        context,
+        vi: 'Dừng phát trước khi quét mã mới.',
+        en: 'Stop streaming before scanning.',
+        kind: NoticeKind.warning,
       );
       return;
     }
@@ -689,9 +720,11 @@ class _LiveStreamScreenState extends State<LiveStreamScreen> {
       }
     } catch (e) {
       if (mounted) {
-        _showToast(
-          appText(context, 'Lỗi quét QR: $e', 'QR scan error: $e'),
-          isError: true,
+        showAppNotice(
+          context,
+          vi: 'Lỗi quét QR: ${_streamErrorText(e, english: false)}',
+          en: 'QR scan error: ${_streamErrorText(e, english: true)}',
+          kind: NoticeKind.error,
         );
       }
     } finally {
@@ -726,65 +759,63 @@ class _LiveStreamScreenState extends State<LiveStreamScreen> {
     }
   }
 
-  /// Quét bằng camera phải tạm dừng camera trạm (cắt ghi hình, ngắt Tablet).
-  /// Khi trạm đang ghi hoặc có Tablet đang xem thì hỏi trước, kèm lựa chọn
-  /// quét từ ảnh không ảnh hưởng camera trạm. Trả về null nếu huỷ.
+  /// Quét bằng camera phải tạm dừng camera trạm (cắt ghi hình). Khi trạm
+  /// đang ghi hoặc có Tablet đang xem thì hỏi trước, kèm lựa chọn quét từ ảnh
+  /// không ảnh hưởng camera trạm. Trả về null nếu huỷ.
   Future<_QrScanSource?> _chooseQrScanSource() async {
     final recording = widget.runtime.recordingService?.recording == true;
     final peers = widget.runtime.webRtcService?.activePeerCount ?? 0;
     if (!recording && peers == 0) return _QrScanSource.camera;
 
-    final busyVi = [
-      if (recording) 'đang ghi hình',
-      if (peers > 0) 'có $peers Tablet đang xem',
-    ].join(' và ');
-    final busyEn = [
-      if (recording) 'recording',
-      if (peers > 0) 'streaming to $peers tablet(s)',
-    ].join(' and ');
-
     return showDialog<_QrScanSource>(
       context: context,
-      builder: (dialogContext) => AlertDialog(
-        title: Text(
-          appText(
-            dialogContext,
-            'Quét QR sẽ tạm dừng camera trạm',
-            'Scanning will pause the station camera',
-          ),
-        ),
-        content: Text(
-          appText(
-            dialogContext,
-            'Trạm $busyVi. Quét bằng camera sẽ CẮT TẠM việc ghi hình và '
-                'ngắt kết nối Tablet cho tới khi quét xong.\n\n'
-                'Chọn "Quét từ ảnh" (ảnh chụp mã QR) để camera trạm vẫn chạy '
-                'bình thường.',
-            'The station is $busyEn. Scanning with the camera will '
-                'temporarily CUT the recording and disconnect tablets until '
-                'scanning finishes.\n\n'
-                'Choose "Scan from photo" (a picture of the QR code) to keep '
-                'the station camera running.',
-          ),
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(dialogContext),
-            child: Text(appText(dialogContext, 'Hủy', 'Cancel')),
-          ),
-          TextButton(
-            onPressed: () =>
-                Navigator.pop(dialogContext, _QrScanSource.gallery),
-            child: Text(appText(dialogContext, 'Quét từ ảnh', 'Scan from photo')),
-          ),
-          FilledButton(
-            onPressed: () => Navigator.pop(dialogContext, _QrScanSource.camera),
-            child: Text(
-              appText(dialogContext, 'Quét bằng camera', 'Scan with camera'),
+      builder: (dialogContext) {
+        String t(String vi, String en) => appText(dialogContext, vi, en);
+        return _DialogShell(
+          icon: Icons.qr_code_scanner_rounded,
+          accent: BrandColors.primaryBright,
+          title: t('Quét mã QR', 'Scan QR code'),
+          message: recording
+              ? t(
+                  'Đang ghi hình. Quét bằng camera sẽ tạm dừng ghi.',
+                  'Recording. Camera scan pauses recording.',
+                )
+              : t(
+                  'Quét bằng camera sẽ tạm dừng camera trạm.',
+                  'Camera scan pauses the station camera.',
+                ),
+          children: [
+            _ChoiceCard(
+              icon: Icons.photo_library_rounded,
+              color: BrandColors.successSoft,
+              title: t('Quét từ ảnh', 'Scan from photo'),
+              subtitle: t('Camera vẫn chạy', 'Camera keeps running'),
+              badge: t('Khuyên dùng', 'Recommended'),
+              onTap: () => Navigator.pop(dialogContext, _QrScanSource.gallery),
             ),
-          ),
-        ],
-      ),
+            const SizedBox(height: BrandSpace.sm),
+            _ChoiceCard(
+              icon: Icons.photo_camera_rounded,
+              color: BrandColors.warningSoft,
+              title: t('Quét bằng camera', 'Scan with camera'),
+              subtitle: recording
+                  ? t('Tạm dừng ghi', 'Pauses recording')
+                  : t('Tạm dừng camera', 'Pauses the camera'),
+              onTap: () => Navigator.pop(dialogContext, _QrScanSource.camera),
+            ),
+            const SizedBox(height: BrandSpace.sm),
+            Center(
+              child: TextButton(
+                onPressed: () => Navigator.pop(dialogContext),
+                style: TextButton.styleFrom(
+                  foregroundColor: BrandColors.textSecondary,
+                ),
+                child: Text(t('Hủy', 'Cancel')),
+              ),
+            ),
+          ],
+        );
+      },
     );
   }
 
@@ -802,74 +833,89 @@ class _LiveStreamScreenState extends State<LiveStreamScreen> {
     final confirmed = await showDialog<bool>(
       context: context,
       builder: (dialogContext) {
-        final shownHost =
-            host.isEmpty ? appText(dialogContext, '(không rõ)', '(unknown)') : host;
+        String t(String vi, String en) => appText(dialogContext, vi, en);
+        final shownHost = host.isEmpty ? t('(không rõ)', '(unknown)') : host;
         final details = <String>[
-          if (label.isNotEmpty)
-            appText(dialogContext, 'Nền tảng: $label', 'Platform: $label'),
-          appText(dialogContext, 'Máy chủ: $shownHost', 'Server: $shownHost'),
+          if (label.isNotEmpty) t('Nền tảng: $label', 'Platform: $label'),
+          t('Máy chủ: $shownHost', 'Server: $shownHost'),
           if (maskedKey.isNotEmpty)
-            appText(dialogContext, 'Khóa luồng: $maskedKey', 'Stream key: $maskedKey'),
+            t('Khóa luồng: $maskedKey', 'Stream key: $maskedKey'),
         ].join('\n');
         final intro = isPublic
-            ? appText(
-                dialogContext,
-                'Mã QR yêu cầu phát camera và micro lên một kênh $label. '
-                    'Kênh này có thể KHÔNG phải của bạn (mã QR có thể bị dán '
-                    'đè) — hãy kiểm tra khóa luồng trước khi phát.',
-                'The QR code asks to stream the camera and microphone to a '
-                    '$label channel. It may NOT be your channel (the QR code '
-                    'could have been replaced) — check the stream key first.',
+            ? t(
+                'Mã QR muốn phát camera và micro lên kênh $label. Kênh có '
+                    'thể không phải của bạn (QR bị dán đè) — kiểm tra khóa '
+                    'luồng.',
+                'The QR code wants to stream camera and mic to a $label '
+                    'channel. It may not be yours (tampered QR) — check the '
+                    'stream key.',
               )
-            : appText(
-                dialogContext,
-                'Mã QR yêu cầu phát camera và micro tới "$shownHost". '
-                    'Chỉ tiếp tục nếu bạn tin tưởng máy chủ này.',
-                'The QR code asks to stream the camera and microphone to '
-                    '"$shownHost". Continue only if you trust this server.',
+            : t(
+                'Mã QR muốn phát camera và micro tới "$shownHost". Chỉ tiếp '
+                    'tục nếu bạn tin máy chủ này.',
+                'The QR code wants to stream camera and mic to '
+                    '"$shownHost". Continue only if you trust it.',
               );
-        return AlertDialog(
-          title: Text(
-            isPublic
-                ? appText(
-                    dialogContext,
-                    'Phát lên kênh $label?',
-                    'Stream to this $label channel?',
-                  )
-                : appText(
-                    dialogContext,
-                    'Phát tới máy chủ lạ?',
-                    'Stream to an unknown server?',
-                  ),
-          ),
-          content: Text('$intro\n\n$details'),
-          actions: [
-            TextButton(
-              onPressed: () => Navigator.pop(dialogContext, false),
-              child: Text(appText(dialogContext, 'Hủy', 'Cancel')),
+        return _DialogShell(
+          icon: Icons.warning_amber_rounded,
+          accent: BrandColors.warning,
+          title: isPublic
+              ? t('Phát lên kênh $label?', 'Stream to this $label channel?')
+              : t('Phát tới máy chủ lạ?', 'Stream to an unknown server?'),
+          message: intro,
+          children: [
+            Container(
+              padding: const EdgeInsets.all(10),
+              decoration: BoxDecoration(
+                color: BrandColors.surfaceRaised,
+                borderRadius: BorderRadius.circular(BrandRadius.small),
+                border: Border.all(color: BrandColors.border),
+              ),
+              child: Text(
+                details,
+                style: const TextStyle(
+                  color: BrandColors.textPrimary,
+                  fontSize: 13,
+                  fontFamily: 'monospace',
+                  height: 1.4,
+                ),
+              ),
             ),
-            FilledButton(
-              onPressed: () => Navigator.pop(dialogContext, true),
-              child: Text(appText(dialogContext, 'Phát', 'Stream')),
+            const SizedBox(height: BrandSpace.lg),
+            // Hai nút chia đều bề rộng: không tràn khi máy hẹp / chữ lớn.
+            Row(
+              children: [
+                Expanded(
+                  child: OutlinedButton(
+                    onPressed: () => Navigator.pop(dialogContext, false),
+                    style: OutlinedButton.styleFrom(
+                      foregroundColor: BrandColors.textPrimary,
+                    ),
+                    child: Text(
+                      t('Hủy', 'Cancel'),
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                    ),
+                  ),
+                ),
+                const SizedBox(width: BrandSpace.md),
+                Expanded(
+                  child: FilledButton(
+                    onPressed: () => Navigator.pop(dialogContext, true),
+                    child: Text(
+                      t('Phát', 'Stream'),
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                    ),
+                  ),
+                ),
+              ],
             ),
           ],
         );
       },
     );
     return confirmed == true;
-  }
-
-  void _showToast(String message, {bool isError = false}) {
-    if (!mounted) return;
-    ScaffoldMessenger.of(context).hideCurrentSnackBar();
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(
-        content: Text(message),
-        backgroundColor: isError ? Colors.redAccent : const Color(0xFF1976D2),
-        duration: const Duration(seconds: 2),
-        behavior: SnackBarBehavior.floating,
-      ),
-    );
   }
 
   String _formatDuration(Duration d) {
@@ -879,151 +925,207 @@ class _LiveStreamScreenState extends State<LiveStreamScreen> {
     return d.inHours > 0 ? '$hours:$minutes:$seconds' : '$minutes:$seconds';
   }
 
+  Duration get _currentLiveDuration => _whipService.isLive
+      ? _whipService.liveDuration
+      : _rtspService.liveDuration;
+
+  /// Sự kiện mỗi giây (thời lượng / số liệu): chỉ các phần nhỏ dựng lại.
+  Listenable get _liveTicker => Listenable.merge([
+        _rtspService.durationListenable,
+        _rtspService.metricsListenable,
+        _whipService.durationListenable,
+      ]);
+
   @override
   Widget build(BuildContext context) {
-    final webRtc = widget.runtime.webRtcService;
-    final resolution = webRtc?.resolutionProfile.shortLabel ?? '1080p';
-    final fps = webRtc?.resolutionProfile.fps ?? 30;
-
-    final statusBanner = _buildStatusBanner();
-
     return Scaffold(
-      backgroundColor: const Color(0xFF0F1218),
       appBar: AppBar(
-        backgroundColor: const Color(0xFF161B22),
-        elevation: 0,
         leading: IconButton(
-          icon: const Icon(
-            Icons.arrow_back_ios_new_rounded,
-            color: Colors.white,
-            size: 20,
-          ),
+          icon: const Icon(Icons.arrow_back_ios_new_rounded, size: 20),
           tooltip: appText(context, 'Quay lại', 'Back'),
           onPressed: () => Navigator.of(context).pop(),
         ),
         title: Text(
-          appText(context, 'Phát trực tiếp', 'Live Streaming'),
-          style: const TextStyle(
-            color: Colors.white,
-            fontWeight: FontWeight.bold,
-            fontSize: 16,
-          ),
+          appText(context, 'Phát trực tiếp', 'Live streaming'),
+          maxLines: 1,
+          overflow: TextOverflow.ellipsis,
         ),
         actions: [
-          IconButton(
-            icon: const Icon(
-              Icons.qr_code_scanner_rounded,
-              color: Colors.lightBlueAccent,
+          if (_isLive)
+            Padding(
+              padding: const EdgeInsets.only(right: BrandSpace.md),
+              child: Center(
+                child: ListenableBuilder(
+                  listenable: Listenable.merge([
+                    _rtspService.durationListenable,
+                    _whipService.durationListenable,
+                  ]),
+                  builder: (context, _) => BrandPill(
+                    text: 'LIVE ${_formatDuration(_currentLiveDuration)}',
+                    dot: true,
+                    filled: true,
+                    color: BrandColors.live,
+                  ),
+                ),
+              ),
             ),
-            tooltip: appText(context, 'Quét mã QR', 'Scan QR Code'),
-            onPressed: _streamActive ? null : _handleScanQrCode,
-          ),
-          const SizedBox(width: 8),
         ],
       ),
       body: _isLoading
           ? const Center(child: CircularProgressIndicator())
           : SafeArea(
-              child: SingleChildScrollView(
-                padding: const EdgeInsets.all(16.0),
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.stretch,
-                  children: [
-                    // 1. Đang phát: chỉ thẻ số liệu dựng lại mỗi giây.
-                    if (_isLive) ...[
-                      ListenableBuilder(
-                        listenable: Listenable.merge([
-                          _rtspService.durationListenable,
-                          _rtspService.metricsListenable,
-                          _whipService.durationListenable,
-                        ]),
-                        builder: (context, _) => _buildLiveMonitorCard(),
-                      ),
-                      const SizedBox(height: 16),
-                    ],
-
-                    // 2. Chọn nền tảng bằng logo + 3. nhập khoá / link OBS.
-                    // Đang kết nối / kết nối lại: vẫn hiện (mờ, khoá) để
-                    // người dùng thấy đang phát tới đâu.
-                    if (!_isLive) ...[
-                      AnimatedOpacity(
-                        duration: const Duration(milliseconds: 150),
-                        opacity: _streamActive ? 0.5 : 1.0,
-                        child: Column(
-                          crossAxisAlignment: CrossAxisAlignment.stretch,
-                          children: [
-                            _buildPlatformSelector(),
-                            const SizedBox(height: 14),
-                            if (_platform == StreamPlatform.obs)
-                              _buildObsInteractionCard()
-                            else
-                              _buildInputCard(),
-                          ],
-                        ),
-                      ),
-                      const SizedBox(height: 16),
-                    ],
-
-                    // 4. Trạng thái / lỗi.
-                    if (statusBanner != null) ...[
-                      statusBanner,
-                      const SizedBox(height: 8),
-                    ],
-
-                    // 5. Nút chính.
-                    _buildActionButton(),
-
-                    const SizedBox(height: 14),
-
-                    // 6. Nguồn camera + cài đặt nâng cao (thu gọn).
-                    Row(
-                      mainAxisAlignment: MainAxisAlignment.center,
-                      children: [
-                        Icon(
-                          Icons.videocam_rounded,
-                          size: 15,
-                          color: Colors.white.withValues(alpha: 0.4),
-                        ),
-                        const SizedBox(width: 6),
-                        Text(
-                          '$resolution · ${fps}fps',
-                          style: TextStyle(
-                            color: Colors.white.withValues(alpha: 0.45),
-                            fontSize: 12,
-                            fontWeight: FontWeight.w600,
-                          ),
-                        ),
-                        const SizedBox(width: 4),
-                        IconButton(
-                          tooltip: _showAdvanced
-                              ? appText(
-                                  context,
-                                  'Ẩn cài đặt nâng cao',
-                                  'Hide advanced',
-                                )
-                              : appText(
-                                  context,
-                                  'Cài đặt nâng cao',
-                                  'Advanced settings',
-                                ),
-                          icon: Icon(
-                            _showAdvanced
-                                ? Icons.expand_less_rounded
-                                : Icons.settings_rounded,
-                            size: 20,
-                            color: Colors.white54,
-                          ),
-                          onPressed: () =>
-                              setState(() => _showAdvanced = !_showAdvanced),
-                        ),
-                      ],
-                    ),
-
-                    if (_showAdvanced) _buildAdvancedSection(),
-                  ],
-                ),
+              bottom: false,
+              child: LayoutBuilder(
+                builder: (context, constraints) =>
+                    _buildBody(wide: constraints.maxWidth >= 720),
               ),
             ),
+      bottomNavigationBar: _isLoading ? null : _buildBottomBar(),
+    );
+  }
+
+  // ============================================================
+  // BỐ CỤC: dọc 1 cột; rộng ≥ 720 chia 2 cột
+  // ============================================================
+  Widget _buildBody({required bool wide}) {
+    // Đang kết nối / kết nối lại: phần cài đặt vẫn hiện (mờ, khoá) để người
+    // dùng thấy đang phát tới đâu.
+    Widget dimmed(Widget child) => AnimatedOpacity(
+          duration: const Duration(milliseconds: 150),
+          opacity: _streamActive ? 0.5 : 1.0,
+          child: child,
+        );
+    final options = _buildOptionsSection();
+
+    final Widget content;
+    if (_isLive) {
+      // Đang phát: thẻ trạng thái thay cho phần chọn nền tảng / đích phát.
+      final monitor = ListenableBuilder(
+        listenable: _liveTicker,
+        builder: (context, _) => _buildLiveMonitorCard(),
+      );
+      content = wide
+          ? Row(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Expanded(child: monitor),
+                const SizedBox(width: BrandSpace.xl),
+                Expanded(child: options),
+              ],
+            )
+          : Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                monitor,
+                const SizedBox(height: BrandSpace.xl),
+                options,
+              ],
+            );
+    } else if (wide) {
+      // Máy ngang / tablet: trái = chọn nền tảng (+ tuỳ chọn), phải = thông
+      // tin nhập của nền tảng vừa chọn.
+      content = Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                dimmed(_buildPlatformSection(compact: true)),
+                const SizedBox(height: BrandSpace.xl),
+                options,
+              ],
+            ),
+          ),
+          const SizedBox(width: BrandSpace.xl),
+          Expanded(child: dimmed(_buildDestinationSection())),
+        ],
+      );
+    } else {
+      content = Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          dimmed(
+            Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                _buildPlatformSection(),
+                const SizedBox(height: BrandSpace.xl),
+                _buildDestinationSection(),
+              ],
+            ),
+          ),
+          const SizedBox(height: BrandSpace.xl),
+          options,
+        ],
+      );
+    }
+
+    return SingleChildScrollView(
+      padding: const EdgeInsets.all(BrandSpace.lg),
+      child: Align(
+        alignment: Alignment.topCenter,
+        child: ConstrainedBox(
+          constraints: const BoxConstraints(maxWidth: 1080),
+          child: content,
+        ),
+      ),
+    );
+  }
+
+  /// Thanh đáy cố định: banner lỗi / kết nối lại + nút hành động chính.
+  Widget _buildBottomBar() {
+    final banner = _buildStatusBanner();
+    return DecoratedBox(
+      decoration: const BoxDecoration(
+        color: BrandColors.background,
+        border: Border(top: BorderSide(color: BrandColors.border)),
+      ),
+      child: SafeArea(
+        top: false,
+        child: Padding(
+          padding: const EdgeInsets.fromLTRB(
+            BrandSpace.lg,
+            BrandSpace.md,
+            BrandSpace.lg,
+            BrandSpace.md,
+          ),
+          child: Align(
+            alignment: Alignment.topCenter,
+            heightFactor: 1,
+            child: ConstrainedBox(
+              constraints: const BoxConstraints(maxWidth: 640),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  if (banner != null) ...[
+                    banner,
+                    const SizedBox(height: BrandSpace.sm),
+                  ],
+                  _buildActionButton(),
+                ],
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _sectionLabel(String text) {
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(4, 0, 4, BrandSpace.sm),
+      child: Text(
+        text.toUpperCase(),
+        maxLines: 1,
+        overflow: TextOverflow.ellipsis,
+        style: BrandText.label,
+      ),
     );
   }
 
@@ -1051,99 +1153,34 @@ class _LiveStreamScreenState extends State<LiveStreamScreen> {
             : null);
 
     if (err != null && err.isNotEmpty) {
-      return Container(
-        margin: const EdgeInsets.only(bottom: 4),
-        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
-        decoration: BoxDecoration(
-          color: const Color(0xFF3E1A1A),
-          borderRadius: BorderRadius.circular(10),
-          border: Border.all(color: Colors.redAccent.withValues(alpha: 0.5)),
-        ),
-        child: Row(
-          children: [
-            const Icon(
-              Icons.error_outline_rounded,
-              color: Colors.redAccent,
-              size: 20,
-            ),
-            const SizedBox(width: 8),
-            Expanded(
-              child: Text(
-                err,
-                style: const TextStyle(color: Colors.white, fontSize: 12),
-              ),
-            ),
-            TextButton(
-              onPressed: (_isBusy || _actionInFlight)
-                  ? null
-                  : (_rtspService.state == RtspPublishState.error
-                      ? _handleStartLive
-                      : _handleStartWhip),
-              child: Text(
-                appText(context, 'Thử lại', 'Retry'),
-                style: const TextStyle(
-                  color: Colors.lightBlueAccent,
-                  fontWeight: FontWeight.bold,
-                ),
-              ),
-            ),
-          ],
+      return AppNoticeBanner(
+        message: err,
+        kind: NoticeKind.error,
+        dense: true,
+        action: TextButton(
+          onPressed: (_isBusy || _actionInFlight)
+              ? null
+              : (_rtspService.state == RtspPublishState.error
+                  ? _handleStartLive
+                  : _handleStartWhip),
+          child: Text(appText(context, 'Thử lại', 'Retry')),
         ),
       );
     }
 
     if (isReconnecting) {
-      return Container(
-        margin: const EdgeInsets.only(bottom: 4),
-        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
-        decoration: BoxDecoration(
-          color: const Color(0xFF332A15),
-          borderRadius: BorderRadius.circular(10),
-          border: Border.all(color: Colors.amber.withValues(alpha: 0.5)),
-        ),
-        child: Row(
-          children: [
-            const SizedBox(
-              width: 16,
-              height: 16,
-              child: CircularProgressIndicator(
-                strokeWidth: 2,
-                color: Colors.amber,
-              ),
-            ),
-            const SizedBox(width: 10),
-            Expanded(
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  Text(
-                    appText(
-                      context,
-                      'Mất kết nối, đang thử lại…',
-                      'Connection lost, reconnecting…',
-                    ),
-                    style: const TextStyle(
-                      color: Colors.amberAccent,
-                      fontSize: 12,
-                    ),
-                  ),
-                  if (reconnectReason != null &&
-                      reconnectReason.isNotEmpty) ...[
-                    const SizedBox(height: 3),
-                    Text(
-                      reconnectReason,
-                      style: const TextStyle(
-                        color: Colors.white70,
-                        fontSize: 11,
-                      ),
-                    ),
-                  ],
-                ],
-              ),
-            ),
-          ],
-        ),
+      final base = appText(
+        context,
+        'Mất kết nối, đang thử lại…',
+        'Connection lost, reconnecting…',
+      );
+      return AppNoticeBanner(
+        message: reconnectReason != null && reconnectReason.isNotEmpty
+            ? '$base\n$reconnectReason'
+            : base,
+        kind: NoticeKind.warning,
+        icon: Icons.sync_rounded,
+        dense: true,
       );
     }
 
@@ -1188,74 +1225,93 @@ class _LiveStreamScreenState extends State<LiveStreamScreen> {
   }
 
   // ============================================================
-  // WIDGET: CHỌN NỀN TẢNG — lưới ô logo lớn (3 cột, máy rộng 6 cột)
+  // KHỐI NỀN TẢNG — lưới ô logo vuông (3 cột, khối rộng 6 cột)
   // ============================================================
-  Widget _buildPlatformSelector() {
+  /// [compact]: máy ngang/tablet — ô thấp hơn (tối đa 88) để cả 2 hàng nền
+  /// tảng và phần tuỳ chọn vừa màn hình mà không phải cuộn nhiều.
+  Widget _buildPlatformSection({bool compact = false}) {
     final locked = _streamActive;
-    return LayoutBuilder(
-      builder: (context, constraints) {
-        final columns = constraints.maxWidth >= 560 ? 6 : 3;
-        const spacing = 10.0;
-        final tileWidth =
-            ((constraints.maxWidth - spacing * (columns - 1)) / columns)
-                .floorToDouble();
-        return Wrap(
-          spacing: spacing,
-          runSpacing: spacing,
-          children: [
-            for (final platform in _platformOrder)
-              SizedBox(
-                width: tileWidth,
-                child: _buildPlatformTile(platform, locked: locked),
-              ),
-          ],
-        );
-      },
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        _sectionLabel(appText(context, 'Nền tảng', 'Platform')),
+        LayoutBuilder(
+          builder: (context, constraints) {
+            final columns = constraints.maxWidth >= 520 ? 6 : 3;
+            const spacing = BrandSpace.sm;
+            final tile =
+                ((constraints.maxWidth - spacing * (columns - 1)) / columns)
+                    .floorToDouble();
+            final tileHeight = compact && tile > 88 ? 88.0 : tile;
+            return Wrap(
+              spacing: spacing,
+              runSpacing: spacing,
+              children: [
+                for (final platform in _platformOrder)
+                  SizedBox(
+                    width: tile,
+                    height: tileHeight,
+                    child: _buildPlatformTile(
+                      platform,
+                      locked: locked,
+                      size: tileHeight,
+                    ),
+                  ),
+              ],
+            );
+          },
+        ),
+      ],
     );
   }
 
-  Widget _buildPlatformTile(StreamPlatform platform, {required bool locked}) {
+  Widget _buildPlatformTile(
+    StreamPlatform platform, {
+    required bool locked,
+    required double size,
+  }) {
     final meta = _platformMeta[platform]!;
     final selected = _platform == platform;
     final name = meta.name ?? appText(context, 'Tùy chỉnh', 'Custom');
+    var logoSize = size * 0.4;
+    if (logoSize > 48) logoSize = 48;
+    if (logoSize < 24) logoSize = 24;
     return Semantics(
       button: true,
       selected: selected,
       enabled: !locked,
       child: Material(
-        color: selected
-            ? meta.color.withValues(alpha: 0.14)
-            : const Color(0xFF161B22),
-        borderRadius: BorderRadius.circular(16),
+        color: selected ? BrandColors.surfaceRaised : BrandColors.surface,
+        clipBehavior: Clip.antiAlias,
+        shape: RoundedRectangleBorder(
+          borderRadius: BorderRadius.circular(BrandRadius.medium),
+          side: BorderSide(
+            color: selected ? BrandColors.primaryBright : BrandColors.border,
+            width: selected ? 2 : 1,
+          ),
+        ),
         child: InkWell(
-          borderRadius: BorderRadius.circular(16),
           onTap: locked ? null : () => _selectPlatform(platform),
-          child: AnimatedContainer(
-            duration: const Duration(milliseconds: 150),
-            height: 92,
-            decoration: BoxDecoration(
-              borderRadius: BorderRadius.circular(16),
-              border: Border.all(
-                color: selected
-                    ? meta.color
-                    : Colors.white.withValues(alpha: 0.08),
-                width: selected ? 2 : 1,
-              ),
-            ),
-            child: Stack(
-              children: [
-                Center(
+          child: Stack(
+            children: [
+              Center(
+                child: Padding(
+                  padding: const EdgeInsets.all(BrandSpace.sm),
                   child: Column(
                     mainAxisSize: MainAxisSize.min,
                     children: [
-                      _platformLogo(platform, size: 40),
-                      const SizedBox(height: 8),
+                      _platformLogo(platform, size: logoSize),
+                      const SizedBox(height: 6),
                       Text(
                         name,
                         maxLines: 1,
                         overflow: TextOverflow.ellipsis,
+                        textAlign: TextAlign.center,
                         style: TextStyle(
-                          color: selected ? Colors.white : Colors.white60,
+                          color: selected
+                              ? BrandColors.textPrimary
+                              : BrandColors.textSecondary,
                           fontSize: 12,
                           fontWeight:
                               selected ? FontWeight.w700 : FontWeight.w500,
@@ -1264,18 +1320,18 @@ class _LiveStreamScreenState extends State<LiveStreamScreen> {
                     ],
                   ),
                 ),
-                if (selected)
-                  Positioned(
-                    top: 6,
-                    right: 6,
-                    child: Icon(
-                      Icons.check_circle_rounded,
-                      size: 18,
-                      color: meta.color,
-                    ),
+              ),
+              if (selected)
+                const Positioned(
+                  top: 6,
+                  right: 6,
+                  child: Icon(
+                    Icons.check_circle_rounded,
+                    size: 16,
+                    color: BrandColors.primaryBright,
                   ),
-              ],
-            ),
+                ),
+            ],
           ),
         ),
       ),
@@ -1283,66 +1339,83 @@ class _LiveStreamScreenState extends State<LiveStreamScreen> {
   }
 
   // ============================================================
-  // WIDGET: OBS — chỉ link RTSP; hướng dẫn thu gọn sau nút "?"
+  // KHỐI ĐÍCH PHÁT — ô nhập máy chủ / khoá luồng, hoặc link OBS
   // ============================================================
-  Widget _buildObsInteractionCard() {
-    return Container(
-      padding: const EdgeInsets.all(14),
-      decoration: BoxDecoration(
-        color: const Color(0xFF161B22),
-        borderRadius: BorderRadius.circular(14),
-        border: Border.all(
-          color: const Color(0xFF90CAF9).withValues(alpha: 0.35),
+  Widget _buildDestinationSection() {
+    return BrandSection(
+      title: appText(context, 'Đích phát', 'Destination'),
+      trailing: IconButton(
+        icon: const Icon(
+          Icons.qr_code_scanner_rounded,
+          color: BrandColors.primaryBright,
         ),
+        tooltip: appText(context, 'Quét mã QR', 'Scan QR code'),
+        onPressed: _streamActive ? null : _handleScanQrCode,
       ),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.stretch,
-        children: [
-          Row(
-            children: [
-              _platformLogo(StreamPlatform.obs, size: 36),
-              const SizedBox(width: 12),
-              Expanded(
-                child: SelectableText(
-                  _localRtspUrl,
-                  style: const TextStyle(
-                    color: Color(0xFF81D4FA),
-                    fontSize: 13.5,
-                    fontFamily: 'monospace',
-                    fontWeight: FontWeight.w600,
-                  ),
+      padding: const EdgeInsets.all(BrandSpace.md),
+      children: [
+        if (_platform == StreamPlatform.obs)
+          _buildObsContent()
+        else
+          _buildInputContent(),
+      ],
+    );
+  }
+
+  /// OBS: chỉ link RTSP; hướng dẫn thu gọn sau nút "?".
+  Widget _buildObsContent() {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        Row(
+          children: [
+            const Icon(
+              Icons.link_rounded,
+              size: 18,
+              color: BrandColors.textDisabled,
+            ),
+            const SizedBox(width: BrandSpace.sm),
+            Expanded(
+              child: SelectableText(
+                _localRtspUrl,
+                maxLines: 2,
+                style: const TextStyle(
+                  color: BrandColors.primarySoft,
+                  fontSize: 13.5,
+                  fontFamily: 'monospace',
+                  fontWeight: FontWeight.w600,
                 ),
-              ),
-              IconButton(
-                tooltip: appText(context, 'Hướng dẫn', 'How to'),
-                icon: Icon(
-                  _showObsGuide
-                      ? Icons.help_rounded
-                      : Icons.help_outline_rounded,
-                  color: Colors.white54,
-                ),
-                onPressed: () =>
-                    setState(() => _showObsGuide = !_showObsGuide),
-              ),
-            ],
-          ),
-          if (_showObsGuide) ...[
-            const SizedBox(height: 12),
-            _buildObsStep('1', 'Sources → + → Media Source'),
-            const SizedBox(height: 6),
-            _buildObsStep(
-              '2',
-              appText(
-                context,
-                'Bỏ "Local File", dán link vào "Input"',
-                'Uncheck "Local File", paste into "Input"',
               ),
             ),
-            const SizedBox(height: 6),
-            _buildObsStep('3', 'Network Buffering: 0–1 MB'),
+            IconButton(
+              tooltip: appText(context, 'Hướng dẫn', 'How to'),
+              icon: Icon(
+                _showObsGuide
+                    ? Icons.help_rounded
+                    : Icons.help_outline_rounded,
+                color: BrandColors.textSecondary,
+              ),
+              onPressed: () => setState(() => _showObsGuide = !_showObsGuide),
+            ),
           ],
+        ),
+        if (_showObsGuide) ...[
+          const SizedBox(height: BrandSpace.sm),
+          _buildObsStep('1', 'Sources → + → Media Source'),
+          const SizedBox(height: 6),
+          _buildObsStep(
+            '2',
+            appText(
+              context,
+              'Bỏ "Local File", dán link vào "Input"',
+              'Uncheck "Local File", paste into "Input"',
+            ),
+          ),
+          const SizedBox(height: 6),
+          _buildObsStep('3', 'Network Buffering: 0–1 MB'),
         ],
-      ),
+      ],
     );
   }
 
@@ -1354,225 +1427,188 @@ class _LiveStreamScreenState extends State<LiveStreamScreen> {
           width: 18,
           height: 18,
           decoration: BoxDecoration(
-            color: Colors.lightBlueAccent.withValues(alpha: 0.15),
+            color: BrandColors.primaryBright.withValues(alpha: 0.15),
             shape: BoxShape.circle,
             border: Border.all(
-              color: Colors.lightBlueAccent.withValues(alpha: 0.4),
+              color: BrandColors.primaryBright.withValues(alpha: 0.4),
             ),
           ),
           child: Center(
             child: Text(
               step,
               style: const TextStyle(
-                color: Colors.lightBlueAccent,
+                color: BrandColors.primaryBright,
                 fontSize: 10,
                 fontWeight: FontWeight.bold,
               ),
             ),
           ),
         ),
-        const SizedBox(width: 8),
+        const SizedBox(width: BrandSpace.sm),
         Expanded(
-          child: Text(
-            text,
-            style: TextStyle(
-              color: Colors.white.withValues(alpha: 0.75),
-              fontSize: 11.5,
-              height: 1.3,
-            ),
-          ),
+          child: Text(text, style: BrandText.caption),
         ),
       ],
     );
   }
 
-  // ============================================================
-  // WIDGET: NHẬP KHOÁ — một ô nhập + 2 nút lớn Dán / QR
-  // ============================================================
-  Widget _buildInputCard() {
+  Widget _buildInputContent() {
     final isCustom = _platform == StreamPlatform.custom;
     final isTiktok = _platform == StreamPlatform.tiktok;
     final defaultServer = kDefaultServers[_platform] ?? '';
     final locked = _streamActive;
     const monoStyle = TextStyle(
-      color: Colors.white,
+      color: BrandColors.textPrimary,
       fontSize: 13,
       fontFamily: 'monospace',
     );
 
-    return Container(
-      padding: const EdgeInsets.all(14),
-      decoration: BoxDecoration(
-        color: const Color(0xFF161B22),
-        borderRadius: BorderRadius.circular(14),
-        border: Border.all(color: Colors.white.withValues(alpha: 0.08)),
-      ),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.stretch,
-        children: [
-          // TikTok bắt buộc nhập Server URL (mỗi phiên một server khác).
-          if (isTiktok) ...[
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        // TikTok bắt buộc nhập Server URL (mỗi phiên một server khác).
+        if (isTiktok) ...[
+          TextFormField(
+            controller: _serverController,
+            enabled: !locked,
+            style: monoStyle,
+            decoration: _inputDecoration(
+              hint: 'Server URL',
+              prefixIcon: Icons.dns_rounded,
+            ),
+          ),
+          const SizedBox(height: BrandSpace.sm),
+        ] else if (!isCustom) ...[
+          if (_editServer) ...[
             TextFormField(
               controller: _serverController,
               enabled: !locked,
-              style: monoStyle,
+              style: monoStyle.copyWith(fontSize: 12.5),
               decoration: _inputDecoration(
-                hint: 'Server URL',
+                hint: defaultServer,
                 prefixIcon: Icons.dns_rounded,
-              ),
-            ),
-            const SizedBox(height: 10),
-          ] else if (!isCustom) ...[
-            if (_editServer) ...[
-              TextFormField(
-                controller: _serverController,
-                enabled: !locked,
-                style: monoStyle.copyWith(fontSize: 12.5),
-                decoration: _inputDecoration(
-                  hint: defaultServer,
-                  prefixIcon: Icons.dns_rounded,
-                  suffixIcon: IconButton(
-                    icon: const Icon(
-                      Icons.restart_alt_rounded,
-                      size: 18,
-                      color: Colors.white54,
-                    ),
-                    tooltip: appText(
-                      context,
-                      'Đặt lại mặc định',
-                      'Reset default',
-                    ),
-                    onPressed: locked
-                        ? null
-                        : () => setState(() {
-                              _serverController.text = defaultServer;
-                              _editServer = false;
-                            }),
+                suffixIcon: IconButton(
+                  icon: const Icon(
+                    Icons.restart_alt_rounded,
+                    size: 18,
+                    color: BrandColors.textSecondary,
                   ),
+                  tooltip: appText(
+                    context,
+                    'Đặt lại mặc định',
+                    'Reset default',
+                  ),
+                  onPressed: locked
+                      ? null
+                      : () => setState(() {
+                            _serverController.text = defaultServer;
+                            _editServer = false;
+                          }),
                 ),
               ),
-              const SizedBox(height: 10),
-            ] else ...[
-              // Server mặc định: chỉ hiện mờ, bấm bút để sửa.
-              Row(
-                children: [
-                  Icon(
-                    Icons.dns_rounded,
-                    size: 14,
-                    color: Colors.white.withValues(alpha: 0.35),
-                  ),
-                  const SizedBox(width: 6),
-                  Expanded(
-                    child: Text(
-                      _serverController.text.isNotEmpty
-                          ? _serverController.text
-                          : defaultServer,
-                      style: TextStyle(
-                        color: Colors.white.withValues(alpha: 0.4),
-                        fontSize: 11.5,
-                        fontFamily: 'monospace',
-                      ),
-                      overflow: TextOverflow.ellipsis,
+            ),
+            const SizedBox(height: BrandSpace.sm),
+          ] else ...[
+            // Server mặc định: chỉ hiện mờ, bấm bút để sửa.
+            Row(
+              children: [
+                const SizedBox(width: BrandSpace.xs),
+                const Icon(
+                  Icons.dns_rounded,
+                  size: 16,
+                  color: BrandColors.textDisabled,
+                ),
+                const SizedBox(width: BrandSpace.sm),
+                Expanded(
+                  child: Text(
+                    _serverController.text.isNotEmpty
+                        ? _serverController.text
+                        : defaultServer,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: const TextStyle(
+                      color: BrandColors.textSecondary,
+                      fontSize: 12,
+                      fontFamily: 'monospace',
                     ),
                   ),
-                  IconButton(
-                    icon: const Icon(
-                      Icons.edit_rounded,
-                      size: 16,
-                      color: Colors.white54,
-                    ),
-                    tooltip: appText(
-                      context,
-                      'Chỉnh sửa máy chủ',
-                      'Edit server',
-                    ),
-                    onPressed: locked
-                        ? null
-                        : () => setState(() => _editServer = true),
+                ),
+                IconButton(
+                  icon: const Icon(
+                    Icons.edit_rounded,
+                    size: 18,
+                    color: BrandColors.textSecondary,
                   ),
-                ],
-              ),
-              const SizedBox(height: 4),
-            ],
+                  tooltip: appText(
+                    context,
+                    'Chỉnh sửa máy chủ',
+                    'Edit server',
+                  ),
+                  onPressed:
+                      locked ? null : () => setState(() => _editServer = true),
+                ),
+              ],
+            ),
+            const SizedBox(height: BrandSpace.xs),
           ],
+        ],
 
-          TextFormField(
-            controller: isCustom ? _customUrlController : _streamKeyController,
-            enabled: !locked,
-            // URL tùy chỉnh cũng chứa stream key: che như ô khóa luồng.
-            obscureText: _obscureKey,
-            style: monoStyle,
-            decoration: _inputDecoration(
-              hint: isCustom ? 'rtmp://server/live/key' : 'Stream Key',
-              prefixIcon: isCustom ? Icons.link_rounded : Icons.key_rounded,
-              suffixIcon: IconButton(
-                icon: Icon(
-                  _obscureKey
-                      ? Icons.visibility_off_rounded
-                      : Icons.visibility_rounded,
-                  size: 18,
-                  color: Colors.white54,
+        TextFormField(
+          controller: isCustom ? _customUrlController : _streamKeyController,
+          enabled: !locked,
+          // URL tùy chỉnh cũng chứa stream key: che như ô khóa luồng.
+          obscureText: _obscureKey,
+          style: monoStyle,
+          decoration: _inputDecoration(
+            hint: isCustom
+                ? 'rtmp://server/live/key'
+                : appText(context, 'Khóa luồng (Stream Key)', 'Stream key'),
+            prefixIcon: isCustom ? Icons.link_rounded : Icons.key_rounded,
+            suffixIcon: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                IconButton(
+                  icon: Icon(
+                    _obscureKey
+                        ? Icons.visibility_off_rounded
+                        : Icons.visibility_rounded,
+                    size: 18,
+                    color: BrandColors.textSecondary,
+                  ),
+                  tooltip: _obscureKey
+                      ? appText(context, 'Hiện', 'Show')
+                      : appText(context, 'Ẩn', 'Hide'),
+                  onPressed: () => setState(() => _obscureKey = !_obscureKey),
                 ),
-                tooltip: _obscureKey
-                    ? appText(context, 'Hiện', 'Show')
-                    : appText(context, 'Ẩn', 'Hide'),
-                onPressed: () => setState(() => _obscureKey = !_obscureKey),
-              ),
-            ),
-          ),
-          const SizedBox(height: 10),
-          Row(
-            children: [
-              Expanded(
-                child: _buildQuickButton(
-                  icon: Icons.content_paste_rounded,
-                  label: appText(context, 'Dán', 'Paste'),
-                  color: Colors.amberAccent,
+                IconButton(
+                  icon: const Icon(
+                    Icons.content_paste_rounded,
+                    size: 18,
+                    color: BrandColors.warningSoft,
+                  ),
+                  tooltip: appText(context, 'Dán', 'Paste'),
                   onPressed: locked ? null : _pasteFromClipboard,
                 ),
-              ),
-              const SizedBox(width: 10),
-              Expanded(
-                child: _buildQuickButton(
-                  icon: Icons.qr_code_scanner_rounded,
-                  label: 'QR',
-                  color: Colors.lightBlueAccent,
-                  onPressed: locked ? null : _handleScanQrCode,
-                ),
-              ),
-            ],
-          ),
-        ],
-      ),
-    );
-  }
-
-  Widget _buildQuickButton({
-    required IconData icon,
-    required String label,
-    required Color color,
-    required VoidCallback? onPressed,
-  }) {
-    return SizedBox(
-      height: 48,
-      child: OutlinedButton.icon(
-        style: OutlinedButton.styleFrom(
-          foregroundColor: color,
-          side: BorderSide(
-            color: color.withValues(alpha: onPressed == null ? 0.15 : 0.45),
-          ),
-          shape: RoundedRectangleBorder(
-            borderRadius: BorderRadius.circular(12),
-          ),
-          textStyle: const TextStyle(
-            fontSize: 14,
-            fontWeight: FontWeight.w700,
+              ],
+            ),
           ),
         ),
-        onPressed: onPressed,
-        icon: Icon(icon, size: 20),
-        label: Text(label),
-      ),
+        const SizedBox(height: BrandSpace.sm),
+        Padding(
+          padding: const EdgeInsets.symmetric(horizontal: BrandSpace.xs),
+          child: Text(
+            appText(
+              context,
+              'Dán khóa hoặc quét mã QR',
+              'Paste the key or scan a QR code',
+            ),
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+            style: BrandText.caption,
+          ),
+        ),
+      ],
     );
   }
 
@@ -1581,379 +1617,599 @@ class _LiveStreamScreenState extends State<LiveStreamScreen> {
     Widget? suffixIcon,
     IconData? prefixIcon,
   }) {
+    // Nền, viền, màu gợi ý: theo inputDecorationTheme của app.
     return InputDecoration(
       hintText: hint,
-      hintStyle: TextStyle(
-        color: Colors.white.withValues(alpha: 0.25),
+      hintStyle: const TextStyle(
+        color: BrandColors.textDisabled,
         fontSize: 12.5,
       ),
-      filled: true,
-      fillColor: const Color(0xFF0F1218),
       contentPadding: const EdgeInsets.symmetric(horizontal: 12, vertical: 14),
       prefixIcon: prefixIcon == null
           ? null
-          : Icon(prefixIcon, size: 18, color: Colors.white38),
+          : Icon(prefixIcon, size: 18, color: BrandColors.textDisabled),
       suffixIcon: suffixIcon,
-      border: OutlineInputBorder(
-        borderRadius: BorderRadius.circular(12),
-        borderSide: BorderSide(color: Colors.white.withValues(alpha: 0.12)),
-      ),
-      enabledBorder: OutlineInputBorder(
-        borderRadius: BorderRadius.circular(12),
-        borderSide: BorderSide(color: Colors.white.withValues(alpha: 0.12)),
-      ),
-      focusedBorder: OutlineInputBorder(
-        borderRadius: BorderRadius.circular(12),
-        borderSide: const BorderSide(color: Color(0xFF1976D2), width: 1.5),
-      ),
     );
   }
 
   // ============================================================
-  // WIDGET: THẺ ĐANG PHÁT — logo, LIVE, đồng hồ lớn, số liệu bằng icon
+  // KHỐI TUỲ CHỌN — bảng tỉ số, âm thanh Tablet, chất lượng, nâng cao
+  // ============================================================
+  Widget _buildOptionsSection() {
+    final webRtc = widget.runtime.webRtcService;
+    final resolution = webRtc?.resolutionProfile.shortLabel ?? '1080p';
+    final fps = webRtc?.resolutionProfile.fps ?? 30;
+
+    return BrandSection(
+      title: appText(context, 'Tùy chọn', 'Options'),
+      children: [
+        ListenableBuilder(
+          listenable: _liveTicker,
+          builder: (context, _) => _buildScoreboardTile(),
+        ),
+        BrandTile(
+          icon: Icons.volume_up_rounded,
+          title: appText(context, 'Âm thanh Tablet', 'Tablet audio'),
+          trailing: Switch.adaptive(
+            value: widget.runtime.rtspTabletAudio,
+            onChanged: _setTabletAudio,
+          ),
+        ),
+        BrandTile(
+          icon: Icons.hd_rounded,
+          title: appText(context, 'Chất lượng', 'Quality'),
+          trailing: Text(
+            '$resolution · ${fps}fps',
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+            style: const TextStyle(
+              color: BrandColors.textSecondary,
+              fontSize: 13,
+              fontWeight: FontWeight.w600,
+            ),
+          ),
+        ),
+        _buildAdvancedTile(),
+      ],
+    );
+  }
+
+  Widget _buildScoreboardTile() {
+    final isWhip = _whipService.isLive;
+    final short = _scoreboardShortStatus(isWhip);
+    final full = _scoreboardStatusText(isWhip);
+    final visible = _overlayVisible;
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        BrandTile(
+          icon: Icons.scoreboard_rounded,
+          title: appText(context, 'Bảng tỉ số', 'Scoreboard'),
+          trailing: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Text(
+                short.$1,
+                maxLines: 1,
+                style: TextStyle(
+                  color: short.$2,
+                  fontSize: 13,
+                  fontWeight: FontWeight.w700,
+                ),
+              ),
+              const SizedBox(width: BrandSpace.xs),
+              const Icon(
+                Icons.info_outline_rounded,
+                size: 18,
+                color: BrandColors.textDisabled,
+              ),
+            ],
+          ),
+          onTap: () => showAppNotice(context, vi: full.$1, en: full.$2),
+        ),
+        // Ẩn/Hiện overlay (overlay.visible): ẩn thì ảnh in vào video trong
+        // suốt dù đang phát.
+        Padding(
+          padding: const EdgeInsets.fromLTRB(
+            BrandSpace.lg,
+            0,
+            BrandSpace.lg,
+            BrandSpace.md,
+          ),
+          child: Row(
+            children: [
+              Expanded(
+                child: Text(
+                  visible
+                      ? appText(context, 'Hiện trên video', 'Shown on video')
+                      : appText(
+                          context,
+                          'Chọn Hiện để in vào video',
+                          'Pick Show to put it on video',
+                        ),
+                  maxLines: 2,
+                  overflow: TextOverflow.ellipsis,
+                  style: BrandText.caption.copyWith(
+                    color: visible
+                        ? BrandColors.textSecondary
+                        : BrandColors.warningSoft,
+                  ),
+                ),
+              ),
+              const SizedBox(width: BrandSpace.sm),
+              BrandSegmented<bool>(
+                values: const [false, true],
+                labelOf: (value) => value
+                    ? appText(context, 'Hiện', 'Show')
+                    : appText(context, 'Ẩn', 'Hide'),
+                selected: visible,
+                dense: true,
+                onChanged: (value) {
+                  if (value != _overlayVisible) _setOverlayVisible(value);
+                },
+              ),
+            ],
+          ),
+        ),
+      ],
+    );
+  }
+
+  Future<void> _setTabletAudio(bool value) async {
+    try {
+      await widget.runtime.setRtspTabletAudio(value);
+    } catch (error) {
+      if (!mounted) return;
+      showAppNotice(
+        context,
+        vi: 'Không đổi được âm thanh Tablet: ${_streamErrorText(error, english: false)}',
+        en: 'Could not change tablet audio: ${_streamErrorText(error, english: true)}',
+        kind: NoticeKind.error,
+      );
+    }
+    if (mounted) setState(() {});
+  }
+
+  /// Mục "Nâng cao" thu gọn: RTSP nội bộ + WHIP.
+  Widget _buildAdvancedTile() {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        BrandTile(
+          icon: Icons.tune_rounded,
+          title: appText(context, 'Nâng cao', 'Advanced'),
+          subtitle: 'WHIP · RTSP',
+          trailing: AnimatedRotation(
+            turns: _showAdvanced ? 0.5 : 0,
+            duration: const Duration(milliseconds: 150),
+            child: const Icon(
+              Icons.expand_more_rounded,
+              color: BrandColors.textSecondary,
+            ),
+          ),
+          onTap: () => setState(() => _showAdvanced = !_showAdvanced),
+        ),
+        AnimatedSize(
+          duration: const Duration(milliseconds: 180),
+          alignment: Alignment.topCenter,
+          child: _showAdvanced
+              ? _buildAdvancedContent()
+              : const SizedBox(width: double.infinity),
+        ),
+      ],
+    );
+  }
+
+  // ============================================================
+  // THẺ ĐANG PHÁT — nền tảng + danh sách tham số đang phát
   // ============================================================
   Widget _buildLiveMonitorCard() {
     final isWhip = _whipService.isLive;
     final duration =
         isWhip ? _whipService.liveDuration : _rtspService.liveDuration;
+    final url = isWhip
+        ? (_whipService.currentEndpoint ?? _whipUrlController.text.trim())
+        : (_rtspService.targetUrl ?? _buildEffectiveUrl());
+
+    final isCustom = !isWhip && _platform == StreamPlatform.custom;
+    var name = isWhip
+        ? 'WHIP'
+        : (_platformMeta[_platform]!.name ??
+            appText(context, 'Tùy chỉnh', 'Custom'));
+    if (isCustom) {
+      final detected = streamDestinationLabel(url);
+      if (detected.isNotEmpty) name = '$name · $detected';
+    }
+
+    final server = _serverDisplay(url);
+    final whipToken = _whipTokenController.text.trim();
+    final maskedKey = isWhip
+        ? (whipToken.isEmpty ? '' : maskStreamSecret(whipToken))
+        : maskedStreamKeyOf(url);
+    final protocol = isWhip ? 'WHIP' : _protocolOf(url);
+
+    final webRtc = widget.runtime.webRtcService;
+    final profile = webRtc?.resolutionProfile;
     final fps = isWhip ? 0.0 : _rtspService.currentFps;
-    final bitrate = isWhip ? 0 : _rtspService.currentBitrateKbps;
+    final bitrate = isWhip ? 0.0 : _rtspService.currentBitrateKbps;
+    final targetKbps = isWhip ? 0 : _rtspService.targetBitrateKbps;
+    final quality = isWhip ? null : _networkQualityLabel();
 
-    final fpsStr = fps > 0 ? fps.toStringAsFixed(0) : '—';
-    final bitrateStr =
-        bitrate > 0 ? '${(bitrate / 1000).toStringAsFixed(1)}M' : '—';
-    final cellular = !isWhip && _rtspService.cellularFallbackActive;
-    final networkStr = isWhip ? 'WebRTC' : (cellular ? '4G/5G' : 'Wi-Fi');
-    final networkIcon = isWhip
-        ? Icons.podcasts_rounded
-        : (cellular ? Icons.signal_cellular_alt_rounded : Icons.wifi_rounded);
-    final scoreboard = _scoreboardShortStatus(isWhip);
+    final String scoreboard;
+    final Color scoreboardColor;
+    if (!isWhip && _rtspService.overlayActive && _overlayBurnIn) {
+      if (_overlayVisible) {
+        scoreboard = appText(context, 'Đang in', 'On video');
+        scoreboardColor = BrandColors.successSoft;
+      } else {
+        scoreboard = appText(context, 'Đang ẩn', 'Hidden');
+        scoreboardColor = BrandColors.warning;
+      }
+    } else {
+      scoreboard = appText(context, 'Không', 'None');
+      scoreboardColor = BrandColors.textSecondary;
+    }
 
-    return Container(
-      padding: const EdgeInsets.all(18),
-      decoration: BoxDecoration(
-        color: const Color(0xFF161B22),
-        borderRadius: BorderRadius.circular(16),
-        border: Border.all(
-          color: Colors.redAccent.withValues(alpha: 0.6),
-          width: 1.5,
+    final rows = <_InfoRow>[
+      _InfoRow(
+        appText(context, 'Thời lượng', 'Duration'),
+        _formatDuration(duration),
+        mono: true,
+      ),
+      _InfoRow(appText(context, 'Nền tảng', 'Platform'), name),
+      if (server.isNotEmpty)
+        _InfoRow(appText(context, 'Máy chủ', 'Server'), server, mono: true),
+      if (maskedKey.isNotEmpty)
+        _InfoRow(
+          appText(context, 'Khóa luồng', 'Stream key'),
+          maskedKey,
+          mono: true,
         ),
-        boxShadow: [
-          BoxShadow(
-            color: Colors.red.withValues(alpha: 0.15),
-            blurRadius: 16,
-            spreadRadius: 2,
-          ),
-        ],
+      if (protocol.isNotEmpty)
+        _InfoRow(appText(context, 'Giao thức', 'Protocol'), protocol),
+      if (profile != null)
+        _InfoRow(
+          appText(context, 'Cấu hình', 'Profile'),
+          '${profile.shortLabel} · ${profile.fps} FPS',
+        ),
+      if (targetKbps > 0)
+        _InfoRow(
+          appText(context, 'Bitrate đặt', 'Target bitrate'),
+          _formatKbps(targetKbps.toDouble()),
+        ),
+      if (fps > 0)
+        _InfoRow(
+          appText(context, 'FPS thực', 'Actual FPS'),
+          fps.toStringAsFixed(0),
+        ),
+      if (bitrate > 0)
+        _InfoRow(
+          appText(context, 'Bitrate thực', 'Actual bitrate'),
+          _formatKbps(bitrate),
+        ),
+      if (quality != null)
+        _InfoRow(
+          appText(context, 'Mạng', 'Network'),
+          quality.$1,
+          color: quality.$2,
+        ),
+      _InfoRow(
+        appText(context, 'Bảng tỉ số', 'Scoreboard'),
+        scoreboard,
+        color: scoreboardColor,
       ),
-      child: Column(
-        children: [
-          Row(
-            mainAxisAlignment: MainAxisAlignment.center,
-            children: [
-              if (!isWhip) ...[
-                _platformLogo(_platform, size: 32),
-                const SizedBox(width: 12),
-              ],
-              Container(
-                padding: const EdgeInsets.symmetric(horizontal: 9, vertical: 4),
-                decoration: BoxDecoration(
-                  color: Colors.redAccent,
-                  borderRadius: BorderRadius.circular(6),
-                ),
-                child: const Row(
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    Icon(Icons.circle, color: Colors.white, size: 8),
-                    SizedBox(width: 5),
-                    Text(
-                      'LIVE',
-                      style: TextStyle(
-                        color: Colors.white,
-                        fontWeight: FontWeight.bold,
-                        fontSize: 12,
-                      ),
-                    ),
-                  ],
-                ),
-              ),
-              const SizedBox(width: 12),
-              // Máy hẹp / chữ lớn: thu nhỏ đồng hồ thay vì tràn ngang.
-              Flexible(
-                child: FittedBox(
-                  fit: BoxFit.scaleDown,
-                  child: Text(
-                    _formatDuration(duration),
-                    maxLines: 1,
-                    style: const TextStyle(
-                      color: Colors.white,
-                      fontWeight: FontWeight.bold,
-                      fontSize: 28,
-                      fontFamily: 'monospace',
-                    ),
-                  ),
-                ),
-              ),
-            ],
+      if (!isWhip)
+        _InfoRow(
+          appText(context, 'Đường truyền', 'Uplink'),
+          _rtspService.cellularFallbackActive ? '4G/5G' : 'Wi-Fi',
+        ),
+    ];
+
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        _sectionLabel(appText(context, 'Đang phát', 'On air')),
+        Container(
+          padding: const EdgeInsets.all(BrandSpace.lg),
+          decoration: BoxDecoration(
+            color: BrandColors.surface,
+            borderRadius: BorderRadius.circular(BrandRadius.medium),
+            border: Border.all(
+              color: BrandColors.live.withValues(alpha: 0.5),
+              width: 1.5,
+            ),
           ),
-          const SizedBox(height: 16),
-          // 4 ô chia đều; ô quá chật (máy hẹp / chữ lớn) tự thu nhỏ.
-          Row(
-            children: [
-              _metricCell(
-                _buildMetricChip(
-                  icon: Icons.speed_rounded,
-                  value: fpsStr,
-                  tooltip: 'FPS',
-                  color: Colors.lightBlueAccent,
-                ),
-              ),
-              _metricCell(
-                _buildMetricChip(
-                  icon: Icons.upload_rounded,
-                  value: bitrateStr,
-                  tooltip: 'Bitrate',
-                  color: Colors.greenAccent,
-                ),
-              ),
-              _metricCell(
-                _buildMetricChip(
-                  icon: networkIcon,
-                  value: networkStr,
-                  tooltip: appText(context, 'Mạng', 'Network'),
-                  color: Colors.amberAccent,
-                ),
-              ),
-              // Bảng tỉ số: hiện ngắn gọn; chạm để xem giải thích đầy đủ.
-              _metricCell(
-                _buildMetricChip(
-                  icon: Icons.scoreboard_rounded,
-                  value: scoreboard.$1,
-                  tooltip: _scoreboardStatus(isWhip),
-                  color: scoreboard.$2,
-                  onTap: () => _showToast(_scoreboardStatus(isWhip)),
-                ),
-              ),
-            ],
-          ),
-        ],
-      ),
-    );
-  }
-
-  /// Trạng thái in bảng tỉ số vào video livestream.
-  String _scoreboardStatus(bool isWhip) {
-    if (isWhip) {
-      return appText(
-        context,
-        'Phát WHIP không in được bảng tỉ số (dùng RTMP/RTSP hoặc OBS).',
-        'WHIP cannot show the scoreboard (use RTMP/RTSP or OBS).',
-      );
-    }
-    if (!Platform.isAndroid && !Platform.isIOS) {
-      return appText(
-        context,
-        'Thiết bị này chưa hỗ trợ in bảng tỉ số vào livestream (dùng OBS).',
-        'This device cannot burn the scoreboard into the livestream yet (use OBS).',
-      );
-    }
-    if (_rtspService.overlayIssue != null) {
-      return appText(
-        context,
-        'Máy này không in được bảng tỉ số vào livestream; đang phát không có bảng tỉ số.',
-        'This phone cannot burn the scoreboard into the livestream; streaming without it.',
-      );
-    }
-    final overlay = ScoreboardService.instance.snapshot()['overlay'];
-    if (_rtspService.overlayActive) {
-      if (overlay is Map && overlay['visible'] == false) {
-        return appText(
-          context,
-          'Overlay đang ẩn (bật lại trên trang điều khiển → Overlay)',
-          'Overlay is hidden (show it again on the control page → Overlay)',
-        );
-      }
-      return appText(
-        context,
-        'Bảng tỉ số đang hiện trên livestream',
-        'Scoreboard is shown on the livestream',
-      );
-    }
-    final enabled = overlay is Map && overlay['burnIn'] != false;
-    if (enabled) {
-      return appText(
-        context,
-        'Đang chuẩn bị bảng tỉ số cho livestream…',
-        'Preparing the scoreboard for the livestream…',
-      );
-    }
-    return appText(
-      context,
-      'Bảng tỉ số đang tắt trên livestream (bật trên trang điều khiển → Overlay)',
-      'Scoreboard is off on the livestream (turn it on on the control page → Overlay)',
-    );
-  }
-
-  /// Trạng thái bảng tỉ số dạng một từ cho thẻ đang phát.
-  (String, Color) _scoreboardShortStatus(bool isWhip) {
-    if (isWhip ||
-        (!Platform.isAndroid && !Platform.isIOS) ||
-        _rtspService.overlayIssue != null) {
-      return ('—', Colors.white38);
-    }
-    final overlay = ScoreboardService.instance.snapshot()['overlay'];
-    if (_rtspService.overlayActive) {
-      if (overlay is Map && overlay['visible'] == false) {
-        return (appText(context, 'Ẩn', 'Hidden'), Colors.white54);
-      }
-      return (appText(context, 'Bật', 'On'), Colors.amberAccent);
-    }
-    final enabled = overlay is Map && overlay['burnIn'] != false;
-    if (enabled) return ('…', Colors.amber.shade200);
-    return (appText(context, 'Tắt', 'Off'), Colors.white38);
-  }
-
-  Widget _metricCell(Widget chip) {
-    return Expanded(
-      child: FittedBox(fit: BoxFit.scaleDown, child: chip),
-    );
-  }
-
-  Widget _buildMetricChip({
-    required IconData icon,
-    required String value,
-    required String tooltip,
-    required Color color,
-    VoidCallback? onTap,
-  }) {
-    return Tooltip(
-      message: tooltip,
-      child: InkWell(
-        borderRadius: BorderRadius.circular(10),
-        onTap: onTap,
-        child: Padding(
-          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
           child: Column(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
             mainAxisSize: MainAxisSize.min,
             children: [
-              Icon(icon, size: 20, color: color.withValues(alpha: 0.85)),
-              const SizedBox(height: 4),
-              Text(
-                value,
-                style: TextStyle(
-                  color: color,
-                  fontWeight: FontWeight.bold,
-                  fontSize: 15,
-                  fontFamily: 'monospace',
-                ),
-              ),
-            ],
-          ),
-        ),
-      ),
-    );
-  }
-
-  // ============================================================
-  // WIDGET: NÚT CHÍNH — to, ít chữ
-  // ============================================================
-  Widget _buildBigButton({
-    required Widget leading,
-    required String label,
-    required VoidCallback? onTap,
-    Gradient? gradient,
-    Color? color,
-    Color foreground = Colors.white,
-    Color? borderColor,
-    Color? glowColor,
-    String? semanticsHint,
-  }) {
-    final button = Container(
-      height: 58,
-      decoration: BoxDecoration(
-        borderRadius: BorderRadius.circular(29),
-        gradient: gradient,
-        color: gradient == null ? color : null,
-        border: borderColor == null ? null : Border.all(color: borderColor),
-        boxShadow: glowColor == null
-            ? null
-            : [
-                BoxShadow(
-                  color: glowColor.withValues(alpha: 0.35),
-                  blurRadius: 12,
-                  offset: const Offset(0, 4),
-                ),
-              ],
-      ),
-      child: Material(
-        color: Colors.transparent,
-        child: InkWell(
-          borderRadius: BorderRadius.circular(29),
-          onTap: onTap,
-          child: Padding(
-            padding: const EdgeInsets.symmetric(horizontal: 16),
-            child: Center(
-              child: Row(
-                mainAxisSize: MainAxisSize.min,
+              Row(
                 children: [
-                  leading,
-                  const SizedBox(width: 10),
-                  // Máy hẹp / chữ lớn: thu nhỏ nhãn thay vì tràn ngang.
-                  Flexible(
-                    child: FittedBox(
-                      fit: BoxFit.scaleDown,
-                      child: Text(
-                        label,
-                        maxLines: 1,
-                        style: TextStyle(
-                          color: foreground,
-                          fontSize: 16,
-                          fontWeight: FontWeight.bold,
-                          letterSpacing: 0.8,
-                        ),
-                      ),
+                  if (isWhip)
+                    const Icon(
+                      Icons.podcasts_rounded,
+                      size: 28,
+                      color: BrandColors.primaryBright,
+                    )
+                  else
+                    _platformLogo(_platform, size: 32),
+                  const SizedBox(width: BrandSpace.md),
+                  Expanded(
+                    child: Text(
+                      name,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: BrandText.title,
                     ),
                   ),
                 ],
               ),
+              const SizedBox(height: BrandSpace.md),
+              const Divider(height: 1, color: BrandColors.border),
+              const SizedBox(height: BrandSpace.md),
+              // Danh sách nhãn – giá trị; rộng thì chia 2 cột.
+              LayoutBuilder(
+                builder: (context, constraints) {
+                  final twoColumns = constraints.maxWidth >= 520;
+                  const gap = BrandSpace.xl;
+                  final itemWidth = twoColumns
+                      ? ((constraints.maxWidth - gap) / 2).floorToDouble()
+                      : constraints.maxWidth;
+                  return Wrap(
+                    spacing: gap,
+                    runSpacing: BrandSpace.sm,
+                    children: [
+                      for (final row in rows)
+                        SizedBox(width: itemWidth, child: _buildInfoRow(row)),
+                    ],
+                  );
+                },
+              ),
+            ],
+          ),
+        ),
+      ],
+    );
+  }
+
+  Widget _buildInfoRow(_InfoRow row) {
+    return Row(
+      crossAxisAlignment: CrossAxisAlignment.center,
+      children: [
+        Expanded(
+          flex: 2,
+          child: Text(
+            row.label,
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+            style: BrandText.caption,
+          ),
+        ),
+        const SizedBox(width: BrandSpace.sm),
+        Expanded(
+          flex: 3,
+          child: Text(
+            row.value,
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+            textAlign: TextAlign.end,
+            style: TextStyle(
+              color: row.color ?? BrandColors.textPrimary,
+              fontSize: 13,
+              fontWeight: FontWeight.w600,
+              fontFamily: row.mono ? 'monospace' : null,
             ),
           ),
         ),
+      ],
+    );
+  }
+
+  /// Máy chủ để hiển thị: host(:port) + segment app đầu tiên; KHÔNG kèm
+  /// khoá luồng / query.
+  static String _serverDisplay(String url) {
+    try {
+      final uri = Uri.tryParse(url.trim());
+      if (uri == null || uri.host.isEmpty) return '';
+      final hostPort = uri.hasPort ? '${uri.host}:${uri.port}' : uri.host;
+      final segments = uri.pathSegments.where((s) => s.isNotEmpty);
+      return segments.isEmpty ? hostPort : '$hostPort/${segments.first}';
+    } catch (_) {
+      // Đường dẫn mã hoá sai: không hiện máy chủ.
+      return '';
+    }
+  }
+
+  /// Giao thức theo scheme của URL phát (rỗng nếu không nhận ra).
+  static String _protocolOf(String url) {
+    final lower = url.trim().toLowerCase();
+    for (final scheme in const ['rtmps', 'rtmp', 'rtsps', 'rtsp', 'srt']) {
+      if (lower.startsWith('$scheme://')) return scheme.toUpperCase();
+    }
+    return '';
+  }
+
+  static String _formatKbps(double kbps) => kbps >= 1000
+      ? '${(kbps / 1000).toStringAsFixed(1)} Mbps'
+      : '${kbps.toStringAsFixed(0)} kbps';
+
+  /// Chất lượng mạng RTMP/RTSP dạng chữ + màu (null khi chưa có số liệu).
+  (String, Color)? _networkQualityLabel() {
+    return switch (_rtspService.networkQuality) {
+      StreamNetworkQuality.good =>
+        (appText(context, 'Tốt', 'Good'), BrandColors.successSoft),
+      StreamNetworkQuality.warning =>
+        (appText(context, 'Trung bình', 'Fair'), BrandColors.warning),
+      StreamNetworkQuality.poor =>
+        (appText(context, 'Kém', 'Poor'), BrandColors.dangerSoft),
+      StreamNetworkQuality.unknown => null,
+    };
+  }
+
+  /// Trạng thái in bảng tỉ số vào video livestream (Việt, Anh).
+  (String, String) _scoreboardStatusText(bool isWhip) {
+    if (isWhip) {
+      return (
+        'WHIP không in được bảng tỉ số (dùng RTMP/RTSP hoặc OBS).',
+        "WHIP can't show the scoreboard (use RTMP/RTSP or OBS).",
+      );
+    }
+    if (!Platform.isAndroid && !Platform.isIOS) {
+      return (
+        'Thiết bị chưa hỗ trợ in bảng tỉ số (dùng OBS).',
+        "This device can't burn in the scoreboard (use OBS).",
+      );
+    }
+    if (_rtspService.overlayIssue != null) {
+      return (
+        'Máy không in được bảng tỉ số; đang phát không kèm bảng.',
+        "This phone can't burn in the scoreboard; streaming without it.",
+      );
+    }
+    if (!_overlayBurnIn) {
+      return (
+        'Bảng tỉ số đang tắt (bật: trang điều khiển → Overlay)',
+        'Scoreboard off (turn on: control page → Overlay)',
+      );
+    }
+    if (!_overlayVisible) {
+      return (
+        'Bảng tỉ số đang ẩn — chọn Hiện để in vào video',
+        'Scoreboard hidden — pick Show to put it on video',
+      );
+    }
+    if (_rtspService.overlayActive) {
+      return (
+        'Bảng tỉ số đang hiện trên livestream',
+        'Scoreboard is shown on the livestream',
+      );
+    }
+    if (_isRtspActive) {
+      return (
+        'Đang chuẩn bị bảng tỉ số…',
+        'Preparing the scoreboard…',
+      );
+    }
+    return (
+      'Bảng tỉ số sẽ hiện khi bắt đầu phát',
+      'Scoreboard shows once you go live',
+    );
+  }
+
+  /// Trạng thái bảng tỉ số dạng ngắn, đúng với cái đang in vào video.
+  (String, Color) _scoreboardShortStatus(bool isWhip) {
+    if (isWhip ||
+        (!Platform.isAndroid && !Platform.isIOS) ||
+        _rtspService.overlayIssue != null) {
+      return ('—', BrandColors.textDisabled);
+    }
+    if (!_overlayBurnIn) {
+      return (appText(context, 'Tắt', 'Off'), BrandColors.textDisabled);
+    }
+    if (!_overlayVisible) {
+      return (appText(context, 'Đang ẩn', 'Hidden'), BrandColors.warning);
+    }
+    if (_rtspService.overlayActive) {
+      return (appText(context, 'Đang in', 'On video'), BrandColors.successSoft);
+    }
+    if (_isRtspActive) return ('…', BrandColors.warning);
+    return (appText(context, 'Sẵn sàng', 'Ready'), BrandColors.textSecondary);
+  }
+
+  // ============================================================
+  // NÚT CHÍNH — cố định ở đáy, full-width
+  // ============================================================
+  ButtonStyle _filledMainStyle(Color color) {
+    return FilledButton.styleFrom(
+      backgroundColor: color,
+      foregroundColor: Colors.white,
+      disabledBackgroundColor: BrandColors.surfaceRaised,
+      disabledForegroundColor: BrandColors.textSecondary,
+      padding: const EdgeInsets.symmetric(horizontal: BrandSpace.lg),
+      shape: RoundedRectangleBorder(
+        borderRadius: BorderRadius.circular(BrandRadius.medium),
+      ),
+      textStyle: const TextStyle(fontSize: 16, fontWeight: FontWeight.w700),
+    );
+  }
+
+  ButtonStyle _outlinedMainStyle({
+    required Color foreground,
+    required Color border,
+    required Color background,
+  }) {
+    return OutlinedButton.styleFrom(
+      foregroundColor: foreground,
+      backgroundColor: background,
+      side: BorderSide(color: border, width: 1.5),
+      padding: const EdgeInsets.symmetric(horizontal: BrandSpace.lg),
+      shape: RoundedRectangleBorder(
+        borderRadius: BorderRadius.circular(BrandRadius.medium),
+      ),
+      textStyle: const TextStyle(fontSize: 16, fontWeight: FontWeight.w700),
+    );
+  }
+
+  Widget _mainButton({
+    required Widget icon,
+    required String label,
+    required VoidCallback? onPressed,
+    required ButtonStyle style,
+    bool outlined = false,
+    String? semanticsHint,
+  }) {
+    final child = Row(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        icon,
+        const SizedBox(width: 10),
+        // Máy hẹp / chữ lớn: thu nhỏ nhãn thay vì tràn ngang.
+        Flexible(
+          child: FittedBox(
+            fit: BoxFit.scaleDown,
+            child: Text(label, maxLines: 1),
+          ),
+        ),
+      ],
+    );
+    final Widget button = outlined
+        ? OutlinedButton(onPressed: onPressed, style: style, child: child)
+        : FilledButton(onPressed: onPressed, style: style, child: child);
+    final sized = SizedBox(width: double.infinity, height: 56, child: button);
+    if (semanticsHint == null) return sized;
+    return Semantics(hint: semanticsHint, child: sized);
+  }
+
+  Widget _stopButton({required bool whip}) {
+    return _mainButton(
+      icon: const Icon(Icons.stop_circle_rounded, size: 24),
+      label: appText(context, 'Dừng', 'Stop'),
+      // Luôn bấm được (kể cả khi đang kết nối); chỉ khoá khi đang dừng.
+      onPressed: _stopInFlight ? null : () => _requestStop(whip: whip),
+      outlined: true,
+      style: _outlinedMainStyle(
+        foreground: BrandColors.dangerSoft,
+        border: BrandColors.danger.withValues(alpha: 0.7),
+        background: BrandColors.danger.withValues(alpha: 0.12),
       ),
     );
-    if (semanticsHint == null) return button;
-    return Semantics(hint: semanticsHint, child: button);
   }
 
   Widget _buildActionButton() {
     if (_platform == StreamPlatform.obs && !_isRtspActive && !_isWhipActive) {
-      return _buildBigButton(
-        leading: const Icon(Icons.copy_rounded, color: Colors.white, size: 22),
-        label: appText(context, 'SAO CHÉP LINK', 'COPY LINK'),
+      return _mainButton(
+        icon: const Icon(Icons.copy_rounded, size: 22),
+        label: appText(context, 'Sao chép link', 'Copy link'),
         // Với OBS, _handleStartLive chỉ sao chép link RTSP nội bộ.
-        onTap: _handleStartLive,
-        gradient: const LinearGradient(
-          colors: [Color(0xFF2979FF), Color(0xFF1565C0)],
-        ),
-        glowColor: const Color(0xFF2979FF),
+        onPressed: _handleStartLive,
+        style: _filledMainStyle(BrandColors.primary),
       );
     }
 
-    if (_isRtspActive) {
-      return _buildBigButton(
-        leading: const Icon(
-          Icons.stop_circle_rounded,
-          color: Colors.redAccent,
-          size: 24,
-        ),
-        label: appText(context, 'DỪNG', 'STOP'),
-        // Luôn bấm được (kể cả khi đang kết nối); chỉ khoá khi đang dừng.
-        onTap: _stopInFlight ? null : () => _requestStop(whip: false),
-        color: const Color(0xFF33181C),
-        foreground: Colors.redAccent,
-        borderColor: Colors.redAccent.withValues(alpha: 0.6),
-      );
-    }
+    if (_isRtspActive) return _stopButton(whip: false);
 
     if (_isWhipActive) {
       final firstConnect = !_whipService.isLive &&
@@ -1961,104 +2217,91 @@ class _LiveStreamScreenState extends State<LiveStreamScreen> {
           _whipService.state != WhipPublishState.reconnecting;
       if (firstConnect) {
         // WHIP đang kết nối lần đầu (có thể tới ~50 giây): bấm để huỷ.
-        return _buildBigButton(
-          leading: const SizedBox(
+        return _mainButton(
+          icon: const SizedBox(
             width: 20,
             height: 20,
             child: CircularProgressIndicator(
               strokeWidth: 2.2,
-              color: Colors.white,
+              color: BrandColors.textPrimary,
             ),
           ),
           label: appText(
             context,
-            'ĐANG KẾT NỐI · HỦY',
-            'CONNECTING · CANCEL',
+            'Đang kết nối · Hủy',
+            'Connecting · Cancel',
           ),
           semanticsHint: appText(context, 'Bấm để hủy', 'Tap to cancel'),
-          onTap: _stopInFlight ? null : () => _requestStop(whip: true),
-          gradient: LinearGradient(
-            colors: [Colors.grey.shade700, Colors.grey.shade800],
+          onPressed: _stopInFlight ? null : () => _requestStop(whip: true),
+          outlined: true,
+          style: _outlinedMainStyle(
+            foreground: BrandColors.textPrimary,
+            border: BrandColors.border,
+            background: BrandColors.surfaceRaised,
           ),
         );
       }
-      // Đang phát hoặc đang kết nối lại sau khi đã phát: như RTMP — DỪNG.
-      return _buildBigButton(
-        leading: const Icon(
-          Icons.stop_circle_rounded,
-          color: Colors.redAccent,
-          size: 24,
-        ),
-        label: appText(context, 'DỪNG', 'STOP'),
-        onTap: _stopInFlight ? null : () => _requestStop(whip: true),
-        color: const Color(0xFF33181C),
-        foreground: Colors.redAccent,
-        borderColor: Colors.redAccent.withValues(alpha: 0.6),
-      );
+      // Đang phát hoặc đang kết nối lại sau khi đã phát: như RTMP — Dừng.
+      return _stopButton(whip: true);
     }
 
     final isBusy = _isBusy || _actionInFlight;
-    return _buildBigButton(
-      leading: isBusy
+    return _mainButton(
+      icon: isBusy
           ? const SizedBox(
               width: 20,
               height: 20,
               child: CircularProgressIndicator(
                 strokeWidth: 2.2,
-                color: Colors.white,
+                color: BrandColors.textSecondary,
               ),
             )
-          : const Icon(Icons.cell_tower_rounded, color: Colors.white, size: 22),
+          : const Icon(Icons.cell_tower_rounded, size: 22),
       label: isBusy
-          ? appText(context, 'ĐANG KẾT NỐI', 'CONNECTING')
-          : appText(context, 'PHÁT TRỰC TIẾP', 'GO LIVE'),
-      onTap: isBusy ? null : _handleStartLive,
-      gradient: isBusy
-          ? LinearGradient(
-              colors: [Colors.grey.shade700, Colors.grey.shade800],
-            )
-          : const LinearGradient(
-              colors: [Color(0xFFFF2A4B), Color(0xFFD50000)],
-            ),
-      glowColor: isBusy ? null : const Color(0xFFFF1744),
+          ? appText(context, 'Đang kết nối', 'Connecting')
+          : appText(context, 'Bắt đầu phát', 'Go live'),
+      onPressed: isBusy ? null : _handleStartLive,
+      style: _filledMainStyle(BrandColors.live),
     );
   }
 
   // ============================================================
-  // WIDGET: ADVANCED SECTION
+  // NỘI DUNG NÂNG CAO — RTSP nội bộ + WHIP
   // ============================================================
-  Widget _buildAdvancedSection() {
+  Widget _buildAdvancedContent() {
     final localRtspUrl = _localRtspUrl;
     final isWhipActive = _isWhipActive;
     final isWhipBusy = _whipService.state == WhipPublishState.connecting;
     final canStartWhip = !_isRtspActive && !_isBusy && !_actionInFlight;
+    const monoStyle = TextStyle(
+      color: BrandColors.textPrimary,
+      fontSize: 12.5,
+      fontFamily: 'monospace',
+    );
 
-    return Container(
-      margin: const EdgeInsets.only(top: 8),
-      padding: const EdgeInsets.all(12),
-      decoration: BoxDecoration(
-        color: const Color(0xFF161B22),
-        borderRadius: BorderRadius.circular(12),
-        border: Border.all(color: Colors.white.withValues(alpha: 0.06)),
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(
+        BrandSpace.lg,
+        0,
+        BrandSpace.lg,
+        BrandSpace.lg,
       ),
       child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        mainAxisSize: MainAxisSize.min,
         children: [
           Row(
-            mainAxisAlignment: MainAxisAlignment.spaceBetween,
             children: [
               Expanded(
                 child: Text(
                   appText(
                     context,
-                    'Link RTSP nội bộ (VLC / NVR):',
-                    'Local RTSP Link:',
+                    'RTSP nội bộ (VLC/NVR)',
+                    'Local RTSP (VLC/NVR)',
                   ),
-                  style: const TextStyle(
-                    color: Colors.white70,
-                    fontSize: 11.5,
-                    fontWeight: FontWeight.bold,
-                  ),
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: BrandText.caption,
                 ),
               ),
               IconButton(
@@ -2069,17 +2312,16 @@ class _LiveStreamScreenState extends State<LiveStreamScreen> {
                 ),
                 icon: const Icon(
                   Icons.copy_rounded,
-                  size: 16,
-                  color: Colors.lightBlueAccent,
+                  size: 18,
+                  color: BrandColors.primaryBright,
                 ),
                 onPressed: () {
                   Clipboard.setData(ClipboardData(text: localRtspUrl));
-                  _showToast(
-                    appText(
-                      context,
-                      'Đã sao chép link RTSP!',
-                      'Copied RTSP link!',
-                    ),
+                  showAppNotice(
+                    context,
+                    vi: 'Đã sao chép link RTSP',
+                    en: 'RTSP link copied',
+                    kind: NoticeKind.success,
                   );
                 },
               ),
@@ -2088,87 +2330,54 @@ class _LiveStreamScreenState extends State<LiveStreamScreen> {
           SelectableText(
             localRtspUrl,
             style: const TextStyle(
-              color: Color(0xFF81D4FA),
-              fontSize: 11.5,
+              color: BrandColors.primarySoft,
+              fontSize: 12,
               fontFamily: 'monospace',
             ),
           ),
-          const SizedBox(height: 8),
-          SwitchListTile.adaptive(
-            contentPadding: EdgeInsets.zero,
-            value: widget.runtime.rtspTabletAudio,
-            onChanged: (value) async {
-              try {
-                await widget.runtime.setRtspTabletAudio(value);
-              } catch (error) {
-                if (!mounted) return;
-                _showToast(
-                  appText(
-                    context,
-                    'Không đổi được âm thanh cho Tablet: $error',
-                    'Unable to change tablet audio: $error',
-                  ),
-                  isError: true,
-                );
-              }
-              if (mounted) setState(() {});
-            },
-            title: Text(
-              appText(context, 'Âm thanh cho Tablet', 'Audio for Tablets'),
-              style: const TextStyle(color: Colors.white, fontSize: 12),
+          const Divider(color: BrandColors.border, height: BrandSpace.xl),
+          Padding(
+            padding: const EdgeInsets.only(bottom: BrandSpace.sm),
+            child: Text(
+              appText(
+                context,
+                'WHIP (MediaMTX nội bộ)',
+                'WHIP (local MediaMTX)',
+              ),
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: BrandText.caption,
             ),
           ),
-          const Divider(color: Colors.white12, height: 20),
-
-          // WHIP Section
-          Text(
-            appText(
-              context,
-              'WHIP (Máy chủ nội bộ MediaMTX):',
-              'WHIP (Internal MediaMTX server):',
-            ),
-            style: const TextStyle(
-              color: Colors.white70,
-              fontSize: 11.5,
-              fontWeight: FontWeight.bold,
-            ),
-          ),
-          const SizedBox(height: 8),
           TextFormField(
             controller: _whipUrlController,
             enabled: !isWhipActive,
-            style: const TextStyle(
-              color: Colors.white,
-              fontSize: 12.5,
-              fontFamily: 'monospace',
-            ),
+            style: monoStyle,
             decoration: _inputDecoration(
               hint: 'http://server:8889/live/whip',
+              prefixIcon: Icons.link_rounded,
             ),
           ),
-          const SizedBox(height: 8),
+          const SizedBox(height: BrandSpace.sm),
           TextFormField(
             controller: _whipTokenController,
             enabled: !isWhipActive,
             obscureText: _obscureWhipToken,
-            style: const TextStyle(
-              color: Colors.white,
-              fontSize: 12.5,
-              fontFamily: 'monospace',
-            ),
+            style: monoStyle,
             decoration: _inputDecoration(
               hint: appText(
                 context,
                 'Bearer Token (tùy chọn)',
                 'Bearer Token (optional)',
               ),
+              prefixIcon: Icons.key_rounded,
               suffixIcon: IconButton(
                 icon: Icon(
                   _obscureWhipToken
                       ? Icons.visibility_off_rounded
                       : Icons.visibility_rounded,
                   size: 18,
-                  color: Colors.white54,
+                  color: BrandColors.textSecondary,
                 ),
                 tooltip: _obscureWhipToken
                     ? appText(context, 'Hiện token', 'Show token')
@@ -2178,18 +2387,15 @@ class _LiveStreamScreenState extends State<LiveStreamScreen> {
               ),
             ),
           ),
-          const SizedBox(height: 10),
+          const SizedBox(height: BrandSpace.md),
           SizedBox(
             width: double.infinity,
+            height: 48,
             child: FilledButton.icon(
               style: FilledButton.styleFrom(
-                backgroundColor: isWhipActive
-                    ? Colors.redAccent.shade700
-                    : const Color(0xFF00897B),
-                foregroundColor: Colors.white,
-                padding: const EdgeInsets.symmetric(vertical: 11),
+                backgroundColor: isWhipActive ? BrandColors.danger : null,
                 shape: RoundedRectangleBorder(
-                  borderRadius: BorderRadius.circular(10),
+                  borderRadius: BorderRadius.circular(BrandRadius.small),
                 ),
               ),
               onPressed: isWhipActive
@@ -2212,16 +2418,18 @@ class _LiveStreamScreenState extends State<LiveStreamScreen> {
                     ),
               label: Text(
                 isWhipActive
-                    ? appText(context, 'DỪNG WHIP', 'STOP WHIP')
+                    ? appText(context, 'Dừng WHIP', 'Stop WHIP')
                     : isWhipBusy
                         ? appText(
                             context,
-                            'ĐANG KẾT NỐI WHIP...',
-                            'CONNECTING WHIP...',
+                            'Đang kết nối WHIP…',
+                            'Connecting WHIP…',
                           )
-                        : appText(context, 'PHÁT WHIP', 'START WHIP'),
+                        : appText(context, 'Phát WHIP', 'Start WHIP'),
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
                 style: const TextStyle(
-                  fontSize: 12.5,
+                  fontSize: 13,
                   fontWeight: FontWeight.bold,
                 ),
               ),
@@ -2231,4 +2439,193 @@ class _LiveStreamScreenState extends State<LiveStreamScreen> {
       ),
     );
   }
+}
+
+/// Lỗi phát trực tiếp cho người dùng: dùng bản dịch nếu lỗi có sẵn hai ngôn ngữ,
+/// ngược lại giữ nguyên nội dung (lỗi máy chủ RTMP/WHIP như "publish denied"
+/// không được hiểu nhầm thành thiếu quyền Camera/Micro).
+String _streamErrorText(Object error, {required bool english}) {
+  if (error is StationException) return error.message(english: english);
+  if (error is BilingualMessage) return error.localized(english: english);
+  final raw = error
+      .toString()
+      .replaceFirst(RegExp(r'^(Exception|Bad state|StateError): '), '')
+      .trim();
+  return raw.isEmpty
+      ? stationErrorMessage(error, english: english)
+      : raw;
+}
+
+/// Khung hộp thoại của màn này: icon tròn, tiêu đề, một dòng mô tả, rồi nội
+/// dung tuỳ ý ([children]). Rộng tối đa 420, cuộn được khi màn hình thấp
+/// (điện thoại ngang); khi rất thấp thì bỏ icon cho gọn.
+class _DialogShell extends StatelessWidget {
+  const _DialogShell({
+    required this.icon,
+    required this.accent,
+    required this.title,
+    required this.message,
+    required this.children,
+  });
+
+  final IconData icon;
+  final Color accent;
+  final String title;
+  final String message;
+  final List<Widget> children;
+
+  @override
+  Widget build(BuildContext context) {
+    final short = MediaQuery.sizeOf(context).height < 480;
+    return Dialog(
+      backgroundColor: BrandColors.surface,
+      surfaceTintColor: Colors.transparent,
+      insetPadding: const EdgeInsets.symmetric(
+        horizontal: BrandSpace.xl,
+        vertical: BrandSpace.lg,
+      ),
+      shape: RoundedRectangleBorder(
+        borderRadius: BorderRadius.circular(BrandRadius.large),
+        side: const BorderSide(color: BrandColors.border),
+      ),
+      child: ConstrainedBox(
+        constraints: const BoxConstraints(maxWidth: 420),
+        child: SingleChildScrollView(
+          padding: const EdgeInsets.fromLTRB(20, 20, 20, 12),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              if (!short) ...[
+                Center(
+                  child: AppNoticeIcon(icon: icon, color: accent, size: 24),
+                ),
+                const SizedBox(height: BrandSpace.md),
+              ],
+              Text(
+                title,
+                textAlign: TextAlign.center,
+                style: BrandText.title,
+              ),
+              const SizedBox(height: 6),
+              Text(
+                message,
+                textAlign: TextAlign.center,
+                style: const TextStyle(
+                  color: BrandColors.textSecondary,
+                  fontSize: 14,
+                  height: 1.4,
+                ),
+              ),
+              const SizedBox(height: BrandSpace.lg),
+              ...children,
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+/// Thẻ lựa chọn full-width trong hộp thoại: icon trong ô màu, tiêu đề (kèm
+/// nhãn [badge] tuỳ chọn) và một dòng phụ đề.
+class _ChoiceCard extends StatelessWidget {
+  const _ChoiceCard({
+    required this.icon,
+    required this.color,
+    required this.title,
+    required this.subtitle,
+    required this.onTap,
+    this.badge,
+  });
+
+  final IconData icon;
+  final Color color;
+  final String title;
+  final String subtitle;
+  final VoidCallback onTap;
+  final String? badge;
+
+  @override
+  Widget build(BuildContext context) {
+    final tag = badge;
+    return Material(
+      color: BrandColors.surfaceRaised,
+      clipBehavior: Clip.antiAlias,
+      shape: RoundedRectangleBorder(
+        borderRadius: BorderRadius.circular(BrandRadius.medium),
+        side: const BorderSide(color: BrandColors.border),
+      ),
+      child: InkWell(
+        onTap: onTap,
+        child: ConstrainedBox(
+          constraints: const BoxConstraints(minHeight: 64),
+          child: Padding(
+            padding: const EdgeInsets.all(BrandSpace.md),
+            child: Row(
+              children: [
+                Container(
+                  width: 40,
+                  height: 40,
+                  decoration: BoxDecoration(
+                    color: color.withValues(alpha: 0.16),
+                    borderRadius: BorderRadius.circular(BrandRadius.small),
+                  ),
+                  child: Icon(icon, color: color, size: 22),
+                ),
+                const SizedBox(width: BrandSpace.md),
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      // Wrap: máy hẹp / chữ lớn thì nhãn xuống dòng thay vì
+                      // cắt tiêu đề.
+                      Wrap(
+                        spacing: BrandSpace.sm,
+                        runSpacing: BrandSpace.xs,
+                        crossAxisAlignment: WrapCrossAlignment.center,
+                        children: [
+                          Text(
+                            title,
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                            style: BrandText.body.copyWith(
+                              fontWeight: FontWeight.w700,
+                            ),
+                          ),
+                          if (tag != null)
+                            BrandPill(
+                              text: tag,
+                              color: BrandColors.successSoft,
+                            ),
+                        ],
+                      ),
+                      const SizedBox(height: 2),
+                      Text(
+                        subtitle,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: BrandText.caption,
+                      ),
+                    ],
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+/// Một dòng nhãn – giá trị trong thẻ "Đang phát".
+class _InfoRow {
+  const _InfoRow(this.label, this.value, {this.mono = false, this.color});
+
+  final String label;
+  final String value;
+  final bool mono;
+  final Color? color;
 }

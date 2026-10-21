@@ -47,9 +47,67 @@ enum StationErrorCode {
   unknown,
 }
 
+/// Lỗi/thông báo có sẵn bản tiếng Việt và tiếng Anh để UI hiển thị theo ngôn
+/// ngữ đang chọn (xem [stationErrorMessage]). `toString()` của các lớp cài đặt
+/// vẫn là tiếng Việt như trước nên log và JSON trả cho tablet không đổi.
+abstract interface class BilingualMessage {
+  String get messageVi;
+  String get messageEn;
+}
+
+extension BilingualMessageText on BilingualMessage {
+  /// Thông báo theo ngôn ngữ giao diện.
+  String localized({required bool english}) =>
+      english ? messageEn : messageVi;
+}
+
+/// [StateError] kèm bản tiếng Anh. `message`/`toString()` giữ nguyên tiếng
+/// Việt; `on StateError` vẫn bắt được như trước.
+class BilingualStateError extends StateError implements BilingualMessage {
+  BilingualStateError(this.messageVi, this.messageEn) : super(messageVi);
+
+  @override
+  final String messageVi;
+
+  @override
+  final String messageEn;
+}
+
+/// Thay cho `Exception('...')`: `toString()` giữ nguyên dạng
+/// `Exception: <tiếng Việt>`.
+class BilingualException implements Exception, BilingualMessage {
+  const BilingualException(this.messageVi, this.messageEn);
+
+  @override
+  final String messageVi;
+
+  @override
+  final String messageEn;
+
+  @override
+  String toString() => 'Exception: $messageVi';
+}
+
+/// [FileSystemException] kèm bản tiếng Anh; `message`/`toString()` giữ
+/// nguyên tiếng Việt.
+class BilingualFileSystemException extends FileSystemException
+    implements BilingualMessage {
+  const BilingualFileSystemException(
+    this.messageVi,
+    this.messageEn, [
+    String? path = '',
+  ]) : super(messageVi, path);
+
+  @override
+  final String messageVi;
+
+  @override
+  final String messageEn;
+}
+
 /// Lỗi có mã của Camera Station. [toString] trả câu tiếng Việt để giữ tương
 /// thích với các chỗ đang hiển thị `error.toString()`.
-class StationException implements Exception {
+class StationException implements Exception, BilingualMessage {
   const StationException(
     this.code, {
     required this.messageVi,
@@ -69,7 +127,11 @@ class StationException implements Exception {
   }
 
   final StationErrorCode code;
+
+  @override
   final String messageVi;
+
+  @override
   final String messageEn;
 
   /// Lỗi gốc (nếu có), ví dụ lỗi getUserMedia khi thiếu quyền.
@@ -185,6 +247,9 @@ String stationErrorMessage(Object error, {required bool english}) {
     return StationException.fromCode(
       StationErrorCode.permissionDenied,
     ).message(english: english);
+  }
+  if (error is BilingualMessage) {
+    return error.localized(english: english);
   }
   final raw = error
       .toString()

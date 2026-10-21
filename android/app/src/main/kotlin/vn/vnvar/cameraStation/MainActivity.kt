@@ -35,6 +35,8 @@ import kotlin.math.atan
 
 class MainActivity : FlutterActivity() {
     private var pendingStart: PendingStart? = null
+    /** Lệnh `ensureCapturePermissions` đang chờ người dùng trả lời hộp thoại quyền. */
+    private var pendingCapturePermissionResult: MethodChannel.Result? = null
     private var activityResumed = false
     // Đọc từ luồng thu âm (onPcm) nên cần volatile.
     @Volatile
@@ -199,6 +201,12 @@ class MainActivity : FlutterActivity() {
                 }
 
                 "isEmulator" -> result.success(isRunningOnEmulator())
+
+                // Xin quyền camera/micro (và thông báo) TRƯỚC khi mở camera, chờ
+                // người dùng trả lời không giới hạn thời gian. Trước đây hộp thoại
+                // quyền bật ra giữa lúc getUserMedia (timeout 12 s) nên lần cài
+                // đầu tiên hay báo lỗi và phải bấm "Thử lại".
+                "ensureCapturePermissions" -> ensureCapturePermissions(result)
 
                 "openAppSettings" -> {
                     val opened = try {
@@ -608,12 +616,43 @@ class MainActivity : FlutterActivity() {
         completePendingStartIfPossible()
     }
 
+    private fun capturePermissionStatus(): Map<String, Boolean> = mapOf(
+        "camera" to hasCameraPermission(),
+        "microphone" to (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) ==
+            PackageManager.PERMISSION_GRANTED),
+    )
+
+    private fun ensureCapturePermissions(result: MethodChannel.Result) {
+        val missing = requiredRuntimePermissions().filter {
+            ContextCompat.checkSelfPermission(this, it) != PackageManager.PERMISSION_GRANTED
+        }
+        // Chỉ hỏi khi còn thiếu camera hoặc micro; thông báo được hỏi kèm cho gọn.
+        val needsCapture = missing.any {
+            it == Manifest.permission.CAMERA || it == Manifest.permission.RECORD_AUDIO
+        }
+        if (!needsCapture) {
+            result.success(capturePermissionStatus())
+            return
+        }
+        // Một lệnh đang chờ: trả trạng thái hiện tại cho lệnh cũ, giữ lệnh mới.
+        pendingCapturePermissionResult?.success(capturePermissionStatus())
+        pendingCapturePermissionResult = result
+        requestPermissions(missing.toTypedArray(), CAPTURE_PERMISSION_REQUEST)
+    }
+
     override fun onRequestPermissionsResult(
         requestCode: Int,
         permissions: Array<out String>,
         grantResults: IntArray,
     ) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+
+        if (requestCode == CAPTURE_PERMISSION_REQUEST) {
+            val pending = pendingCapturePermissionResult
+            pendingCapturePermissionResult = null
+            pending?.success(capturePermissionStatus())
+            return
+        }
 
         if (requestCode == STORAGE_PERMISSION_REQUEST) {
             if (grantResults.isNotEmpty() && grantResults.first() == PackageManager.PERMISSION_GRANTED) {
@@ -1115,6 +1154,7 @@ class MainActivity : FlutterActivity() {
         private const val CHANNEL_NAME = "vnvar/camera_station_service"
         private const val PERMISSION_REQUEST = 4101
         private const val NOTIFICATION_PERMISSION_REQUEST = 4102
+        private const val CAPTURE_PERMISSION_REQUEST = 4103
         private const val VIDEO_FOLDER_REQUEST = 45186
         private const val STORAGE_PERMISSION_REQUEST = 45187
     }

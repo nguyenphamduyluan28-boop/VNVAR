@@ -183,6 +183,8 @@ import UIKit
         self.openAppSettings(result)
       case "requestMicrophonePermission":
         self.requestMicrophonePermission(result)
+      case "ensureCapturePermissions":
+        self.ensureCapturePermissions(result)
       case "startNativeAudioSegment":
         self.startNativeAudioSegment(call, result)
       case "stopNativeAudioSegment":
@@ -653,6 +655,32 @@ import UIKit
     }
     UIApplication.shared.open(url, options: [:]) { opened in
       result(opened)
+    }
+  }
+
+  /// Hỏi quyền camera rồi micro TRƯỚC khi mở camera (không giới hạn thời gian
+  /// chờ người dùng). Trả `{camera: Bool, microphone: Bool}`.
+  private func ensureCapturePermissions(_ result: @escaping FlutterResult) {
+    requestCameraAccess { cameraGranted in
+      self.requestMicrophonePermission { micGranted in
+        result([
+          "camera": cameraGranted,
+          "microphone": (micGranted as? Bool) ?? false,
+        ])
+      }
+    }
+  }
+
+  private func requestCameraAccess(_ completion: @escaping (Bool) -> Void) {
+    switch AVCaptureDevice.authorizationStatus(for: .video) {
+    case .authorized:
+      completion(true)
+    case .notDetermined:
+      AVCaptureDevice.requestAccess(for: .video) { granted in
+        DispatchQueue.main.async { completion(granted) }
+      }
+    default:
+      completion(false)
     }
   }
 

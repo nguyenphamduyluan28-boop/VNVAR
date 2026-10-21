@@ -266,4 +266,88 @@ void main() {
       expect(applied, [1]);
     });
   });
+
+  group('readScoreOverlayFlags / scoreOverlayHint', () {
+    test('thiếu dữ liệu overlay thì dùng mặc định (in bật, ẩn)', () {
+      expect(readScoreOverlayFlags(null), defaultScoreOverlayFlags);
+      expect(readScoreOverlayFlags(<String, dynamic>{}), (
+        burnIn: true,
+        visible: false,
+      ));
+    });
+
+    test('đọc cờ burnIn/visible từ snapshot', () {
+      final flags = readScoreOverlayFlags(<String, dynamic>{
+        'overlay': <String, dynamic>{'burnIn': false, 'visible': true},
+      });
+      expect(flags.burnIn, isFalse);
+      expect(flags.visible, isTrue);
+    });
+
+    test('chỉ nhắc khi đang live và có in bảng tỉ số', () {
+      expect(
+        scoreOverlayHint(live: false, flags: defaultScoreOverlayFlags),
+        ScoreOverlayHint.none,
+      );
+      expect(
+        scoreOverlayHint(live: true, flags: defaultScoreOverlayFlags),
+        ScoreOverlayHint.hidden,
+      );
+      expect(
+        scoreOverlayHint(live: true, flags: (burnIn: true, visible: true)),
+        ScoreOverlayHint.shown,
+      );
+      expect(
+        scoreOverlayHint(live: true, flags: (burnIn: false, visible: false)),
+        ScoreOverlayHint.none,
+      );
+    });
+  });
+
+  group('formatStreamMetrics', () {
+    test('ghép FPS và kbps, bỏ phần chưa có số liệu', () {
+      expect(formatStreamMetrics(29.6, 2450.4), '30 fps · 2450 kbps');
+      expect(formatStreamMetrics(0, 1800), '1800 kbps');
+      expect(formatStreamMetrics(25, 0), '25 fps');
+      expect(formatStreamMetrics(0, 0), isNull);
+      expect(formatStreamMetrics(double.nan, double.infinity), isNull);
+    });
+  });
+
+  group('quickMenuLayout', () {
+    test('màn dọc đủ cao: 1 cột dòng thường', () {
+      expect(
+        quickMenuLayout(maxWidth: 340, maxHeight: 420, itemCount: 5),
+        (columns: 1, dense: false),
+      );
+    });
+
+    test('hơi thấp: 1 cột dòng gọn', () {
+      expect(
+        quickMenuLayout(maxWidth: 340, maxHeight: 265, itemCount: 5),
+        (columns: 1, dense: true),
+      );
+    });
+
+    test('máy ngang thấp (640x360): lưới 2 cột vừa không cần cuộn', () {
+      final layout = quickMenuLayout(
+        maxWidth: 560,
+        maxHeight: 220,
+        itemCount: 5,
+      );
+      expect(layout, (columns: 2, dense: true));
+      const rows = 3;
+      expect(
+        rows * quickMenuDenseRowHeight + quickMenuVerticalChrome,
+        lessThanOrEqualTo(220),
+      );
+    });
+
+    test('thấp và hẹp: 1 cột dòng gọn (tự cuộn)', () {
+      expect(
+        quickMenuLayout(maxWidth: 300, maxHeight: 200, itemCount: 5),
+        (columns: 1, dense: true),
+      );
+    });
+  });
 }

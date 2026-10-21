@@ -14,6 +14,7 @@ import 'package:path_provider/path_provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import 'audio_cleanup.dart';
+import 'station_errors.dart';
 import 'station_platform_events.dart';
 import 'video_storage_service.dart';
 
@@ -637,8 +638,13 @@ bool isOrphanAuxiliaryFile(String path) {
       name.endsWith('.tmp');
 }
 
+const String _unknownUserFacingErrorVi = 'Đã xảy ra lỗi không xác định.';
+const String _unknownUserFacingErrorEn = 'An unknown error occurred.';
+
 /// Converts native/FFmpeg failures into a bounded string safe for a Flutter
 /// Text widget. Full command output remains available in debug logs.
+/// Luôn tiếng Việt (dùng cả cho JSON trả tablet); UI dùng
+/// [localizedUserFacingError].
 String userFacingError(Object error) {
   var message = error.toString().trim();
   message = message.replaceFirst(RegExp(r'^Bad state:\s*'), '');
@@ -652,7 +658,20 @@ String userFacingError(Object error) {
       .toList();
   message = lines.isEmpty ? message : lines.first;
   if (message.length > 240) message = '${message.substring(0, 237)}...';
-  return message.isEmpty ? 'Đã xảy ra lỗi không xác định.' : message;
+  return message.isEmpty ? _unknownUserFacingErrorVi : message;
+}
+
+/// Như [userFacingError] nhưng theo ngôn ngữ giao diện: lỗi có sẵn hai ngôn
+/// ngữ ([BilingualMessage]) dùng đúng bản; lỗi khác giữ nguyên nội dung gốc.
+String localizedUserFacingError(Object error, {required bool english}) {
+  final source = error is BilingualMessage
+      ? error.localized(english: english)
+      : error;
+  final message = userFacingError(source);
+  if (english && message == _unknownUserFacingErrorVi) {
+    return _unknownUserFacingErrorEn;
+  }
+  return message;
 }
 
 String normalizeCameraKey(String cameraId) {
@@ -680,9 +699,19 @@ class TrimInProgressException implements Exception {
   String toString() => message;
 }
 
-class StorageSafetyException implements Exception {
+class StorageSafetyException implements Exception, BilingualMessage {
   final String message;
-  const StorageSafetyException(this.message);
+
+  /// Bản tiếng Anh cho UI; mặc định dùng chung [message].
+  final String? englishMessage;
+
+  const StorageSafetyException(this.message, [this.englishMessage]);
+
+  @override
+  String get messageVi => message;
+
+  @override
+  String get messageEn => englishMessage ?? message;
 
   @override
   String toString() => message;
@@ -1608,7 +1637,11 @@ class RecordingService {
     File source,
   ) async {
     if (!await source.exists()) {
-      throw FileSystemException('Video không còn tồn tại.', source.path);
+      throw BilingualFileSystemException(
+        'Video không còn tồn tại.',
+        'The video no longer exists.',
+        source.path,
+      );
     }
     final temporaryRoot = await getTemporaryDirectory();
     final directory = Directory(
@@ -1722,9 +1755,10 @@ class RecordingService {
           )
           .take(6)
           .join('\n');
-      throw StateError(
-        'Không thể chuẩn bị video để phát: '
-        '${conciseOutput.isEmpty ? code : conciseOutput}',
+      final detail = conciseOutput.isEmpty ? code : conciseOutput;
+      throw BilingualStateError(
+        'Không thể chuẩn bị video để phát: $detail',
+        'Cannot prepare video for playback: $detail',
       );
     }
     return target;
@@ -2727,7 +2761,10 @@ class RecordingService {
     final videoTrack = _videoTrack;
 
     if (videoTrack == null) {
-      throw StateError('Không có video track để ghi.');
+      throw BilingualStateError(
+        'Không có video track để ghi.',
+        'No video track to record.',
+      );
     }
 
     await _ensureFreeSpaceForNewSegment();
@@ -2898,7 +2935,10 @@ class RecordingService {
         );
         debugPrint('[VNVAR] NATIVE AUDIO START FAILED: $error');
         _notifyVideoChanges();
-        throw StateError('Microphone bắt buộc nhưng không thể bắt đầu: $error');
+        throw BilingualStateError(
+          'Microphone bắt buộc nhưng không thể bắt đầu: $error',
+          'Microphone is required but failed to start: $error',
+        );
       }
     }
     _notifyVideoChanges();
@@ -2927,9 +2967,11 @@ class RecordingService {
     }
     if (available != null && available < minimumStartFreeSpaceBytes) {
       _setStorageSuspended(true);
+      final freeMb = (available / (1024 * 1024)).toStringAsFixed(0);
       throw StorageSafetyException(
         'Không đủ dung lượng an toàn để bắt đầu segment mới '
-        '(${(available / (1024 * 1024)).toStringAsFixed(0)} MB còn trống).',
+        '($freeMb MB còn trống).',
+        'Not enough free storage for a new segment ($freeMb MB left).',
       );
     }
     _setStorageSuspended(false);
