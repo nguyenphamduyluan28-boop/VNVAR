@@ -540,7 +540,7 @@ class _MenuTile extends StatelessWidget {
                 style: BrandText.body,
               ),
             ),
-            if (trailing != null) trailing!,
+            ?trailing,
           ],
         ),
       ),
@@ -753,7 +753,7 @@ class _CameraNotice extends StatelessWidget {
               ),
             ),
           ),
-          if (action != null) action!,
+          ?action,
         ],
       ),
     );

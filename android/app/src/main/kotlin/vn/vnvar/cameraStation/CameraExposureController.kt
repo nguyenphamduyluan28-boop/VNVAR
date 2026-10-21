@@ -47,8 +47,8 @@ object CameraExposureController {
     /** Không khoá trong chừng này sau khi phiên chụp mở (AF/AE còn đang chạy lần đầu). */
     private const val MIN_LOCK_AFTER_SESSION_MS = 3_000L
     /**
-     * AF không báo "đã nét" sau chừng này (cảnh quá tối/phẳng) thì vẫn khoá AE/AWB
-     * nhưng KHÔNG khoá tiêu cự: AF liên tục tiếp tục chạy, tránh đóng băng hình mờ.
+     * AF không báo "đã nét" sau chừng này (cảnh quá tối/phẳng) thì khoá tiêu cự ở
+     * vị trí hiện tại (sau khi AF đã quét) và cho phép khoá AE/AWB.
      */
     private const val AF_FOCUS_TIMEOUT_MS = 8_000L
     /** AF báo nét (sau khi đã quét) liên tục chừng này thì khoá tiêu cự. */
@@ -114,6 +114,9 @@ object CameraExposureController {
     /** Ống kính hiện tại có lấy nét tự động (không phải ống fixed-focus). */
     @Volatile
     private var activeHasAutoFocus = false
+    /** Ống kính cho chỉnh tay tiêu cự (AF_MODE_OFF + LENS_FOCUS_DISTANCE). */
+    @Volatile
+    private var activeManualFocus = false
     /** Capture session đang theo dõi và thời điểm nó bắt đầu (elapsedRealtime). */
     @Volatile
     private var sessionStartHash = 0
@@ -319,8 +322,6 @@ object CameraExposureController {
      */
     private fun observeConvergence(trackId: String, generation: Int, result: TotalCaptureResult) {
         if (!stableExposureEnabled || activeCameraLock) return
-        // Không có bộ đo sáng thì không thể phát hiện ánh sáng đổi: giữ tự động.
-        if (!lumaMeter.isAttachedTo(trackId)) return
         val now = SystemClock.elapsedRealtime()
         val af = result.get(CaptureResult.CONTROL_AF_STATE)
         // Chỉ coi là "đã nét" khi AF thật sự báo nét SAU khi đã quét: INACTIVE lúc
@@ -351,7 +352,10 @@ object CameraExposureController {
             val focusedLongEnough = focusedSinceMs > 0L &&
                 now - focusedSinceMs >= FOCUS_LOCK_AFTER_MS
             val gaveUp = afTimedOut && afScanSeen && !afScanning && lensStill
+            // Máy không chỉnh tay được tiêu cự thường không báo LENS_FOCUS_DISTANCE;
+            // khi đó khoá bằng AF_MODE_AUTO (không dùng giá trị) nên dùng 0f làm dấu.
             val distance = result.get(CaptureResult.LENS_FOCUS_DISTANCE)
+                ?: if (!activeManualFocus) 0f else null
             if ((focusedLongEnough || gaveUp) && distance != null) {
                 focusLockPending = true
                 lifecycleHandler.post {
@@ -371,6 +375,9 @@ object CameraExposureController {
 
         // ---- 2. Khoá AE/AWB ----
         if (autoLocked || lockPending) return
+        // Không có bộ đo sáng thì không phát hiện được ánh sáng đổi để mở khoá:
+        // giữ AE/AWB tự động (khoá tiêu cự ở trên không cần bộ đo sáng).
+        if (!lumaMeter.isAttachedTo(trackId)) return
         val ae = result.get(CaptureResult.CONTROL_AE_STATE) ?: return
         val sinceAeReleaseMs =
             if (aeReleasedAtMs > 0L) now - aeReleasedAtMs else sinceSessionMs
@@ -767,6 +774,14 @@ object CameraExposureController {
             afScanSeen = false
             afRestartPending = true
             focusedSinceMs = 0L
+            // Phiên chụp mới (đổi ống kính/độ phân giải, camera dựng lại): tiêu
+            // cự đã khoá thuộc phiên cũ, có thể của ống kính khác → lấy nét lại.
+            // (Trước đây chỉ nhả khi AE cũng đang khoá.)
+            if (lockedFocusDistance != null) {
+                lockedFocusDistance = null
+                focusLockPending = false
+                focusReleasedAtMs = sessionStartedMs
+            }
         }
         val lockedOn = lockedSessionHash
         if (autoLocked && lockedOn != null && lockedOn != sessionHash) {
@@ -786,6 +801,9 @@ object CameraExposureController {
             it == CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_VIDEO ||
                 it == CaptureRequest.CONTROL_AF_MODE_AUTO
         } == true
+        activeManualFocus = (characteristics.get(
+            CameraCharacteristics.LENS_INFO_MINIMUM_FOCUS_DISTANCE,
+        ) ?: 0f) > 0f && availableAfModes?.contains(CaptureRequest.CONTROL_AF_MODE_OFF) == true
         val compensationRange = characteristics.get(
             CameraCharacteristics.CONTROL_AE_COMPENSATION_RANGE,
         )
@@ -952,6 +970,14 @@ object CameraExposureController {
                         characteristics.get(CameraCharacteristics.CONTROL_AVAILABLE_VIDEO_STABILIZATION_MODES),
                         CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE_OFF,
                     )
+                }
+                if (afRestartPending) {
+                    // Xoá dấu "đã quét" NGAY trên camera thread trước khi request mới
+                    // chạy: kết quả của request cũ (đang xử lý trên thread này giữa
+                    // releaseAutoLock() và ++requestGeneration ở main thread) có thể
+                    // đã đặt lại afScanSeen/focusedSinceMs → tin nhầm PASSIVE_FOCUSED.
+                    afScanSeen = false
+                    focusedSinceMs = 0L
                 }
                 captureSession.setRepeatingRequest(
                     request.build(),

@@ -365,17 +365,27 @@ class BrandTile extends StatelessWidget {
                     crossAxisAlignment: CrossAxisAlignment.start,
                     mainAxisSize: MainAxisSize.min,
                     children: [
-                      Text(title, style: BrandText.body),
+                      Text(
+                        title,
+                        style: BrandText.body,
+                        maxLines: 2,
+                        overflow: TextOverflow.ellipsis,
+                      ),
                       if (sub != null) ...[
                         const SizedBox(height: 2),
-                        Text(sub, style: BrandText.caption),
+                        Text(
+                          sub,
+                          style: BrandText.caption,
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                        ),
                       ],
                     ],
                   ),
                 ),
                 if (trailing != null) ...[
                   const SizedBox(width: BrandSpace.sm),
-                  trailing!,
+                  Flexible(child: trailing!),
                 ] else if (onTap != null)
                   const Icon(
                     Icons.chevron_right_rounded,

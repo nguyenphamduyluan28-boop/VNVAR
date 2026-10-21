@@ -795,7 +795,7 @@ class _VideoListState extends State<VideoList> {
       }
     }
 
-    if (isActivelyRecording && startedAt != null) {
+    if (isActivelyRecording) {
       addDay(startedAt);
       entries.add(const _ListEntry.active());
     }
