@@ -594,13 +594,17 @@ class _StorageSettings extends StatelessWidget {
                   : Row(
                       mainAxisSize: MainAxisSize.min,
                       children: [
-                        Text(
-                          storagePath.isEmpty
-                              ? appText(context, 'Chọn', 'Choose')
-                              : appText(context, 'Đổi', 'Change'),
-                          style: BrandText.body.copyWith(
-                            color: BrandColors.primarySoft,
-                            fontWeight: FontWeight.w700,
+                        Flexible(
+                          child: Text(
+                            storagePath.isEmpty
+                                ? appText(context, 'Chọn', 'Choose')
+                                : appText(context, 'Đổi', 'Change'),
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                            style: BrandText.body.copyWith(
+                              color: BrandColors.primarySoft,
+                              fontWeight: FontWeight.w700,
+                            ),
                           ),
                         ),
                         const Icon(

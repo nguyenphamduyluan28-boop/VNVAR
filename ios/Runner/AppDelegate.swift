@@ -28,8 +28,9 @@ import UIKit
   private var overlayPublisher: VnvarOverlayRtspPublisher?
   private var overlayGeneration: UInt64 = 0
   private var pendingOverlayStartCancel: (() -> Void)?
-  /// Thời gian chờ server nghe + encoder có SPS/PPS (cần cho DESCRIBE của FFmpeg).
-  private let overlayStartTimeout: TimeInterval = 5
+  /// Thời gian chờ server nghe + encoder có SPS/PPS (cần cho DESCRIBE của FFmpeg),
+  /// tính cả các lần thử bind lại (C6, cửa sổ thử < 5 s). Dart chờ 8 s.
+  private let overlayStartTimeout: TimeInterval = 6.5
   private var finalizationTask: UIBackgroundTaskIdentifier = .invalid
   private var brightnessBeforeDimming: CGFloat?
 
@@ -419,7 +420,7 @@ import UIKit
     let publisher = VnvarRtspPublisher(
       track: track,
       audioTrackId: audioTrackId,
-      nativeAudioAvailable: AVAudioSession.sharedInstance().recordPermission == .granted,
+      nativeAudioAvailable: microphonePermission() == .granted,
       port: port,
       bitrate: bitrate,
       fps: fps
@@ -520,8 +521,53 @@ import UIKit
     FlutterError(code: "OVERLAY_RTSP_FAILED", message: message, details: details)
   }
 
+  /// Trạng thái một lần gọi `startOverlayRtsp` (có thể gồm nhiều lần thử bind).
+  /// Chỉ truy cập trên main thread.
+  private final class OverlayStartState {
+    let generation: UInt64
+    let firstAttemptUptime: TimeInterval
+    let track: RTCVideoTrack
+    let port: Int
+    let bitrate: Int
+    let fps: Int
+    let overlayPath: String
+    private let result: FlutterResult
+    private(set) var resultSent = false
+    var attempt = 0
+    var serverReady = false
+    var encoderReady = false
+
+    init(
+      generation: UInt64,
+      track: RTCVideoTrack,
+      port: Int,
+      bitrate: Int,
+      fps: Int,
+      overlayPath: String,
+      result: @escaping FlutterResult
+    ) {
+      self.generation = generation
+      firstAttemptUptime = ProcessInfo.processInfo.systemUptime
+      self.track = track
+      self.port = port
+      self.bitrate = bitrate
+      self.fps = fps
+      self.overlayPath = overlayPath
+      self.result = result
+    }
+
+    /// Gọi FlutterResult đúng một lần.
+    func finish(_ value: Any?) {
+      guard !resultSent else { return }
+      resultSent = true
+      result(value)
+    }
+  }
+
   /// C5: `true` khi server loopback đã nghe VÀ encoder đã có SPS/PPS (để
   /// DESCRIBE của FFmpeg không nhận 503). FlutterResult được gọi đúng một lần.
+  /// C6: listener lỗi lúc khởi động (cổng chưa nhả sau lần dừng trước) → tự
+  /// thử bind lại tối đa 5 lần, cách ~300 ms, không chặn main thread.
   private func startOverlayRtsp(_ call: FlutterMethodCall, _ result: @escaping FlutterResult) {
     guard let arguments = call.arguments as? [String: Any],
           let trackId = arguments["trackId"] as? String, !trackId.isEmpty else {
@@ -546,31 +592,17 @@ import UIKit
     // Gọi lại khi đang chạy: dừng phiên cũ rồi chạy lại.
     stopOverlayRtsp()
 
-    let publisher: VnvarOverlayRtspPublisher
-    do {
-      publisher = try VnvarOverlayRtspPublisher(
-        track: track,
-        port: port,
-        bitrate: bitrate,
-        fps: fps,
-        overlayPath: overlayPath
-      )
-    } catch {
-      result(overlayFailure(String(describing: error)))
-      return
-    }
-
-    let generation = overlayGeneration
-    var resultSent = false
-    var serverReady = false
-    var encoderReady = false
-    let finish: (Any?) -> Void = { value in
-      guard !resultSent else { return }
-      resultSent = true
-      result(value)
-    }
+    let state = OverlayStartState(
+      generation: overlayGeneration,
+      track: track,
+      port: port,
+      bitrate: bitrate,
+      fps: fps,
+      overlayPath: overlayPath,
+      result: result
+    )
     pendingOverlayStartCancel = {
-      finish(
+      state.finish(
         FlutterError(
           code: "OVERLAY_RTSP_FAILED",
           message: "Overlay RTSP start was cancelled.",
@@ -578,25 +610,76 @@ import UIKit
         )
       )
     }
+    // Hạn chót chung cho mọi lần thử (Dart chờ 8 s).
+    DispatchQueue.main.asyncAfter(deadline: .now() + overlayStartTimeout) { [weak self] in
+      guard let self = self,
+            self.overlayGeneration == state.generation,
+            !state.resultSent else { return }
+      let reason = state.serverReady
+        ? "No camera frame was encoded for the overlay stream."
+        : "Overlay RTSP server did not start listening."
+      state.finish(
+        FlutterError(code: "OVERLAY_RTSP_FAILED", message: reason, details: nil)
+      )
+      self.stopOverlayRtsp()
+    }
+    launchOverlayAttempt(state)
+  }
+
+  /// Một lần thử tạo + chạy publisher overlay. Chỉ gọi trên main thread.
+  private func launchOverlayAttempt(_ state: OverlayStartState) {
+    guard overlayGeneration == state.generation, !state.resultSent else { return }
+    state.attempt += 1
+    let attempt = state.attempt
+    state.serverReady = false
+    state.encoderReady = false
+
+    let publisher: VnvarOverlayRtspPublisher
+    do {
+      publisher = try VnvarOverlayRtspPublisher(
+        track: state.track,
+        port: state.port,
+        bitrate: state.bitrate,
+        fps: state.fps,
+        overlayPath: state.overlayPath
+      )
+    } catch {
+      state.finish(overlayFailure(String(describing: error)))
+      stopOverlayRtsp()
+      return
+    }
+
+    // Callback của lần thử cũ (đã bị thay) hoặc phiên đã dừng bị bỏ qua.
+    let isCurrent: () -> Bool = { [weak self] in
+      guard let self = self else { return false }
+      return self.overlayGeneration == state.generation && state.attempt == attempt
+    }
     let completeIfReady: () -> Void = { [weak self] in
       guard let self = self,
-            self.overlayGeneration == generation,
-            serverReady, encoderReady, !resultSent else { return }
+            isCurrent(),
+            state.serverReady, state.encoderReady, !state.resultSent else { return }
       self.pendingOverlayStartCancel = nil
-      finish(true)
+      state.finish(true)
     }
     publisher.onServerReady = {
-      serverReady = true
+      guard isCurrent() else { return }
+      state.serverReady = true
       completeIfReady()
     }
     publisher.onEncoderConfigured = {
-      encoderReady = true
+      guard isCurrent() else { return }
+      state.encoderReady = true
       completeIfReady()
     }
-    publisher.onError = { [weak self] message in
-      guard let self = self, self.overlayGeneration == generation else { return }
-      let startPending = !resultSent
-      finish(
+    publisher.onError = { [weak self] message, recoverable in
+      guard let self = self, isCurrent() else { return }
+      // Listener lỗi khi chưa từng nghe: thường là cổng chưa được nhả.
+      if !state.resultSent, recoverable, !state.serverReady,
+         self.scheduleOverlayRetry(state, failedAttempt: attempt, reason: message) {
+        return
+      }
+      let startPending = !state.resultSent
+      state.finish(
         FlutterError(code: "OVERLAY_RTSP_FAILED", message: message, details: nil)
       )
       // Dừng ngay để nhả GPU/encoder/cổng; Dart gọi stopOverlayRtsp sau đó
@@ -605,7 +688,7 @@ import UIKit
       if !startPending {
         self.stationChannel?.invokeMethod(
           "onOverlayRtspError",
-          arguments: ["error": message]
+          arguments: ["error": message, "recoverable": recoverable]
         )
       }
     }
@@ -613,22 +696,44 @@ import UIKit
     do {
       try publisher.start()
     } catch {
-      finish(overlayFailure(String(describing: error)))
+      let message = String(describing: error)
+      if scheduleOverlayRetry(state, failedAttempt: attempt, reason: message) {
+        return
+      }
+      state.finish(overlayFailure(message))
       stopOverlayRtsp()
       return
     }
-    DispatchQueue.main.asyncAfter(deadline: .now() + overlayStartTimeout) { [weak self] in
-      guard let self = self,
-            self.overlayGeneration == generation,
-            !resultSent else { return }
-      let reason = serverReady
-        ? "No camera frame was encoded for the overlay stream."
-        : "Overlay RTSP server did not start listening."
-      finish(
-        FlutterError(code: "OVERLAY_RTSP_FAILED", message: reason, details: nil)
-      )
-      self.stopOverlayRtsp()
+  }
+
+  /// Dừng publisher của lần thử vừa lỗi và hẹn lần thử kế tiếp sau ~300 ms
+  /// (không chặn main thread). Trả false khi đã hết lượt/hết thời gian thử.
+  private func scheduleOverlayRetry(
+    _ state: OverlayStartState,
+    failedAttempt: Int,
+    reason: String
+  ) -> Bool {
+    let elapsed = ProcessInfo.processInfo.systemUptime - state.firstAttemptUptime
+    guard overlayGeneration == state.generation,
+          !state.resultSent,
+          VnvarListenerBindRetryPolicy.shouldRetry(
+            failedAttempt: failedAttempt,
+            elapsed: elapsed
+          ) else { return false }
+    NSLog(
+      "[VNVAR-RTSP-OVERLAY] Listener failed (attempt %ld): %@; retrying bind",
+      failedAttempt,
+      reason
+    )
+    // Không gọi stopOverlayRtsp(): nó đổi generation và huỷ FlutterResult đang chờ.
+    overlayPublisher?.stop()
+    overlayPublisher = nil
+    DispatchQueue.main.asyncAfter(
+      deadline: .now() + VnvarListenerBindRetryPolicy.retryDelay
+    ) { [weak self] in
+      self?.launchOverlayAttempt(state)
     }
+    return true
   }
 
   /// An toàn khi chưa chạy. Chỉ gọi trên main thread.
@@ -684,19 +789,58 @@ import UIKit
     }
   }
 
+  private enum MicrophonePermission {
+    case granted
+    case denied
+    case undetermined
+  }
+
+  /// iOS 17+: AVAudioApplication (API AVAudioSession.recordPermission đã cũ);
+  /// iOS 15–16 giữ API cũ.
+  private func microphonePermission() -> MicrophonePermission {
+    if #available(iOS 17.0, *) {
+      switch AVAudioApplication.shared.recordPermission {
+      case .granted:
+        return .granted
+      case .denied:
+        return .denied
+      case .undetermined:
+        return .undetermined
+      @unknown default:
+        return .denied
+      }
+    }
+    switch AVAudioSession.sharedInstance().recordPermission {
+    case .granted:
+      return .granted
+    case .denied:
+      return .denied
+    case .undetermined:
+      return .undetermined
+    @unknown default:
+      return .denied
+    }
+  }
+
+  /// [completion] có thể chạy trên luồng nền.
+  private func requestRecordAccess(_ completion: @escaping (Bool) -> Void) {
+    if #available(iOS 17.0, *) {
+      AVAudioApplication.requestRecordPermission(completionHandler: completion)
+    } else {
+      AVAudioSession.sharedInstance().requestRecordPermission(completion)
+    }
+  }
+
   private func requestMicrophonePermission(_ result: @escaping FlutterResult) {
-    let audioSession = AVAudioSession.sharedInstance()
-    switch audioSession.recordPermission {
+    switch microphonePermission() {
     case .granted:
       result(true)
     case .denied:
       result(false)
     case .undetermined:
-      audioSession.requestRecordPermission { granted in
+      requestRecordAccess { granted in
         DispatchQueue.main.async { result(granted) }
       }
-    @unknown default:
-      result(false)
     }
   }
 
@@ -706,7 +850,7 @@ import UIKit
       result(FlutterError(code: "AUDIO_PATH_REQUIRED", message: "Audio path is required.", details: nil))
       return
     }
-    guard AVAudioSession.sharedInstance().recordPermission == .granted else {
+    guard microphonePermission() == .granted else {
       result(FlutterError(code: "MICROPHONE_PERMISSION_DENIED", message: "Microphone permission is not granted.", details: nil))
       return
     }
@@ -852,10 +996,11 @@ import UIKit
     }
     DispatchQueue.main.async {
       if dimmed {
+        let screen = self.currentScreen()
         if self.brightnessBeforeDimming == nil {
-          self.brightnessBeforeDimming = UIScreen.main.brightness
+          self.brightnessBeforeDimming = screen.brightness
         }
-        UIScreen.main.brightness = 0.05
+        screen.brightness = 0.05
       } else {
         self.restoreBrightnessIfNeeded()
       }
@@ -875,7 +1020,18 @@ import UIKit
 
   private func performRestoreBrightness() {
     guard let previousBrightness = brightnessBeforeDimming else { return }
-    UIScreen.main.brightness = previousBrightness
+    currentScreen().brightness = previousBrightness
     brightnessBeforeDimming = nil
+  }
+
+  /// Màn hình của window scene (ưu tiên scene đang hoạt động); không có scene
+  /// nào thì dùng UIScreen.main như trước. Chỉ gọi trên main thread.
+  private func currentScreen() -> UIScreen {
+    let scenes = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }
+    if let scene = scenes.first(where: { $0.activationState == .foregroundActive })
+      ?? scenes.first {
+      return scene.screen
+    }
+    return UIScreen.main
   }
 }

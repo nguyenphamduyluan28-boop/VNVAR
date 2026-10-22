@@ -15,6 +15,7 @@ import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
 import android.util.Log
+import androidx.core.app.NotificationCompat
 import io.flutter.embedding.engine.FlutterEngineCache
 import io.flutter.plugin.common.MethodChannel
 
@@ -126,10 +127,12 @@ class CameraStationForegroundService : Service() {
     private fun startForegroundMinimal(): Boolean {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) return false
         val notification = try {
-            Notification.Builder(this, CHANNEL_ID)
+            // NotificationCompat: Notification.Builder(ctx, channelId) cần API 26
+            // (Android 7.x sập với NoSuchMethodError).
+            NotificationCompat.Builder(this, CHANNEL_ID)
                 .setSmallIcon(android.R.drawable.presence_video_online)
                 .setContentTitle("SportO Cam")
-                .setCategory(Notification.CATEGORY_SERVICE)
+                .setCategory(NotificationCompat.CATEGORY_SERVICE)
                 .build()
         } catch (error: Exception) {
             Log.e(TAG, "[SERVICE] Unable to build minimal notification", error)
@@ -241,12 +244,14 @@ class CameraStationForegroundService : Service() {
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
         )
 
-        return Notification.Builder(this, CHANNEL_ID)
+        // NotificationCompat thay Notification.Builder(ctx, channelId) (API 26+).
+        return NotificationCompat.Builder(this, CHANNEL_ID)
             .setSmallIcon(android.R.drawable.presence_video_online)
             .setContentTitle("SportO Cam")
             .setContentText("$cameraId đang hoạt động · $courtId")
             .setContentIntent(openAppPendingIntent)
-            .setCategory(Notification.CATEGORY_SERVICE)
+            .setCategory(NotificationCompat.CATEGORY_SERVICE)
+            .setPriority(NotificationCompat.PRIORITY_LOW)
             .setOngoing(true)
             .setOnlyAlertOnce(true)
             .build()

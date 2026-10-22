@@ -852,7 +852,7 @@ class WebRtcService {
 
     // Xin quyền trước, KHÔNG giới hạn thời gian: hộp thoại quyền lần cài đầu
     // tiên không còn rơi vào timeout 12 s của getUserMedia bên dưới.
-    await _ensureCapturePermissions();
+    await ensureCapturePermissions();
     if (cameraGeneration != _cameraLifecycleGeneration) return;
 
     _isEmulator ??= await _detectEmulator();
@@ -1065,10 +1065,34 @@ class WebRtcService {
     }
   }
 
+  static Future<void>? _pendingCapturePermissions;
+
   /// Hỏi quyền camera/micro qua native và chờ người dùng trả lời. Thiếu quyền
   /// camera → [StationException] permissionDenied (màn lỗi có nút Mở Cài đặt,
   /// không tự thử lại). Thiếu micro vẫn chạy (ghi hình không tiếng như cũ).
-  Future<void> _ensureCapturePermissions() async {
+  ///
+  /// Không giới hạn thời gian (người dùng có thể đọc hộp thoại lâu): runtime
+  /// gọi hàm này TRƯỚC khi vào hàng đợi vòng đời có timeout. Các lời gọi đồng
+  /// thời dùng chung một Future (không hỏi quyền hai lần). Đã có quyền thì
+  /// trả ngay.
+  static Future<void> ensureCapturePermissions() {
+    final pending = _pendingCapturePermissions;
+    if (pending != null) return pending;
+    final request = _requestCapturePermissions();
+    _pendingCapturePermissions = request;
+    void clear() {
+      if (identical(_pendingCapturePermissions, request)) {
+        _pendingCapturePermissions = null;
+      }
+    }
+
+    unawaited(
+      request.then<void>((_) => clear(), onError: (Object _) => clear()),
+    );
+    return request;
+  }
+
+  static Future<void> _requestCapturePermissions() async {
     if (!Platform.isAndroid && !Platform.isIOS) return;
     Map<Object?, Object?>? status;
     try {

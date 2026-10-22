@@ -320,30 +320,80 @@ String defaultServerFor(StreamPlatform platform, StreamProtocol protocol) {
   return kDefaultRtspServers[platform] ?? convertServerScheme(rtmp, protocol);
 }
 
+/// Chuẩn hoá máy chủ để so sánh: bỏ khoảng trắng, bỏ "/" cuối, scheme và
+/// host chữ thường (đường dẫn giữ nguyên chữ hoa/thường).
+String normalizeStreamServer(String server) {
+  final trimmed = server.trim().replaceAll(RegExp(r'/+$'), '');
+  final m = RegExp(
+    r'^([a-z][a-z0-9+.-]*://[^/?#]*)(.*)$',
+    caseSensitive: false,
+  ).firstMatch(trimmed);
+  if (m == null) return trimmed;
+  return '${m.group(1)!.toLowerCase()}${m.group(2)}';
+}
+
+/// Cổng RTMP/RTSP đã biết của máy chủ đối tác (host chữ thường): đổi giao
+/// thức thì dùng đúng cổng của giao thức mới thay vì bỏ cổng.
+const Map<String, ({int rtmp, int rtsp})> kKnownPartnerPorts = {
+  'media.aqvision.net': (rtmp: 11935, rtsp: 18554),
+};
+
+/// Cổng mặc định của từng họ giao thức: đổi sang giao thức khác thì bỏ cổng
+/// này (giao thức mới dùng cổng mặc định của nó). Cổng lạ thì giữ nguyên.
+const Map<StreamProtocol, Set<int>> _defaultPortsOf = {
+  StreamProtocol.rtmp: {1935, 443},
+  StreamProtocol.rtsp: {554, 8554, 322},
+};
+
 /// Đổi [server] sang [target]: máy chủ đang là mặc định (của giao thức nào
-/// cũng vậy) hoặc trống → mặc định của giao thức mới; máy chủ tự nhập → đổi
-/// scheme và BỎ cổng (cổng RTMP/RTSP khác nhau; người dùng sửa lại nếu cần).
+/// cũng vậy, so khớp sau khi chuẩn hoá) hoặc trống → mặc định của giao thức
+/// mới; máy chủ tự nhập → [convertServerScheme].
 String serverForProtocol(
   StreamPlatform platform,
   String server,
   StreamProtocol target,
 ) {
   final current = server.trim();
+  final normalized = normalizeStreamServer(current);
   final isDefault = current.isEmpty ||
-      StreamProtocol.values.any((p) => current == defaultServerFor(platform, p));
+      StreamProtocol.values.any(
+        (p) => normalized == normalizeStreamServer(defaultServerFor(platform, p)),
+      );
   if (isDefault) return defaultServerFor(platform, target);
   return convertServerScheme(current, target);
 }
 
-/// Đổi scheme của [server] sang [target] và bỏ cổng; giữ host + đường dẫn.
+/// Đổi scheme của [server] sang [target]; giữ host + đường dẫn. Cổng:
+/// - host đối tác đã biết ([kKnownPartnerPorts]) → cổng của giao thức mới;
+/// - cổng mặc định của giao thức cũ (1935/443 hoặc 554/8554/322) → bỏ;
+/// - cổng lạ → giữ (người dùng tự sửa nếu cần).
 String convertServerScheme(String server, StreamProtocol target) {
   final current = server.trim();
   if (current.isEmpty || streamProtocolOf(current) == target) return current;
   final m = RegExp(
-    r'^[a-z]+://([^/:]+|\[[^\]]+\])(?::\d+)?(.*)$',
+    r'^[a-z][a-z0-9+.-]*://([^/:?#]+|\[[^\]]+\])(?::(\d+))?(.*)$',
     caseSensitive: false,
   ).firstMatch(current);
   if (m == null) return current;
+  final host = m.group(1)!;
+  final rest = m.group(3)!;
   final scheme = target == StreamProtocol.rtsp ? 'rtsp' : 'rtmp';
-  return '$scheme://${m.group(1)}${m.group(2)}';
+  final known = kKnownPartnerPorts[host.toLowerCase()];
+  if (known != null) {
+    final port = target == StreamProtocol.rtsp ? known.rtsp : known.rtmp;
+    return '$scheme://$host:$port$rest';
+  }
+  final port = int.tryParse(m.group(2) ?? '');
+  final source = streamProtocolOf(current);
+  final keepPort =
+      port != null && !(_defaultPortsOf[source] ?? const <int>{}).contains(port);
+  return keepPort ? '$scheme://$host:$port$rest' : '$scheme://$host$rest';
+}
+
+/// Đổi [fromServer] sang giao thức [to] làm MẤT mã hoá (rtmps:// → rtsp://,
+/// rtsps:// → rtmp://): UI nên cảnh báo người dùng.
+bool protocolDowngradesEncryption(String fromServer, StreamProtocol to) {
+  final lower = fromServer.trim().toLowerCase();
+  final encrypted = lower.startsWith('rtmps://') || lower.startsWith('rtsps://');
+  return encrypted && streamProtocolOf(lower) != to;
 }

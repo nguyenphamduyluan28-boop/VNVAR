@@ -55,8 +55,10 @@ class _SavedVideosScreenState extends State<SavedVideosScreen> {
     if (failure != null) {
       showAppNotice(
         context,
-        vi: 'Không tải lại được danh sách: $failure',
-        en: 'Unable to refresh list: $failure',
+        vi: 'Không tải lại được danh sách: '
+            '${localizedUserFacingError(failure, english: false)}',
+        en: 'Unable to refresh list: '
+            '${localizedUserFacingError(failure, english: true)}',
         kind: NoticeKind.error,
       );
     }

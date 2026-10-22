@@ -40,6 +40,8 @@ object CameraExposureController {
     private const val TAG = "CameraExposure"
     private val lifecycleHandler = Handler(Looper.getMainLooper())
     private const val WATCHDOG_INTERVAL_MS = 1_500L
+    /** Trần giãn cách thử lại của watchdog khi plugin/capturer liên tục không có. */
+    private const val WATCHDOG_MAX_BACKOFF_MS = 30_000L
     private const val CAPTURE_HEARTBEAT_TIMEOUT_MS = 3_000L
     private const val METERING_REGION_FRACTION = 0.3
     /** AE/AF phải ổn định liên tục chừng này trước khi tự khoá. */
@@ -156,6 +158,16 @@ object CameraExposureController {
     private var currentSessionHash = 0
     @Volatile
     private var lockedSessionHash: Int? = null
+    /**
+     * Số lần liên tiếp watchdog khôi phục request thất bại (plugin/capturer
+     * chưa có, camera thread dừng...). Dùng để giãn dần khoảng thử
+     * (1,5 s → tối đa 30 s) và chỉ ghi log lần đầu. Về 0 khi apply thành công.
+     */
+    @Volatile
+    private var watchdogFailures = 0
+    /** Đã tự kiểm tra các trường private của flutter_webrtc dùng qua reflection. */
+    @Volatile
+    private var reflectionChecked = false
     private val lumaMeter = LumaMeter { trackId, luma ->
         lifecycleHandler.post { onLuma(trackId, luma) }
     }
@@ -166,13 +178,20 @@ object CameraExposureController {
             if (activeCamera2 &&
                 SystemClock.elapsedRealtime() - lastCaptureHeartbeatMs > CAPTURE_HEARTBEAT_TIMEOUT_MS
             ) {
-                Log.i(TAG, "Capture request heartbeat lost; restoring exposure")
+                // Chỉ ghi log ở lần đầu của một chuỗi thất bại (không spam log
+                // mỗi 1,5 s khi plugin/capturer đã mất hẳn).
+                if (watchdogFailures == 0) {
+                    Log.i(TAG, "Capture request heartbeat lost; restoring exposure")
+                }
                 apply(trackId, activeTargetEv) { response ->
-                    if (response["applied"] != true) {
-                        Log.w(TAG, "Exposure watchdog retry failed: ${response["reason"]}")
+                    if (response["applied"] != true &&
+                        response["reason"] != "request_cancelled"
+                    ) {
+                        onWatchdogRetryFailed(trackId, response["reason"])
                     }
                 }
-                // apply() restarts the watchdog from a single fresh schedule.
+                // apply() restarts the watchdog from a single fresh schedule
+                // (giãn cách lại trong onWatchdogRetryFailed khi thất bại).
                 return
             }
             if (!lumaMeter.isAttachedTo(trackId)) lumaMeter.attach(trackId)
@@ -180,7 +199,30 @@ object CameraExposureController {
         }
     }
 
-    fun apply(trackId: String, targetEv: Double, callback: (Map<String, Any>) -> Unit) {
+    /**
+     * Watchdog không khôi phục được request: thay lịch 1,5 s mà apply() vừa đặt
+     * bằng khoảng thử giãn dần (1,5 s × 2^n, tối đa 30 s). Gọi từ main hoặc
+     * camera thread (Handler an toàn đa luồng).
+     */
+    private fun onWatchdogRetryFailed(trackId: String, reason: Any?) {
+        if (activeTrackId != trackId) return
+        val failures = watchdogFailures + 1
+        watchdogFailures = failures
+        val shift = (failures).coerceAtMost(5)
+        val delayMs = (WATCHDOG_INTERVAL_MS shl shift).coerceAtMost(WATCHDOG_MAX_BACKOFF_MS)
+        if (failures == 1) {
+            Log.w(TAG, "Exposure watchdog retry failed: $reason; backing off (max ${WATCHDOG_MAX_BACKOFF_MS / 1000} s, further failures not logged)")
+        }
+        lifecycleHandler.removeCallbacks(captureWatchdog)
+        lifecycleHandler.postDelayed(captureWatchdog, delayMs)
+    }
+
+    fun apply(trackId: String, targetEv: Double, requestCallback: (Map<String, Any>) -> Unit) {
+        // Apply thành công (từ bất kỳ nguồn nào) đưa watchdog về nhịp 1,5 s.
+        val callback: (Map<String, Any>) -> Unit = { response ->
+            if (response["applied"] == true) watchdogFailures = 0
+            requestCallback(response)
+        }
         if (activeTrackId != trackId) {
             requestGeneration++
             lastCaptureHeartbeatMs = 0L
@@ -199,6 +241,7 @@ object CameraExposureController {
         try {
             val plugin = FlutterWebRTCPlugin.sharedSingleton
                 ?: return callback(result(false, reason = "plugin_unavailable"))
+            if (!reflectionChecked) verifyReflectionContract(plugin, trackId)
             val handler = readField(plugin, "methodCallHandler")
             val getUserMedia = readField(handler, "getUserMediaImpl") as GetUserMediaImpl
             val info = getUserMedia.getCapturerInfo(trackId)
@@ -216,8 +259,98 @@ object CameraExposureController {
                 else -> callback(result(false, reason = "unsupported_capturer"))
             }
         } catch (error: Throwable) {
-            Log.w(TAG, "Exposure boost unavailable", error)
+            // Watchdog đang thử lại liên tục: không ghi lại stack trace mỗi lần.
+            if (watchdogFailures == 0) Log.w(TAG, "Exposure boost unavailable", error)
             callback(result(false, reason = error.javaClass.simpleName))
+        }
+    }
+
+    private fun hasField(type: Class<*>?, name: String): Boolean {
+        var current = type
+        while (current != null) {
+            try {
+                current.getDeclaredField(name)
+                return true
+            } catch (_: NoSuchFieldException) {
+                current = current.superclass
+            }
+        }
+        return false
+    }
+
+    /**
+     * Tự kiểm tra một lần các trường private của flutter_webrtc mà controller
+     * đọc qua reflection; log rõ trường nào thiếu (bản flutter_webrtc khác) thay
+     * vì chỉ thấy lỗi chung chung ở mỗi lần apply. Không bao giờ ném lỗi. Chỉ
+     * đánh dấu "đã kiểm" khi đã kiểm được tới tầng session (hoặc đã thiếu sớm).
+     */
+    private fun verifyReflectionContract(plugin: Any, trackId: String) {
+        try {
+            val missing = mutableListOf<String>()
+            fun check(owner: Any?, label: String, vararg names: String) {
+                if (owner == null) return
+                for (name in names) {
+                    if (!hasField(owner.javaClass, name)) missing += "$label.$name"
+                }
+            }
+            fun readOrNull(owner: Any?, name: String): Any? =
+                if (owner == null) null else try { readField(owner, name) } catch (_: Throwable) { null }
+
+            check(plugin, plugin.javaClass.simpleName, "methodCallHandler")
+            val handler = readOrNull(plugin, "methodCallHandler")
+            check(handler, handler?.javaClass?.simpleName ?: "MethodCallHandler", "getUserMediaImpl")
+            val getUserMedia = readOrNull(handler, "getUserMediaImpl")
+            check(getUserMedia, "GetUserMediaImpl", "isFacing")
+            val capturer = try {
+                (getUserMedia as? GetUserMediaImpl)?.getCapturerInfo(trackId)?.capturer
+            } catch (_: Throwable) {
+                null
+            }
+            var complete = handler == null || getUserMedia == null
+            when (capturer) {
+                is Camera2Capturer -> {
+                    check(capturer, "Camera2Capturer", "currentSession", "cameraManager")
+                    val session = readOrNull(capturer, "currentSession")
+                    if (session != null) {
+                        check(
+                            session,
+                            session.javaClass.simpleName,
+                            "cameraDevice",
+                            "captureSession",
+                            "surface",
+                            "cameraThreadHandler",
+                            "captureFormat",
+                            "fpsUnitFactor",
+                            "surfaceTextureHelper",
+                        )
+                        complete = true
+                    }
+                }
+                is Camera1Capturer -> {
+                    check(capturer, "Camera1Capturer", "currentSession")
+                    val session = readOrNull(capturer, "currentSession")
+                    if (session != null) {
+                        check(session, session.javaClass.simpleName, "camera", "surfaceTextureHelper")
+                        complete = true
+                    }
+                }
+                null -> {}
+                else -> complete = true
+            }
+            if (missing.isNotEmpty()) {
+                reflectionChecked = true
+                Log.e(
+                    TAG,
+                    "flutter_webrtc reflection self-check: missing private field(s) " +
+                        missing.joinToString() + " — exposure/zoom/rotation control may not work",
+                )
+            } else if (complete) {
+                reflectionChecked = true
+                Log.i(TAG, "flutter_webrtc reflection self-check OK")
+            }
+        } catch (error: Throwable) {
+            reflectionChecked = true
+            Log.w(TAG, "flutter_webrtc reflection self-check failed", error)
         }
     }
 
@@ -251,6 +384,7 @@ object CameraExposureController {
         lumaMeter.detach()
         lastCaptureHeartbeatMs = 0L
         requestGeneration++
+        watchdogFailures = 0
         lifecycleHandler.removeCallbacks(captureWatchdog)
     }
 
@@ -841,6 +975,9 @@ object CameraExposureController {
                 return@post
             }
             try {
+                // AF_MODE_AUTO dùng để QUÉT (máy không có CONTINUOUS_VIDEO), khác
+                // AF_MODE_AUTO dùng để GIỮ tiêu cự (đã khoá / khoá camera).
+                var afAutoScanMode = false
                 val request = cameraDevice.createCaptureRequest(CameraDevice.TEMPLATE_RECORD).apply {
                     addTarget(surface)
                     set(CaptureRequest.CONTROL_MODE, CaptureRequest.CONTROL_MODE_AUTO)
@@ -895,6 +1032,8 @@ object CameraExposureController {
                             set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_VIDEO)
                         } else {
                             set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_AUTO)
+                            // AF_MODE_AUTO chỉ quét khi có AF_TRIGGER_START.
+                            afAutoScanMode = afModes?.contains(CaptureRequest.CONTROL_AF_MODE_AUTO) == true
                         }
                     }
                     set(CaptureRequest.CONTROL_AWB_MODE, CaptureRequest.CONTROL_AWB_MODE_AUTO)
@@ -997,22 +1136,42 @@ object CameraExposureController {
                 )
                 lastCaptureHeartbeatMs = SystemClock.elapsedRealtime()
                 lastAppliedKey = appliedKey
-                if (afRestartPending && activeHasAutoFocus &&
-                    request.get(CaptureRequest.CONTROL_AF_MODE) ==
-                    CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_VIDEO
-                ) {
+                if (afRestartPending) {
+                    // Xoá cờ ở MỌI chế độ AF sau khi xử lý: trước đây cờ chỉ được
+                    // xoá ở CONTINUOUS_VIDEO, nên ở các chế độ khác mỗi lần apply
+                    // lại xoá afScanSeen (khoá tiêu cự không bao giờ tin được "nét").
                     afRestartPending = false
-                    // Ép AF liên tục quét lại từ đầu: ở CONTINUOUS_VIDEO, START khoá
-                    // tức thì (không di chuyển ống kính), CANCEL sau đó nhả khoá và
-                    // "Restart AF scan" theo bảng trạng thái Camera2. Không dùng thì
-                    // vài máy giữ ống kính đứng yên tới khi khung hình đổi (zoom).
-                    try {
-                        request.set(CaptureRequest.CONTROL_AF_TRIGGER, CaptureRequest.CONTROL_AF_TRIGGER_START)
-                        captureSession.capture(request.build(), null, cameraThread)
-                        request.set(CaptureRequest.CONTROL_AF_TRIGGER, CaptureRequest.CONTROL_AF_TRIGGER_CANCEL)
-                        captureSession.capture(request.build(), null, cameraThread)
-                    } catch (error: Throwable) {
-                        Log.w(TAG, "Cannot restart autofocus scan", error)
+                    val afMode = request.get(CaptureRequest.CONTROL_AF_MODE)
+                    if (activeHasAutoFocus &&
+                        afMode == CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_VIDEO
+                    ) {
+                        // Ép AF liên tục quét lại từ đầu: ở CONTINUOUS_VIDEO, START khoá
+                        // tức thì (không di chuyển ống kính), CANCEL sau đó nhả khoá và
+                        // "Restart AF scan" theo bảng trạng thái Camera2. Không dùng thì
+                        // vài máy giữ ống kính đứng yên tới khi khung hình đổi (zoom).
+                        try {
+                            request.set(CaptureRequest.CONTROL_AF_TRIGGER, CaptureRequest.CONTROL_AF_TRIGGER_START)
+                            captureSession.capture(request.build(), null, cameraThread)
+                            request.set(CaptureRequest.CONTROL_AF_TRIGGER, CaptureRequest.CONTROL_AF_TRIGGER_CANCEL)
+                            captureSession.capture(request.build(), null, cameraThread)
+                        } catch (error: Throwable) {
+                            Log.w(TAG, "Cannot restart autofocus scan", error)
+                        }
+                    } else if (activeHasAutoFocus && afAutoScanMode &&
+                        afMode == CaptureRequest.CONTROL_AF_MODE_AUTO
+                    ) {
+                        // Máy không có CONTINUOUS_VIDEO: AF_MODE_AUTO đứng yên nếu
+                        // không có trigger → không bao giờ lấy nét. CANCEL (về
+                        // INACTIVE) rồi START một lần để quét; ống kính giữ vị trí
+                        // nét (FOCUSED_LOCKED) cho tới lần nhả khoá kế tiếp.
+                        try {
+                            request.set(CaptureRequest.CONTROL_AF_TRIGGER, CaptureRequest.CONTROL_AF_TRIGGER_CANCEL)
+                            captureSession.capture(request.build(), null, cameraThread)
+                            request.set(CaptureRequest.CONTROL_AF_TRIGGER, CaptureRequest.CONTROL_AF_TRIGGER_START)
+                            captureSession.capture(request.build(), null, cameraThread)
+                        } catch (error: Throwable) {
+                            Log.w(TAG, "Cannot trigger autofocus scan", error)
+                        }
                     }
                 }
                 callback(result(true, compensation, compensation * compensationStep))

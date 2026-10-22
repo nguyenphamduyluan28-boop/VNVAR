@@ -7,6 +7,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 
 import '../models/scoreboard_state.dart';
 import '../services/app_language_service.dart';
+import '../services/camera_station_runtime.dart';
 import '../services/scoreboard_service.dart';
 import '../theme/app_theme.dart';
 import 'app_notice.dart';
@@ -20,6 +21,7 @@ Future<void> showScoreboardHub(
   required int port,
   Stream<void>? networkChanges,
   ScoreboardService? service,
+  bool Function()? showRestartsLive,
 }) {
   return showModalBottomSheet<void>(
     context: context,
@@ -36,6 +38,9 @@ Future<void> showScoreboardHub(
       port: port,
       networkChanges: networkChanges,
       service: service ?? ScoreboardService.instance,
+      showRestartsLive:
+          showRestartsLive ??
+          (() => CameraStationRuntime.instance.scoreboardShowRestartsLive),
     ),
   );
 }
@@ -47,12 +52,16 @@ class ScoreboardHubSheet extends StatefulWidget {
     required this.port,
     required this.service,
     this.networkChanges,
+    this.showRestartsLive,
   });
 
   final String? Function() lanAddress;
   final int port;
   final ScoreboardService service;
   final Stream<void>? networkChanges;
+
+  /// Đang phát và bảng đang Ẩn: bấm Hiện sẽ phát lại live (~3 giây).
+  final bool Function()? showRestartsLive;
 
   @override
   State<ScoreboardHubSheet> createState() => _ScoreboardHubSheetState();
@@ -346,6 +355,14 @@ class _ScoreboardHubSheetState extends State<ScoreboardHubSheet> {
                       ? BrandColors.success
                       : BrandColors.textSecondary,
                   title: 'Overlay',
+                  subtitle: !_overlayVisible &&
+                          (widget.showRestartsLive?.call() ?? false)
+                      ? appText(
+                          context,
+                          'Bấm Hiện sẽ phát lại live ~3 giây',
+                          'Show restarts the live stream (~3 s)',
+                        )
+                      : null,
                   trailing: BrandSegmented<bool>(
                     dense: true,
                     values: const [false, true],

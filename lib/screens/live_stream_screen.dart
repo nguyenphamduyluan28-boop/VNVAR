@@ -106,6 +106,13 @@ class LiveStreamScreen extends StatefulWidget {
 class _LiveStreamScreenState extends State<LiveStreamScreen> {
   StreamPlatform _platform = StreamPlatform.sporto;
 
+  /// Giao thức đẩy luồng đang chọn — lưu riêng, không suy từ ô máy chủ, để
+  /// nền tảng chưa có máy chủ (TikTok ô trống) vẫn giữ lựa chọn RTSP.
+  StreamProtocol _protocol = StreamProtocol.rtmp;
+
+  /// Vừa chuyển từ máy chủ mã hoá (rtmps/rtsps) sang giao thức không mã hoá.
+  bool _protocolDowngradeWarning = false;
+
   // Controllers
   final TextEditingController _streamKeyController = TextEditingController();
   final TextEditingController _customUrlController = TextEditingController();
@@ -308,6 +315,7 @@ class _LiveStreamScreenState extends State<LiveStreamScreen> {
             _detectPlatformAndParse(rtspUrl);
           } else {
             _platform = StreamPlatform.sporto;
+            _protocol = StreamProtocol.rtmp;
             _serverController.text =
                 kDefaultServers[StreamPlatform.sporto] ?? '';
           }
@@ -342,6 +350,9 @@ class _LiveStreamScreenState extends State<LiveStreamScreen> {
     _customUrlController.text = url;
     final parsed = parseStreamUrl(url);
     _platform = parsed.platform;
+    // URL đã lưu / dán / quét QR quyết định giao thức theo scheme của nó.
+    _protocol = streamProtocolOf(url);
+    _protocolDowngradeWarning = false;
     // Cấu hình cũ còn máy chủ SportO trước đây → chuyển sang máy chủ mới.
     final server = parsed.platform == StreamPlatform.sporto &&
             parsed.server == kLegacySportoServer
@@ -1222,12 +1233,15 @@ class _LiveStreamScreenState extends State<LiveStreamScreen> {
   /// Đổi giao thức RTMP/RTSP: máy chủ mặc định đổi sang mặc định của giao
   /// thức mới; máy chủ tự nhập đổi scheme (bỏ cổng) và mở ô sửa để kiểm tra.
   void _selectProtocol(StreamProtocol protocol) {
+    if (_protocol == protocol) return;
     final current = _serverController.text;
-    if (streamProtocolOf(current) == protocol && current.trim().isNotEmpty) {
-      return;
-    }
     setState(() {
       final next = serverForProtocol(_platform, current, protocol);
+      // rtmps:// (hoặc rtsps://) → giao thức không mã hoá: khoá luồng sẽ đi
+      // dạng rõ trên mạng, cảnh báo người dùng.
+      _protocolDowngradeWarning =
+          _isEncryptedServer(current) && !_isEncryptedServer(next);
+      _protocol = protocol;
       _serverController.text = next;
       final isDefault = next.isNotEmpty &&
           next == defaultServerFor(_platform, protocol);
@@ -1236,11 +1250,30 @@ class _LiveStreamScreenState extends State<LiveStreamScreen> {
     });
   }
 
+  static bool _isEncryptedServer(String server) {
+    final lower = server.trim().toLowerCase();
+    return lower.startsWith('rtmps://') || lower.startsWith('rtsps://');
+  }
+
+  /// Người dùng tự gõ máy chủ có scheme rõ ràng → giao thức theo máy chủ đó.
+  void _syncProtocolFromServer(String server) {
+    final lower = server.trim().toLowerCase();
+    final hasScheme = const ['rtmp://', 'rtmps://', 'rtsp://', 'rtsps://']
+        .any(lower.startsWith);
+    if (!hasScheme) return;
+    final protocol = streamProtocolOf(lower);
+    if (protocol == _protocol) return;
+    setState(() {
+      _protocol = protocol;
+      _protocolDowngradeWarning = false;
+    });
+  }
+
   void _selectPlatform(StreamPlatform platform) {
     setState(() {
       final oldPlatform = _platform;
       final currentServer = _serverController.text.trim();
-      final protocol = streamProtocolOf(currentServer);
+      final protocol = _protocol;
       final wasDefault = currentServer.isEmpty ||
           StreamProtocol.values.any(
             (p) => currentServer == defaultServerFor(oldPlatform, p),
@@ -1257,6 +1290,7 @@ class _LiveStreamScreenState extends State<LiveStreamScreen> {
       }
       _platform = platform;
       _editServer = false;
+      _protocolDowngradeWarning = false;
       // Giữ giao thức đang chọn khi đổi nền tảng.
       if (wasDefault) {
         _serverController.text = defaultServerFor(platform, protocol);
@@ -1495,7 +1529,7 @@ class _LiveStreamScreenState extends State<LiveStreamScreen> {
   Widget _buildInputContent() {
     final isCustom = _platform == StreamPlatform.custom;
     final isTiktok = _platform == StreamPlatform.tiktok;
-    final protocol = streamProtocolOf(_serverController.text);
+    final protocol = _protocol;
     final defaultServer = defaultServerFor(_platform, protocol);
     final locked = _streamActive;
     final showProtocol = !isCustom && _platform != StreamPlatform.obs;
@@ -1531,6 +1565,19 @@ class _LiveStreamScreenState extends State<LiveStreamScreen> {
               ),
             ],
           ),
+          if (_protocolDowngradeWarning) ...[
+            const SizedBox(height: BrandSpace.sm),
+            AppNoticeBanner(
+              dense: true,
+              kind: NoticeKind.warning,
+              icon: Icons.lock_open_rounded,
+              message: appText(
+                context,
+                'Khoá luồng sẽ gửi không mã hoá',
+                'Stream key will be sent unencrypted',
+              ),
+            ),
+          ],
           if (protocol == StreamProtocol.rtsp && publicPlatform) ...[
             const SizedBox(height: BrandSpace.sm),
             AppNoticeBanner(
@@ -1551,6 +1598,7 @@ class _LiveStreamScreenState extends State<LiveStreamScreen> {
             controller: _serverController,
             enabled: !locked,
             style: monoStyle,
+            onChanged: _syncProtocolFromServer,
             decoration: _inputDecoration(
               hint: 'Server URL',
               prefixIcon: Icons.dns_rounded,
@@ -1563,6 +1611,7 @@ class _LiveStreamScreenState extends State<LiveStreamScreen> {
               controller: _serverController,
               enabled: !locked,
               style: monoStyle.copyWith(fontSize: 12.5),
+              onChanged: _syncProtocolFromServer,
               decoration: _inputDecoration(
                 hint: defaultServer,
                 prefixIcon: Icons.dns_rounded,
@@ -1870,13 +1919,16 @@ class _LiveStreamScreenState extends State<LiveStreamScreen> {
           trailing: Row(
             mainAxisSize: MainAxisSize.min,
             children: [
-              Text(
-                short.$1,
-                maxLines: 1,
-                style: TextStyle(
-                  color: short.$2,
-                  fontSize: 13,
-                  fontWeight: FontWeight.w700,
+              Flexible(
+                child: Text(
+                  short.$1,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: TextStyle(
+                    color: short.$2,
+                    fontSize: 13,
+                    fontWeight: FontWeight.w700,
+                  ),
                 ),
               ),
               const SizedBox(width: BrandSpace.xs),
@@ -1904,6 +1956,14 @@ class _LiveStreamScreenState extends State<LiveStreamScreen> {
                 child: Text(
                   visible
                       ? appText(context, 'Hiện trên video', 'Shown on video')
+                      // Đang phát (copy nguyên luồng vì bảng đang ẩn): bấm
+                      // Hiện sẽ phát lại phiên để in bảng tỉ số.
+                      : widget.runtime.scoreboardShowRestartsLive
+                      ? appText(
+                          context,
+                          'Bấm Hiện sẽ phát lại live ~3 giây',
+                          'Show restarts the live stream (~3 s)',
+                        )
                       : appText(
                           context,
                           'Chọn Hiện để in vào video',
@@ -2018,20 +2078,8 @@ class _LiveStreamScreenState extends State<LiveStreamScreen> {
     final targetKbps = isWhip ? 0 : _rtspService.targetBitrateKbps;
     final quality = isWhip ? null : _networkQualityLabel();
 
-    final String scoreboard;
-    final Color scoreboardColor;
-    if (!isWhip && _rtspService.overlayActive && _overlayBurnIn) {
-      if (_overlayVisible) {
-        scoreboard = appText(context, 'Đang in', 'On video');
-        scoreboardColor = BrandColors.successSoft;
-      } else {
-        scoreboard = appText(context, 'Đang ẩn', 'Hidden');
-        scoreboardColor = BrandColors.warning;
-      }
-    } else {
-      scoreboard = appText(context, 'Không', 'None');
-      scoreboardColor = BrandColors.textSecondary;
-    }
+    // Dùng chung trạng thái ngắn với ô "Tùy chọn" để hai chỗ luôn khớp.
+    final (scoreboard, scoreboardColor) = _scoreboardShortStatus(isWhip);
 
     final rows = <_InfoRow>[
       _InfoRow(

@@ -4,6 +4,29 @@ import CoreVideo
 import Foundation
 import Metal
 
+/// Chọn MỘT nguồn tiếng cho RTSP: PCM từ audio sink WebRTC khi nó vừa có dữ
+/// liệu trong `webRtcFreshness` giây gần nhất, ngược lại PCM native (file ghi
+/// âm). Hai nguồn cùng ghi vào một đồng hồ RTP sẽ chồng lấn/nhảy timestamp.
+/// Thuần để kiểm thử; thời điểm là systemUptime (đơn điệu).
+struct VnvarAudioSourceSelector {
+  static let webRtcFreshness: TimeInterval = 1.0
+  private(set) var lastWebRtcPcmUptime: TimeInterval?
+
+  mutating func noteWebRtcPcm(at now: TimeInterval) {
+    lastWebRtcPcmUptime = now
+  }
+
+  /// true: WebRTC đang cấp tiếng, bỏ PCM native.
+  func prefersWebRtc(at now: TimeInterval) -> Bool {
+    guard let last = lastWebRtcPcmUptime else { return false }
+    return now - last <= Self.webRtcFreshness
+  }
+
+  func acceptsNativePcm(at now: TimeInterval) -> Bool {
+    !prefersWebRtc(at: now)
+  }
+}
+
 final class VnvarRtspPublisher: NSObject, RTCVideoRenderer {
   var onEncoderConfigured: (() -> Void)?
   var onEncoderError: ((String) -> Void)?
@@ -36,6 +59,12 @@ final class VnvarRtspPublisher: NSObject, RTCVideoRenderer {
   private var nextAudioTimestamp: UInt64?
   var audioAvailable: Bool { audioSink != nil || nativeAudioAvailable }
   private let nativeAudioAvailable: Bool
+  // Chọn nguồn tiếng (WebRTC hay native). Khoá được giữ suốt quyết định +
+  // handleAudio để tại một thời điểm chỉ một nguồn ghi vào nextAudioTimestamp.
+  // Trong khoá chỉ có stateQueue.sync/async và khoá trạng thái của server;
+  // không hàng đợi nào trong đó lấy lại audioSourceLock nên không thể deadlock.
+  private let audioSourceLock = NSLock()
+  private var audioSource = VnvarAudioSourceSelector()
 
   init(
     track: RTCVideoTrack,
@@ -95,7 +124,11 @@ final class VnvarRtspPublisher: NSObject, RTCVideoRenderer {
     }
     server.setAudioAvailable(audioSink != nil || nativeAudioAvailable)
     audioSink?.onPcm = { [weak self] pcm, sampleRate, channels, bits in
-      self?.handleAudio(
+      guard let self = self else { return }
+      self.audioSourceLock.lock()
+      defer { self.audioSourceLock.unlock() }
+      self.audioSource.noteWebRtcPcm(at: ProcessInfo.processInfo.systemUptime)
+      self.handleAudio(
         pcm,
         sampleRate: sampleRate,
         channels: channels,
@@ -121,12 +154,22 @@ final class VnvarRtspPublisher: NSObject, RTCVideoRenderer {
 
   func sendNativePcm(_ pcm: Data) {
     guard nativeAudioAvailable else { return }
+    audioSourceLock.lock()
+    defer { audioSourceLock.unlock() }
+    // WebRTC vừa cấp tiếng (~1 s gần nhất): bỏ PCM native.
+    guard audioSource.acceptsNativePcm(at: ProcessInfo.processInfo.systemUptime) else {
+      return
+    }
     handleAudio(pcm, sampleRate: 48_000, channels: 1, bitsPerSample: 16)
   }
 
-  /// Có client RTSP đang nhận tiếng: chỉ khi đó mới cần đọc PCM từ file ghi âm.
+  /// Có client RTSP đang nhận tiếng và WebRTC không cấp tiếng: chỉ khi đó mới
+  /// cần đọc PCM từ file ghi âm.
   var needsNativeAudio: Bool {
-    nativeAudioAvailable && server.hasPlayingAudioClients
+    guard nativeAudioAvailable, server.hasPlayingAudioClients else { return false }
+    audioSourceLock.lock()
+    defer { audioSourceLock.unlock() }
+    return audioSource.acceptsNativePcm(at: ProcessInfo.processInfo.systemUptime)
   }
 
   func start() throws {
@@ -623,7 +666,9 @@ final class VnvarOverlayCompositor {
 final class VnvarOverlayRtspPublisher: NSObject, RTCVideoRenderer {
   var onServerReady: (() -> Void)?
   var onEncoderConfigured: (() -> Void)?
-  var onError: ((String) -> Void)?
+  /// C6: [recoverable] = true khi lỗi là listener/socket (iOS thu hồi khi vào
+  /// nền, mất loopback); false khi encoder/compositor hỏng.
+  var onError: ((_ message: String, _ recoverable: Bool) -> Void)?
 
   /// Số khung lỗi chồng ảnh liên tiếp trước khi báo lỗi lên Dart (một lần
   /// cấp phát buffer hụt không đáng dừng livestream).
@@ -676,10 +721,15 @@ final class VnvarOverlayRtspPublisher: NSObject, RTCVideoRenderer {
     encoder.onAccessUnit = { [weak self] nals, timestamp, isKeyFrame in
       self?.server.sendAccessUnit(nals: nals, timestamp: timestamp, isKeyFrame: isKeyFrame)
     }
-    encoder.onError = { [weak self] message in self?.reportError(message) }
+    encoder.onError = { [weak self] message in
+      self?.reportError(message, recoverable: false)
+    }
     server.onPlayRequested = { [weak self] in self?.encoder.requestKeyFrame() }
     server.onPictureLossIndication = { [weak self] in self?.encoder.requestKeyFrame() }
-    server.onError = { [weak self] message in self?.reportError(message) }
+    // VnvarRtspServer chỉ báo lỗi listener (bind/socket).
+    server.onError = { [weak self] message in
+      self?.reportError(message, recoverable: true)
+    }
     server.onReady = { [weak self] in
       DispatchQueue.main.async { [weak self] in self?.onServerReady?() }
     }
@@ -755,7 +805,7 @@ final class VnvarOverlayRtspPublisher: NSObject, RTCVideoRenderer {
           self.releaseFramePending()
           self.consecutiveFrameFailures += 1
           if self.consecutiveFrameFailures >= Self.maximumConsecutiveFrameFailures {
-            self.reportError("Cannot compose overlay frame")
+            self.reportError("Cannot compose overlay frame", recoverable: false)
           }
           return
         }
@@ -784,11 +834,11 @@ final class VnvarOverlayRtspPublisher: NSObject, RTCVideoRenderer {
     withGate { framePending = false }
   }
 
-  private func reportError(_ message: String) {
+  private func reportError(_ message: String, recoverable: Bool) {
     stateQueue.async { [weak self] in
       guard let self = self, !self.errorReported else { return }
       self.errorReported = true
-      DispatchQueue.main.async { [weak self] in self?.onError?(message) }
+      DispatchQueue.main.async { [weak self] in self?.onError?(message, recoverable) }
     }
   }
 }

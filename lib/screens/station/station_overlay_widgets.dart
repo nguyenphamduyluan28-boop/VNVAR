@@ -127,7 +127,7 @@ class _StatusPill extends StatelessWidget {
         : null;
     Widget pill = Container(
       constraints: const BoxConstraints(minHeight: 32),
-      padding: EdgeInsets.only(left: 12, right: onClose != null ? 4 : 12),
+      padding: const EdgeInsets.symmetric(horizontal: 12),
       decoration: BoxDecoration(
         color: background ?? const Color(0x8C080D18),
         borderRadius: BorderRadius.circular(999),
@@ -178,19 +178,6 @@ class _StatusPill extends StatelessWidget {
               color: color.withValues(alpha: 0.7),
             ),
           ],
-          if (onClose != null)
-            InkResponse(
-              onTap: onClose,
-              radius: 14,
-              child: Padding(
-                padding: const EdgeInsets.all(5),
-                child: Icon(
-                  Icons.close_rounded,
-                  size: 15,
-                  color: color.withValues(alpha: 0.8),
-                ),
-              ),
-            ),
         ],
       ),
     );
@@ -204,7 +191,60 @@ class _StatusPill extends StatelessWidget {
         ),
       );
     }
-    return Tooltip(message: tooltip, child: pill);
+    pill = Tooltip(message: tooltip, child: pill);
+    final close = onClose;
+    if (close == null) return pill;
+    // Nút đóng tách khỏi vùng chạm của viên (chạm viên = mở chất lượng) và có
+    // vùng chạm riêng 48 dp.
+    return Row(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        pill,
+        _PillCloseButton(onPressed: close, color: color),
+      ],
+    );
+  }
+}
+
+/// Nút đóng tròn nhỏ (hình 28 dp) cạnh viên trạng thái, vùng chạm 48 dp.
+class _PillCloseButton extends StatelessWidget {
+  const _PillCloseButton({required this.onPressed, required this.color});
+
+  final VoidCallback onPressed;
+  final Color color;
+
+  @override
+  Widget build(BuildContext context) {
+    return Tooltip(
+      message: appText(context, 'Đóng', 'Close'),
+      child: Material(
+        type: MaterialType.transparency,
+        child: InkResponse(
+          onTap: onPressed,
+          radius: 22,
+          child: SizedBox(
+            width: 48,
+            height: 48,
+            child: Center(
+              child: Container(
+                width: 28,
+                height: 28,
+                decoration: BoxDecoration(
+                  color: const Color(0x8C080D18),
+                  shape: BoxShape.circle,
+                  border: Border.all(color: const Color(0x24FFFFFF)),
+                ),
+                child: Icon(
+                  Icons.close_rounded,
+                  size: 15,
+                  color: color.withValues(alpha: 0.8),
+                ),
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
   }
 }
 
@@ -649,8 +689,8 @@ class _NetworkStatusBanner extends StatelessWidget {
     final message = recovering
         ? appText(
             context,
-            'Đang kết nối lại live…',
-            'Reconnecting live…',
+            'Kết nối Tablet…',
+            'Connecting tablets…',
           )
         : connectedAddress == null
         ? appText(
@@ -661,11 +701,11 @@ class _NetworkStatusBanner extends StatelessWidget {
         : appText(
             context,
             hasError
-                ? 'Kết nối live lỗi. Vẫn đang ghi hình.'
-                : 'Kết nối live cần làm mới.',
+                ? 'Lỗi kết nối Tablet. Vẫn đang ghi hình.'
+                : 'Kết nối Tablet cần làm mới.',
             hasError
-                ? 'Live connection error. Still recording.'
-                : 'Live connection needs a refresh.',
+                ? 'Tablet connection error. Still recording.'
+                : 'Tablet connection needs a refresh.',
           );
     return _CameraNotice(
       compact: compact,

@@ -112,8 +112,43 @@ class ScoreboardFrameRenderer {
 
   static Rect? _pixelBounds(
     _ScoreView view,
-    Size size,
-    {
+    Size size, {
+    required List<String> scenes,
+    required List<bool> logoOptions,
+    required List<bool> tickerOptions,
+    required bool banner,
+    required bool tickerBand,
+  }) {
+    final rects = _pixelRects(
+      view,
+      size,
+      scenes: scenes,
+      logoOptions: logoOptions,
+      tickerOptions: tickerOptions,
+      banner: banner,
+      tickerBand: tickerBand,
+    );
+    if (rects.isEmpty) return null;
+    var union = rects.first;
+    for (final rect in rects.skip(1)) {
+      union = union.expandToInclude(rect);
+    }
+    final clipped = Rect.fromLTRB(
+      union.left.floorToDouble(),
+      union.top.floorToDouble(),
+      union.right.ceilToDouble(),
+      union.bottom.ceilToDouble(),
+    ).intersect(Offset.zero & size);
+    if (clipped.width <= 0 || clipped.height <= 0) return null;
+    return clipped;
+  }
+
+  /// Từng vùng (pixel video, chưa kẹp trong khung) có thể vẽ của các tổ hợp
+  /// cảnh / logo / chữ chạy: thanh tỉ số hoặc bảng lớn, thông báo, thanh chữ
+  /// chạy.
+  static List<Rect> _pixelRects(
+    _ScoreView view,
+    Size size, {
     required List<String> scenes,
     required List<bool> logoOptions,
     required List<bool> tickerOptions,
@@ -121,7 +156,7 @@ class ScoreboardFrameRenderer {
     required bool tickerBand,
   }) {
     final base = math.min(size.width / designWidth, size.height / designHeight);
-    if (base <= 0) return null;
+    if (base <= 0) return const [];
     final rects = <Rect>[];
     for (final scene in scenes) {
       for (final hasLogo in logoOptions) {
@@ -165,19 +200,209 @@ class ScoreboardFrameRenderer {
         ),
       );
     }
-    if (rects.isEmpty) return null;
-    var union = rects.first;
-    for (final rect in rects.skip(1)) {
-      union = union.expandToInclude(rect);
+    return rects;
+  }
+
+  // ============================================================
+  // VÙNG OVERLAY CỐ ĐỊNH CHO CẢ PHIÊN (Android: chồng từng vùng)
+  // ============================================================
+
+  /// Hai vùng cách nhau không quá khoảng này (đơn vị khung thiết kế) thì gộp.
+  static const double regionMergeGap = 64;
+
+  /// Nhiều vùng hơn mức này, hoặc tổng diện tích vượt tỉ lệ khung này, thì
+  /// dùng một vùng bao trọn (chuỗi bộ lọc đơn giản hơn, lợi ích không đáng).
+  static const int maxOverlayRegions = 3;
+  static const double maxOverlayRegionAreaFraction = 0.6;
+
+  static const List<String> _allScenes = ['scorebar', 'full', 'intro', 'result'];
+
+  /// Cảnh bảng lớn ở giữa màn hình.
+  static bool isLargeScene(String scene) =>
+      scene == 'full' || scene == 'intro' || scene == 'result';
+
+  /// Trạng thái đang dùng cảnh bảng lớn (cần vùng giữa màn hình).
+  static bool sessionNeedsScenes(Map<String, dynamic> state) =>
+      isLargeScene(_ScoreView(state, nowMs: 0, logos: const {}).scene);
+
+  /// Bảng tỉ số đang hiện (có thể vẽ gì đó lên video).
+  static bool isShown(Map<String, dynamic> state) {
+    final view = _ScoreView(state, nowMs: 0, logos: const {});
+    return view.visible && view.scene != 'hidden';
+  }
+
+  /// Các phần (pixel video, đã kẹp trong khung) có thể có nội dung trong
+  /// phiên ở vị trí / "Kích thước" / số set hiện tại: thanh tỉ số (có/không
+  /// logo, có/không chữ chạy), thông báo dài nhất, thanh chữ chạy; thêm bảng
+  /// lớn và thông báo của các cảnh lớn khi [scenes] = true.
+  static List<Rect> sessionParts(
+    Map<String, dynamic> state, {
+    required int width,
+    required int height,
+    bool scenes = true,
+  }) {
+    final size = Size(width.toDouble(), height.toDouble());
+    if (size.isEmpty) return const [];
+    final frame = Offset.zero & size;
+    final view = _ScoreView(state, nowMs: 0, logos: const {});
+    return [
+      for (final rect in _pixelRects(
+        view,
+        size,
+        scenes: scenes ? _allScenes : const ['scorebar'],
+        logoOptions: const [false, true],
+        tickerOptions: const [false, true],
+        banner: true,
+        tickerBand: true,
+      ))
+        if (rect.overlaps(frame)) rect.intersect(frame),
+    ];
+  }
+
+  /// Danh sách vùng (pixel chẵn, không chồng lấn) cố định cho một phiên
+  /// FFmpeg: không đổi khi đổi điểm, tên, thông báo, chữ chạy.
+  ///
+  /// Ưu tiên bộ vùng gồm cả bảng lớn (đổi cảnh không phải phát lại). Nếu bộ
+  /// đó vượt ngưỡng ([maxOverlayRegions], [maxOverlayRegionAreaFraction]) mà
+  /// cảnh hiện tại là thanh tỉ số (và chưa dùng cảnh lớn trong phiên —
+  /// [reserveScenes] = false) thì chỉ giữ vùng thanh tỉ số / thông báo / chữ
+  /// chạy; chuyển sang cảnh lớn khi đó cần phát lại (xem [sessionParts] và
+  /// [overlayRegionsCover]). Còn lại: một vùng bao trọn mọi thứ.
+  static List<Rect> sessionRegions(
+    Map<String, dynamic> state, {
+    required int width,
+    required int height,
+    bool reserveScenes = false,
+  }) {
+    final frame = Rect.fromLTWH(0, 0, width.toDouble(), height.toDouble());
+    if (frame.isEmpty) return [frame];
+    final gap = regionMergeGap * baseScale(width, height);
+    final all = mergeOverlayRegions(
+      sessionParts(state, width: width, height: height),
+      width: width,
+      height: height,
+      gap: gap,
+    );
+    if (all.isEmpty) return [frame];
+    if (overlayRegionsWithinBudget(all, width: width, height: height)) {
+      return all;
     }
-    final clipped = Rect.fromLTRB(
-      union.left.floorToDouble(),
-      union.top.floorToDouble(),
-      union.right.ceilToDouble(),
-      union.bottom.ceilToDouble(),
-    ).intersect(Offset.zero & size);
-    if (clipped.width <= 0 || clipped.height <= 0) return null;
-    return clipped;
+    if (!reserveScenes && !sessionNeedsScenes(state)) {
+      final compact = mergeOverlayRegions(
+        sessionParts(state, width: width, height: height, scenes: false),
+        width: width,
+        height: height,
+        gap: gap,
+      );
+      if (compact.isNotEmpty &&
+          overlayRegionsWithinBudget(compact, width: width, height: height)) {
+        return compact;
+      }
+    }
+    return [boundingRegion(all)];
+  }
+
+  /// Gộp các phần [parts] thành vùng overlay: làm tròn ra ngoài tới pixel
+  /// chẵn (yuv420), kẹp trong khung [width]×[height], gộp các vùng chồng lấn
+  /// hoặc cách nhau không quá [gap] pixel (cả hai chiều) cho tới khi không
+  /// còn cặp nào gộp được. Kết quả không chồng lấn, xếp theo top rồi left.
+  static List<Rect> mergeOverlayRegions(
+    List<Rect> parts, {
+    required int width,
+    required int height,
+    required double gap,
+  }) {
+    final rects = <Rect>[];
+    for (final part in parts) {
+      final rect = _evenOut(part, width, height);
+      if (rect != null) rects.add(rect);
+    }
+    var merged = true;
+    while (merged) {
+      merged = false;
+      for (var i = 0; i < rects.length && !merged; i++) {
+        for (var j = i + 1; j < rects.length; j++) {
+          if (_near(rects[i], rects[j], gap)) {
+            rects[i] = rects[i].expandToInclude(rects[j]);
+            rects.removeAt(j);
+            merged = true;
+            break;
+          }
+        }
+      }
+    }
+    rects.sort((a, b) {
+      final byTop = a.top.compareTo(b.top);
+      return byTop != 0 ? byTop : a.left.compareTo(b.left);
+    });
+    return rects;
+  }
+
+  /// Bộ vùng đủ đơn giản để chồng từng vùng: không quá [maxRegions] vùng và
+  /// tổng diện tích không quá [maxAreaFraction] khung.
+  static bool overlayRegionsWithinBudget(
+    List<Rect> regions, {
+    required int width,
+    required int height,
+    int maxRegions = maxOverlayRegions,
+    double maxAreaFraction = maxOverlayRegionAreaFraction,
+  }) {
+    if (regions.isEmpty || regions.length > maxRegions) return false;
+    var area = 0.0;
+    for (final region in regions) {
+      area += region.width * region.height;
+    }
+    return area <= width * height * maxAreaFraction;
+  }
+
+  /// Hình chữ nhật bao mọi vùng trong [regions] (không rỗng).
+  static Rect boundingRegion(List<Rect> regions) {
+    var union = regions.first;
+    for (final region in regions.skip(1)) {
+      union = union.expandToInclude(region);
+    }
+    return union;
+  }
+
+  /// Mỗi phần trong [parts] nằm trọn trong một vùng của [regions].
+  static bool overlayRegionsCover(List<Rect> regions, List<Rect> parts) {
+    const epsilon = 0.5;
+    bool inside(Rect outer, Rect inner) =>
+        inner.left >= outer.left - epsilon &&
+        inner.top >= outer.top - epsilon &&
+        inner.right <= outer.right + epsilon &&
+        inner.bottom <= outer.bottom + epsilon;
+    return parts.every(
+      (part) => regions.any((region) => inside(region, part)),
+    );
+  }
+
+  /// Làm tròn [rect] ra ngoài tới pixel chẵn, kẹp trong khung; null nếu rỗng.
+  static Rect? _evenOut(Rect rect, int width, int height) {
+    if (!rect.isFinite) return null;
+    final left = math.max(0, rect.left.floor());
+    final top = math.max(0, rect.top.floor());
+    var right = math.min(width, rect.right.ceil());
+    var bottom = math.min(height, rect.bottom.ceil());
+    // Cạnh phải/dưới lẻ: nới thêm 1 nếu còn trong khung.
+    if (right.isOdd && right < width) right++;
+    if (bottom.isOdd && bottom < height) bottom++;
+    final evenLeft = left - left % 2;
+    final evenTop = top - top % 2;
+    if (right <= evenLeft || bottom <= evenTop) return null;
+    return Rect.fromLTRB(
+      evenLeft.toDouble(),
+      evenTop.toDouble(),
+      right.toDouble(),
+      bottom.toDouble(),
+    );
+  }
+
+  /// Hai vùng chồng lấn hoặc cách nhau không quá [gap] theo cả hai chiều.
+  static bool _near(Rect a, Rect b, double gap) {
+    final dx = math.max(0.0, math.max(b.left - a.right, a.left - b.right));
+    final dy = math.max(0.0, math.max(b.top - a.bottom, a.top - b.bottom));
+    return dx <= gap && dy <= gap;
   }
 
   /// Chữ chạy đang hiện (rỗng nếu overlay đang ẩn, cảnh "hidden" hoặc tắt).
@@ -206,33 +431,83 @@ class ScoreboardFrameRenderer {
     Rect? region,
   }) async {
     final frame = Rect.fromLTWH(0, 0, width.toDouble(), height.toDouble());
-    final crop = region == null ? frame : region.intersect(frame);
-    final left = crop.left.roundToDouble();
-    final top = crop.top.roundToDouble();
-    final outWidth = crop.width.round();
-    final outHeight = crop.height.round();
-    if (outWidth <= 0 || outHeight <= 0) {
-      throw ArgumentError.value(region, 'region', 'Vùng vẽ nằm ngoài khung hình');
+    final images = await renderRegionsPng(
+      state,
+      width: width,
+      height: height,
+      nowMs: nowMs,
+      logos: logos,
+      tickerText: tickerText,
+      regions: [region ?? frame],
+    );
+    return images.single;
+  }
+
+  /// Vẽ khung [width]×[height] một lần (ghi lại thành Picture) rồi xuất mỗi
+  /// vùng trong [regions] (pixel, số nguyên) thành một PNG riêng có kích
+  /// thước của vùng: chỉ raster hoá và mã hoá PNG phần trong vùng.
+  Future<List<Uint8List>> renderRegionsPng(
+    Map<String, dynamic> state, {
+    required int width,
+    required int height,
+    required int nowMs,
+    required List<Rect> regions,
+    Map<String, ui.Image> logos = const {},
+    bool tickerText = true,
+  }) async {
+    final frame = Rect.fromLTWH(0, 0, width.toDouble(), height.toDouble());
+    final crops = <Rect>[];
+    for (final region in regions) {
+      final crop = region.intersect(frame);
+      if (crop.width.round() <= 0 || crop.height.round() <= 0) {
+        throw ArgumentError.value(
+          region,
+          'region',
+          'Vùng vẽ nằm ngoài khung hình',
+        );
+      }
+      crops.add(crop);
     }
     final recorder = ui.PictureRecorder();
-    final canvas = Canvas(
-      recorder,
-      Rect.fromLTWH(0, 0, outWidth.toDouble(), outHeight.toDouble()),
-    );
-    if (left != 0 || top != 0) canvas.translate(-left, -top);
     paint(
-      canvas,
-      Size(width.toDouble(), height.toDouble()),
+      Canvas(recorder, frame),
+      frame.size,
       state,
       nowMs: nowMs,
       logos: logos,
       tickerText: tickerText,
     );
-    final image = await _rasterize(
-      recorder.endRecording(),
-      outWidth,
-      outHeight,
-    );
+    final picture = recorder.endRecording();
+    try {
+      final images = <Uint8List>[];
+      for (final crop in crops) {
+        images.add(await _encodeCrop(picture, crop));
+      }
+      return images;
+    } finally {
+      picture.dispose();
+    }
+  }
+
+  /// Raster hoá phần [crop] của [picture] (vẽ cả khung) thành PNG.
+  static Future<Uint8List> _encodeCrop(ui.Picture picture, Rect crop) async {
+    final left = crop.left.roundToDouble();
+    final top = crop.top.roundToDouble();
+    final outWidth = crop.width.round();
+    final outHeight = crop.height.round();
+    final ui.Image image;
+    if (left == 0 && top == 0) {
+      image = await picture.toImage(outWidth, outHeight);
+    } else {
+      final recorder = ui.PictureRecorder();
+      final canvas = Canvas(
+        recorder,
+        Rect.fromLTWH(0, 0, outWidth.toDouble(), outHeight.toDouble()),
+      );
+      canvas.translate(-left, -top);
+      canvas.drawPicture(picture);
+      image = await _rasterize(recorder.endRecording(), outWidth, outHeight);
+    }
     try {
       final data = await image.toByteData(format: ui.ImageByteFormat.png);
       if (data == null) {

@@ -1,9 +1,38 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:developer' as developer;
 import 'dart:io';
 
+import 'package:flutter/foundation.dart' show visibleForTesting;
+
+/// Đóng kết nối discovery mà không bao giờ ném lỗi. [graceful]: đã trả lời
+/// xong thì đóng chiều ghi và chờ tối đa [timeout]; ngược lại (client im lặng,
+/// lỗi) huỷ socket ngay.
+Future<void> closeDiscoveryClient(
+  Socket client, {
+  required bool graceful,
+  Duration timeout = const Duration(seconds: 2),
+}) async {
+  if (graceful) {
+    try {
+      await client.close().timeout(timeout);
+      return;
+    } catch (_) {
+      // Đóng lỗi/quá hạn: huỷ hẳn bên dưới.
+    }
+  }
+  try {
+    client.destroy();
+  } catch (_) {}
+}
+
 class DiscoveryService {
+  DiscoveryService({this.clientTimeout = const Duration(seconds: 2)});
+
   static const int discoveryPort = 40404;
+
+  /// Thời gian chờ dòng lệnh discovery của một client trước khi đóng kết nối.
+  final Duration clientTimeout;
 
   static const String discoverMessage = 'VNVAR_DISCOVER_V1';
 
@@ -90,15 +119,40 @@ class DiscoveryService {
   // HANDLE DISCOVERY
   // ============================================================
 
+  /// Chỉ dùng trong test: xử lý một kết nối discovery đã nhận.
+  @visibleForTesting
+  Future<void> debugHandleClient(Socket client) => _handleClient(client);
+
   Future<void> _handleClient(Socket client) async {
+    StreamSubscription<String>? subscription;
+    var responded = false;
     try {
       client.setOption(SocketOption.tcpNoDelay, true);
-      final message = await utf8.decoder
+      final firstLine = Completer<String?>();
+      subscription = utf8.decoder
           .bind(client)
           .transform(const LineSplitter())
-          .first
-          .timeout(const Duration(seconds: 2));
-      if (message.trim() != discoverMessage) return;
+          .listen(
+            (line) {
+              if (!firstLine.isCompleted) firstLine.complete(line);
+            },
+            onError: (Object error, StackTrace stackTrace) {
+              if (!firstLine.isCompleted) {
+                firstLine.completeError(error, stackTrace);
+              }
+            },
+            onDone: () {
+              if (!firstLine.isCompleted) firstLine.complete(null);
+            },
+            cancelOnError: true,
+          );
+      // Client im lặng quá hạn: bỏ (subscription bị huỷ và socket bị đóng
+      // hẳn ở finally, không treo tài nguyên).
+      final message = await firstLine.future.timeout(
+        clientTimeout,
+        onTimeout: () => null,
+      );
+      if (message == null || message.trim() != discoverMessage) return;
 
       client.writeln(
         jsonEncode({
@@ -113,6 +167,7 @@ class DiscoveryService {
         }),
       );
       await client.flush();
+      responded = true;
     } catch (error, stackTrace) {
       developer.log(
         'TCP discovery client error',
@@ -121,7 +176,10 @@ class DiscoveryService {
         name: 'DiscoveryService',
       );
     } finally {
-      await client.close();
+      try {
+        await subscription?.cancel();
+      } catch (_) {}
+      await closeDiscoveryClient(client, graceful: responded);
     }
   }
 

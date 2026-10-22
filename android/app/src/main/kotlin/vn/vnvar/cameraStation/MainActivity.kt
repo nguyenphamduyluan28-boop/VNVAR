@@ -35,9 +35,18 @@ import kotlin.math.atan
 
 class MainActivity : FlutterActivity() {
     private var pendingStart: PendingStart? = null
-    /** Lệnh `ensureCapturePermissions` đang chờ người dùng trả lời hộp thoại quyền. */
-    private var pendingCapturePermissionResult: MethodChannel.Result? = null
+    /**
+     * Các lệnh `ensureCapturePermissions` đang chờ người dùng trả lời hộp thoại
+     * quyền (C7): lệnh đến khi hộp thoại đang mở chỉ được xếp vào đây, không
+     * requestPermissions lần hai; khi có kết quả trả cho tất cả.
+     */
+    private val pendingCapturePermissionResults = mutableListOf<MethodChannel.Result>()
     private var activityResumed = false
+    /**
+     * Chính app vừa tự mở một màn hình khác (cài đặt ứng dụng, chọn thư mục):
+     * onUserLeaveHint không được đưa app vào PiP. Xoá ở onResume.
+     */
+    private var suppressPipForOwnActivity = false
     // Đọc từ luồng thu âm (onPcm) nên cần volatile.
     @Volatile
     private var rtspPublisher: VnvarRtspPublisher? = null
@@ -53,8 +62,14 @@ class MainActivity : FlutterActivity() {
     private var lastKnownLandscapeRotation: Int = ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE
     private var manualQuarterTurns = 0
     private var orientationListener: OrientationEventListener? = null
-    private val cellularUplinkDelegate = lazy { CellularUplink(applicationContext) }
-    private val cellularUplink by cellularUplinkDelegate
+    // Dùng chung cấp tiến trình (giống sharedAudioRecorder): Activity mới dùng
+    // lại đường 4G/5G của Activity cũ thay vì để nó rò NetworkCallback/socket.
+    private val cellularUplink: CellularUplink
+        get() = sharedCellularUplink ?: synchronized(MainActivity::class.java) {
+            sharedCellularUplink ?: CellularUplink(applicationContext).also {
+                sharedCellularUplink = it
+            }
+        }
     private val nativeAudioRecorder: NativeAudioSegmentRecorder
         get() = sharedAudioRecorder ?: synchronized(MainActivity::class.java) {
             sharedAudioRecorder ?: NativeAudioSegmentRecorder(applicationContext).also {
@@ -88,6 +103,8 @@ class MainActivity : FlutterActivity() {
         // Khi người dùng bấm Home hoặc vuốt thoát app:
         // Khóa hướng landscape và chuyển sang chế độ Picture-in-Picture (PiP) 16:9
         lockOrientationForBackground()
+        // App tự mở màn hình khác (cài đặt, chọn thư mục): không vào PiP.
+        if (suppressPipForOwnActivity) return
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             try {
                 val params = android.app.PictureInPictureParams.Builder()
@@ -124,6 +141,8 @@ class MainActivity : FlutterActivity() {
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
         FlutterEngineCache.getInstance().put(ENGINE_CACHE_KEY, flutterEngine)
+        // Activity này giờ sở hữu handler của channel (engine dùng chung).
+        activeActivity = java.lang.ref.WeakReference(this)
 
         platformChannel = MethodChannel(
             flutterEngine.dartExecutor.binaryMessenger,
@@ -209,6 +228,7 @@ class MainActivity : FlutterActivity() {
                 "ensureCapturePermissions" -> ensureCapturePermissions(result)
 
                 "openAppSettings" -> {
+                    suppressPipForOwnActivity = true
                     val opened = try {
                         startActivity(
                             Intent(
@@ -218,6 +238,7 @@ class MainActivity : FlutterActivity() {
                         )
                         true
                     } catch (error: Exception) {
+                        suppressPipForOwnActivity = false
                         android.util.Log.w("MainActivity", "Unable to open app settings: ${error.message}")
                         false
                     }
@@ -439,9 +460,10 @@ class MainActivity : FlutterActivity() {
                 }
 
                 "closeCellularTunnel" -> {
-                    if (cellularUplinkDelegate.isInitialized()) {
+                    val uplink = sharedCellularUplink
+                    if (uplink != null) {
                         Thread({
-                            try { cellularUplink.close() } catch (_: Throwable) {}
+                            try { uplink.close() } catch (_: Throwable) {}
                         }, "VNVAR-Cellular-Close").start()
                     }
                     result.success(null)
@@ -634,10 +656,32 @@ class MainActivity : FlutterActivity() {
             result.success(capturePermissionStatus())
             return
         }
-        // Một lệnh đang chờ: trả trạng thái hiện tại cho lệnh cũ, giữ lệnh mới.
-        pendingCapturePermissionResult?.success(capturePermissionStatus())
-        pendingCapturePermissionResult = result
-        requestPermissions(missing.toTypedArray(), CAPTURE_PERMISSION_REQUEST)
+        // C7: hộp thoại đang mở → chỉ xếp hàng, KHÔNG requestPermissions lần hai
+        // (lần gọi thứ hai sẽ huỷ/đè hộp thoại đang chờ). Kết quả trả cho tất cả.
+        val dialogPending = pendingCapturePermissionResults.isNotEmpty()
+        pendingCapturePermissionResults.add(result)
+        if (dialogPending) return
+        try {
+            requestPermissions(missing.toTypedArray(), CAPTURE_PERMISSION_REQUEST)
+        } catch (error: Exception) {
+            android.util.Log.w("MainActivity", "requestPermissions failed: ${error.message}")
+            completeCapturePermissionRequests()
+        }
+    }
+
+    /** Trả trạng thái quyền hiện tại cho mọi lệnh `ensureCapturePermissions` đang chờ. */
+    private fun completeCapturePermissionRequests() {
+        if (pendingCapturePermissionResults.isEmpty()) return
+        val waiting = pendingCapturePermissionResults.toList()
+        pendingCapturePermissionResults.clear()
+        val status = capturePermissionStatus()
+        for (pending in waiting) {
+            try {
+                pending.success(status)
+            } catch (error: Exception) {
+                android.util.Log.w("MainActivity", "ensureCapturePermissions reply failed: ${error.message}")
+            }
+        }
     }
 
     override fun onRequestPermissionsResult(
@@ -648,9 +692,7 @@ class MainActivity : FlutterActivity() {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults)
 
         if (requestCode == CAPTURE_PERMISSION_REQUEST) {
-            val pending = pendingCapturePermissionResult
-            pendingCapturePermissionResult = null
-            pending?.success(capturePermissionStatus())
+            completeCapturePermissionRequests()
             return
         }
 
@@ -684,6 +726,12 @@ class MainActivity : FlutterActivity() {
             return
         }
         completePendingStartIfPossible()
+    }
+
+    override fun onResume() {
+        super.onResume()
+        // Đã quay lại app: lần rời app kế tiếp (Home) lại được vào PiP.
+        suppressPipForOwnActivity = false
     }
 
     override fun onPostResume() {
@@ -846,6 +894,8 @@ class MainActivity : FlutterActivity() {
     }
 
     private fun launchFolderPicker() {
+        // Trình chọn thư mục là màn hình do app tự mở: không vào PiP.
+        suppressPipForOwnActivity = true
         startActivityForResult(
             Intent(Intent.ACTION_OPEN_DOCUMENT_TREE).apply {
                 // This Station only supports a real path in primary storage.
@@ -1143,6 +1193,15 @@ class MainActivity : FlutterActivity() {
         private const val ENGINE_CACHE_KEY = "vnvar_camera_station_engine"
         @Volatile
         private var sharedAudioRecorder: NativeAudioSegmentRecorder? = null
+        @Volatile
+        private var sharedCellularUplink: CellularUplink? = null
+        /**
+         * Activity đang sở hữu MethodCallHandler của engine dùng chung. Activity
+         * cũ bị huỷ SAU khi Activity mới đã gắn handler không được gỡ handler
+         * hay dừng tài nguyên dùng chung (micro, 4G) của Activity mới.
+         */
+        @Volatile
+        private var activeActivity: java.lang.ref.WeakReference<MainActivity>? = null
         // Dùng chung cho mọi instance Activity (recorder cũng dùng chung), một
         // luồng mỗi loại để giữ thứ tự start/stop âm thanh và các thao tác file.
         private val audioExecutor: ExecutorService = Executors.newSingleThreadExecutor { task ->
@@ -1344,20 +1403,38 @@ class MainActivity : FlutterActivity() {
     override fun onDestroy() {
         orientationListener?.disable()
         orientationListener = null
-        nativeAudioRecorder.onPcm = null
-        runInBackground(audioExecutor, "stopStreaming(onDestroy)") {
-            nativeAudioRecorder.stopStreaming()
+        // Lệnh xin quyền còn treo: trả trạng thái hiện tại thay vì bỏ rơi Future Dart.
+        completeCapturePermissionRequests()
+        // Không còn Activity chủ nào (null/đã thu hồi) cũng coi như là chủ.
+        val currentOwner = activeActivity?.get()
+        val ownsChannel = currentOwner == null || currentOwner === this
+        if (ownsChannel) {
+            activeActivity = null
+            // Engine được giữ lại sau khi Activity huỷ: gỡ handler để lệnh Dart
+            // (vd startRtsp thử lại) không còn tạo publisher/uplink trong Activity
+            // đã chết (rò cổng 8554, micro, 4G). Activity mới sẽ gắn handler mới.
+            if (::platformChannel.isInitialized) {
+                try { platformChannel.setMethodCallHandler(null) } catch (_: Exception) {}
+            }
         }
         val publisher = rtspPublisher
         rtspPublisher = null
         if (publisher != null) {
             try { publisher.stop() } catch (_: Exception) {}
-            notifyRtspStoppedByActivityDestroy()
         }
-        if (cellularUplinkDelegate.isInitialized()) {
-            // close() đồng bộ với open() (có thể đang chờ mạng di động vài giây).
-            val uplink = cellularUplink
-            runInBackground(ioExecutor, "cellularUplink.close") { uplink.close() }
+        if (ownsChannel) {
+            // Micro (recorder dùng chung) và 4G chỉ dừng khi Activity này còn là
+            // chủ; nếu Activity mới đã tiếp quản thì tài nguyên thuộc về nó.
+            nativeAudioRecorder.onPcm = null
+            runInBackground(audioExecutor, "stopStreaming(onDestroy)") {
+                nativeAudioRecorder.stopStreaming()
+            }
+            if (publisher != null) notifyRtspStoppedByActivityDestroy()
+            val uplink = sharedCellularUplink
+            if (uplink != null) {
+                // close() đồng bộ với open() (có thể đang chờ mạng di động vài giây).
+                runInBackground(ioExecutor, "cellularUplink.close") { uplink.close() }
+            }
         }
         super.onDestroy()
     }

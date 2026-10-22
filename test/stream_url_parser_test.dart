@@ -347,5 +347,106 @@ void main() {
         'rtsp://my.server.vn/app',
       );
     });
+
+    test('defaults match after normalising case and trailing slash', () {
+      expect(
+        serverForProtocol(
+          StreamPlatform.sporto,
+          '  RTMP://Media.AQVision.net:11935/live/ ',
+          StreamProtocol.rtsp,
+        ),
+        'rtsp://media.aqvision.net:18554/live',
+      );
+      expect(
+        serverForProtocol(
+          StreamPlatform.youtube,
+          'rtmp://A.RTMP.YouTube.com/live2/',
+          StreamProtocol.rtsp,
+        ),
+        'rtsp://a.rtmp.youtube.com/live2',
+      );
+      expect(
+        normalizeStreamServer(' RTSP://Host.VN:554/Live/ '),
+        'rtsp://host.vn:554/Live',
+      );
+    });
+
+    test('known partner host keeps the right port for each protocol', () {
+      expect(
+        convertServerScheme(
+          'rtmp://media.aqvision.net:11935/live2',
+          StreamProtocol.rtsp,
+        ),
+        'rtsp://media.aqvision.net:18554/live2',
+      );
+      expect(
+        convertServerScheme(
+          'rtsp://media.aqvision.net:18554/live2',
+          StreamProtocol.rtmp,
+        ),
+        'rtmp://media.aqvision.net:11935/live2',
+      );
+      expect(
+        convertServerScheme(
+          'rtmp://MEDIA.aqvision.net/live',
+          StreamProtocol.rtsp,
+        ),
+        'rtsp://MEDIA.aqvision.net:18554/live',
+      );
+    });
+
+    test('default ports are dropped, unusual ports are kept', () {
+      expect(
+        convertServerScheme('rtmp://my.server.vn:1935/app', StreamProtocol.rtsp),
+        'rtsp://my.server.vn/app',
+      );
+      expect(
+        convertServerScheme('rtsp://my.server.vn:8554/app', StreamProtocol.rtmp),
+        'rtmp://my.server.vn/app',
+      );
+      expect(
+        convertServerScheme('rtsp://my.server.vn:554/app', StreamProtocol.rtmp),
+        'rtmp://my.server.vn/app',
+      );
+      expect(
+        convertServerScheme('rtmp://my.server.vn:2935/app', StreamProtocol.rtsp),
+        'rtsp://my.server.vn:2935/app',
+      );
+      expect(
+        convertServerScheme('rtmp://my.server.vn/app', StreamProtocol.rtsp),
+        'rtsp://my.server.vn/app',
+      );
+      // Cùng giao thức: giữ nguyên.
+      expect(
+        convertServerScheme('rtmp://my.server.vn:2935/app', StreamProtocol.rtmp),
+        'rtmp://my.server.vn:2935/app',
+      );
+    });
+
+    test('protocolDowngradesEncryption', () {
+      expect(
+        protocolDowngradesEncryption(
+          'rtmps://live-api-s.facebook.com:443/rtmp',
+          StreamProtocol.rtsp,
+        ),
+        isTrue,
+      );
+      expect(
+        protocolDowngradesEncryption('RTSPS://h/live', StreamProtocol.rtmp),
+        isTrue,
+      );
+      expect(
+        protocolDowngradesEncryption(
+          'rtmps://live-api-s.facebook.com:443/rtmp',
+          StreamProtocol.rtmp,
+        ),
+        isFalse,
+      );
+      expect(
+        protocolDowngradesEncryption('rtmp://h/live', StreamProtocol.rtsp),
+        isFalse,
+      );
+      expect(protocolDowngradesEncryption('', StreamProtocol.rtsp), isFalse);
+    });
   });
 }

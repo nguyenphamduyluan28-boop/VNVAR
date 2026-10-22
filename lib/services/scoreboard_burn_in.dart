@@ -2,10 +2,12 @@ import 'dart:async';
 import 'dart:developer' as developer;
 import 'dart:io';
 import 'dart:math' as math;
+import 'dart:typed_data';
 import 'dart:ui' as ui;
 
 import 'package:ffmpeg_kit_flutter_new_video/ffprobe_kit.dart';
 import 'package:ffmpeg_kit_flutter_new_video/ffprobe_session.dart';
+import 'package:flutter/foundation.dart' show listEquals;
 import 'package:path_provider/path_provider.dart';
 
 import 'scoreboard_frame_renderer.dart';
@@ -33,8 +35,27 @@ class LivestreamTicker {
   });
 }
 
+/// Một ảnh PNG overlay chồng tại (`x`, `y`) pixel video, kích thước
+/// `width`×`height` (Android: mỗi vùng bảng tỉ số là một input FFmpeg).
+class LivestreamOverlayRegion {
+  final String imagePath;
+  final int x;
+  final int y;
+  final int width;
+  final int height;
+
+  const LivestreamOverlayRegion({
+    required this.imagePath,
+    required this.x,
+    required this.y,
+    required this.width,
+    required this.height,
+  });
+}
+
 /// Ảnh overlay đã sẵn sàng cho một phiên livestream.
 class LivestreamOverlay {
+  /// Ảnh đầu tiên (iOS / cả khung: ảnh PNG toàn khung duy nhất — C5).
   final String imagePath;
 
   /// Kích thước khung video.
@@ -53,6 +74,8 @@ class LivestreamOverlay {
   final int imageWidth;
   final int imageHeight;
 
+  final List<LivestreamOverlayRegion>? _regions;
+
   const LivestreamOverlay({
     required this.imagePath,
     required this.width,
@@ -62,8 +85,69 @@ class LivestreamOverlay {
     this.y = 0,
     int? imageWidth,
     int? imageHeight,
+    List<LivestreamOverlayRegion>? regions,
   }) : imageWidth = imageWidth ?? width,
-       imageHeight = imageHeight ?? height;
+       imageHeight = imageHeight ?? height,
+       // ignore: prefer_initializing_formals
+       _regions = regions;
+
+  /// Các ảnh cần chồng (theo thứ tự input FFmpeg 1, 2, ...). Không truyền
+  /// `regions`: một ảnh [imagePath] tại [x]:[y].
+  List<LivestreamOverlayRegion> get regions {
+    final regions = _regions;
+    if (regions != null && regions.isNotEmpty) return regions;
+    return [
+      LivestreamOverlayRegion(
+        imagePath: imagePath,
+        x: x,
+        y: y,
+        width: imageWidth,
+        height: imageHeight,
+      ),
+    ];
+  }
+}
+
+/// Hai cờ của overlay bảng tỉ số quyết định có in vào livestream không.
+typedef LivestreamOverlayFlags = ({bool burnIn, bool visible});
+
+/// Đọc (`overlay.burnIn`, `overlay.visible`) từ JSON trạng thái bảng tỉ số
+/// (cùng quy ước với trang `/overlay`: thiếu khoá = bật).
+LivestreamOverlayFlags livestreamOverlayFlags(Map<String, dynamic> state) {
+  final overlay = state['overlay'];
+  if (overlay is! Map) return (burnIn: false, visible: false);
+  return (
+    burnIn: overlay['burnIn'] != false,
+    visible: overlay['visible'] != false,
+  );
+}
+
+/// Phiên phát cần chồng bảng tỉ số (giải mã + mã hoá lại hình). Bảng đang
+/// ẩn: copy nguyên luồng (Android) / không mở luồng overlay native (iOS).
+bool livestreamOverlayNeeded(LivestreamOverlayFlags flags) =>
+    flags.burnIn && flags.visible;
+
+/// Đổi cờ overlay khi đang phát có cần khởi động lại phiên phát không.
+///
+/// [sessionHasOverlay]: phiên hiện tại đang chồng bảng tỉ số.
+/// - Phiên chưa chồng bảng: chỉ phát lại khi "cần overlay" vừa đổi
+///   false → true (bấm Hiện, hoặc bật in khi đang hiện).
+/// - Phiên đang chồng bảng: ẩn/hiện chỉ đổi ảnh (trong suốt khi ẩn), không
+///   phát lại; chỉ phát lại khi bảng sắp hiện mà "in vào livestream" đã tắt
+///   (tắt in khi đang hiện, hoặc bấm Hiện sau khi đã tắt in) để về copy.
+/// Đổi điểm số, tên, cảnh... không làm đổi hai cờ nên không phát lại.
+bool livestreamOverlayRestartNeeded({
+  required LivestreamOverlayFlags? previous,
+  required LivestreamOverlayFlags next,
+  required bool sessionHasOverlay,
+}) {
+  if (previous == null) return false;
+  if (sessionHasOverlay) {
+    final wasShownWithoutBurnIn = previous.visible && !previous.burnIn;
+    final shownWithoutBurnIn = next.visible && !next.burnIn;
+    return shownWithoutBurnIn && !wasShownWithoutBurnIn;
+  }
+  return livestreamOverlayNeeded(next) && !livestreamOverlayNeeded(previous);
 }
 
 /// [inner] nằm trọn trong [outer].
@@ -193,8 +277,8 @@ Future<({int width, int height})?> probeRtspVideoSize(
   }
 }
 
-/// Giữ file PNG overlay luôn khớp với trạng thái bảng tỉ số trong lúc
-/// livestream. FFmpeg đọc lại file này nhiều lần mỗi giây.
+/// Giữ (các) file PNG overlay luôn khớp với trạng thái bảng tỉ số trong lúc
+/// livestream. FFmpeg đọc lại các file này nhiều lần mỗi giây.
 class ScoreboardBurnIn {
   ScoreboardBurnIn({
     ScoreboardService? service,
@@ -209,30 +293,42 @@ class ScoreboardBurnIn {
   int _width = 0;
   int _height = 0;
 
-  /// Vùng ảnh overlay (pixel video) khi chỉ vẽ vùng có nội dung; null = cả khung.
-  ui.Rect? _region;
-  String? _path;
+  /// Các vùng ảnh overlay (pixel video) khi chồng từng vùng; null = một ảnh
+  /// cả khung.
+  List<ui.Rect>? _regions;
+
+  /// File PNG của từng vùng (cùng thứ tự [_regions]); cả khung: một file.
+  List<String> _paths = const [];
+  String? _directory;
   String? _tickerPath;
   bool _scrollingTicker = false;
   String? _writtenTickerText;
 
-  /// Khoá (kích thước khung + vùng) của file PNG đang có trên đĩa; null nếu
-  /// chưa có file dùng được.
+  /// Khoá (kích thước khung + các vùng) của bộ file PNG đang có trên đĩa;
+  /// null nếu chưa có bộ file dùng được.
   String? _writtenKey;
+
+  /// Nội dung PNG đã ghi của từng file (bỏ qua ghi lại vùng không đổi).
+  List<Uint8List?> _writtenBytes = const [];
   Future<bool>? _inFlight;
   bool _dirty = false;
   bool _active = false;
   bool _regionOutgrownReported = false;
+
+  /// Đã dùng cảnh bảng lớn trong lần phát này: các phiên FFmpeg sau (kết nối
+  /// lại) giữ sẵn vùng giữa màn hình. Xoá khi [stop].
+  bool _reserveScenes = false;
   int _logoDecodeSize = 0;
   final Map<String, ui.Image> _logos = {};
 
-  /// Chế độ chỉ vẽ vùng có nội dung ([start] với `cropToContent`): gọi một
-  /// lần khi nội dung mới (đổi vị trí, "Kích thước", số set) cần vùng lớn hơn
-  /// vùng đã khoá cho phiên FFmpeg. Phần thừa bị cắt cho tới khi phiên đẩy
-  /// luồng được khởi động lại (runtime nên khởi động lại khi nhận được).
+  /// Chế độ chồng từng vùng ([start] với `cropToRegions`): gọi một lần khi
+  /// nội dung mới (đổi vị trí, "Kích thước", số set, lần đầu dùng cảnh lớn)
+  /// cần vùng lớn hơn các vùng đã khoá cho phiên FFmpeg. Phần thừa bị cắt cho
+  /// tới khi phiên đẩy luồng được khởi động lại (runtime khởi động lại khi
+  /// nhận được). Không gọi khi bảng tỉ số đang ẩn.
   void Function()? onRegionOutgrown;
 
-  /// Gọi sau mỗi lần ghi xong (đổi tên nguyên tử) ảnh PNG mới tại [path].
+  /// Gọi sau mỗi lần ghi xong (đổi tên nguyên tử) một ảnh PNG mới tại [path].
   /// iOS: publisher báo native nạp lại ảnh (`updateOverlayImage`).
   void Function(String path)? onImageWritten;
 
@@ -245,16 +341,23 @@ class ScoreboardBurnIn {
     return overlay is Map && overlay['burnIn'] != false;
   }
 
+  /// Cờ "in vào livestream" và "Hiện" hiện tại của bảng tỉ số.
+  Future<LivestreamOverlayFlags> overlayFlags() async {
+    await _service.load();
+    return livestreamOverlayFlags(_service.snapshot());
+  }
+
   /// Vẽ ảnh đầu tiên (bắt buộc có file trước khi FFmpeg chạy) và bắt đầu
   /// cập nhật theo bảng tỉ số.
   ///
   /// [scrollingTicker]: để FFmpeg vẽ chữ chạy theo từng khung hình (cần font
   /// hệ thống); nếu không, chữ chạy đứng yên trong ảnh.
   ///
-  /// [cropToContent]: chỉ vẽ vùng có thể có nội dung trong phiên
-  /// ([ScoreboardFrameRenderer.sessionRegion]) thay vì cả khung; khi đó
-  /// FFmpeg PHẢI chồng ảnh tại [LivestreamOverlay.x]:[LivestreamOverlay.y]
-  /// (truyền `overlayX`/`overlayY` cho [livestreamOverlayVideoArgs]).
+  /// [cropToRegions] (Android): chỉ vẽ các vùng cố định của phiên
+  /// ([ScoreboardFrameRenderer.sessionRegions]), mỗi vùng một PNG; FFmpeg
+  /// PHẢI chồng từng ảnh tại vị trí của nó ([LivestreamOverlay.regions] →
+  /// [livestreamOverlayInputArgs] + [livestreamOverlayVideoArgs]). false
+  /// (iOS, C5): một PNG toàn khung.
   ///
   /// Ném lỗi nếu chưa vẽ được ảnh đúng kích thước (FFmpeg không được chạy với
   /// ảnh thiếu hoặc ảnh cũ sai kích thước).
@@ -262,37 +365,54 @@ class ScoreboardBurnIn {
     int width,
     int height, {
     bool scrollingTicker = false,
-    bool cropToContent = false,
+    bool cropToRegions = false,
   }) async {
     await _service.load();
-    final region = cropToContent
-        ? ScoreboardFrameRenderer.sessionRegion(
-            _service.snapshot(),
+    final state = _service.snapshot();
+    if (cropToRegions && ScoreboardFrameRenderer.sessionNeedsScenes(state)) {
+      _reserveScenes = true;
+    }
+    final regions = cropToRegions
+        ? ScoreboardFrameRenderer.sessionRegions(
+            state,
             width: width,
             height: height,
+            reserveScenes: _reserveScenes,
           )
         : null;
-    final key = _fileKey(width, height, region);
-    _width = width;
-    _height = height;
-    _region = region;
-    _regionOutgrownReported = false;
-    if (_path == null) {
+    final key = _fileKey(width, height, regions);
+    if (_directory == null) {
       final temp = await getTemporaryDirectory();
       final directory = Directory(
         '${temp.path}${Platform.pathSeparator}scoreboard_burnin',
       );
       if (!await directory.exists()) await directory.create(recursive: true);
-      _path = '${directory.path}${Platform.pathSeparator}overlay.png';
+      _directory = directory.path;
       _tickerPath = '${directory.path}${Platform.pathSeparator}ticker.txt';
     }
-    final path = _path!;
+    final directory = _directory!;
+    final paths = regions == null
+        ? ['$directory${Platform.pathSeparator}overlay.png']
+        : [
+            for (var i = 0; i < regions.length; i++)
+              '$directory${Platform.pathSeparator}overlay_$i.png',
+          ];
+    final oldPaths = _paths;
+    _width = width;
+    _height = height;
+    _regions = regions;
+    _paths = paths;
+    _regionOutgrownReported = false;
+    // Phiên FFmpeg mới: ghi lại mọi file (không bỏ qua vùng "không đổi").
+    _writtenBytes = const [];
     final tickerPath = _tickerPath!;
     if (_writtenKey != key) {
       // Đổi kích thước/vùng: bỏ ảnh cũ để FFmpeg không bao giờ đọc ảnh sai
       // kích thước nếu lần vẽ đầu lỗi.
       _writtenKey = null;
-      await _deleteQuietly(path);
+      for (final path in {...oldPaths, ...paths}) {
+        await _deleteQuietly(path);
+      }
     }
     // iOS luôn dùng chữ chạy đứng yên trong ảnh (đường "không có font").
     final scroll = useScrollingLivestreamTicker(
@@ -361,23 +481,41 @@ class ScoreboardBurnIn {
         ),
       );
     }
+    final first = regions?.first;
     return LivestreamOverlay(
-      imagePath: path,
+      imagePath: paths.first,
       width: width,
       height: height,
       ticker: ticker,
-      x: region?.left.round() ?? 0,
-      y: region?.top.round() ?? 0,
-      imageWidth: region?.width.round() ?? width,
-      imageHeight: region?.height.round() ?? height,
+      x: first?.left.round() ?? 0,
+      y: first?.top.round() ?? 0,
+      imageWidth: first?.width.round() ?? width,
+      imageHeight: first?.height.round() ?? height,
+      regions: regions == null
+          ? null
+          : [
+              for (var i = 0; i < regions.length; i++)
+                LivestreamOverlayRegion(
+                  imagePath: paths[i],
+                  x: regions[i].left.round(),
+                  y: regions[i].top.round(),
+                  width: regions[i].width.round(),
+                  height: regions[i].height.round(),
+                ),
+            ],
     );
   }
 
-  static String _fileKey(int width, int height, ui.Rect? region) =>
-      region == null
-      ? '${width}x$height'
-      : '${width}x$height@${region.left.round()},${region.top.round()},'
-            '${region.width.round()}x${region.height.round()}';
+  static String _fileKey(int width, int height, List<ui.Rect>? regions) {
+    final buffer = StringBuffer('${width}x$height');
+    for (final region in regions ?? const <ui.Rect>[]) {
+      buffer.write(
+        '@${region.left.round()},${region.top.round()},'
+        '${region.width.round()}x${region.height.round()}',
+      );
+    }
+    return buffer.toString();
+  }
 
   static Future<void> _deleteQuietly(String path) async {
     for (final candidate in [path, '$path.tmp']) {
@@ -390,6 +528,7 @@ class ScoreboardBurnIn {
 
   void stop() {
     _active = false;
+    _reserveScenes = false;
     _subscription?.cancel();
     _subscription = null;
     _ticker?.cancel();
@@ -437,8 +576,7 @@ class ScoreboardBurnIn {
   }
 
   Future<bool> _renderLoop() async {
-    final path = _path;
-    if (path == null || _width <= 0 || _height <= 0) return false;
+    if (_paths.isEmpty || _width <= 0 || _height <= 0) return false;
     var ok = false;
     try {
       do {
@@ -446,8 +584,9 @@ class ScoreboardBurnIn {
         ok = false;
         final width = _width;
         final height = _height;
-        final region = _region;
-        final key = _fileKey(width, height, region);
+        final regions = _regions;
+        final paths = _paths;
+        final key = _fileKey(width, height, regions);
         final state = _service.snapshot();
         final scrolling = _scrollingTicker;
         if (scrolling) {
@@ -462,25 +601,50 @@ class ScoreboardBurnIn {
           }
         }
         await _loadLogos(state, width, height);
-        final bytes = await _renderer
-            .renderPng(
+        final images = await _renderer
+            .renderRegionsPng(
               state,
               width: width,
               height: height,
               nowMs: _service.nowMs,
               logos: _logos,
               tickerText: !scrolling,
-              region: region,
+              regions:
+                  regions ??
+                  [
+                    ui.Rect.fromLTWH(
+                      0,
+                      0,
+                      width.toDouble(),
+                      height.toDouble(),
+                    ),
+                  ],
             )
             .timeout(const Duration(seconds: 3));
-        // Ghi file tạm rồi đổi tên: FFmpeg không bao giờ đọc phải ảnh ghi dở.
-        final temp = File('$path.tmp');
-        await temp.writeAsBytes(bytes, flush: true);
-        await temp.rename(path);
+        if (images.length != paths.length) {
+          throw StateError('Số ảnh vùng không khớp số file overlay.');
+        }
+        // Cùng bộ file với lần ghi trước: chỉ ghi lại vùng đổi nội dung.
+        var written = _writtenBytes;
+        if (_writtenKey != key || written.length != paths.length) {
+          written = List<Uint8List?>.filled(paths.length, null);
+          _writtenBytes = written;
+        }
+        for (var i = 0; i < paths.length; i++) {
+          final bytes = images[i];
+          final previous = written[i];
+          if (previous != null && listEquals(previous, bytes)) continue;
+          // Ghi file tạm rồi đổi tên: FFmpeg không bao giờ đọc phải ảnh ghi dở.
+          final path = paths[i];
+          final temp = File('$path.tmp');
+          await temp.writeAsBytes(bytes, flush: true);
+          await temp.rename(path);
+          written[i] = bytes;
+          _notifyImageWritten(path);
+        }
         _writtenKey = key;
         ok = true;
-        _notifyImageWritten(path);
-        if (region != null) _checkRegion(state, width, height, region);
+        if (regions != null) _checkRegions(state, width, height, regions);
       } while (_dirty && _active);
     } catch (error, stackTrace) {
       developer.log(
@@ -508,24 +672,31 @@ class ScoreboardBurnIn {
     }
   }
 
-  /// Chế độ vùng: báo khi nội dung có thể hiện cần vùng lớn hơn vùng đã khoá.
-  void _checkRegion(
+  /// Chế độ vùng: báo khi nội dung có thể hiện cần vùng lớn hơn các vùng đã
+  /// khoá. Bảng đang ẩn thì chưa báo (không phát lại khi đang ẩn); kiểm lại
+  /// ở lần vẽ sau khi bảng hiện.
+  void _checkRegions(
     Map<String, dynamic> state,
     int width,
     int height,
-    ui.Rect region,
+    List<ui.Rect> regions,
   ) {
     if (_regionOutgrownReported) return;
-    final needed = ScoreboardFrameRenderer.sessionRegion(
+    if (!ScoreboardFrameRenderer.isShown(state)) return;
+    if (ScoreboardFrameRenderer.sessionNeedsScenes(state)) {
+      _reserveScenes = true;
+    }
+    final needed = ScoreboardFrameRenderer.sessionParts(
       state,
       width: width,
       height: height,
+      scenes: _reserveScenes,
     );
-    if (livestreamRegionContains(region, needed)) return;
+    if (ScoreboardFrameRenderer.overlayRegionsCover(regions, needed)) return;
     _regionOutgrownReported = true;
     developer.log(
-      '[SCOREBOARD] Overlay region $region is too small for $needed; '
-      'livestream needs a restart',
+      '[SCOREBOARD] Overlay regions $regions are too small for the '
+      'scoreboard; livestream needs a restart',
       name: 'ScoreboardBurnIn',
     );
     onRegionOutgrown?.call();
@@ -627,16 +798,26 @@ List<String> livestreamOverlayInputArgs(String imagePath) => [
 ];
 
 /// [overlayX]/[overlayY]: vị trí ảnh overlay ([LivestreamOverlay.x]/`y`);
-/// mặc định 0:0 (ảnh phủ cả khung).
+/// mặc định 0:0 (ảnh phủ cả khung). [regions]: chồng nhiều ảnh (input 1..N,
+/// mỗi ảnh một [livestreamOverlayInputArgs] theo đúng thứ tự); khi có thì
+/// bỏ qua [overlayX]/[overlayY].
 List<String> livestreamOverlayVideoArgs({
   required int bitrateBps,
   required int fps,
   LivestreamTicker? ticker,
   int overlayX = 0,
   int overlayY = 0,
+  List<LivestreamOverlayRegion>? regions,
 }) => [
   '-filter_complex',
-  livestreamOverlayFilter(ticker, x: overlayX, y: overlayY),
+  livestreamOverlayFilter(
+    ticker,
+    x: overlayX,
+    y: overlayY,
+    positions: regions == null
+        ? null
+        : [for (final region in regions) (x: region.x, y: region.y)],
+  ),
   '-map',
   '[vout]',
   '-c:v',
@@ -650,15 +831,40 @@ List<String> livestreamOverlayVideoArgs({
 /// Bộ lọc: chồng ảnh overlay (input 1) lên video (input 0); có [ticker] thì
 /// vẽ thêm chữ chạy bằng drawtext (đọc lại file chữ mỗi khung hình, chạy từ
 /// phải sang trái như trang /overlay). [x]/[y]: vị trí ảnh overlay (pixel).
+///
+/// [positions] (nhiều hơn một): chồng lần lượt input 1..N tại các vị trí đó:
+/// `[0:v][ovr1]overlay=x1:y1[ov1];[ov1][ovr2]overlay=x2:y2,...[vout]`.
 String livestreamOverlayFilter(
   LivestreamTicker? ticker, {
   int x = 0,
   int y = 0,
+  List<({int x, int y})>? positions,
 }) {
-  final buffer = StringBuffer(
-    '[1:v]format=rgba,setpts=PTS-STARTPTS[ovr];'
-    '[0:v][ovr]overlay=$x:$y:eof_action=repeat:format=auto',
-  );
+  final points = positions == null || positions.isEmpty
+      ? [(x: x, y: y)]
+      : positions;
+  final buffer = StringBuffer();
+  if (points.length == 1) {
+    // Một ảnh: giữ nguyên chuỗi bộ lọc cũ.
+    final point = points.single;
+    buffer.write(
+      '[1:v]format=rgba,setpts=PTS-STARTPTS[ovr];'
+      '[0:v][ovr]overlay=${point.x}:${point.y}:eof_action=repeat:format=auto',
+    );
+  } else {
+    for (var i = 1; i <= points.length; i++) {
+      buffer.write('[$i:v]format=rgba,setpts=PTS-STARTPTS[ovr$i];');
+    }
+    for (var i = 1; i <= points.length; i++) {
+      final point = points[i - 1];
+      final source = i == 1 ? '[0:v]' : '[ov${i - 1}]';
+      buffer.write(
+        '$source[ovr$i]overlay=${point.x}:${point.y}'
+        ':eof_action=repeat:format=auto',
+      );
+      if (i < points.length) buffer.write('[ov$i];');
+    }
+  }
   if (ticker != null) {
     buffer
       ..write(',drawtext=fontfile=\'${ticker.fontPath}\'')

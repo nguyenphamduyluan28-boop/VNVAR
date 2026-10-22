@@ -591,4 +591,83 @@ class RunnerTests: XCTestCase {
       try VnvarOverlayCompositor(overlayPath: "/nonexistent/vnvar-overlay.png")
     )
   }
+
+  // MARK: C6 — thử bind lại cổng overlay
+
+  func testBindRetryAllowsFiveRetriesWithinWindow() {
+    for attempt in 1...VnvarListenerBindRetryPolicy.maximumRetries {
+      XCTAssertTrue(
+        VnvarListenerBindRetryPolicy.shouldRetry(failedAttempt: attempt, elapsed: 0.5)
+      )
+    }
+    XCTAssertEqual(VnvarListenerBindRetryPolicy.maximumRetries, 5)
+    // Lần thử thứ 6 (lần đầu + 5 lần lại) lỗi: dừng.
+    XCTAssertFalse(VnvarListenerBindRetryPolicy.shouldRetry(failedAttempt: 6, elapsed: 0.5))
+    XCTAssertFalse(VnvarListenerBindRetryPolicy.shouldRetry(failedAttempt: 0, elapsed: 0))
+  }
+
+  func testBindRetryStopsBeforeDartTimeout() {
+    let window = VnvarListenerBindRetryPolicy.retryWindow
+    XCTAssertLessThan(window, 6)
+    XCTAssertFalse(VnvarListenerBindRetryPolicy.shouldRetry(failedAttempt: 1, elapsed: window))
+    XCTAssertFalse(
+      VnvarListenerBindRetryPolicy.shouldRetry(failedAttempt: 1, elapsed: .infinity)
+    )
+    XCTAssertFalse(VnvarListenerBindRetryPolicy.shouldRetry(failedAttempt: 1, elapsed: -1))
+  }
+
+  // MARK: Bộ đếm tạo lại phiên VideoToolbox
+
+  func testEncoderResetMonitorReportsAfterThresholdWithinWindow() {
+    var monitor = VnvarEncoderResetMonitor(threshold: 5, window: 10)
+    for index in 0..<4 {
+      XCTAssertFalse(monitor.recordReset(at: 100 + Double(index)))
+    }
+    XCTAssertTrue(monitor.recordReset(at: 104))
+    // Đã báo: bộ đếm xoá, cần đủ ngưỡng lần nữa mới báo tiếp.
+    XCTAssertFalse(monitor.recordReset(at: 105))
+    XCTAssertEqual(monitor.resetUptimes.count, 1)
+  }
+
+  func testEncoderResetMonitorIgnoresResetsOutsideWindow() {
+    var monitor = VnvarEncoderResetMonitor(threshold: 5, window: 10)
+    for time in [0.0, 4.0, 8.0, 12.0, 16.0, 20.0] {
+      XCTAssertFalse(monitor.recordReset(at: time))
+    }
+    XCTAssertLessThan(monitor.resetUptimes.count, 5)
+  }
+
+  func testEncoderResetMonitorClearsOnSuccessfulEncode() {
+    var monitor = VnvarEncoderResetMonitor(threshold: 5, window: 10)
+    for index in 0..<4 {
+      XCTAssertFalse(monitor.recordReset(at: Double(index)))
+    }
+    monitor.recordSuccess()
+    XCTAssertTrue(monitor.resetUptimes.isEmpty)
+    XCTAssertFalse(monitor.recordReset(at: 4))
+  }
+
+  // MARK: Chọn nguồn tiếng RTSP
+
+  func testNativeAudioUsedUntilWebRtcDeliversPcm() {
+    let selector = VnvarAudioSourceSelector()
+    XCTAssertTrue(selector.acceptsNativePcm(at: 50))
+    XCTAssertFalse(selector.prefersWebRtc(at: 50))
+  }
+
+  func testWebRtcAudioSuppressesNativeWhileFresh() {
+    var selector = VnvarAudioSourceSelector()
+    selector.noteWebRtcPcm(at: 100)
+    XCTAssertTrue(selector.prefersWebRtc(at: 100.5))
+    XCTAssertFalse(selector.acceptsNativePcm(at: 100.5))
+    XCTAssertFalse(selector.acceptsNativePcm(at: 100 + VnvarAudioSourceSelector.webRtcFreshness))
+  }
+
+  func testNativeAudioResumesAfterWebRtcGoesQuiet() {
+    var selector = VnvarAudioSourceSelector()
+    selector.noteWebRtcPcm(at: 100)
+    XCTAssertTrue(selector.acceptsNativePcm(at: 101.5))
+    selector.noteWebRtcPcm(at: 102)
+    XCTAssertFalse(selector.acceptsNativePcm(at: 102.2))
+  }
 }

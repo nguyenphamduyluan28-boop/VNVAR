@@ -376,6 +376,122 @@ bool thermalRestoreCoolEnough({
   return cool || temperatureC != null;
 }
 
+/// Hành động với độ sáng màn hình do nhiệt (xem [thermalScreenDimDecision]).
+enum ThermalDimAction { none, dim, undim }
+
+/// Quyết định DUY NHẤT về việc runtime làm tối / bật sáng màn hình vì nhiệt.
+///
+/// - [dimmedByThermal]: màn hình đang tối do chính runtime làm tối.
+/// - [autoDimAllowed]: được phép tự làm tối (màn Station đang hiển thị, chưa
+///   tối, người dùng không vừa bật sáng trong khoảng giữ 10 phút).
+/// - [planWantsDim]: kế hoạch giảm tải hiện hành yêu cầu làm tối.
+/// - [riseWantsDim]: nhiệt độ tăng nhanh (Android) / iOS báo serious.
+/// - [cooled]: đã đủ mát để bật sáng lại (pin ≤ 39,5°C / iOS nominal-fair).
+///
+/// Chỉ bật sáng lại khi đã mát VÀ kế hoạch tải không còn yêu cầu làm tối;
+/// nếu không, kế hoạch tải sẽ làm tối lại ngay lần kiểm tra sau (màn hình
+/// chớp sáng/tối mỗi 10 giây).
+ThermalDimAction thermalScreenDimDecision({
+  required bool dimmedByThermal,
+  required bool autoDimAllowed,
+  required bool planWantsDim,
+  required bool riseWantsDim,
+  required bool cooled,
+}) {
+  if (dimmedByThermal) {
+    return cooled && !planWantsDim
+        ? ThermalDimAction.undim
+        : ThermalDimAction.none;
+  }
+  if (autoDimAllowed && (planWantsDim || riseWantsDim)) {
+    return ThermalDimAction.dim;
+  }
+  return ThermalDimAction.none;
+}
+
+/// Lúc khởi động có hạ cấu hình xuống 720p30 vì nhiệt không. Cùng chính sách
+/// với lúc chạy: mức "nóng" không đổi độ phân giải (chỉ giảm tải tại chỗ),
+/// chỉ critical/khẩn cấp mới hạ (bỏ qua khoá độ phân giải vì là mức an toàn).
+bool startupThermalDegradeRequired({
+  required bool critical,
+  required bool emergency,
+}) => critical || emergency;
+
+/// Giới hạn FPS vì nhiệt đang THẬT SỰ áp lên track [trackId] (null = không
+/// giới hạn). [appliedKey] là khoá `trackId|cap` của lần áp thành công gần
+/// nhất. Chỉ Android áp được giới hạn FPS tại chỗ; iOS giữ FPS cấu hình.
+int? reportedThermalFpsCap({
+  required bool isAndroid,
+  required String? trackId,
+  required String? appliedKey,
+}) {
+  if (!isAndroid || trackId == null || appliedKey == null) return null;
+  final prefix = '$trackId|';
+  if (!appliedKey.startsWith(prefix)) return null;
+  final cap = int.tryParse(appliedKey.substring(prefix.length));
+  return cap == null || cap <= 0 ? null : cap;
+}
+
+/// Thao tác đổi cấu hình (độ phân giải / ống kính) có huỷ recovery đang chạy
+/// không: chỉ khi nó thật sự sẽ mở lại camera. Thao tác bị từ chối (camera
+/// tắt, bị chặn) hoặc không đổi gì không được huỷ recovery (camera đang đóng
+/// sẽ bị bỏ đóng).
+bool reconfigurationShouldInterruptRecovery({
+  required bool cameraEnabled,
+  required bool openBlocked,
+  required bool changesConfiguration,
+}) => cameraEnabled && !openBlocked && changesConfiguration;
+
+/// Đổi zoom có được chạy ngay không. Zoom không đi qua hàng đợi vòng đời (để
+/// không bị trễ), nên phải bỏ qua khi camera đang được mở/đóng/đổi cấu hình
+/// ([lifecycleBusy]: hàng đợi vòng đời đang có thao tác chạy hoặc chờ).
+bool cameraZoomAllowed({
+  required bool cameraEnabled,
+  required bool initialized,
+  required bool stopping,
+  required bool profileSwitching,
+  required bool lensSwitching,
+  required bool recovering,
+  required bool openBlocked,
+  required bool lifecycleBusy,
+}) =>
+    cameraEnabled &&
+    initialized &&
+    !stopping &&
+    !profileSwitching &&
+    !lensSwitching &&
+    !recovering &&
+    !openBlocked &&
+    !lifecycleBusy;
+
+/// Đếm số lần giữ một tác vụ dùng chung (ví dụ background task iOS: native
+/// chỉ có một task). [onFirstAcquire] chạy đồng bộ khi chuyển 0 → 1 lần giữ,
+/// [onLastRelease] khi lần giữ cuối được trả. Mỗi hàm trả về từ [acquire] chỉ
+/// có tác dụng ở lần gọi đầu tiên.
+class SharedTaskHold {
+  SharedTaskHold({required this.onFirstAcquire, required this.onLastRelease});
+
+  final void Function() onFirstAcquire;
+  final Future<void> Function() onLastRelease;
+  int _holds = 0;
+
+  int get holds => _holds;
+
+  Future<void> Function() acquire() {
+    _holds++;
+    if (_holds == 1) onFirstAcquire();
+    var released = false;
+    return () {
+      if (released) return Future<void>.value();
+      released = true;
+      _holds--;
+      if (_holds > 0) return Future<void>.value();
+      _holds = 0;
+      return onLastRelease();
+    };
+  }
+}
+
 /// Thao tác vòng đời đã quá hạn (hàng đợi đã giao cho thao tác khác) hoặc đã
 /// bị thay thế: dừng giữa chừng, không mở camera / đổi trạng thái nữa.
 class _StaleLifecycleOperation implements Exception {
@@ -440,6 +556,8 @@ class CameraStationRuntime {
   RecordingService? _recordingService;
   CameraServer? _cameraServer;
   Future<void> _lifecycleTail = Future<void>.value();
+  // Số thao tác vòng đời đang chạy hoặc đang chờ trong hàng đợi.
+  int _lifecycleOperationsPending = 0;
   Completer<void> _recoveryCancellation = Completer<void>();
   String? _cameraId;
   String? _courtId;
@@ -453,6 +571,16 @@ class CameraStationRuntime {
   DateTime? _pendingThermalAt;
   Timer? _pendingThermalRestoreTimer;
   bool _thermalThrottled = false;
+  // Đang khôi phục cấu hình sau khi hạ nhiệt (đã xếp/đang đổi độ phân giải):
+  // _thermalThrottled và profile mục tiêu được giữ tới khi khôi phục THÀNH
+  // CÔNG, lần kiểm tra nhiệt chen vào không được xoá chúng.
+  bool _thermalRestoreInFlight = false;
+  // iOS: background task hoàn tất segment (native chỉ có một task, nên đếm ở
+  // Dart để begin/end đúng một lần).
+  late final SharedTaskHold _iosFinalizationHold = SharedTaskHold(
+    onFirstAcquire: () => unawaited(_beginIosBackgroundFinalization()),
+    onLastRelease: _endIosBackgroundFinalization,
+  );
   bool _thermalUserOverride = false;
   DateTime? _thermalCooledDownSince;
   bool _thermalCriticalSuspended = false;
@@ -630,7 +758,9 @@ class CameraStationRuntime {
   /// FFmpeg chỉ copy — gói FFmpeg iOS không có VideoToolbox/libx264).
   final ScoreboardBurnIn _scoreboardBurnIn = ScoreboardBurnIn();
   StreamSubscription<Map<String, dynamic>>? _scoreboardSubscription;
-  bool? _lastBurnInSetting;
+  /// Cờ (burnIn, visible) của bảng tỉ số lần gần nhất runtime thấy (null
+  /// cho tới lần chuẩn bị overlay đầu tiên).
+  LivestreamOverlayFlags? _lastOverlayFlags;
   bool _wasRtspBeforeCameraDisable = false;
   bool _wasWhipBeforeCameraDisable = false;
 
@@ -666,8 +796,13 @@ class CameraStationRuntime {
   bool get thermalUserOverride => _thermalUserOverride;
   /// Máy đang nóng trong lúc cắm sạc: sạc là nguồn nhiệt lớn, nên gợi ý.
   bool get thermalChargingWhileHot => _charging && thermalWarning;
-  /// FPS đang bị giới hạn tạm thời vì nhiệt (null = không giới hạn).
-  int? get thermalFpsCap => _thermalLoadPlan.fpsCap;
+  /// FPS đang bị giới hạn tạm thời vì nhiệt và đã thật sự áp lên camera
+  /// (null = không giới hạn; iOS luôn null vì không giới hạn FPS tại chỗ).
+  int? get thermalFpsCap => reportedThermalFpsCap(
+    isAndroid: Platform.isAndroid,
+    trackId: _webRtcService?.localVideoTrack?.id,
+    appliedKey: _appliedFpsCapKey,
+  );
 
   /// Bậc giảm tải tại chỗ: 0 bình thường, 1 ấm, 2 nóng, 3 critical.
   int get thermalLoadLevel => _thermalLoadPlan.level;
@@ -806,33 +941,74 @@ class CameraStationRuntime {
     // Android: FFmpeg mã hoá lại (MediaCodec). iOS: native tạo luồng overlay
     // (RtspPublisherService gọi startOverlayRtsp với ảnh này).
     if (!Platform.isAndroid && !Platform.isIOS) return null;
-    final enabled = await _scoreboardBurnIn.enabled();
-    _lastBurnInSetting = enabled;
-    if (!enabled) return null;
+    final flags = await _scoreboardBurnIn.overlayFlags();
+    _lastOverlayFlags = flags;
+    // Tắt in hoặc bảng tỉ số đang Ẩn: phát copy nguyên luồng (không giải mã /
+    // mã hoá lại; iOS không mở luồng overlay native). Bấm Hiện khi đang phát
+    // sẽ phát lại phiên (xem _handleScoreboardChange).
+    if (!livestreamOverlayNeeded(flags)) return null;
     var size = await probeRtspVideoSize(localRtspUrl);
     size ??= (width: _resolutionProfile.width, height: _resolutionProfile.height);
     return _scoreboardBurnIn.start(
       size.width,
       size.height,
       scrollingTicker: scrollingTicker,
+      // Android: chồng từng vùng nhỏ thay vì PNG toàn khung. iOS giữ một
+      // PNG toàn khung cho native (hợp đồng C5).
+      cropToRegions: Platform.isAndroid,
     );
   }
 
-  /// Bật/tắt "in bảng tỉ số vào livestream" khi đang phát: chạy lại phiên
-  /// đẩy luồng để áp dụng (mất hình vài giây).
+  /// Bảng tỉ số đổi cờ "in vào livestream" / Ẩn–Hiện khi đang phát: chạy lại
+  /// phiên đẩy luồng khi cần (mất hình vài giây) — xem
+  /// [livestreamOverlayRestartNeeded]. Đổi điểm số, tên, cảnh... không phát
+  /// lại.
   void _handleScoreboardChange(Map<String, dynamic> json) {
-    final overlay = json['overlay'];
-    final burnIn = overlay is Map && overlay['burnIn'] != false;
-    final previous = _lastBurnInSetting;
-    _lastBurnInSetting = burnIn;
+    final next = livestreamOverlayFlags(json);
+    final previous = _lastOverlayFlags;
+    _lastOverlayFlags = next;
     if (previous == null ||
-        previous == burnIn ||
+        previous == next ||
         (!Platform.isAndroid && !Platform.isIOS)) {
       return;
     }
-    if (!_rtspPublisherService.wantsPublishing) return;
-    if (burnIn) _rtspPublisherService.clearOverlayFailure();
-    unawaited(_rtspPublisherService.restartIfPublishing());
+    final rtsp = _rtspPublisherService;
+    if (!rtsp.wantsPublishing) return;
+    // Vừa bật lại "in vào livestream": cho phép thử in lại sau lỗi cũ.
+    if (next.burnIn && !previous.burnIn) rtsp.clearOverlayFailure();
+    if (!livestreamOverlayRestartNeeded(
+      previous: previous,
+      next: next,
+      sessionHasOverlay: rtsp.overlayActive,
+    )) {
+      return;
+    }
+    // Máy đã báo không in được bảng tỉ số: phát lại cũng không có bảng.
+    if (livestreamOverlayNeeded(next) && rtsp.overlayUnavailable) return;
+    unawaited(rtsp.restartIfPublishing());
+  }
+
+  /// Android, chồng từng vùng: bảng tỉ số mới (đổi vị trí, "Kích thước", số
+  /// set, lần đầu dùng cảnh lớn) cần vùng lớn hơn vùng đã khoá cho phiên
+  /// FFmpeg: phát lại để không bị cắt bảng.
+  void _handleScoreboardRegionOutgrown() {
+    final rtsp = _rtspPublisherService;
+    if (!rtsp.wantsPublishing || !rtsp.overlayActive) return;
+    unawaited(rtsp.restartIfPublishing());
+  }
+
+  /// Đang phát RTMP/RTSP (chưa in bảng tỉ số) mà bảng đang Ẩn: bấm Hiện sẽ
+  /// phát lại phiên (~3 giây) để in bảng tỉ số vào video.
+  bool get scoreboardShowRestartsLive {
+    if (!Platform.isAndroid && !Platform.isIOS) return false;
+    final rtsp = _rtspPublisherService;
+    if (!rtsp.wantsPublishing ||
+        rtsp.overlayActive ||
+        rtsp.overlayUnavailable) {
+      return false;
+    }
+    final flags = livestreamOverlayFlags(ScoreboardService.instance.snapshot());
+    return flags.burnIn && !flags.visible;
   }
 
   Future<void> setResolutionLocked(bool locked) async {
@@ -943,6 +1119,11 @@ class CameraStationRuntime {
     final retryEpoch = _initRetryEpoch;
     final session = ++_initSession;
     try {
+      // Hộp thoại quyền lần cài đầu chờ người dùng trả lời, có thể lâu: xin
+      // quyền TRƯỚC khi vào hàng đợi vòng đời để không tính vào timeout khởi
+      // tạo. Thiếu quyền camera → StationException permissionDenied (không tự
+      // thử lại). initializeCamera vẫn gọi lại (đã có quyền nên trả ngay).
+      await WebRtcService.ensureCapturePermissions();
       await _serializeLifecycle(() async {
         // Đã bị thay thế (stop/khởi tạo mới) trong lúc chờ hàng đợi.
         if (session != _initSession) {
@@ -1078,58 +1259,63 @@ class CameraStationRuntime {
   }) {
     final completer = Completer<T>();
     final previous = _lifecycleTail;
+    _lifecycleOperationsPending++;
     _lifecycleTail = previous.catchError((Object _) {}).then((_) async {
-      var timedOut = false;
-      final pending = Future<T>.sync(operation);
       try {
-        completer.complete(
-          await pending.timeout(
-            timeout,
-            onTimeout: () {
-              timedOut = true;
-              throw TimeoutException(
-                'Lifecycle $label exceeded ${timeout.inSeconds}s',
-                timeout,
-              );
-            },
-          ),
-        );
-      } catch (error, stackTrace) {
-        if (!timedOut) {
-          completer.completeError(error, stackTrace);
-          return;
+        var timedOut = false;
+        final pending = Future<T>.sync(operation);
+        try {
+          completer.complete(
+            await pending.timeout(
+              timeout,
+              onTimeout: () {
+                timedOut = true;
+                throw TimeoutException(
+                  'Lifecycle $label exceeded ${timeout.inSeconds}s',
+                  timeout,
+                );
+              },
+            ),
+          );
+        } catch (error, stackTrace) {
+          if (!timedOut) {
+            completer.completeError(error, stackTrace);
+            return;
+          }
+          // Thao tác treo vẫn chạy nền: đổi epoch để nó dừng ở mốc kiểm tra kế
+          // tiếp (không mở camera song song với thao tác sau).
+          _lifecycleEpoch++;
+          developer.log(
+            '[LIFECYCLE] "$label" exceeded ${timeout.inSeconds}s; releasing the '
+            'lifecycle queue and ignoring its late result',
+            error: error,
+            stackTrace: stackTrace,
+            name: 'CameraStationRuntime',
+          );
+          unawaited(
+            pending.then<void>(
+              (_) {},
+              onError: (Object lateError, StackTrace lateStackTrace) {
+                developer.log(
+                  '[LIFECYCLE] Timed-out "$label" failed later',
+                  error: lateError,
+                  stackTrace: lateStackTrace,
+                  name: 'CameraStationRuntime',
+                );
+              },
+            ),
+          );
+          completer.completeError(
+            StationException.fromCode(
+              StationErrorCode.operationTimeout,
+              cause: error,
+            ),
+            stackTrace,
+          );
+          if (recoverOnTimeout) _recoverAfterLifecycleTimeout(label);
         }
-        // Thao tác treo vẫn chạy nền: đổi epoch để nó dừng ở mốc kiểm tra kế
-        // tiếp (không mở camera song song với thao tác sau).
-        _lifecycleEpoch++;
-        developer.log(
-          '[LIFECYCLE] "$label" exceeded ${timeout.inSeconds}s; releasing the '
-          'lifecycle queue and ignoring its late result',
-          error: error,
-          stackTrace: stackTrace,
-          name: 'CameraStationRuntime',
-        );
-        unawaited(
-          pending.then<void>(
-            (_) {},
-            onError: (Object lateError, StackTrace lateStackTrace) {
-              developer.log(
-                '[LIFECYCLE] Timed-out "$label" failed later',
-                error: lateError,
-                stackTrace: lateStackTrace,
-                name: 'CameraStationRuntime',
-              );
-            },
-          ),
-        );
-        completer.completeError(
-          StationException.fromCode(
-            StationErrorCode.operationTimeout,
-            cause: error,
-          ),
-          stackTrace,
-        );
-        if (recoverOnTimeout) _recoverAfterLifecycleTimeout(label);
+      } finally {
+        _lifecycleOperationsPending--;
       }
     });
     return completer.future;
@@ -1153,6 +1339,20 @@ class CameraStationRuntime {
     _generation++;
     _emitState();
     _scheduleRecovery('lifecycle_timeout_$label');
+  }
+
+  /// Huỷ recovery chỉ khi thao tác đổi cấu hình thật sự sẽ mở lại camera
+  /// (xem [reconfigurationShouldInterruptRecovery]).
+  void _interruptRecoveryForReconfiguration({
+    required bool changesConfiguration,
+  }) {
+    if (reconfigurationShouldInterruptRecovery(
+      cameraEnabled: _cameraEnabled,
+      openBlocked: _cameraOpenBlockedError() != null,
+      changesConfiguration: changesConfiguration,
+    )) {
+      _interruptRecovery();
+    }
   }
 
   void _interruptRecovery() {
@@ -1267,6 +1467,7 @@ class CameraStationRuntime {
         _webRtcService?.localVideoTrack?.id;
     _scoreboardBurnIn.onImageWritten =
         _rtspPublisherService.handleOverlayImageWritten;
+    _scoreboardBurnIn.onRegionOutgrown = _handleScoreboardRegionOutgrown;
     _scoreboardSubscription ??= ScoreboardService.instance.changes.listen(
       _handleScoreboardChange,
     );
@@ -1320,8 +1521,13 @@ class CameraStationRuntime {
       // Chỉ mức khẩn cấp mới giữ camera dừng; critical thì khởi động ở cấu
       // hình nhẹ (720p30) để vẫn quay và livestream.
       final criticalThermal = preflightThermal.emergency;
-      if (preflightThermal.critical ||
-          (preflightThermal.hot && !_resolutionLocked)) {
+      // Cùng chính sách với lúc chạy: mức "nóng" không hạ độ phân giải (thermal
+      // monitor giảm tải tại chỗ: FPS, bitrate, làm tối màn hình); chỉ
+      // critical/khẩn cấp mới khởi động ở 720p30.
+      if (startupThermalDegradeRequired(
+        critical: preflightThermal.critical,
+        emergency: preflightThermal.emergency,
+      )) {
         _profileBeforeThermalThrottle = _resolutionProfile;
         _thermalThrottled = true;
         _resolutionProfile = CameraResolutionProfile.hd720.withFps(30);
@@ -1508,6 +1714,7 @@ class CameraStationRuntime {
     _pendingThermalRestoreTimer?.cancel();
     _pendingThermalRestoreTimer = null;
     _thermalThrottled = false;
+    _thermalRestoreInFlight = false;
     _thermalCriticalSuspended = false;
     _thermalCriticalDegraded = false;
     _thermalCriticalDegradedSince = null;
@@ -1624,13 +1831,20 @@ class CameraStationRuntime {
     }
     _iosLifecycleSuspended = true;
     final lifecycleGeneration = ++_iosLifecycleGeneration;
+    // Xin thời gian chạy nền NGAY (đồng bộ, trước khi xếp hàng): thao tác
+    // trước trong hàng đợi có thể chiếm vài giây, iOS sẽ treo app trước khi
+    // segment được chốt nếu chỉ xin khi thao tác này bắt đầu chạy.
+    final releaseFinalization = _holdIosBackgroundFinalization();
     _interruptRecovery();
     _emitState();
+    // Trả background task đúng một lần dù thao tác xong, lỗi, bị bỏ qua hay
+    // quá hạn (_serializeLifecycle luôn hoàn tất Future sau tối đa
+    // _iosSuspendOperationTimeout).
     return _serializeLifecycle(
       () => _suspendForIosBackgroundInternal(lifecycleGeneration),
       timeout: _iosSuspendOperationTimeout,
       label: 'ios_suspend',
-    );
+    ).whenComplete(releaseFinalization);
   }
 
   Future<void> _suspendForIosBackgroundInternal(int lifecycleGeneration) async {
@@ -1646,7 +1860,7 @@ class CameraStationRuntime {
       '[LIFECYCLE] iOS entering background; finalizing current segment',
       name: 'CameraStationRuntime',
     );
-    await _beginIosBackgroundFinalization();
+    // Background task đã được xin đồng bộ trong suspendForIosBackground.
     await _pauseLivePublishers();
     try {
       try {
@@ -1705,8 +1919,6 @@ class CameraStationRuntime {
           stackTrace: stackTrace,
           name: 'CameraStationRuntime',
         );
-      } finally {
-        await _endIosBackgroundFinalization();
       }
     }
   }
@@ -2027,7 +2239,8 @@ class CameraStationRuntime {
   Future<void> switchCamera() {
     final current = _lensSwitchOperation;
     if (current != null) return current;
-    _interruptRecovery();
+    // Camera tắt / bị chặn: thao tác sẽ bị từ chối, không huỷ recovery.
+    _interruptRecoveryForReconfiguration(changesConfiguration: true);
     final operation = _serializeLifecycle(
       _switchCameraInternal,
       timeout: _reconfigureOperationTimeout,
@@ -2045,7 +2258,8 @@ class CameraStationRuntime {
   Future<void> switchToLensMode(String mode) {
     final current = _lensSwitchOperation;
     if (current != null) return current;
-    _interruptRecovery();
+    // Camera tắt / bị chặn: thao tác sẽ bị từ chối, không huỷ recovery.
+    _interruptRecoveryForReconfiguration(changesConfiguration: true);
     final operation = _serializeLifecycle(() async {
       if (!_cameraEnabled) {
         throw StationException.fromCode(StationErrorCode.cameraDisabled);
@@ -2077,11 +2291,32 @@ class CameraStationRuntime {
 
   /// Set zoom camera và tự động persist lens state để restore sau khi đổi
   /// resolution hoặc khởi động lại app.
+  ///
+  /// Không đi qua hàng đợi vòng đời (zoom không bị trễ), nên bị bỏ qua khi
+  /// camera đang khởi tạo / đổi ống kính / đổi độ phân giải / khôi phục, và
+  /// không lưu trạng thái ống kính nếu cấu hình đổi trong lúc đang zoom.
   Future<void> setCameraZoom(double zoom) async {
     final webRtc = _webRtcService;
-    if (webRtc == null || !_cameraEnabled) return;
+    if (webRtc == null || !_cameraZoomAllowedNow) {
+      developer.log(
+        '[CAMERA] Ignoring zoom while the camera is not ready or is being '
+        'reconfigured',
+        name: 'CameraStationRuntime',
+      );
+      return;
+    }
+    final generation = _generation;
+    final epoch = _lifecycleEpoch;
     try {
       await webRtc.setCameraZoom(zoom);
+      // Ống kính/độ phân giải bắt đầu đổi (hoặc camera được mở lại) trong lúc
+      // zoom: trạng thái ống kính lúc này là dở dang, không lưu.
+      if (generation != _generation ||
+          epoch != _lifecycleEpoch ||
+          !identical(webRtc, _webRtcService) ||
+          !_cameraZoomAllowedNow) {
+        return;
+      }
       final isUltraWide = webRtc.isCurrentUltraWide;
       final actualZoom = webRtc.cameraZoom;
       unawaited(StationConfigService().saveCameraLensState(
@@ -2095,6 +2330,17 @@ class CameraStationRuntime {
       developer.log('[CAMERA] setCameraZoom error: $e', name: 'CameraStationRuntime');
     }
   }
+
+  bool get _cameraZoomAllowedNow => cameraZoomAllowed(
+    cameraEnabled: _cameraEnabled,
+    initialized: _initCompleted,
+    stopping: _stopping,
+    profileSwitching: _profileSwitching,
+    lensSwitching: _lensSwitchOperation != null,
+    recovering: _recovering,
+    openBlocked: _cameraOpenBlockedError() != null || _iosResumeQueued,
+    lifecycleBusy: _lifecycleOperationsPending > 0,
+  );
 
   Future<void> _switchCameraInternal() async {
     // Quá hạn (hàng đợi đã giao cho recovery/thao tác khác) thì dừng ở mốc
@@ -2455,7 +2701,9 @@ class CameraStationRuntime {
         return Future<void>.value();
       }
       // Cấu hình nhẹ hơn cấu hình hiện tại: áp dụng ngay (giảm tải thêm).
-      _interruptRecovery();
+      _interruptRecoveryForReconfiguration(
+        changesConfiguration: profile != _resolutionProfile,
+      );
       return _serializeLifecycle(
         () => _setResolutionProfileInternal(profile),
         timeout: _reconfigureOperationTimeout,
@@ -2488,7 +2736,11 @@ class CameraStationRuntime {
       _thermalAutoRestoreBlocked = false;
       _lastThermalRestoreAt = null;
     }
-    _interruptRecovery();
+    // Cùng cấu hình: thao tác không mở lại camera nên không được huỷ recovery
+    // đang chạy (camera đang đóng sẽ bị bỏ đóng).
+    _interruptRecoveryForReconfiguration(
+      changesConfiguration: profile != _resolutionProfile,
+    );
     return _serializeLifecycle(
       () => _setResolutionProfileInternal(profile),
       timeout: _reconfigureOperationTimeout,
@@ -2988,7 +3240,9 @@ class CameraStationRuntime {
   }
 
   void _emitState() {
-    final fpsCap = _thermalLoadPlan.fpsCap;
+    // Chỉ báo FPS bị giới hạn khi giới hạn đã thật sự áp lên camera (Android);
+    // iOS không giới hạn FPS tại chỗ nên giữ FPS cấu hình.
+    final fpsCap = thermalFpsCap;
     _rtspPublisherService.expectedFps = fpsCap == null
         ? _resolutionProfile.fps
         : math.min(fpsCap, _resolutionProfile.fps);
@@ -3504,7 +3758,7 @@ class CameraStationRuntime {
       final temperature = snapshot.temperatureC;
       _temperatureC = temperature;
 
-      _updateThermalAutoDim(
+      final dimSignals = _readThermalDimSignals(
         temperature,
         hot: snapshot.hot,
         cool: snapshot.cool,
@@ -3531,7 +3785,9 @@ class CameraStationRuntime {
         );
       }
       _charging = snapshot.charging;
-      if (!_thermalCriticalSuspended) {
+      if (_thermalCriticalSuspended) {
+        _applyThermalScreenDim(dimSignals, temperature: temperature);
+      } else {
         await _applyThermalLoadPlan(
           thermalLoadPlan(
             hot: hot,
@@ -3543,6 +3799,7 @@ class CameraStationRuntime {
           ),
         );
         if (session != _monitorSession || _stopping) return;
+        _applyThermalScreenDim(dimSignals, temperature: temperature);
         final degradedSince = _thermalCriticalDegradedSince;
         final action = thermalEscalation(
           criticalStreak: _thermalCriticalStreak,
@@ -3566,7 +3823,7 @@ class CameraStationRuntime {
           return;
         }
       }
-      if (!hot && !_thermalThrottled) {
+      if (!hot && !_thermalThrottled && !_thermalRestoreInFlight) {
         _pendingThermalThrottleTimer?.cancel();
         _pendingThermalThrottleTimer = null;
         _pendingThermalTarget = null;
@@ -3614,6 +3871,7 @@ class CameraStationRuntime {
         // thì chưa tính thời gian khôi phục cấu hình.
         if (_thermalThrottled &&
             !_profileSwitching &&
+            !_thermalRestoreInFlight &&
             !_thermalCriticalDegraded) {
           final now = DateTime.now();
           // Android MODERATE kéo dài vẫn được tính nếu pin ≤ 40°C; thời gian
@@ -3677,9 +3935,10 @@ class CameraStationRuntime {
   static const double _thermalAutoDimMinimumC = 41.0;
   static const double _thermalAutoUndimBelowC = 39.5;
 
-  /// Giám sát tốc độ tăng nhiệt (ΔT/Δt) để tự làm tối màn hình khi máy nóng
-  /// nhanh, và tự bật sáng lại khi đã nguội nếu chính runtime làm tối.
-  void _updateThermalAutoDim(
+  /// Giám sát tốc độ tăng nhiệt (ΔT/Δt) và trả về tín hiệu làm tối / bật sáng
+  /// màn hình. Không tự đổi độ sáng: quyết định duy nhất nằm ở
+  /// [_applyThermalScreenDim] (kết hợp với kế hoạch giảm tải).
+  ({bool riseWantsDim, bool cooled}) _readThermalDimSignals(
     double? temperature, {
     required bool hot,
     required bool cool,
@@ -3687,22 +3946,7 @@ class CameraStationRuntime {
     if (temperature == null) {
       // iOS không công bố nhiệt độ, chỉ có ProcessInfo.thermalState: làm tối
       // khi đạt mức serious, bật sáng lại khi về nominal/fair.
-      if (_screenDimmedByThermal && cool) {
-        _screenDimmedByThermal = false;
-        _autoScreenDimmed = false;
-        unawaited(_setScreenDimmedSafely(false));
-        _emitState();
-      } else if (hot && _thermalAutoDimAllowed) {
-        _autoScreenDimmed = true;
-        _screenDimmedByThermal = true;
-        developer.log(
-          '[THERMAL] Thermal state serious; tự động làm tối màn hình để giải nhiệt.',
-          name: 'CameraStationRuntime',
-        );
-        unawaited(_setScreenDimmedSafely(true));
-        _emitState();
-      }
-      return;
+      return (riseWantsDim: hot, cooled: cool);
     }
     final now = DateTime.now();
     _temperatureHistory.add((timestamp: now, temperatureC: temperature));
@@ -3710,42 +3954,74 @@ class CameraStationRuntime {
       (e) => now.difference(e.timestamp) > _thermalRiseWindow,
     );
 
-    if (_screenDimmedByThermal && temperature <= _thermalAutoUndimBelowC) {
-      _screenDimmedByThermal = false;
-      _autoScreenDimmed = false;
-      developer.log(
-        '[THERMAL] Nhiệt độ đã hạ (${temperature.toStringAsFixed(1)}°C); '
-        'bật sáng lại màn hình',
-        name: 'CameraStationRuntime',
-      );
-      unawaited(_setScreenDimmedSafely(false));
-      _emitState();
-      return;
+    final cooled = temperature <= _thermalAutoUndimBelowC;
+    if (_screenDimmedByThermal && cooled) {
+      return (riseWantsDim: false, cooled: true);
     }
 
     // Cần đủ mẫu và khoảng thời gian dài để tránh nhiễu cảm biến pin (0,1°C).
-    if (_temperatureHistory.length < 3) return;
+    if (_temperatureHistory.length < 3) {
+      return (riseWantsDim: false, cooled: cooled);
+    }
     final oldest = _temperatureHistory.first;
     final elapsedSeconds = now.difference(oldest.timestamp).inSeconds;
-    if (elapsedSeconds < _thermalRiseMinimumSpan.inSeconds) return;
+    if (elapsedSeconds < _thermalRiseMinimumSpan.inSeconds) {
+      return (riseWantsDim: false, cooled: cooled);
+    }
     final riseRate =
         (temperature - oldest.temperatureC) / elapsedSeconds * 60.0;
     _thermalRiseRatePerMin = riseRate;
+    return (
+      riseWantsDim:
+          riseRate > _thermalRiseDimRatePerMin &&
+          temperature >= _thermalAutoDimMinimumC,
+      cooled: cooled,
+    );
+  }
 
-    if (riseRate > _thermalRiseDimRatePerMin &&
-        temperature >= _thermalAutoDimMinimumC &&
-        _thermalAutoDimAllowed) {
-      _autoScreenDimmed = true;
-      _screenDimmedByThermal = true;
-      developer.log(
-        '[THERMAL] Tốc độ tăng nhiệt cao: ${riseRate.toStringAsFixed(2)}°C/phút '
-        '(nhiệt độ hiện tại: ${temperature.toStringAsFixed(1)}°C). '
-        'Tự động làm tối màn hình để giải nhiệt.',
-        name: 'CameraStationRuntime',
-      );
-      unawaited(_setScreenDimmedSafely(true));
-      _emitState();
+  /// Nơi DUY NHẤT tự làm tối / bật sáng màn hình vì nhiệt (xem
+  /// [thermalScreenDimDecision]).
+  void _applyThermalScreenDim(
+    ({bool riseWantsDim, bool cooled}) signals, {
+    double? temperature,
+  }) {
+    final action = thermalScreenDimDecision(
+      dimmedByThermal: _screenDimmedByThermal,
+      autoDimAllowed: _thermalAutoDimAllowed,
+      planWantsDim: !_thermalCriticalSuspended && _thermalLoadPlan.dimScreen,
+      riseWantsDim: signals.riseWantsDim,
+      cooled: signals.cooled,
+    );
+    switch (action) {
+      case ThermalDimAction.none:
+        return;
+      case ThermalDimAction.undim:
+        _screenDimmedByThermal = false;
+        _autoScreenDimmed = false;
+        developer.log(
+          '[THERMAL] Máy đã nguội'
+          '${temperature == null ? '' : ' (${temperature.toStringAsFixed(1)}°C)'}'
+          '; bật sáng lại màn hình',
+          name: 'CameraStationRuntime',
+        );
+        unawaited(_setScreenDimmedSafely(false));
+      case ThermalDimAction.dim:
+        _autoScreenDimmed = true;
+        _screenDimmedByThermal = true;
+        final rate = _thermalRiseRatePerMin;
+        developer.log(
+          signals.riseWantsDim && rate != null && temperature != null
+              ? '[THERMAL] Tốc độ tăng nhiệt cao: '
+                    '${rate.toStringAsFixed(2)}°C/phút (nhiệt độ hiện tại: '
+                    '${temperature.toStringAsFixed(1)}°C). Tự động làm tối '
+                    'màn hình để giải nhiệt.'
+              : '[THERMAL] Tự động làm tối màn hình để giải nhiệt '
+                    '(giảm tải bậc ${_thermalLoadPlan.level}).',
+          name: 'CameraStationRuntime',
+        );
+        unawaited(_setScreenDimmedSafely(true));
     }
+    _emitState();
   }
 
   Future<void> _setScreenDimmedSafely(bool dimmed) async {
@@ -3788,19 +4064,40 @@ class CameraStationRuntime {
         _iosLifecycleSuspended ||
         _scannerPaused ||
         !_thermalThrottled ||
+        _thermalRestoreInFlight ||
         _livePublishingActive ||
         _profileSwitching) {
       return;
     }
-    _thermalThrottled = false;
+    // Giữ _thermalThrottled và profile mục tiêu trong lúc chờ đổi độ phân
+    // giải: lần kiểm tra nhiệt chen vào không được coi là "đã hết hạ nhiệt"
+    // mà xoá profile mục tiêu (lỗi thì kẹt ở 720p).
+    _thermalRestoreInFlight = true;
+    final session = _monitorSession;
     try {
       await _serializeLifecycle(
-        () => _setResolutionProfileInternal(profile, persistSelection: false),
+        () async {
+          // Đang đổi cấu hình khác: _setResolutionProfileInternal sẽ bỏ qua
+          // im lặng, không được coi là đã khôi phục.
+          if (_profileSwitching) {
+            throw StationException.fromCode(StationErrorCode.cameraBusy);
+          }
+          await _setResolutionProfileInternal(
+            profile,
+            persistSelection: false,
+          );
+        },
         timeout: _reconfigureOperationTimeout,
         label: 'thermal_restore',
         recoverOnTimeout: true,
       );
-      _profileBeforeThermalThrottle = null;
+      if (session != _monitorSession) return;
+      // Critical quay lại trong lúc khôi phục: giữ profile mục tiêu để khôi
+      // phục lần sau khi nguội.
+      if (!_thermalCriticalDegraded && !_thermalCriticalSuspended) {
+        _thermalThrottled = false;
+        _profileBeforeThermalThrottle = null;
+      }
       _thermalNormalSince = null;
       _thermalCooledDownSince = DateTime.now();
       _lastThermalRestoreAt = DateTime.now();
@@ -3809,16 +4106,23 @@ class CameraStationRuntime {
         name: 'CameraStationRuntime',
       );
     } catch (error, stackTrace) {
-      _thermalThrottled = true;
+      if (session != _monitorSession) return;
+      // Giữ profile mục tiêu (và cờ hạ nhiệt) để thử lại sau thời gian ổn
+      // định kế tiếp.
       _thermalNormalSince = DateTime.now();
       developer.log(
-        '[THERMAL] Failed to restore camera profile',
+        '[THERMAL] Failed to restore camera profile; keeping '
+        '${profile.shortLabel} as the restore target',
         error: error,
         stackTrace: stackTrace,
         name: 'CameraStationRuntime',
       );
+    } finally {
+      if (session == _monitorSession) {
+        _thermalRestoreInFlight = false;
+        _emitState();
+      }
     }
-    _emitState();
   }
 
   Duration _delayUntilSegmentBoundary() {
@@ -3876,12 +4180,8 @@ class CameraStationRuntime {
       _thermalLoadPlan = plan;
       _emitState();
     }
-    if (plan.dimScreen && _thermalAutoDimAllowed) {
-      _autoScreenDimmed = true;
-      _screenDimmedByThermal = true;
-      unawaited(_setScreenDimmedSafely(true));
-      _emitState();
-    }
+    // Làm tối màn hình theo kế hoạch được quyết định chung ở
+    // _applyThermalScreenDim (không bật/tắt ở hai nơi gây chớp màn hình).
     await _applyThermalFpsCap(plan.fpsCap);
   }
 
@@ -3897,7 +4197,11 @@ class CameraStationRuntime {
       _appliedFpsCapKey = key;
       return;
     }
-    if (await webRtc.setCaptureFpsCap(cap)) _appliedFpsCapKey = key;
+    if (await webRtc.setCaptureFpsCap(cap)) {
+      _appliedFpsCapKey = key;
+      // FPS mong đợi của RTSP publisher theo giới hạn vừa áp.
+      _emitState();
+    }
   }
 
   void _cancelPendingThermalTimers() {
@@ -4163,6 +4467,13 @@ class CameraStationRuntime {
         name: 'CameraStationRuntime',
       );
     }
+  }
+
+  /// Giữ background task hoàn tất segment của iOS (begin gửi lên native ngay
+  /// trong lời gọi này). Hàm trả về trả lần giữ này đúng một lần.
+  Future<void> Function() _holdIosBackgroundFinalization() {
+    if (!Platform.isIOS) return () => Future<void>.value();
+    return _iosFinalizationHold.acquire();
   }
 
   Future<void> _beginIosBackgroundFinalization() async {

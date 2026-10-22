@@ -73,3 +73,16 @@ sau khi bật ghi (riêng khi camera đang đổi cấu hình/khôi phục: `sta
 - `tiebreakAt` phải trong `[gamesPerSet - 1, gamesPerSet]`, sai → 422.
 - `setScore` đủ số set thắng → trận tự kết thúc.
 - `newMatch` / `config` có `reset: true` xoá lịch sử Hoàn tác.
+
+## 6. Thay đổi 22/10/2026
+
+- **CheckVAR sát lúc chuyển segment:** trạm chờ segment chứa sự kiện được chốt rồi mới cắt (có thể chậm thêm ~2 s).
+  Nếu vẫn chưa đủ dữ liệu: trả `NOT_RECORDING`, `retryable: true` — gửi lại cùng `X-Request-ID`.
+  Trước đây có thể trả clip thiếu khoảnh khắc mà vẫn `success`.
+- **CheckVAR khi trạm đã dừng ghi:** vẫn tìm trong các segment đã chốt theo thời điểm sự kiện trước khi báo lỗi.
+- **CheckVAR được ưu tiên** hơn các lệnh `/trim` đang chờ.
+- **`/trim` tối đa 10 phút:** dài hơn → **422** `{error, message, errorCode: "TRIM_FAILED", maximumDurationMs}`.
+- **`/checkvar/jobs/{id}`** với mã `%` hỏng → **400** (trước trả 500).
+- **Ngay sau khi trạm khởi động**, HTTP/discovery bật ngay; danh sách `/segments` có thể chưa đủ trong vài giây
+  trong lúc trạm khôi phục file ghi dở.
+

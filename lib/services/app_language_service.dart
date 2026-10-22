@@ -107,8 +107,12 @@ class AppLanguageButton extends StatelessWidget {
               ),
             )
             .toList(),
+        // Thu nhỏ (không tràn) khi cờ + mã ngôn ngữ rộng hơn ô, vd chữ hệ
+        // thống phóng to hoặc font không có emoji cờ.
         child: Center(
-          child: Row(
+          child: FittedBox(
+            fit: BoxFit.scaleDown,
+            child: Row(
             mainAxisSize: MainAxisSize.min,
             children: [
               Text(
@@ -125,6 +129,7 @@ class AppLanguageButton extends StatelessWidget {
                 ),
               ),
             ],
+          ),
           ),
         ),
       ),

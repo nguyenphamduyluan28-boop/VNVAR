@@ -186,6 +186,106 @@ Map<String, dynamic> checkVarFailureResult({
   };
 }
 
+/// Mốc phải có trong file nguồn của clip Check VAR: thời điểm sự kiện, nhưng
+/// không muộn hơn lúc trạm nhận request (đồng hồ tablet có thể nhanh hơn vài
+/// giây; sự kiện thật không thể xảy ra sau lúc request đến).
+DateTime checkVarCoverageTarget({
+  required DateTime requestedAt,
+  required DateTime receivedAt,
+}) => requestedAt.isAfter(receivedAt) ? receivedAt : requestedAt;
+
+/// Sai số cho phép giữa mốc kết thúc segment và thời điểm sự kiện.
+const Duration checkVarCoverageTolerance = Duration(milliseconds: 300);
+
+/// Khoảng hở tối đa giữa hai segment (recorder cũ dừng → recorder mới mở)
+/// mà sự kiện rơi vào đó được coi là "không có hình nào bị bỏ sót".
+const Duration checkVarMaximumUnrecordedGap = Duration(seconds: 2);
+
+/// Tuổi tối thiểu của segment đang ghi trước khi chốt cho Check VAR: segment
+/// ngắn hơn 1 s hình không được công bố (bị chuyển vào FRAGMENTS) nên phải
+/// chờ đủ để đoạn chứa sự kiện luôn dùng được.
+const Duration checkVarMinimumActiveSegmentAge = Duration(milliseconds: 2200);
+
+enum CheckVarSourceCoverage {
+  /// Segment nguồn chứa thời điểm sự kiện.
+  covered,
+
+  /// Sự kiện nằm trong segment đang ghi (segment nguồn đã chốt trước đó,
+  /// ví dụ Check VAR nhập vào lượt chuyển segment định kỳ): phải chốt tiếp
+  /// segment đang ghi rồi mới cắt.
+  needsActiveSegment,
+
+  /// Sự kiện rơi vào khoảng hở ngắn giữa hai recorder: không có hình nào
+  /// khác được ghi, segment nguồn là bản đầy đủ nhất.
+  unrecordedGap,
+
+  /// Thiếu dữ liệu sau segment nguồn.
+  missing,
+}
+
+/// Segment nguồn kết thúc lúc [sourceEndedAt] có đủ hình tới [target] không.
+CheckVarSourceCoverage checkVarSourceCoverage({
+  required DateTime sourceEndedAt,
+  required DateTime target,
+  required DateTime? activeStartedAt,
+  Duration tolerance = checkVarCoverageTolerance,
+  Duration maximumGap = checkVarMaximumUnrecordedGap,
+}) {
+  if (!target.isAfter(sourceEndedAt.add(tolerance))) {
+    return CheckVarSourceCoverage.covered;
+  }
+  if (activeStartedAt != null && !activeStartedAt.isAfter(target)) {
+    return CheckVarSourceCoverage.needsActiveSegment;
+  }
+  if (activeStartedAt != null &&
+      target.difference(sourceEndedAt) <= maximumGap) {
+    return CheckVarSourceCoverage.unrecordedGap;
+  }
+  return CheckVarSourceCoverage.missing;
+}
+
+/// Thời gian cần chờ để segment đang ghi đủ [minimumAge] trước khi chốt.
+Duration checkVarActiveSegmentWait({
+  required DateTime activeStartedAt,
+  required DateTime now,
+  Duration minimumAge = checkVarMinimumActiveSegmentAge,
+}) {
+  final age = now.difference(activeStartedAt);
+  if (age.isNegative) return minimumAge;
+  return age >= minimumAge ? Duration.zero : minimumAge - age;
+}
+
+/// Thời gian chờ tối đa để chốt segment chứa sự kiện: phần đã ghi (tối đa
+/// một segment) cộng biên cho việc dừng recorder và đóng gói TS.
+Duration checkVarFollowUpTimeout({
+  required Duration activeAge,
+  required Duration segmentDuration,
+  Duration margin = const Duration(seconds: 30),
+}) {
+  var recorded = activeAge.isNegative ? Duration.zero : activeAge;
+  if (recorded > segmentDuration) recorded = segmentDuration;
+  return recorded + checkVarMinimumActiveSegmentAge + margin;
+}
+
+/// Độ dài tối đa của một clip cắt thủ công qua `/trim`. Clip dài hơn chiếm
+/// hàng đợi FFmpeg lâu và làm chậm Check VAR.
+const int maximumManualTrimDurationMs = 10 * 60 * 1000;
+
+bool isManualTrimDurationAllowed({required num startMs, required num endMs}) =>
+    endMs - startMs <= maximumManualTrimDurationMs;
+
+/// Giải mã requestId trong `/checkvar/jobs/{requestId}`; null khi mã `%`
+/// hỏng hoặc không phải UTF-8 hợp lệ (trả 400 thay vì 500).
+String? decodeCheckVarJobId(String raw) {
+  try {
+    return Uri.decodeComponent(raw);
+  } on FormatException {
+    return null;
+  } on ArgumentError {
+    return null;
+  }
+}
+
 /// HTTP status trả cho một kết quả Check VAR đã lưu.
 int checkVarResponseStatus(Map<String, dynamic> result) {
   if (result['status'] != 'FAILED') return HttpStatus.ok;
@@ -355,6 +455,11 @@ class CameraServer {
   Future<void> _checkVarProcessingTail = Future<void>.value();
   final RequestRateLimiter _rateLimiter = RequestRateLimiter();
   Future<void> _webRtcOfferTail = Future<void>.value();
+  // Dọn/khôi phục lưu trữ lúc khởi động (chạy nền, xem start()).
+  Future<void>? _startupMaintenance;
+
+  /// Lượt dọn/khôi phục lưu trữ lúc khởi động server (null nếu chưa chạy).
+  Future<void>? get startupMaintenance => _startupMaintenance;
   int _pendingWebRtcOffers = 0;
   static const int maximumPendingWebRtcOffers = 4;
 
@@ -426,9 +531,23 @@ class CameraServer {
 
     await recordingService.loadSettings();
 
-    // Nạp lại video đã lưu trên điện thoại.
-    // Đã gồm dọn toàn bộ thư mục ngày hết hạn (removeExpiredData).
-    await recordingService.cleanupOldTempFiles();
+    // Nạp lại video đã lưu trên điện thoại, khôi phục file ghi dở sau crash
+    // và dọn thư mục ngày hết hạn (removeExpiredData). Việc này có thể mất
+    // nhiều giây/phút (FFmpeg) nên chạy NỀN: HTTP + discovery bật ngay để
+    // tablet thấy camera. An toàn khi recorder ghi song song: dọn staging bỏ
+    // qua file đang/vừa ghi, lượt khôi phục nối tiếp theo camera, và cắt clip
+    // chờ lượt dọn clip xuất tạm (được xếp hàng ngay trong lời gọi này).
+    _startupMaintenance = recordingService.cleanupOldTempFiles().catchError((
+      Object error,
+      StackTrace stackTrace,
+    ) {
+      developer.log(
+        'Startup storage recovery failed',
+        error: error,
+        stackTrace: stackTrace,
+        name: 'CameraServer',
+      );
+    });
 
     // Legacy tablet discovery uses a short TCP request/response on port 40404.
     try {
@@ -789,10 +908,18 @@ class CameraServer {
       // ========================================================
 
       if (path.startsWith('/checkvar/jobs/') && method == 'GET') {
-        final requestId = normalizeCheckVarRequestId(
-          Uri.decodeComponent(path.substring('/checkvar/jobs/'.length)),
-          DateTime.now(),
+        final decodedId = decodeCheckVarJobId(
+          path.substring('/checkvar/jobs/'.length),
         );
+        if (decodedId == null) {
+          await _sendBadRequest(
+            request.response,
+            'Bad Request',
+            message: 'requestId không hợp lệ.',
+          );
+          return;
+        }
+        final requestId = normalizeCheckVarRequestId(decodedId, DateTime.now());
         final result = _checkVarResults[requestId];
         final processing = _checkVarJobs.containsKey(requestId);
         await _sendJson(
@@ -862,6 +989,7 @@ class CameraServer {
             request,
             requestId: requestId,
             requestedAt: requestedAt,
+            receivedAt: receivedAt,
           );
           _checkVarJobs[requestId] = operation;
         } else if (request.contentLength != 0) {
@@ -1469,6 +1597,7 @@ class CameraServer {
     HttpRequest request, {
     required String requestId,
     required DateTime requestedAt,
+    required DateTime receivedAt,
   }) async {
     final owner = _exportOwnerFor(request);
     int? requestedLookback = int.tryParse(
@@ -1481,7 +1610,7 @@ class CameraServer {
     // boundary and handed capture to the next file. Post-checkpoint trimming
     // runs on a separate queue below, so it cannot keep the recorder lock.
     final source = await _serializeRecordingRequest(
-      () => _checkpointCheckVar(requestedAt),
+      () => _checkpointCheckVar(requestedAt, receivedAt: receivedAt),
     );
     // The recorder boundary is the time-sensitive part of CheckVAR. Never
     // wait for a slow HTTP body before stopping it: on a weak LAN that used
@@ -1512,33 +1641,60 @@ class CameraServer {
   }
 
   Future<({RecordedSegment segment, bool usedPrevious})> _checkpointCheckVar(
-    DateTime requestedAt,
-  ) async {
+    DateTime requestedAt, {
+    required DateTime receivedAt,
+  }) async {
+    final target = checkVarCoverageTarget(
+      requestedAt: requestedAt,
+      receivedAt: receivedAt,
+    );
     final activeStartedAt = recordingService.currentSegmentStartedAt;
-    final historical =
-        activeStartedAt != null && requestedAt.isBefore(activeStartedAt)
-        ? recordingService.findByTime(requestedAt)
-        : null;
-    if (activeStartedAt != null &&
-        requestedAt.isBefore(activeStartedAt) &&
-        historical == null) {
-      throw CheckVarSegmentUnavailableException(
-        'NO_SEGMENT',
-        'Không còn segment chứa thời điểm CheckVAR '
-        '${requestedAt.toIso8601String()}.',
-      );
+    RecordedSegment? historical;
+    if (activeStartedAt == null) {
+      // Không có segment đang ghi (đã /stop, đang treo ghi...): sự kiện vẫn
+      // có thể nằm trong một segment đã chốt. Không có thì mới xét chốt
+      // segment hiện tại (trả NOT_RECORDING nếu không có gì để chốt).
+      historical = recordingService.findByTime(requestedAt);
+    } else if (requestedAt.isBefore(activeStartedAt)) {
+      historical = recordingService.findByTime(requestedAt);
+      if (historical == null) {
+        throw CheckVarSegmentUnavailableException(
+          'NO_SEGMENT',
+          'Không còn segment chứa thời điểm CheckVAR '
+              '${requestedAt.toIso8601String()}.',
+        );
+      }
     }
-    final segment =
-        historical ?? await recordingService.checkpointCurrentSegment();
-    final usedPrevious = historical == null
-        ? recordingService.lastCheckpointUsedPrevious
-        : true;
+    RecordedSegment segment;
+    bool usedPrevious;
+    if (historical != null) {
+      segment = historical;
+      usedPrevious = true;
+    } else {
+      // Sự kiện nằm trong segment đang ghi: để segment đó đủ dài để được
+      // công bố (≥ 1 s hình) trước khi chốt, nếu không đoạn chứa sự kiện bị
+      // chuyển vào FRAGMENTS và clip thiếu khoảnh khắc.
+      if (activeStartedAt != null) {
+        await _waitForCheckVarActiveSegment(activeStartedAt);
+      }
+      segment = await recordingService.checkpointCurrentSegment();
+      usedPrevious = recordingService.lastCheckpointUsedPrevious;
+      final resolved = await _ensureCheckVarSourceCovers(segment, target);
+      if (!identical(resolved, segment)) {
+        segment = resolved;
+        usedPrevious = false;
+      }
+    }
     developer.log(
       '[CHECKVAR] Recorder boundary secured: ${segment.fileName} '
       '(${segment.durationMs}ms)',
       name: 'CameraServer',
     );
-    if (!recordingService.recording && !recordingService.rotating) {
+    // Chỉ mở lại recorder sau một lần chốt thật; tra segment đã chốt (đã
+    // /stop, treo ghi, tạm dừng camera) không được tự bật ghi lại.
+    if (historical == null &&
+        !recordingService.recording &&
+        !recordingService.rotating) {
       try {
         await ensureRecording();
       } catch (error, stackTrace) {
@@ -1551,6 +1707,80 @@ class CameraServer {
       }
     }
     return (segment: segment, usedPrevious: usedPrevious);
+  }
+
+  Future<void> _waitForCheckVarActiveSegment(DateTime activeStartedAt) async {
+    final wait = checkVarActiveSegmentWait(
+      activeStartedAt: activeStartedAt,
+      now: DateTime.now(),
+    );
+    if (wait > Duration.zero) await Future<void>.delayed(wait);
+  }
+
+  CheckVarSegmentUnavailableException _checkVarSourceNotReady(
+    DateTime target,
+  ) => CheckVarSegmentUnavailableException(
+    'NOT_RECORDING',
+    'Đoạn video chứa thời điểm CheckVAR ${target.toIso8601String()} '
+        'chưa được chốt xong; vui lòng gửi lại.',
+  );
+
+  /// Segment nguồn trả về khi nhập vào một lượt chuyển segment đang chạy kết
+  /// thúc TRƯỚC thời điểm sự kiện: chốt tiếp segment đang ghi (chứa sự kiện)
+  /// rồi mới cắt; clip sẽ ghép phần cuối segment trước. Không đủ dữ liệu thì
+  /// báo lỗi thử lại được thay vì trả clip thiếu khoảnh khắc.
+  Future<RecordedSegment> _ensureCheckVarSourceCovers(
+    RecordedSegment segment,
+    DateTime target,
+  ) async {
+    final activeStartedAt = recordingService.currentSegmentStartedAt;
+    final coverage = checkVarSourceCoverage(
+      sourceEndedAt: segment.endedAt,
+      target: target,
+      activeStartedAt: activeStartedAt,
+    );
+    if (coverage == CheckVarSourceCoverage.covered ||
+        coverage == CheckVarSourceCoverage.unrecordedGap) {
+      return segment;
+    }
+    // Một lượt chuyển segment khác có thể đã chốt đoạn chứa sự kiện.
+    final finalized = recordingService.findByTime(target);
+    if (finalized != null) return finalized;
+    if (coverage != CheckVarSourceCoverage.needsActiveSegment ||
+        activeStartedAt == null) {
+      throw _checkVarSourceNotReady(target);
+    }
+    developer.log(
+      '[CHECKVAR] ${segment.fileName} ends before the event '
+      '(${segment.endedAt.toIso8601String()} < ${target.toIso8601String()}); '
+      'checkpointing the active segment',
+      name: 'CameraServer',
+    );
+    final timeout = checkVarFollowUpTimeout(
+      activeAge: DateTime.now().difference(activeStartedAt),
+      segmentDuration: recordingService.segmentDuration,
+    );
+    final RecordedSegment next;
+    try {
+      next = await () async {
+        await _waitForCheckVarActiveSegment(activeStartedAt);
+        return recordingService.checkpointCurrentSegment();
+      }().timeout(timeout);
+    } on TimeoutException {
+      throw _checkVarSourceNotReady(target);
+    }
+    final nextCoverage = checkVarSourceCoverage(
+      sourceEndedAt: next.endedAt,
+      target: target,
+      activeStartedAt: recordingService.currentSegmentStartedAt,
+    );
+    if (nextCoverage == CheckVarSourceCoverage.covered &&
+        !next.startedAt.isAfter(target.add(checkVarCoverageTolerance))) {
+      return next;
+    }
+    final contained = recordingService.findByTime(target);
+    if (contained != null) return contained;
+    throw _checkVarSourceNotReady(target);
   }
 
   Future<Map<String, dynamic>> _finishCheckVar({
@@ -1591,12 +1821,14 @@ class CameraServer {
           minimumOutputDurationMs: 500,
           precedingSegmentId: preceding?.id,
           owner: owner,
+          // Check VAR chen trước các lệnh /trim thủ công đang chờ.
+          priority: true,
         );
         try {
           checkpoint = await trim();
         } on TrimInProgressException {
-          // Một lệnh cắt clip thủ công đang chạy: chờ xong rồi cắt, không bỏ
-          // clip Check VAR.
+          // Dự phòng (job ưu tiên không bị giới hạn hàng đợi): chờ xong rồi
+          // cắt, không bỏ clip Check VAR.
           await recordingService.waitForTrimIdle();
           checkpoint = await trim();
         }
@@ -1910,6 +2142,17 @@ class CameraServer {
       await _sendJson(request.response, HttpStatus.badRequest, {
         'error': 'Bad Request',
         'message': 'segmentId, startMs và endMs là bắt buộc',
+      });
+      return;
+    }
+    if (!isManualTrimDurationAllowed(startMs: startMs, endMs: endMs)) {
+      // Clip quá dài giữ hàng đợi FFmpeg lâu và làm chậm Check VAR.
+      await _sendJson(request.response, HttpStatus.unprocessableEntity, {
+        'error': 'Unprocessable Entity',
+        'errorCode': 'TRIM_FAILED',
+        'message':
+            'Đoạn cắt tối đa ${maximumManualTrimDurationMs ~/ 60000} phút.',
+        'maximumDurationMs': maximumManualTrimDurationMs,
       });
       return;
     }

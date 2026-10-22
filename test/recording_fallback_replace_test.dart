@@ -213,6 +213,9 @@ void main() {
       final staging = '$tempPath${sep}vnvar_recording';
       stagingVideo = await writeFile('$staging${sep}CAM-01_1000.mp4', [5, 5]);
       final startedAt = DateTime.now().subtract(const Duration(minutes: 5));
+      // File staging vừa ghi (< 30 s) được coi là có thể đang được recorder
+      // dùng và bị bỏ qua; MP4 bỏ dở sau crash luôn đã cũ.
+      await stagingVideo.setLastModified(startedAt);
       journal = await writeFile('${stagingVideo.path}.json', utf8.encode(
         jsonEncode({
           'state': 'preserved_fallback',

@@ -138,6 +138,162 @@ bool shouldUsePreviousCheckpointSegment({
   return (startMs: startMs, endMs: endMs);
 }
 
+/// Mốc in/out (giây, theo dấu thời gian tuyệt đối của từng file) cho concat
+/// demuxer khi ghép phần cuối [precedingMs] của segment trước với segment
+/// hiện tại. `inpoint`/`outpoint` của concat demuxer tính theo dấu thời gian
+/// trong file (gồm `start_time`, với TS thường ~0,5–1,4 s), còn nhánh một
+/// file dùng `-ss` tương đối từ đầu file: phải cộng `start_time` thật để hai
+/// nhánh cắt cùng một mốc. Thiếu/không hợp lệ `start_time` của một trong hai
+/// file → null (caller dùng `-ss`/`-t` tương đối trên đầu vào concat).
+({double inpoint, double outpoint})? concatTrimPoints({
+  required double? precedingStartTimeSeconds,
+  required double? currentStartTimeSeconds,
+  required int precedingMs,
+  required int effectiveStartMs,
+  required int endMs,
+}) {
+  final previousStart = precedingStartTimeSeconds;
+  final currentStart = currentStartTimeSeconds;
+  if (previousStart == null ||
+      currentStart == null ||
+      !previousStart.isFinite ||
+      !currentStart.isFinite ||
+      previousStart < 0 ||
+      currentStart < 0) {
+    return null;
+  }
+  final inOffsetMs = (precedingMs + effectiveStartMs).clamp(0, precedingMs);
+  return (
+    inpoint: previousStart + inOffsetMs / 1000,
+    outpoint: currentStart + endMs / 1000,
+  );
+}
+
+/// `start_time` (giây) đọc từ FFprobe; null khi thiếu hoặc không phải số.
+double? parseProbeStartTime(String? value) {
+  final parsed = double.tryParse(value?.trim() ?? '');
+  if (parsed == null || !parsed.isFinite || parsed < 0) return null;
+  return parsed;
+}
+
+/// Thư mục con chứa file tạm khi ghi (MP4/WAV staging, journal).
+const String recordingStagingFolderName = 'vnvar_recording';
+
+/// Thư mục staging chính: trong Application Support (Android/iOS không tự
+/// xoá như cache). Không lấy được Application Support thì dùng cache như
+/// trước. Trả null nếu không có thư mục nào.
+String? recordingStagingDirectoryPath({
+  required String? supportPath,
+  required String? temporaryPath,
+  String separator = '/',
+}) {
+  final base = (supportPath != null && supportPath.trim().isNotEmpty)
+      ? supportPath
+      : temporaryPath;
+  if (base == null || base.trim().isEmpty) return null;
+  return '$base$separator$recordingStagingFolderName';
+}
+
+/// Các thư mục staging cần quét khi dọn/khôi phục: thư mục chính và thư mục
+/// cũ trong cache (bản cũ ghi ở đó), không trùng lặp, thư mục chính trước.
+List<String> recordingStagingScanPaths({
+  required String? supportPath,
+  required String? temporaryPath,
+  String separator = '/',
+}) {
+  final result = <String>[];
+  String normalized(String path) => path.replaceAll('\\', '/').toLowerCase();
+  void add(String? path) {
+    if (path == null) return;
+    if (result.any((item) => normalized(item) == normalized(path))) return;
+    result.add(path);
+  }
+
+  add(
+    recordingStagingDirectoryPath(
+      supportPath: supportPath,
+      temporaryPath: temporaryPath,
+      separator: separator,
+    ),
+  );
+  if (temporaryPath != null && temporaryPath.trim().isNotEmpty) {
+    add('$temporaryPath$separator$recordingStagingFolderName');
+  }
+  return result;
+}
+
+/// File staging vừa được sửa gần đây có thể đang được recorder/FFmpeg ghi
+/// (segment vừa mở sau khi lượt dọn bắt đầu): không khôi phục/xoá.
+const Duration recentStagingFileProtection = Duration(seconds: 30);
+
+bool isRecentlyModifiedStagingFile({
+  required DateTime modified,
+  required DateTime now,
+  Duration protection = recentStagingFileProtection,
+}) => now.difference(modified) < protection;
+
+/// Cách xử lý dung lượng trước khi mở segment mới.
+enum NewSegmentStorageAction {
+  /// Đủ chỗ: mở recorder.
+  open,
+
+  /// Dưới mức cảnh báo nhưng vẫn trên mức chặn: mở recorder NGAY, dọn dung
+  /// lượng chạy nền (không tạo khoảng trống không ghi).
+  openThenCleanup,
+
+  /// Thư mục video dưới mức chặn: dọn trước (bắt buộc) rồi xét lại.
+  cleanupFirst,
+
+  /// Ổ chứa file tạm (khác ổ video) dưới mức chặn: xoá video không giúp gì,
+  /// treo ghi.
+  suspendStaging,
+}
+
+NewSegmentStorageAction newSegmentStorageAction({
+  required int? videoAvailableBytes,
+  required int? stagingAvailableBytes,
+  required int warningBytes,
+  required int minimumBytes,
+}) {
+  final video = videoAvailableBytes;
+  if (video != null && video < minimumBytes) {
+    return NewSegmentStorageAction.cleanupFirst;
+  }
+  final staging = stagingAvailableBytes;
+  if (staging != null && staging < minimumBytes) {
+    return NewSegmentStorageAction.suspendStaging;
+  }
+  if (video != null && video < warningBytes) {
+    return NewSegmentStorageAction.openThenCleanup;
+  }
+  return NewSegmentStorageAction.open;
+}
+
+/// Sau mỗi segment: có cần quét toàn bộ cây thư mục lưu (giới hạn 20 GB,
+/// dọn theo ngày) hay chỉ cộng dồn ước lượng. Quét đầy đủ khi chưa có ước
+/// lượng, gần chạm giới hạn (≥ 90%), đang thiếu dung lượng, sang ngày mới
+/// (dọn thư mục ngày hết hạn) hoặc lần quét đầy đủ gần nhất đã quá
+/// [maximumInterval].
+bool shouldRunFullStorageScanAfterSegment({
+  required int? estimatedManagedBytes,
+  required int storageLimitBytes,
+  required bool lowStorage,
+  required DateTime? lastFullScanAt,
+  required DateTime now,
+  Duration maximumInterval = const Duration(minutes: 10),
+}) {
+  final estimate = estimatedManagedBytes;
+  if (estimate == null || lastFullScanAt == null || lowStorage) return true;
+  if (estimate >= storageLimitBytes * 0.9) return true;
+  if (lastFullScanAt.year != now.year ||
+      lastFullScanAt.month != now.month ||
+      lastFullScanAt.day != now.day) {
+    return true;
+  }
+  return now.difference(lastFullScanAt) >= maximumInterval ||
+      now.isBefore(lastFullScanAt);
+}
+
 /// Segment ghi liền ngay trước [current] (cùng camera, file `.ts`, khoảng hở
 /// ≤ [maxGap]). Dùng để clip Check VAR lấy đủ thời gian trước sự kiện khi
 /// trọng tài bấm ngay sau lúc chuyển segment.
@@ -444,6 +600,15 @@ typedef _ExportClipRecord = ({
   DateTime createdAt,
   DateTime? lastAccessedAt,
 });
+
+/// Một yêu cầu cắt clip trong hàng đợi của [RecordingService].
+class _TrimJob {
+  _TrimJob({required this.priority, required this.run});
+
+  final bool priority;
+  final Future<RecordedSegment> Function() run;
+  final Completer<RecordedSegment> completer = Completer<RecordedSegment>();
+}
 
 enum FallbackReplacementAction {
   /// Đưa file tạm vào chỗ (rename đè/copy), rồi bỏ bản dự phòng cũ.
@@ -963,7 +1128,13 @@ class RecordingService {
   // dùng chung kết quả với yêu cầu đang chạy.
   final Map<String, Future<RecordedSegment>> _pendingTrims =
       <String, Future<RecordedSegment>>{};
-  Future<void> _trimQueueTail = Future<void>.value();
+  // Hàng đợi cắt clip: job ưu tiên (Check VAR) luôn chen trước các job cắt
+  // thủ công đang chờ; job đang chạy không bị ngắt.
+  final List<_TrimJob> _trimJobs = <_TrimJob>[];
+  // Số job cắt thủ công (không ưu tiên) đang chờ hoặc đang chạy.
+  int _normalPendingTrimCount = 0;
+  // Khác null khi worker cắt clip đang chạy; hoàn tất khi hàng đợi trống.
+  Completer<void>? _trimWorkerIdle;
 
   bool _rotating = false;
   bool _lowStorageWarning = false;
@@ -1118,9 +1289,9 @@ class RecordingService {
   Future<void> waitForTrimIdle() async {
     // Hàng đợi có thể được nối thêm trong lúc chờ: chờ tới khi đứng yên.
     while (true) {
-      final tail = _trimQueueTail;
-      await tail;
-      if (identical(tail, _trimQueueTail)) return;
+      final idle = _trimWorkerIdle;
+      if (idle == null) return;
+      await idle.future;
     }
   }
 
@@ -1128,6 +1299,8 @@ class RecordingService {
   /// [precedingSegmentId] (segment liền trước); hai file `.ts` được nối liền
   /// rồi cắt bằng stream copy. [owner] là khoá phiên tải của tablet yêu cầu:
   /// `cleanupExportDownloads(owner: ...)` chỉ xoá clip của đúng phiên đó.
+  /// [priority] (Check VAR): chen trước mọi job cắt thủ công đang chờ và
+  /// không bị giới hạn [maxPendingTrims] của job thủ công.
   Future<RecordedSegment> trimSegment({
     required String segmentId,
     required int startMs,
@@ -1136,6 +1309,7 @@ class RecordingService {
     int? minimumOutputDurationMs,
     String? precedingSegmentId,
     String? owner,
+    bool priority = false,
   }) {
     final key = [
       segmentId,
@@ -1148,27 +1322,16 @@ class RecordingService {
     ].join('|');
     final duplicate = _pendingTrims[key];
     if (duplicate != null) return duplicate;
-    if (_pendingTrims.length >= maxPendingTrims) {
+    if (!priority && _normalPendingTrimCount >= maxPendingTrims) {
       return Future<RecordedSegment>.error(
         const TrimInProgressException(
           'Camera Station đang xử lý nhiều video; vui lòng thử lại sau ít phút.',
         ),
       );
     }
-    final previous = _trimQueueTail;
-    final operation = () async {
-      await previous;
-      // Không cắt trong lúc đang dọn thư mục tải về: clip mới có thể bị xoá.
-      while (true) {
-        final cleanup = _exportCleanupOperation;
-        if (cleanup == null) break;
-        try {
-          await cleanup;
-        } catch (_) {
-          // Lỗi dọn dẹp đã được trả cho caller của nó.
-        }
-      }
-      final run = _trimSegmentInternal(
+    final job = _TrimJob(
+      priority: priority,
+      run: () => _trimSegmentInternal(
         segmentId: segmentId,
         startMs: startMs,
         endMs: endMs,
@@ -1176,29 +1339,75 @@ class RecordingService {
         minimumOutputDurationMs: minimumOutputDurationMs,
         precedingSegmentId: precedingSegmentId,
         owner: owner,
-      );
-      _trimOperation = run;
-      try {
-        return await run;
-      } finally {
-        if (identical(_trimOperation, run)) _trimOperation = null;
-      }
-    }();
+      ),
+    );
+    final operation = job.completer.future;
+    if (!priority) _normalPendingTrimCount++;
     _pendingTrims[key] = operation;
     final settled = operation.then<void>((_) {}, onError: (Object _) {});
-    _trimQueueTail = settled;
     unawaited(
       settled.whenComplete(() {
+        if (!priority) _normalPendingTrimCount--;
         if (identical(_pendingTrims[key], operation)) _pendingTrims.remove(key);
       }),
     );
+    _trimJobs.add(job);
     if (_pendingTrims.length > 1) {
       developer.log(
-        '[TRIM] Queued trim request (${_pendingTrims.length} pending)',
+        '[TRIM] Queued ${priority ? 'priority ' : ''}trim request '
+        '(${_pendingTrims.length} pending)',
         name: 'RecordingService',
       );
     }
+    _startTrimWorker();
     return operation;
+  }
+
+  /// Job kế tiếp: job ưu tiên đầu tiên, nếu không có thì job cũ nhất.
+  _TrimJob? _takeNextTrimJob() {
+    if (_trimJobs.isEmpty) return null;
+    final priorityIndex = _trimJobs.indexWhere((job) => job.priority);
+    return _trimJobs.removeAt(priorityIndex < 0 ? 0 : priorityIndex);
+  }
+
+  void _startTrimWorker() {
+    if (_trimWorkerIdle != null) return;
+    final idle = Completer<void>();
+    _trimWorkerIdle = idle;
+    unawaited(() async {
+      try {
+        while (true) {
+          // Không cắt trong lúc đang dọn thư mục tải về: clip mới có thể bị
+          // xoá. Chờ trước khi chọn job để job ưu tiên đến trong lúc chờ
+          // vẫn được chạy trước.
+          while (true) {
+            final cleanup = _exportCleanupOperation;
+            if (cleanup == null) break;
+            try {
+              await cleanup;
+            } catch (_) {
+              // Lỗi dọn dẹp đã được trả cho caller của nó.
+            }
+          }
+          // Không có await nào giữa lúc thấy hàng đợi trống và lúc đặt lại
+          // _trimWorkerIdle (finally): job mới luôn khởi động worker mới.
+          final job = _takeNextTrimJob();
+          if (job == null) break;
+          final run = job.run();
+          _trimOperation = run;
+          try {
+            job.completer.complete(await run);
+          } catch (error, stackTrace) {
+            job.completer.completeError(error, stackTrace);
+          } finally {
+            if (identical(_trimOperation, run)) _trimOperation = null;
+          }
+        }
+      } finally {
+        if (identical(_trimWorkerIdle, idle)) _trimWorkerIdle = null;
+        idle.complete();
+      }
+    }());
   }
 
   Future<RecordedSegment> _trimSegmentInternal({
@@ -1328,20 +1537,40 @@ class RecordingService {
       final durationMs = endMs - effectiveStartMs;
       final isTsInput = source.path.toLowerCase().endsWith('.ts');
       final crossSegment = precedingSource;
+      // Mốc cắt tuyệt đối cho concat demuxer (null → cắt tương đối bằng
+      // -ss/-t trên đầu vào concat, cùng cách nhánh một file).
+      ({double inpoint, double outpoint})? concatPoints;
       if (crossSegment != null) {
+        concatPoints = concatTrimPoints(
+          precedingStartTimeSeconds: await _probeStartTimeSeconds(
+            File(crossSegment.path),
+          ),
+          currentStartTimeSeconds: await _probeStartTimeSeconds(
+            File(source.path),
+          ),
+          precedingMs: precedingMs,
+          effectiveStartMs: effectiveStartMs,
+          endMs: endMs,
+        );
         // ffconcat: đường dẫn trong nháy đơn, nháy đơn bên trong viết '\''.
         String quote(String path) => "'${path.replaceAll("'", r"'\''")}'";
-        final inpoint = (precedingMs + effectiveStartMs) / 1000;
+        final points = concatPoints;
         concatList = File('${target.path}.concat.txt');
         await concatList.writeAsString(
-          'ffconcat version 1.0\n'
-          'file ${quote(crossSegment.path)}\n'
-          'inpoint ${inpoint.toStringAsFixed(3)}\n'
-          'file ${quote(source.path)}\n'
-          'outpoint ${(endMs / 1000).toStringAsFixed(3)}\n',
+          points == null
+              ? 'ffconcat version 1.0\n'
+                    'file ${quote(crossSegment.path)}\n'
+                    'file ${quote(source.path)}\n'
+              : 'ffconcat version 1.0\n'
+                    'file ${quote(crossSegment.path)}\n'
+                    'inpoint ${points.inpoint.toStringAsFixed(3)}\n'
+                    'file ${quote(source.path)}\n'
+                    'outpoint ${points.outpoint.toStringAsFixed(3)}\n',
           flush: true,
         );
       }
+      final relativeConcatStartSeconds =
+          (precedingMs + effectiveStartMs) / 1000;
       final inputArguments = crossSegment != null
           ? <String>[
               '-fflags',
@@ -1350,8 +1579,16 @@ class RecordingService {
               'concat',
               '-safe',
               '0',
+              if (concatPoints == null) ...[
+                '-ss',
+                relativeConcatStartSeconds.toStringAsFixed(3),
+              ],
               '-i',
               concatList!.path,
+              if (concatPoints == null) ...[
+                '-t',
+                (durationMs / 1000).toStringAsFixed(3),
+              ],
             ]
           : <String>[
               if (isTsInput) ...[
@@ -1772,6 +2009,78 @@ class RecordingService {
     return _videoStorage.rootDirectory();
   }
 
+  // ============================================================
+  // STAGING (FILE TẠM KHI GHI)
+  // ============================================================
+
+  static Future<String?> _applicationSupportPath() async {
+    try {
+      return (await getApplicationSupportDirectory()).path;
+    } catch (error) {
+      developer.log(
+        'Application Support directory unavailable; using cache: $error',
+        name: 'RecordingService',
+      );
+      return null;
+    }
+  }
+
+  static Future<String?> _temporaryPath() async {
+    try {
+      return (await getTemporaryDirectory()).path;
+    } catch (error) {
+      developer.log(
+        'Temporary directory unavailable: $error',
+        name: 'RecordingService',
+      );
+      return null;
+    }
+  }
+
+  /// Thư mục ghi MP4/WAV staging và journal. Đặt trong Application Support
+  /// (Android không tự xoá như cache khi thiếu bộ nhớ); thiếu thì dùng cache.
+  Future<Directory> _stagingDirectory() async {
+    final path = recordingStagingDirectoryPath(
+      supportPath: await _applicationSupportPath(),
+      temporaryPath: await _temporaryPath(),
+      separator: Platform.pathSeparator,
+    );
+    if (path == null) {
+      throw BilingualStateError(
+        'Không tìm thấy thư mục lưu file tạm khi ghi.',
+        'No directory available for recording temp files.',
+      );
+    }
+    return Directory(path);
+  }
+
+  /// Mọi thư mục staging cần quét khi dọn/khôi phục: thư mục hiện tại và
+  /// thư mục cũ trong cache (file của bản cũ / lần chạy trước).
+  Future<List<Directory>> _stagingScanDirectories() async {
+    return recordingStagingScanPaths(
+      supportPath: await _applicationSupportPath(),
+      temporaryPath: await _temporaryPath(),
+      separator: Platform.pathSeparator,
+    ).map(Directory.new).toList();
+  }
+
+  /// Dung lượng trống của ổ chứa file tạm khi ghi (Android; iOS dùng chung
+  /// một ổ với thư mục video nên không đo riêng). null nếu không đọc được.
+  Future<int?> _stagingAvailableBytes() async {
+    if (!Platform.isAndroid) return null;
+    try {
+      final directory = await _stagingDirectory();
+      await directory.create(recursive: true);
+      return await _videoStorage.availableBytesAt(directory.path);
+    } catch (error) {
+      developer.log(
+        'Unable to read free space of the staging directory: $error',
+        name: 'RecordingService',
+      );
+      return null;
+    }
+  }
+
   /// Thư mục chính + thư mục dự phòng từng được dùng khi thư mục chính lỗi.
   Future<List<Directory>> _allVideoRoots() async {
     final primary = await _videoRootDirectory();
@@ -1864,14 +2173,21 @@ class RecordingService {
           }
 
           // Chỉ bỏ khỏi chỉ mục những file đã thực sự bị xoá; file xoá lỗi vẫn
-          // còn trên đĩa và vẫn tải/xoá được ở lần sau.
-          _segments.removeWhere((segment) {
+          // còn trên đĩa và vẫn tải/xoá được ở lần sau. Kiểm tra bất đồng bộ
+          // (không chặn UI isolate) rồi mới gỡ khỏi chỉ mục.
+          final removedPaths = <String>{};
+          for (final segment in List<RecordedSegment>.of(_segments)) {
             final normalizedPath = segment.path.replaceAll('\\', '/');
             final inside =
                 normalizedPath == normalizedDirectory ||
                 normalizedPath.startsWith('$normalizedDirectory/');
-            return inside && !File(segment.path).existsSync();
-          });
+            if (inside && !await File(segment.path).exists()) {
+              removedPaths.add(segment.path);
+            }
+          }
+          _segments.removeWhere(
+            (segment) => removedPaths.contains(segment.path),
+          );
           _notifyVideoChanges();
           developer.log(
             '[STORAGE] Removed past day directory: ${entity.path}',
@@ -2299,11 +2615,29 @@ class RecordingService {
           deferred: false,
         );
       }
-      final preserved = await source.copy(fallback.path);
+      // Copy lỗi (thường do đầy bộ nhớ) để lại file MP4 dở dang trong thư mục
+      // video: xoá nó để chỉ mục không nhận một video hỏng. Nguồn staging +
+      // journal vẫn còn để lần khôi phục sau thử lại.
+      Future<void> discardPartialFallback() async {
+        try {
+          if (await fallback.exists()) await fallback.delete();
+        } catch (_) {}
+      }
+
+      final File preserved;
+      try {
+        preserved = await source.copy(fallback.path);
+      } catch (_) {
+        await discardPartialFallback();
+        rethrow;
+      }
       if (!await preserved.exists() || await preserved.length() <= 0) {
-        throw StateError(
+        await discardPartialFallback();
+        throw BilingualStateError(
           'Không thể lưu đoạn video cuối. '
-          'FFmpeg: ${output ?? 'không có thông tin lỗi'}',
+              'FFmpeg: ${output ?? 'không có thông tin lỗi'}',
+          'Unable to save the last video segment. '
+              'FFmpeg: ${output ?? 'no error details'}',
         );
       }
       // Giữ lại cặp MP4/WAV staging khi mux audio thất bại. Lần dọn sau sẽ
@@ -2565,6 +2899,23 @@ class RecordingService {
     }
   }
 
+  /// `start_time` (giây) của file theo FFprobe; null nếu không đọc được.
+  Future<double?> _probeStartTimeSeconds(File file) async {
+    try {
+      if (!await file.exists()) return null;
+      final session = await FFprobeKit.getMediaInformation(file.path);
+      return parseProbeStartTime(session.getMediaInformation()?.getStartTime());
+    } catch (error, stackTrace) {
+      developer.log(
+        'FFprobe start_time failed: ${file.path}',
+        error: error,
+        stackTrace: stackTrace,
+        name: 'RecordingService',
+      );
+      return null;
+    }
+  }
+
   Future<File> _preserveShortFragment({
     required File video,
     required File? audio,
@@ -2771,10 +3122,7 @@ class RecordingService {
 
     final now = DateTime.now();
     final timestamp = now.millisecondsSinceEpoch;
-    final stagingRoot = await getTemporaryDirectory();
-    final stagingDirectory = Directory(
-      '${stagingRoot.path}${Platform.pathSeparator}vnvar_recording',
-    );
+    final stagingDirectory = await _stagingDirectory();
     await stagingDirectory.create(recursive: true);
     final fileName = '${cameraId}_$timestamp.mp4';
 
@@ -2951,9 +3299,48 @@ class RecordingService {
 
   Future<void> _ensureFreeSpaceForNewSegment() async {
     var available = await availableStorageBytes();
-    if (available == null || available >= normalFreeSpaceThresholdBytes) {
-      _setStorageSuspended(false);
-      return;
+    final stagingAvailable = await _stagingAvailableBytes();
+    switch (newSegmentStorageAction(
+      videoAvailableBytes: available,
+      stagingAvailableBytes: stagingAvailable,
+      warningBytes: normalFreeSpaceThresholdBytes,
+      minimumBytes: minimumStartFreeSpaceBytes,
+    )) {
+      case NewSegmentStorageAction.open:
+        _setStorageSuspended(false);
+        return;
+      case NewSegmentStorageAction.openThenCleanup:
+        // Vẫn trên mức chặn: mở recorder ngay, dọn dung lượng chạy nền để
+        // việc chuyển segment không tạo khoảng trống không ghi.
+        _setStorageSuspended(false);
+        unawaited(
+          enforceStorageLimit().catchError((
+            Object error,
+            StackTrace stackTrace,
+          ) {
+            developer.log(
+              'Background storage cleanup before new segment failed',
+              error: error,
+              stackTrace: stackTrace,
+              name: 'RecordingService',
+            );
+          }),
+        );
+        return;
+      case NewSegmentStorageAction.suspendStaging:
+        // Ổ chứa file tạm (khác ổ lưu video) gần đầy: xoá video không giải
+        // phóng được chỗ ở ổ này.
+        _setStorageSuspended(true);
+        final freeMb = ((stagingAvailable ?? 0) / (1024 * 1024))
+            .toStringAsFixed(0);
+        throw StorageSafetyException(
+          'Bộ nhớ trong (file tạm khi ghi) không đủ chỗ để bắt đầu segment '
+          'mới ($freeMb MB còn trống).',
+          'Not enough internal storage for recording temp files '
+              '($freeMb MB left).',
+        );
+      case NewSegmentStorageAction.cleanupFirst:
+        break;
     }
 
     // Publish the normal 1 GB warning first. Below 512 MB the grace period is
@@ -3586,9 +3973,12 @@ class RecordingService {
     _segments.add(segment);
     _notifyVideoChanges();
     // Quét/dọn dung lượng chạy nền: Check VAR và việc mở đoạn kế tiếp không
-    // phải chờ duyệt toàn bộ thư mục lưu (có thể vài giây với 20 GB).
+    // phải chờ duyệt toàn bộ thư mục lưu (có thể vài giây với 20 GB). Chỉ
+    // quét toàn bộ cây khi cần (xem shouldRunFullStorageScanAfterSegment).
     unawaited(
-      enforceStorageLimit().catchError((Object error, StackTrace stackTrace) {
+      _enforceStorageLimitAfterSegment(
+        savedSize,
+      ).catchError((Object error, StackTrace stackTrace) {
         developer.log(
           'Background storage limit enforcement failed',
           error: error,
@@ -3814,11 +4204,26 @@ class RecordingService {
         }
         await _deleteDirectoryTreeIfEmpty(directory);
       }
-      // Đồng bộ chỉ mục với các file thực sự còn trên đĩa.
+      // Đồng bộ chỉ mục với các file thực sự còn trên đĩa (kiểm tra bất đồng
+      // bộ, không chặn UI isolate).
+      final missingExportNames = <String>{};
+      for (final entry in Map<String, RecordedSegment>.of(
+        _exportSegments,
+      ).entries) {
+        if (!await File(entry.value.path).exists()) {
+          missingExportNames.add(entry.key);
+        }
+      }
+      final missingOwnerKeys = <String>{};
+      for (final key in List<String>.of(_exportClipOwners.keys)) {
+        if (!await File(key).exists()) missingOwnerKeys.add(key);
+      }
       _exportSegments.removeWhere(
-        (_, segment) => !File(segment.path).existsSync(),
+        (name, _) => missingExportNames.contains(name),
       );
-      _exportClipOwners.removeWhere((key, _) => !File(key).existsSync());
+      _exportClipOwners.removeWhere(
+        (key, _) => missingOwnerKeys.contains(key),
+      );
       developer.log(
         '[STORAGE] Temporary download clips cleaned '
         '(${removeAll ? 'all' : owner == null ? 'expired' : 'session'}).',
@@ -4175,24 +4580,23 @@ class RecordingService {
   Future<Set<String>> _pendingFallbackDeletePaths() async {
     final result = <String>{};
     try {
-      final stagingRoot = await getTemporaryDirectory();
-      final directory = Directory(
-        '${stagingRoot.path}${Platform.pathSeparator}vnvar_recording',
-      );
-      if (!await directory.exists()) return result;
-      await for (final entity in directory.list()) {
-        if (entity is! File || !entity.path.toLowerCase().endsWith('.json')) {
-          continue;
-        }
-        try {
-          final decoded = jsonDecode(await entity.readAsString());
-          if (decoded is! Map<String, dynamic>) continue;
-          final pending = decoded[fallbackPendingDeleteJournalKey];
-          if (pending is String && pending.isNotEmpty) {
-            result.add(_fallbackPathKey(pending));
+      for (final directory in await _stagingScanDirectories()) {
+        if (!await directory.exists()) continue;
+        await for (final entity in directory.list()) {
+          if (entity is! File ||
+              !entity.path.toLowerCase().endsWith('.json')) {
+            continue;
           }
-        } catch (_) {
-          // Journal đang được ghi dở hoặc hỏng: không đủ căn cứ để ẩn TS.
+          try {
+            final decoded = jsonDecode(await entity.readAsString());
+            if (decoded is! Map<String, dynamic>) continue;
+            final pending = decoded[fallbackPendingDeleteJournalKey];
+            if (pending is String && pending.isNotEmpty) {
+              result.add(_fallbackPathKey(pending));
+            }
+          } catch (_) {
+            // Journal đang được ghi dở hoặc hỏng: không đủ căn cứ để ẩn TS.
+          }
         }
       }
     } catch (error, stackTrace) {
@@ -4450,34 +4854,83 @@ class RecordingService {
     final current = _abandonedCleanupOperation;
     if (current != null) return current;
 
-    final operation = _cleanupAbandonedRecordingsInternal(maxAge: maxAge);
+    // Một instance mới (server khởi động lại) có thể bắt đầu dọn khi lượt
+    // khôi phục của instance cũ (chạy nền) chưa xong: nối tiếp theo camera để
+    // hai lượt không cùng chuyển một MP4 staging.
+    final key = normalizeCameraKey(cameraId);
+    final previous = _abandonedCleanupByCamera[key];
+    final operation = () async {
+      if (previous != null) {
+        try {
+          await previous;
+        } catch (_) {
+          // Lỗi của lượt trước đã được trả cho caller của nó.
+        }
+      }
+      await _cleanupAbandonedRecordingsInternal(maxAge: maxAge);
+    }();
     _abandonedCleanupOperation = operation;
+    _abandonedCleanupByCamera[key] = operation;
     return operation.whenComplete(() {
       if (identical(_abandonedCleanupOperation, operation)) {
         _abandonedCleanupOperation = null;
       }
+      if (identical(_abandonedCleanupByCamera[key], operation)) {
+        _abandonedCleanupByCamera.remove(key);
+      }
     });
   }
+
+  static final Map<String, Future<void>> _abandonedCleanupByCamera =
+      <String, Future<void>>{};
 
   Future<void> _cleanupAbandonedRecordingsInternal({
     required Duration maxAge,
   }) async {
-    final stagingRoot = await getTemporaryDirectory();
-    final directory = Directory(
-      '${stagingRoot.path}${Platform.pathSeparator}vnvar_recording',
-    );
+    final directories = await _stagingScanDirectories();
+    for (var index = 0; index < directories.length; index++) {
+      // Thư mục chính (index 0) là nơi recorder đang/sắp ghi: không xoá kể cả
+      // khi rỗng (xoá đúng lúc recorder mở file mới làm mở segment lỗi).
+      // Thư mục cũ trong cache thì xoá khi đã rỗng.
+      await _cleanupAbandonedRecordingsIn(
+        directories[index],
+        maxAge: maxAge,
+        deleteIfEmpty: index > 0,
+      );
+    }
+  }
+
+  Future<void> _cleanupAbandonedRecordingsIn(
+    Directory directory, {
+    required Duration maxAge,
+    required bool deleteIfEmpty,
+  }) async {
     if (!await directory.exists()) return;
 
     final now = DateTime.now();
-    final activePath = _currentPath;
     await for (final entity in directory.list()) {
       if (entity is! File || !entity.path.toLowerCase().endsWith('.mp4')) {
         continue;
       }
+      // Đọc lại _currentPath cho từng file: recorder có thể đã mở segment
+      // mới sau khi lượt dọn bắt đầu (dọn chạy nền lúc khởi động).
+      final activePath = _currentPath;
       if (activePath != null && entity.path == activePath) continue;
       if (_finalizingPaths.contains(entity.path)) continue;
       try {
         final stat = await entity.stat();
+        // File vừa được ghi gần đây có thể đang được recorder/FFmpeg dùng.
+        if (isRecentlyModifiedStagingFile(
+          modified: stat.modified,
+          now: DateTime.now(),
+        )) {
+          continue;
+        }
+        // Kiểm tra lại sau await (stat): recorder có thể vừa nhận file này.
+        if (entity.path == _currentPath ||
+            _finalizingPaths.contains(entity.path)) {
+          continue;
+        }
         final fileName = entity.uri.pathSegments.last;
         final prefix = '${cameraId}_';
         final timestampText = fileName
@@ -4684,7 +5137,7 @@ class RecordingService {
         );
       }
     }
-    await _deleteDirectoryIfEmpty(directory);
+    if (deleteIfEmpty) await _deleteDirectoryIfEmpty(directory);
   }
 
   Future<int> storageSizeBytes() async {
@@ -5017,6 +5470,33 @@ class RecordingService {
   /// Lần quét dung lượng toàn bộ thư mục gần nhất.
   DateTime? get lastStorageEnforcedAt => _lastStorageEnforcedAt;
 
+  // Ước lượng tổng dung lượng video do app quản lý (cập nhật tăng dần sau mỗi
+  // segment, đặt lại sau mỗi lần quét toàn bộ cây thư mục).
+  int? _estimatedManagedBytes;
+  DateTime? _lastFullStorageScanAt;
+
+  /// Sau khi chốt một segment ([addedBytes]): cộng dồn ước lượng dung lượng;
+  /// chỉ quét toàn bộ thư mục lưu khi cần thay vì sau mỗi segment.
+  Future<void> _enforceStorageLimitAfterSegment(int addedBytes) async {
+    final estimate = _estimatedManagedBytes;
+    if (estimate != null) _estimatedManagedBytes = estimate + addedBytes;
+    final available = await availableStorageBytes();
+    final lowStorage =
+        _lowStorageWarning ||
+        _storageSuspended ||
+        (available != null && available < normalFreeSpaceThresholdBytes);
+    if (!shouldRunFullStorageScanAfterSegment(
+      estimatedManagedBytes: _estimatedManagedBytes,
+      storageLimitBytes: storageLimitBytes,
+      lowStorage: lowStorage,
+      lastFullScanAt: _lastFullStorageScanAt,
+      now: DateTime.now(),
+    )) {
+      return;
+    }
+    await enforceStorageLimit();
+  }
+
   Future<void> _enforceStorageLimitInternal() async {
     _lastStorageEnforcedAt = DateTime.now();
     final availableBefore = await availableStorageBytes();
@@ -5164,6 +5644,10 @@ class RecordingService {
       }
       await deleteFile(item);
     }
+    // Mốc cho việc cộng dồn sau mỗi segment. Dọn tiếp theo (thiếu dung lượng,
+    // thư mục ngày hết hạn) chỉ làm tổng thật nhỏ hơn ước lượng này.
+    _estimatedManagedBytes = total;
+    _lastFullStorageScanAt = DateTime.now();
 
     // PerformAutoCleanup: nếu bộ nhớ trống dưới 1 GB, xóa AUTOMODE theo từng
     // lô 10 mốc thời gian, tối đa 50 lượt.

@@ -5,7 +5,8 @@ import 'package:ffmpeg_kit_flutter_new_video/ffmpeg_kit.dart';
 import 'package:ffmpeg_kit_flutter_new_video/ffmpeg_session.dart';
 import 'package:ffmpeg_kit_flutter_new_video/return_code.dart';
 import 'package:ffmpeg_kit_flutter_new_video/statistics.dart';
-import 'package:flutter/foundation.dart' show ValueListenable, ValueNotifier;
+import 'package:flutter/foundation.dart'
+    show ValueListenable, ValueNotifier, visibleForTesting;
 import 'package:flutter/services.dart' show MethodCall, PlatformException;
 
 import 'audio_cleanup.dart';
@@ -225,12 +226,186 @@ class LiveBitrateController {
   }
 }
 
+/// FPS/bitrate/tốc độ đẩy TỨC THỜI của phiên FFmpeg.
+///
+/// `Statistics` của FFmpeg báo FPS/bitrate/speed TRUNG BÌNH từ đầu phiên:
+/// sau vài phút live, một lần nghẽn mạng hầu như không làm các số này đổi.
+/// Lớp này tính chênh lệch số khung / số byte / thời lượng đã đẩy giữa các
+/// lần báo trong một cửa sổ trượt ([window], ~3 giây).
+class InstantStreamRates {
+  InstantStreamRates({
+    this.window = const Duration(seconds: 3),
+    this.minimumSpan = const Duration(seconds: 1),
+  });
+
+  /// Độ dài cửa sổ trượt.
+  final Duration window;
+
+  /// Khoảng đo tối thiểu trước khi trả số liệu (tránh số nhiễu lúc đầu).
+  final Duration minimumSpan;
+
+  final List<({DateTime at, double frame, double size, double time})>
+  _samples = [];
+
+  void reset() => _samples.clear();
+
+  /// Ghi nhận số liệu tích luỹ tại [now]: [frame] khung đã xuất, [sizeBytes]
+  /// byte đã ghi, [timeMs] thời lượng media đã đẩy (ms). Trả về null khi
+  /// chưa đủ [minimumSpan] để tính.
+  ({double fps, double bitrateKbps, double speed})? observe({
+    required DateTime now,
+    required num frame,
+    required num sizeBytes,
+    required num timeMs,
+  }) {
+    final sample = (
+      at: now,
+      frame: frame.toDouble(),
+      size: sizeBytes.toDouble(),
+      time: timeMs.toDouble(),
+    );
+    if (_samples.isNotEmpty) {
+      final last = _samples.last;
+      // Bộ đếm bị đặt lại (phiên mới) hoặc đồng hồ lùi: đo lại từ đầu.
+      if (sample.frame < last.frame ||
+          sample.size < last.size ||
+          sample.time < last.time ||
+          now.isBefore(last.at)) {
+        _samples.clear();
+      }
+    }
+    _samples.add(sample);
+    // Giữ mẫu cũ nhất sao cho khoảng đo vẫn >= [window].
+    while (_samples.length > 2 &&
+        now.difference(_samples[1].at) >= window) {
+      _samples.removeAt(0);
+    }
+    final first = _samples.first;
+    final elapsedUs = now.difference(first.at).inMicroseconds;
+    if (elapsedUs <= 0 || elapsedUs < minimumSpan.inMicroseconds) return null;
+    final seconds = elapsedUs / Duration.microsecondsPerSecond;
+    return (
+      fps: (sample.frame - first.frame) / seconds,
+      bitrateKbps: (sample.size - first.size) * 8 / 1000 / seconds,
+      speed: (sample.time - first.time) / 1000 / seconds,
+    );
+  }
+}
+
+/// Dòng log nói về địa chỉ loopback (127.0.0.1, localhost, ::1).
+bool _mentionsLoopback(String lowerLine) =>
+    lowerLine.contains('127.0.0.1') ||
+    lowerLine.contains('localhost') ||
+    lowerLine.contains('[::1]') ||
+    lowerLine.contains('//::1');
+
+/// "host:port" (chữ thường) của [relayUrl] khi đó là địa chỉ loopback (đường
+/// 4G/5G đi qua bộ chuyển tiếp `127.0.0.1:<cổng>`): dòng log về địa chỉ này là
+/// của server phát, không phải nguồn camera cục bộ.
+String? _loopbackRelayAuthority(String? relayUrl) {
+  if (relayUrl == null || relayUrl.isEmpty) return null;
+  final uri = Uri.tryParse(relayUrl.trim());
+  if (uri == null || uri.host.isEmpty || !uri.hasPort) return null;
+  final authority = '${uri.host}:${uri.port}'.toLowerCase();
+  return _mentionsLoopback(authority) || uri.host == '::1' ? authority : null;
+}
+
+bool _isLocalSourceLine(String line, String? relayAuthority) {
+  final trimmed = line.trim();
+  // "Input #0, rtsp, from '…'" chỉ là thông tin đã mở được nguồn.
+  if (trimmed.startsWith('Input #')) return false;
+  final lower = trimmed.toLowerCase();
+  if (relayAuthority != null && lower.contains(relayAuthority)) return false;
+  // DESCRIBE chỉ dùng khi ĐỌC luồng RTSP (nguồn cục bộ), không khi đẩy.
+  return _mentionsLoopback(lower) || lower.contains('method describe failed');
+}
+
+/// Bỏ các dòng nói về nguồn camera cục bộ (127.0.0.1/localhost/::1), giữ
+/// dòng về bộ chuyển tiếp 4G/5G [relayUrl] (cũng là 127.0.0.1).
+String remoteRelayDiagnosticText(String output, {String? relayUrl}) {
+  final relay = _loopbackRelayAuthority(relayUrl);
+  return ffmpegDiagnosticText(output)
+      .split('\n')
+      .where((line) => !_isLocalSourceLine(line, relay))
+      .join('\n');
+}
+
+const List<String> _sourceErrorMarkers = [
+  'error',
+  'fail',
+  'refused',
+  'timed out',
+  'timeout',
+  'not found',
+  'end of file',
+  'invalid data',
+  'could not',
+  'cannot',
+  'unable',
+];
+
+const List<String> _remoteRouteErrorMarkers = [
+  'broken pipe',
+  'connection reset',
+  'connection refused',
+  'timed out',
+  'i/o error',
+  'network is unreachable',
+  'network is down',
+  'no route to host',
+  'failed to resolve',
+  'name or service not known',
+  'nodename nor servname',
+  'cannot open connection',
+  'error writing trailer',
+  'av_interleaved_write_frame',
+];
+
+/// Phiên kết thúc vì NGUỒN CAMERA CỤC BỘ (RTSP 127.0.0.1) lỗi, còn phía
+/// server phát không báo lỗi mạng: đổi Wi-Fi ↔ 4G/5G không giúp được.
+bool isLocalSourceFailure(String? output, {String? relayUrl}) {
+  if (output == null || output.trim().isEmpty) return false;
+  final relay = _loopbackRelayAuthority(relayUrl);
+  final text = ffmpegDiagnosticText(output);
+  var localError = false;
+  var remoteError = false;
+  for (final line in text.split('\n')) {
+    final lower = line.trim().toLowerCase();
+    if (lower.isEmpty || lower.startsWith('configuration:')) continue;
+    if (_isLocalSourceLine(line, relay)) {
+      if (_sourceErrorMarkers.any(lower.contains)) localError = true;
+    } else if (_remoteRouteErrorMarkers.any(lower.contains)) {
+      remoteError = true;
+    }
+  }
+  return localError && !remoteError;
+}
+
+/// Cổng của server phát trong [url] (mặc định theo giao thức khi URL không
+/// ghi cổng); null nếu không xác định được.
+int? relayDestinationPort(String? url) {
+  if (url == null || url.trim().isEmpty) return null;
+  final uri = Uri.tryParse(url.trim());
+  if (uri == null || uri.host.isEmpty) return null;
+  if (uri.hasPort) return uri.port;
+  return switch (uri.scheme.toLowerCase()) {
+    'rtmp' => 1935,
+    'rtmps' => 443,
+    'rtsp' => 554,
+    'rtsps' => 322,
+    _ => null,
+  };
+}
+
 /// Lỗi relay có thể do đường mạng (timeout, từ chối kết nối, DNS…) hay không.
 /// Server từ chối xác thực hoặc không có luồng (401/403/404) thì đổi Wi-Fi ↔
-/// 4G/5G cũng không giúp được.
-bool isRouteRelatedRelayFailure(String? output) {
+/// 4G/5G cũng không giúp được; lỗi của nguồn camera cục bộ (127.0.0.1) cũng
+/// vậy. [relayUrl]: URL FFmpeg thực sự đẩy tới (có thể là bộ chuyển tiếp
+/// 4G/5G `127.0.0.1:<cổng>`), để không nhầm nó với nguồn cục bộ.
+bool isRouteRelatedRelayFailure(String? output, {String? relayUrl}) {
   if (output == null || output.isEmpty) return true;
-  final text = ffmpegDiagnosticText(output);
+  if (isLocalSourceFailure(output, relayUrl: relayUrl)) return false;
+  final text = remoteRelayDiagnosticText(output, relayUrl: relayUrl);
   const serverRejections = [
     'Unauthorized',
     'Forbidden',
@@ -240,6 +415,36 @@ bool isRouteRelatedRelayFailure(String? output) {
   ];
   return ffmpegServerRejectionCode(text) == null &&
       !serverRejections.any(text.contains);
+}
+
+/// Cách xử lý `onOverlayRtspError` (hợp đồng C6).
+enum NativeOverlayErrorAction {
+  /// Lỗi listener/socket: chạy lại phiên có bảng tỉ số.
+  restartWithScoreboard,
+
+  /// Encoder/compositor hỏng, hoặc đã hết lượt chạy lại: phát không bảng tỉ số.
+  continueWithoutScoreboard,
+}
+
+/// Số lần tối đa chạy lại phiên có bảng tỉ số sau lỗi recoverable (C6).
+const int nativeOverlayRecoverableRestartLimit = 2;
+
+/// Tham số `onOverlayRtspError` báo lỗi phục hồi được (`recoverable: true`).
+/// Thiếu khoá / sai kiểu → false (tương thích bản native cũ).
+bool isRecoverableNativeOverlayError(Object? arguments) =>
+    arguments is Map && arguments['recoverable'] == true;
+
+/// Quyết định khi luồng overlay native báo lỗi; [restartsUsed]: số lần đã
+/// chạy lại vì lỗi recoverable trong phiên phát này.
+NativeOverlayErrorAction nativeOverlayErrorAction(
+  Object? arguments, {
+  required int restartsUsed,
+}) {
+  if (isRecoverableNativeOverlayError(arguments) &&
+      restartsUsed < nativeOverlayRecoverableRestartLimit) {
+    return NativeOverlayErrorAction.restartWithScoreboard;
+  }
+  return NativeOverlayErrorAction.continueWithoutScoreboard;
 }
 
 /// Che stream key/mật khẩu trước khi ghi log: chỉ giữ scheme, máy chủ và tên
@@ -512,6 +717,10 @@ class RtspPublisherService {
   /// để native chồng bảng tỉ số lên cùng khung camera (runtime cung cấp).
   String? Function()? videoTrackId;
 
+  /// Chỉ cho test: gọi ngay trước khi chạy FFmpeg với tham số của phiên.
+  @visibleForTesting
+  void Function(List<String> args)? debugOnFfmpegLaunch;
+
   // iOS: luồng RTSP overlay native (hợp đồng C5). [_nativeOverlayMayRun]:
   // đã gửi startOverlayRtsp và chưa gửi stopOverlayRtsp (kể cả lúc native còn
   // đang mở). [_nativeOverlayActive]: phiên hiện tại đang copy luồng overlay.
@@ -519,6 +728,8 @@ class RtspPublisherService {
   bool _nativeOverlayActive = false;
   int _nativeOverlayStartToken = 0;
   int _nativeOverlaySourceFailures = 0;
+  // Số lần đã chạy lại phiên có bảng tỉ số sau lỗi overlay recoverable (C6).
+  int _nativeOverlayRecoverableRestarts = 0;
   bool _platformListenerInstalled = false;
   static const int _nativeOverlaySourceFailuresBeforeFallback = 2;
 
@@ -541,6 +752,10 @@ class RtspPublisherService {
   /// Lý do không in được bảng tỉ số (máy không mã hoá lại được video...).
   String? get overlayIssue => _overlayIssue;
 
+  /// Máy đã báo không in được bảng tỉ số: các phiên sau phát không kèm bảng
+  /// cho tới [clearOverlayFailure].
+  bool get overlayUnavailable => _overlayUnavailable;
+
   /// Cho phép thử in bảng tỉ số lại ở phiên sau (người dùng vừa bật lại).
   void clearOverlayFailure() {
     _overlayUnavailable = false;
@@ -549,6 +764,7 @@ class RtspPublisherService {
     _hwDecodeUnavailable = false;
     _hwDecodeEarlyFailures = 0;
     _nativeOverlaySourceFailures = 0;
+    _nativeOverlayRecoverableRestarts = 0;
   }
 
   static Future<Object?> _invokeNative(
@@ -579,15 +795,33 @@ class RtspPublisherService {
     final error = arguments is Map ? arguments['error']?.toString() : null;
     // Lỗi của phiên overlay đã dừng: bỏ qua.
     if (!_nativeOverlayActive || _intentionalStop) return;
+    final action = nativeOverlayErrorAction(
+      arguments,
+      restartsUsed: _nativeOverlayRecoverableRestarts,
+    );
+    final restart = action == NativeOverlayErrorAction.restartWithScoreboard;
+    final next = restart
+        ? 'restarting with scoreboard ($_nativeOverlayRecoverableRestarts/'
+              '$nativeOverlayRecoverableRestartLimit restarts used)'
+        : 'continuing without scoreboard';
     developer.log(
-      '[RTSP_PUSH] Native overlay stream failed: ${error ?? 'unknown'}; '
-      'continuing without scoreboard',
+      '[RTSP_PUSH] Native overlay stream failed: ${error ?? 'unknown'} '
+      '(recoverable=${isRecoverableNativeOverlayError(arguments)}); $next',
       name: 'RtspPublisherService',
     );
-    _markOverlayUnavailable();
-    // Ngừng gửi ảnh/bitrate; lệnh dừng vẫn được gửi khi huỷ phiên.
+    if (restart) {
+      // C6: lỗi listener/socket (iOS thu hồi khi vào nền…): máy vẫn in được
+      // bảng tỉ số, chỉ cần mở lại luồng overlay.
+      _nativeOverlayRecoverableRestarts++;
+    } else {
+      _markOverlayUnavailable();
+    }
+    // Ngừng gửi ảnh/bitrate.
     _nativeOverlayActive = false;
-    // Phiên mới không có bảng tỉ số (_executePublish dừng luồng overlay).
+    // Hủy ngay phiên FFmpeg đang đọc luồng overlay hỏng (và dừng luồng
+    // overlay): callback kết thúc của nó không còn tính thành lỗi mạng.
+    unawaited(_cancelActiveSession());
+    // Phiên mới: có bảng tỉ số (restart) hoặc không (_overlayUnavailable).
     _reconnectTimer?.cancel();
     _reconnectTimer = Timer(const Duration(milliseconds: 300), () {
       if (!_intentionalStop) _executePublish();
@@ -874,12 +1108,19 @@ class RtspPublisherService {
   }
 
   Future<void> _executePublish() async {
-    await _cancelActiveSession();
-    final generation = ++_sessionGeneration;
+    // Chốt generation NGAY khi hủy phiên cũ (trước mọi await): phần đồng bộ
+    // của _cancelActiveSession đã tăng _sessionGeneration. Nếu người dùng bấm
+    // Dừng (hoặc một phiên khác thay thế) trong lúc chờ, generation tăng tiếp
+    // và phiên này tự thoát thay vì vượt qua lệnh dừng rồi vẫn chạy FFmpeg.
+    final cancelling = _cancelActiveSession();
+    final generation = _sessionGeneration;
+    bool isCurrent() => generation == _sessionGeneration;
+    bool aborted() => !isCurrent() || _intentionalStop;
+    await cancelling;
+    if (aborted()) return;
     _resetNetworkHealth();
     _currentSpeed = 0;
     _bitrate.beginSession(DateTime.now());
-    bool isCurrent() => generation == _sessionGeneration;
 
     final isRtmp = _targetUrl!.toLowerCase().startsWith('rtmp://') ||
         _targetUrl!.toLowerCase().startsWith('rtmps://');
@@ -888,16 +1129,34 @@ class RtspPublisherService {
     final outputRouteArgs = <String>[];
     final wasCellular = _cellularActive;
     _cellularActive = false;
+    // Người dùng bấm Dừng giữa chừng: dọn những gì phiên này đã mở (tunnel
+    // 4G/5G, luồng overlay native, ảnh bảng tỉ số). Nếu bị một phiên khác
+    // thay thế (không phải Dừng) thì phiên đó tự quản lý các tài nguyên này.
+    void abandonAfterStop({
+      bool tunnelOpened = false,
+      bool overlayPrepared = false,
+    }) {
+      if (!_intentionalStop) return;
+      if (overlayPrepared) releaseOverlay?.call();
+      unawaited(_stopNativeOverlay());
+      if (tunnelOpened || wasCellular || _cellularActive) {
+        _cellularActive = false;
+        unawaited(CellularUplinkService.closeTunnel());
+      }
+    }
+
     if (_preferCellular) {
       final endpoint = cellularTunnelEndpoint(outputUrl);
       final localPort = endpoint == null
           ? null
           : await CellularUplinkService.openTunnel(endpoint);
-      if (!isCurrent()) {
+      if (aborted()) {
         // Phiên đã bị thay thế/dừng trong lúc mở tunnel. Nếu không còn phiên
         // nào cần 4G (đã stop hoặc phiên mới không dùng tunnel) thì đóng nó,
         // tránh tunnel mồ côi giữ mạng di động.
-        if (localPort != null && (_intentionalStop || !_preferCellular)) {
+        if (_intentionalStop) {
+          abandonAfterStop(tunnelOpened: localPort != null);
+        } else if (localPort != null && !_preferCellular) {
           unawaited(CellularUplinkService.closeTunnel());
         }
         return;
@@ -928,10 +1187,10 @@ class RtspPublisherService {
         );
         overlay = null;
       }
-      if (!isCurrent()) {
+      if (aborted()) {
         // Người dùng đã dừng phát trong lúc chuẩn bị: không để ảnh tiếp tục
         // được vẽ lại khi không còn phiên nào dùng.
-        if (overlay != null && _intentionalStop) releaseOverlay?.call();
+        abandonAfterStop(overlayPrepared: overlay != null);
         return;
       }
     }
@@ -941,9 +1200,10 @@ class RtspPublisherService {
     var nativeOverlay = false;
     if (overlay != null && Platform.isIOS) {
       nativeOverlay = await _startNativeOverlay(overlay);
-      if (!isCurrent()) {
-        // Bị dừng/thay thế trong lúc mở: bên dừng đã gửi stopOverlayRtsp.
-        if (_intentionalStop) releaseOverlay?.call();
+      if (aborted()) {
+        // Bị dừng/thay thế trong lúc mở: bên dừng đã gửi stopOverlayRtsp
+        // (abandonAfterStop gửi lại cho chắc; an toàn khi đã dừng).
+        abandonAfterStop(overlayPrepared: true);
         return;
       }
       if (!nativeOverlay) overlay = null;
@@ -957,6 +1217,12 @@ class RtspPublisherService {
     _applyTargetBitrate();
     // Sau _applyTargetBitrate: luồng overlay vừa mở đã đúng bitrate mục tiêu.
     _nativeOverlayActive = usedNativeOverlay;
+    if (usedNativeOverlay) {
+      // Ảnh bảng tỉ số ghi lại trong lúc native mở luồng (chờ probe tới ~5
+      // giây) bị bỏ qua vì khi đó _nativeOverlayActive còn false: gửi ngay
+      // ảnh hiện tại để luồng không hiện tỉ số cũ sau khi kết nối lại.
+      handleOverlayImageWritten(overlay!.imagePath);
+    }
     final usedOverlay = overlay != null;
     final usedTicker = overlay?.ticker != null;
     final usedHwDecode =
@@ -1017,11 +1283,15 @@ class RtspPublisherService {
         '-i',
         _localRtspUrl!,
         if (overlay != null) ...[
-          ...livestreamOverlayInputArgs(overlay.imagePath),
+          // Android: mỗi vùng bảng tỉ số là một ảnh PNG (input 1..N), chồng
+          // lần lượt tại vị trí của vùng.
+          for (final region in overlay.regions)
+            ...livestreamOverlayInputArgs(region.imagePath),
           ...livestreamOverlayVideoArgs(
             bitrateBps: _bitrate.targetBps,
             fps: _expectedFps,
             ticker: overlay.ticker,
+            regions: overlay.regions,
           ),
         ] else ...[
           '-map',
@@ -1083,6 +1353,8 @@ class RtspPublisherService {
       name: 'RtspPublisherService',
     );
 
+    final instantRates = InstantStreamRates();
+    debugOnFfmpegLaunch?.call(args);
     try {
       final session = await FFmpegKit.executeWithArgumentsAsync(
         args,
@@ -1127,7 +1399,7 @@ class RtspPublisherService {
               // codec/bộ lọc (không phải lỗi mạng tới server).
               if (isHardwareDecodeFailure(output)) _hwDecodeUnavailable = true;
             } else if (diedEarly &&
-                !isRouteRelatedRelayFailure(output) &&
+                !isRouteRelatedRelayFailure(output, relayUrl: outputUrl) &&
                 isHardwareDecodeFailure(output)) {
               _hwDecodeEarlyFailures++;
               if (_hwDecodeEarlyFailures >= 2) _hwDecodeUnavailable = true;
@@ -1215,7 +1487,7 @@ class RtspPublisherService {
                   vi: 'Nguồn camera cục bộ đã đóng; đang kết nối lại.',
                   en: 'The local camera feed closed; reconnecting.',
                 )
-              : _extractFailureReason(output);
+              : _extractFailureReason(output, relayUrl: outputUrl);
           if (!isSuccess && isPermanentRelayRejection(output)) {
             // Sai stream key / không có quyền / không có luồng: thử lại vô
             // ích (và có thể bị server chặn). Dừng hẳn, giữ thông báo lỗi.
@@ -1232,9 +1504,13 @@ class RtspPublisherService {
             name: 'RtspPublisherService',
           );
           _currentSession = null;
+          // Nguồn camera cục bộ đóng (FFmpeg trả mã thành công) hay lỗi nguồn
+          // 127.0.0.1 không phải lỗi đường mạng: không tính vào việc đổi
+          // Wi-Fi ↔ 4G/5G.
           _scheduleReconnect(
             failureReason,
-            routeRelated: isSuccess || isRouteRelatedRelayFailure(output),
+            routeRelated: !isSuccess &&
+                isRouteRelatedRelayFailure(output, relayUrl: outputUrl),
           );
         },
         (log) {
@@ -1250,34 +1526,54 @@ class RtspPublisherService {
         },
         (Statistics stats) {
           if (!isCurrent()) return;
-          _currentFps = stats.getVideoFps();
-          _currentBitrateKbps = stats.getBitrate();
-          _currentSpeed = stats.getSpeed();
-          markPublishingIfProgressing(stats.getVideoFrameNumber());
-          _evaluateNetworkHealth(_currentFps, _currentBitrateKbps);
-          if (_state == RtspPublishState.publishing) {
+          final now = DateTime.now();
+          final frame = stats.getVideoFrameNumber();
+          markPublishingIfProgressing(frame);
+          // Số của Statistics là trung bình từ đầu phiên: tính số tức thời
+          // (cửa sổ ~3 giây) để phát hiện nghẽn mạng ngay cả khi đã live lâu.
+          final rates = instantRates.observe(
+            now: now,
+            frame: frame,
+            sizeBytes: stats.getSize(),
+            timeMs: stats.getTime(),
+          );
+          if (rates == null) {
+            // Chưa đủ khoảng đo (vừa mở phiên): chỉ hiển thị, chưa đánh giá.
+            _currentFps = stats.getVideoFps();
+            _currentBitrateKbps = stats.getBitrate();
+            _currentSpeed = stats.getSpeed();
+          } else {
+            _currentFps = rates.fps;
+            _currentBitrateKbps = rates.bitrateKbps;
+            _currentSpeed = rates.speed;
+            _evaluateNetworkHealth(_currentFps, _currentBitrateKbps);
+          }
+          // Android in bảng tỉ số: FFmpeg mã hoá lại ở bitrate cố định của
+          // phiên, không đổi được tại chỗ (khởi động lại phiên thì ngắt live)
+          // và KHÔNG được hạ encoder native dùng chung (hạ chất lượng RTSP
+          // của Tablet mà không giảm tải upload). Khi đó không hạ
+          // _targetBps, tránh mức bitrate "đã thích ứng" mà không áp được.
+          // iOS overlay native: luồng overlay có encoder riêng nên đổi
+          // bitrate tại chỗ, encoder chính giữ nguyên cho Tablet.
+          final canAdaptBitrate = usedNativeOverlay || !usedOverlay;
+          if (rates != null &&
+              canAdaptBitrate &&
+              _state == RtspPublishState.publishing) {
             final next = _bitrate.observe(
               speed: _currentSpeed,
               fps: _currentFps,
               expectedFps: _expectedFps,
-              now: DateTime.now(),
+              now: now,
             );
             if (next != null) {
               developer.log(
                 '[RTSP_PUSH] Upload speed ${_currentSpeed.toStringAsFixed(2)}x, '
-                'FPS ${_currentFps.toStringAsFixed(1)}; bitrate -> ${next ~/ 1000} kbps'
-                '${usedOverlay && !usedNativeOverlay ? ' (applies to the next overlay session)' : ''}',
+                'FPS ${_currentFps.toStringAsFixed(1)}; bitrate -> ${next ~/ 1000} kbps',
                 name: 'RtspPublisherService',
               );
-              // Khi in bảng tỉ số, FFmpeg đang mã hoá lại: KHÔNG hạ encoder
-              // native dùng chung (sẽ hạ chất lượng RTSP của Tablet mà không
-              // giảm tải upload). Bitrate mới áp dụng từ phiên kết nối sau;
-              // không tự khởi động lại phiên (làm livestream bị ngắt).
-              // iOS overlay native: luồng overlay có encoder riêng nên đổi
-              // bitrate tại chỗ, encoder chính giữ nguyên cho Tablet.
               if (usedNativeOverlay) {
                 _applyNativeOverlayBitrate();
-              } else if (!usedOverlay) {
+              } else {
                 _applyTargetBitrate();
               }
             }
@@ -1289,14 +1585,19 @@ class RtspPublisherService {
         },
       );
 
-      if (isCurrent()) {
+      if (!aborted()) {
         _currentSession = session;
       } else {
-        // Phiên đã bị thay thế trong lúc khởi động: hủy để không chạy song song.
+        // Phiên đã bị thay thế (hoặc người dùng bấm Dừng) trong lúc khởi
+        // động: hủy để không chạy song song / không phát sau khi đã dừng.
         unawaited(session.cancel());
+        abandonAfterStop(overlayPrepared: usedOverlay);
       }
     } catch (e) {
-      if (!isCurrent()) return;
+      if (aborted()) {
+        abandonAfterStop(overlayPrepared: usedOverlay);
+        return;
+      }
       if (usedNativeOverlay) unawaited(_stopNativeOverlay());
       final err = (
         vi: 'Không thể khởi động lệnh đẩy luồng: $e',
@@ -1359,18 +1660,35 @@ class RtspPublisherService {
   }
 
   /// Lý do phiên đẩy luồng kết thúc, bằng tiếng Việt và tiếng Anh.
-  ({String vi, String en}) _extractFailureReason(String? output) {
+  ({String vi, String en}) _extractFailureReason(
+    String? output, {
+    String? relayUrl,
+  }) {
     if (output == null || output.isEmpty) {
       return (
         vi: 'Mất kết nối tới server phát (Server ngắt kết nối).',
         en: 'Lost connection to the streaming server (server disconnected).',
       );
     }
-    if (output.contains('Connection refused')) {
+    if (isLocalSourceFailure(output, relayUrl: relayUrl)) {
       return (
-        vi: 'Không thể kết nối (Connection refused). Vui lòng kiểm tra IP/Domain và cổng 18554.',
-        en: 'Unable to connect (Connection refused). Please check the IP/domain and port 18554.',
+        vi: 'Nguồn camera cục bộ chưa sẵn sàng; đang kết nối lại.',
+        en: 'The local camera feed is not ready; reconnecting.',
       );
+    }
+    if (remoteRelayDiagnosticText(output, relayUrl: relayUrl)
+        .contains('Connection refused')) {
+      // Cổng của server đích thật (không phải cổng bộ chuyển tiếp 4G/5G).
+      final port = relayDestinationPort(_targetUrl);
+      return port == null
+          ? (
+              vi: 'Không thể kết nối (Connection refused). Vui lòng kiểm tra IP/Domain và cổng.',
+              en: 'Unable to connect (Connection refused). Please check the IP/domain and port.',
+            )
+          : (
+              vi: 'Không thể kết nối (Connection refused). Vui lòng kiểm tra IP/Domain và cổng $port.',
+              en: 'Unable to connect (Connection refused). Please check the IP/domain and port $port.',
+            );
     }
     final diagnostic = ffmpegDiagnosticText(output);
     final rejection = ffmpegServerRejectionCode(diagnostic);

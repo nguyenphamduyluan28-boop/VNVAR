@@ -2,9 +2,20 @@ import 'dart:async';
 import 'dart:developer' as developer;
 import 'dart:io';
 
+import 'package:flutter/foundation.dart' show visibleForTesting;
 import 'package:flutter/services.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
+
+/// Đường dẫn lưu đã chọn không mở được lúc khởi động: chỉ bỏ hẳn lựa chọn khi
+/// đường dẫn đó giờ là một file (không thể là thư mục nữa). Không tồn tại
+/// (thẻ nhớ chưa mount) hoặc là thư mục nhưng chưa ghi được (quyền chưa sẵn
+/// sàng) thì giữ lựa chọn để thử lại.
+bool shouldForgetSavedStoragePath(FileSystemEntityType type) =>
+    type == FileSystemEntityType.file;
+
+/// Nhịp thử lại thư mục lưu đã chọn khi nó chưa sẵn sàng.
+const Duration pendingStorageRetryInterval = Duration(seconds: 30);
 
 /// Platform-independent access to VNVAR's permanent video storage.
 ///
@@ -18,6 +29,10 @@ class VideoStorageService {
   );
 
   String? _selectedPath;
+  // Thư mục đã chọn (vẫn lưu trong cài đặt) nhưng chưa dùng được; trong lúc
+  // chờ, video ghi vào thư mục mặc định.
+  String? _pendingSelectedPath;
+  DateTime? _nextPendingRetryAt;
   String? _androidPublicPath;
   bool _supportsFolderPicker = Platform.isAndroid;
   // Thư mục dự phòng (Documents/VNVAR) đã từng được dùng khi thư mục chính
@@ -95,29 +110,101 @@ class VideoStorageService {
         savedPath.isEmpty ||
         isLegacyPublicStoragePath(savedPath)) {
       _selectedPath = null;
+      _pendingSelectedPath = null;
+      _nextPendingRetryAt = null;
       if (savedPath != null) await prefs.remove(_storagePathKey);
       return;
     }
     final path = Directory(savedPath).absolute.path;
 
+    _pendingSelectedPath = null;
+    _nextPendingRetryAt = null;
     try {
       await _verifyWritableDirectory(Directory(path));
       _selectedPath = path;
       if (path != savedPath) await prefs.setString(_storagePathKey, path);
     } catch (error, stackTrace) {
       _selectedPath = null;
-      await prefs.remove(_storagePathKey);
-      developer.log(
-        '[STORAGE] Saved custom directory is no longer writable; '
-        'falling back to application Documents.',
-        error: error,
-        stackTrace: stackTrace,
-        name: 'VideoStorageService',
-      );
+      final entityType = await _entityType(path);
+      if (shouldForgetSavedStoragePath(entityType)) {
+        // Đường dẫn giờ là một file (không bao giờ là thư mục được nữa).
+        await prefs.remove(_storagePathKey);
+        developer.log(
+          '[STORAGE] Saved custom directory is no longer a directory; '
+          'falling back to application Documents.',
+          error: error,
+          stackTrace: stackTrace,
+          name: 'VideoStorageService',
+        );
+      } else {
+        // Thẻ nhớ/thư mục chưa sẵn sàng lúc khởi động (chưa mount, quyền
+        // chưa cấp lại...): giữ lựa chọn trong cài đặt, tạm ghi vào thư mục
+        // mặc định và thử lại sau.
+        _pendingSelectedPath = path;
+        _nextPendingRetryAt = DateTime.now().add(pendingStorageRetryInterval);
+        developer.log(
+          '[STORAGE] Saved custom directory is not ready; keeping the choice '
+          'and using the default directory until it becomes available.',
+          error: error,
+          stackTrace: stackTrace,
+          name: 'VideoStorageService',
+        );
+      }
     }
   }
 
+  static Future<FileSystemEntityType> _entityType(String path) async {
+    try {
+      return await FileSystemEntity.type(path);
+    } catch (_) {
+      return FileSystemEntityType.notFound;
+    }
+  }
+
+  /// Thư mục người dùng chọn nhưng chưa dùng được lúc khởi động (null nếu
+  /// không có). Lựa chọn vẫn được giữ trong cài đặt.
+  String? get pendingSelectedPath => _pendingSelectedPath;
+
+  /// Chỉ dùng trong test: bỏ nhịp chờ để lần lấy thư mục kế tiếp thử lại
+  /// ngay thư mục đã chọn đang chờ.
+  @visibleForTesting
+  void debugAllowPendingRetryNow() => _nextPendingRetryAt = null;
+
+  /// Thử lại thư mục đã chọn đang chờ (nhịp tối đa [pendingStorageRetryInterval]).
+  /// Dùng được thì chuyển sang ghi vào đó.
+  Future<void> _retryPendingSelectedPath() async {
+    final pending = _pendingSelectedPath;
+    if (pending == null || _selectedPath != null) return;
+    final now = DateTime.now();
+    final nextRetry = _nextPendingRetryAt;
+    if (nextRetry != null && now.isBefore(nextRetry)) return;
+    _nextPendingRetryAt = now.add(pendingStorageRetryInterval);
+    try {
+      await _verifyWritableDirectory(Directory(pending));
+    } catch (_) {
+      return;
+    }
+    // Người dùng có thể đã chọn thư mục khác trong lúc chờ.
+    if (_pendingSelectedPath != pending || _selectedPath != null) {
+      return;
+    }
+    _selectedPath = pending;
+    _pendingSelectedPath = null;
+    _nextPendingRetryAt = null;
+    developer.log(
+      '[STORAGE] Saved custom directory is available again: $pending',
+      name: 'VideoStorageService',
+    );
+  }
+
   Future<Directory> rootDirectory() async {
+    await _retryPendingSelectedPath();
+    if (_selectedPath == null && _pendingSelectedPath != null) {
+      // Thư mục đã chọn chưa sẵn sàng: ghi tạm vào thư mục dự phòng (được
+      // nhớ lại để video ghi trong lúc này vẫn được index/dọn sau khi thư
+      // mục đã chọn dùng lại được).
+      return _useFallbackRoot();
+    }
     final selectedPath = _selectedPath;
     final String rootPath;
     if (selectedPath != null) {
@@ -148,14 +235,18 @@ class VideoStorageService {
         stackTrace: stackTrace,
         name: 'VideoStorageService',
       );
-      final defaultRoot = await getApplicationDocumentsDirectory();
-      final fallbackDir =
-          Directory('${defaultRoot.path}${Platform.pathSeparator}VNVAR');
-      if (!await fallbackDir.exists()) await fallbackDir.create(recursive: true);
-      _fallbackActive = true;
-      await _rememberFallback(fallbackDir.absolute.path);
-      return fallbackDir;
+      return _useFallbackRoot();
     }
+  }
+
+  Future<Directory> _useFallbackRoot() async {
+    final defaultRoot = await getApplicationDocumentsDirectory();
+    final fallbackDir =
+        Directory('${defaultRoot.path}${Platform.pathSeparator}VNVAR');
+    if (!await fallbackDir.exists()) await fallbackDir.create(recursive: true);
+    _fallbackActive = true;
+    await _rememberFallback(fallbackDir.absolute.path);
+    return fallbackDir;
   }
 
   Future<void> _rememberFallback(String path) async {
@@ -206,6 +297,9 @@ class VideoStorageService {
     }
 
     final prefs = await SharedPreferences.getInstance();
+    // Lựa chọn mới thay cho thư mục đang chờ (nếu có).
+    _pendingSelectedPath = null;
+    _nextPendingRetryAt = null;
     if (normalized == null) {
       await prefs.remove(_storagePathKey);
       _selectedPath = null;
@@ -302,9 +396,25 @@ class VideoStorageService {
     if (!Platform.isAndroid && !Platform.isIOS) return null;
     try {
       final root = await rootDirectory();
+      return await availableBytesAt(root.path);
+    } catch (error, stackTrace) {
+      developer.log(
+        '[STORAGE] Unable to resolve the video root for free-space query.',
+        error: error,
+        stackTrace: stackTrace,
+        name: 'VideoStorageService',
+      );
+      return null;
+    }
+  }
+
+  /// Dung lượng trống của ổ chứa [path] (ví dụ thư mục file tạm khi ghi).
+  Future<int?> availableBytesAt(String path) async {
+    if (!Platform.isAndroid && !Platform.isIOS) return null;
+    try {
       return await _androidChannel.invokeMethod<int>(
         'getAvailableStorageBytes',
-        {'path': root.path},
+        {'path': path},
       );
     } on MissingPluginException {
       return null;

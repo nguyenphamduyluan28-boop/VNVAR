@@ -14,6 +14,8 @@ import org.webrtc.VideoTrack
 import org.webrtc.YuvHelper
 import java.io.InputStream
 import java.io.OutputStream
+import java.net.InetAddress
+import java.net.InetSocketAddress
 import java.net.ServerSocket
 import java.net.Socket
 import java.net.SocketTimeoutException
@@ -136,11 +138,26 @@ class VnvarRtspPublisher(
 
     fun start() {
         if (!running.compareAndSet(false, true)) return
+        // Publisher khác (vd của Activity cũ chưa bị huỷ / bị rò) còn giữ cổng:
+        // dừng nó trước khi bind, nếu không startRtsp sẽ BindException mãi.
+        val previous = activePublishersByPort.put(port, this)
+        if (previous != null && previous !== this) {
+            Log.w(TAG, "Stopping previous RTSP publisher ${previous.publisherId} still bound to :$port")
+            try { previous.stop() } catch (error: Exception) {
+                Log.w(TAG, "Unable to stop previous RTSP publisher", error)
+            }
+        }
         try {
-            serverSocket = ServerSocket(port).apply { reuseAddress = true }
+            // reuseAddress phải đặt TRƯỚC bind mới có tác dụng (cổng còn TIME_WAIT
+            // sau khi phiên cũ vừa đóng).
+            serverSocket = ServerSocket().apply {
+                reuseAddress = true
+                bind(InetSocketAddress(port))
+            }
             track.addSink(this)
         } catch (error: Exception) {
             running.set(false)
+            activePublishersByPort.remove(port, this)
             try { serverSocket?.close() } catch (_: Exception) {}
             serverSocket = null
             throw error
@@ -161,12 +178,21 @@ class VnvarRtspPublisher(
     private fun acceptClient(socket: Socket) {
         var session: Session? = null
         try {
-            if (sessions.size >= MAX_RTSP_CLIENTS) {
-                Log.w(TAG, "Rejecting RTSP client: limit $MAX_RTSP_CLIENTS reached")
+            val loopback = isLoopbackRemote(socket.inetAddress)
+            // Giữ sẵn slot cho relay FFmpeg loopback: Tablet/LAN đầy không được
+            // chặn livestream. (Không thêm xác thực — ràng buộc của dự án.)
+            val totalClients = sessions.size
+            val networkClients = if (loopback) 0 else sessions.values.count { !it.isLoopbackClient }
+            val networkLimit = MAX_RTSP_CLIENTS - RESERVED_LOOPBACK_SLOTS
+            if (totalClients >= MAX_RTSP_CLIENTS || (!loopback && networkClients >= networkLimit)) {
+                Log.w(
+                    TAG,
+                    "Rejecting RTSP client (loopback=$loopback): total=$totalClients/$MAX_RTSP_CLIENTS, " +
+                        "network=$networkClients/$networkLimit",
+                )
                 try { socket.close() } catch (_: Exception) {}
                 return
             }
-            val loopback = socket.inetAddress?.isLoopbackAddress == true
             socket.tcpNoDelay = true
             // Client mạng: bộ đệm nhỏ để nghẽn lộ ra ở hàng chờ (bị cắt theo
             // thời gian) thay vì nằm im vài giây trong kernel. Relay FFmpeg
@@ -308,18 +334,25 @@ class VnvarRtspPublisher(
                     val encoder = codec ?: return
                     val index = encoder.dequeueInputBuffer(0)
                     if (index >= 0) {
-                        val input = encoder.getInputBuffer(index) ?: return
-                        input.clear()
+                        // COLOR_FormatYUV420Flexible (nv12 = false): khung I420
+                        // liền khít rồi chép sang Image theo stride của encoder.
                         val nv12 = encoderColorFormat ==
                             MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420SemiPlanar
-                        if (outWidth == width && outHeight == height) {
-                            // Khung sau xoay khớp đúng canvas: đường cũ.
-                            if (!writeFrameNative(i420, rotation, nv12, input)) {
-                                input.clear()
-                                writeFrameKotlin(i420, rotation, nv12, input)
-                            }
+                        val queuedSize: Int
+                        if (encoderPackedLayout) {
+                            // Encoder báo đúng stride == rộng, slice-height == cao:
+                            // ghi thẳng vào input buffer (không chép thêm).
+                            val input = encoder.getInputBuffer(index) ?: return
+                            input.clear()
+                            writePackedFrame(i420, rotation, outWidth, outHeight, nv12, input)
+                            queuedSize = input.position()
                         } else {
-                            writeFittedFrame(i420, rotation, nv12, input)
+                            // Bố cục có đệm (stride/slice-height) hoặc chưa rõ: ghi
+                            // khung liền khít vào bộ đệm dùng lại, rồi chép theo
+                            // rowStride/pixelStride của Image (hoặc KEY_STRIDE).
+                            val packed = packedFrameBuffer()
+                            writePackedFrame(i420, rotation, outWidth, outHeight, nv12, packed)
+                            queuedSize = writeStridedInput(encoder, index, packed, nv12)
                         }
                         val nowNanos = android.os.SystemClock.elapsedRealtimeNanos()
                         if (streamStartNanos < 0L) {
@@ -332,7 +365,7 @@ class VnvarRtspPublisher(
                             elapsedUs
                         }
                         lastInputPtsUs = inputPtsUs
-                        encoder.queueInputBuffer(index, 0, input.position(), inputPtsUs, 0)
+                        encoder.queueInputBuffer(index, 0, queuedSize, inputPtsUs, 0)
                         drainEncoder()
                     }
                 } finally {
@@ -442,6 +475,267 @@ class VnvarRtspPublisher(
             nativeYuvAvailable = false
             Log.w(TAG, "libyuv conversion unavailable; using Kotlin fallback", error)
             false
+        }
+    }
+
+    /**
+     * true khi inputFormat của encoder báo rõ stride == rộng và slice-height ==
+     * cao: khung liền khít ghi thẳng vào input buffer. Ngược lại (có đệm căn
+     * hàng, hoặc encoder không báo) phải chép theo bố cục thật. Dưới codecLock.
+     */
+    private var encoderPackedLayout = true
+    /** KEY_STRIDE / KEY_SLICE_HEIGHT của input (đã chặn dưới bởi rộng/cao). */
+    private var encoderStride = 0
+    private var encoderSliceHeight = 0
+    /** Khung liền khít trước khi chép sang bố cục có đệm; dùng lại giữa các khung. */
+    private var packedFrame: ByteBuffer? = null
+    private var imageRowBuffer = ByteArray(0)
+    private var inputImageErrorLogged = false
+
+    /** Ghi khung (đã xoay/đặt vào canvas) dạng liền khít I420/NV12 vào [target]. */
+    private fun writePackedFrame(
+        i420: VideoFrame.I420Buffer,
+        rotation: Int,
+        outWidth: Int,
+        outHeight: Int,
+        nv12: Boolean,
+        target: ByteBuffer,
+    ) {
+        if (outWidth == width && outHeight == height) {
+            // Khung sau xoay khớp đúng canvas: đường cũ.
+            if (!writeFrameNative(i420, rotation, nv12, target)) {
+                target.clear()
+                writeFrameKotlin(i420, rotation, nv12, target)
+            }
+        } else {
+            writeFittedFrame(i420, rotation, nv12, target)
+        }
+    }
+
+    private fun packedFrameBuffer(): ByteBuffer {
+        val size = width * height + 2 * (width / 2) * (height / 2)
+        val buffer = packedFrame?.takeIf { it.capacity() >= size }
+            ?: ByteBuffer.allocateDirect(size).also { packedFrame = it }
+        buffer.clear()
+        return buffer
+    }
+
+    /** Đọc stride/slice-height mà encoder yêu cầu cho input (gọi sau configure/start). */
+    private fun readEncoderInputLayout(encoder: MediaCodec) {
+        val format = try { encoder.inputFormat } catch (_: Exception) { null }
+        fun intOrZero(key: String): Int = try {
+            if (format != null && format.containsKey(key)) format.getInteger(key) else 0
+        } catch (_: Exception) {
+            0
+        }
+        // Dùng chuỗi khoá ("stride", "slice-height") thay hằng KEY_* (API 23).
+        val stride = intOrZero("stride")
+        val sliceHeight = intOrZero("slice-height")
+        encoderStride = if (stride >= width) stride else width
+        encoderSliceHeight = if (sliceHeight >= height) sliceHeight else height
+        encoderPackedLayout = encoderColorFormat != MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420Flexible &&
+            stride == width && sliceHeight == height
+        Log.i(
+            TAG,
+            "H264 input layout: stride=$stride, sliceHeight=$sliceHeight, " +
+                "packed=$encoderPackedLayout (${width}x$height)",
+        )
+    }
+
+    /**
+     * Chép khung liền khít [packed] vào input [index] theo bố cục thật của
+     * encoder: ưu tiên getInputImage (rowStride/pixelStride của từng plane);
+     * nếu null thì theo KEY_STRIDE/KEY_SLICE_HEIGHT. Trả số byte để queue.
+     */
+    private fun writeStridedInput(
+        encoder: MediaCodec,
+        index: Int,
+        packed: ByteBuffer,
+        nv12: Boolean,
+    ): Int {
+        // Lấy dung lượng TRƯỚC getInputImage: gọi getInputBuffer sau đó sẽ vô
+        // hiệu hoá Image vừa nhận.
+        val capacity = encoder.getInputBuffer(index)?.capacity()
+            ?: throw IllegalStateException("Encoder không trả input buffer $index")
+        val image = try {
+            encoder.getInputImage(index)
+        } catch (error: Exception) {
+            if (!inputImageErrorLogged) {
+                inputImageErrorLogged = true
+                Log.w(TAG, "getInputImage failed; using KEY_STRIDE layout", error)
+            }
+            null
+        }
+        if (image != null) {
+            // Không close(): MediaCodec tự vô hiệu Image khi queueInputBuffer.
+            copyPackedToImage(packed, image, nv12)
+            return capacity
+        }
+        if (encoderColorFormat == MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420Flexible) {
+            throw IllegalStateException("Encoder YUV420Flexible không cấp Image cho input")
+        }
+        val input = encoder.getInputBuffer(index)
+            ?: throw IllegalStateException("Encoder không trả input buffer $index")
+        return copyPackedToStrided(packed, input, nv12)
+    }
+
+    private fun copyPackedToImage(packed: ByteBuffer, image: android.media.Image, nv12: Boolean) {
+        val planes = image.planes
+        if (planes.size < 3) {
+            throw IllegalStateException("Image input của encoder chỉ có ${planes.size} plane")
+        }
+        val cols = minOf(width, image.width) and 1.inv()
+        val rows = minOf(height, image.height) and 1.inv()
+        val chromaCols = cols / 2
+        val chromaRows = rows / 2
+        val lumaSize = width * height
+        val chromaSize = (width / 2) * (height / 2)
+        copyPlaneToImage(packed, 0, width, 1, cols, rows, planes[0])
+        if (nv12) {
+            val u = planes[1]
+            val v = planes[2]
+            if (encoderColorFormat == MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420SemiPlanar &&
+                u.pixelStride == 2 && v.pixelStride == 2 && u.rowStride == v.rowStride
+            ) {
+                copyNv12ToImage(packed, lumaSize, width, chromaCols, chromaRows, u, v)
+            } else {
+                copyPlaneToImage(packed, lumaSize, width, 2, chromaCols, chromaRows, u)
+                copyPlaneToImage(packed, lumaSize + 1, width, 2, chromaCols, chromaRows, v)
+            }
+        } else {
+            copyPlaneToImage(packed, lumaSize, width / 2, 1, chromaCols, chromaRows, planes[1])
+            copyPlaneToImage(packed, lumaSize + chromaSize, width / 2, 1, chromaCols, chromaRows, planes[2])
+        }
+    }
+
+    /** Chép một plane (nguồn liền khít, bước [srcPixelStride]) vào plane của Image. */
+    private fun copyPlaneToImage(
+        packed: ByteBuffer,
+        srcOffset: Int,
+        srcRowStride: Int,
+        srcPixelStride: Int,
+        cols: Int,
+        rows: Int,
+        plane: android.media.Image.Plane,
+    ) {
+        if (cols <= 0 || rows <= 0) return
+        val dst = plane.buffer.duplicate()
+        val dstRowStride = plane.rowStride
+        val dstPixelStride = plane.pixelStride
+        val source = packed.duplicate()
+        if (srcPixelStride == 1 && dstPixelStride == 1) {
+            for (row in 0 until rows) {
+                val start = srcOffset + row * srcRowStride
+                source.clear()
+                source.position(start)
+                source.limit(start + cols)
+                dst.position(row * dstRowStride)
+                dst.put(source)
+            }
+            return
+        }
+        val rowBytes = (cols - 1) * srcPixelStride + 1
+        if (imageRowBuffer.size < rowBytes) imageRowBuffer = ByteArray(rowBytes)
+        val rowData = imageRowBuffer
+        for (row in 0 until rows) {
+            source.clear()
+            source.position(srcOffset + row * srcRowStride)
+            source.get(rowData, 0, rowBytes)
+            var srcIndex = 0
+            var dstIndex = row * dstRowStride
+            for (column in 0 until cols) {
+                dst.put(dstIndex, rowData[srcIndex])
+                srcIndex += srcPixelStride
+                dstIndex += dstPixelStride
+            }
+        }
+    }
+
+    /**
+     * NV12 → Image NV12 (pixelStride 2, V = U + 1): chép cả hàng UV một lần qua
+     * plane U; byte V cuối hàng nằm ngoài giới hạn plane U nên ghi qua plane V.
+     */
+    private fun copyNv12ToImage(
+        packed: ByteBuffer,
+        uvOffset: Int,
+        srcRowStride: Int,
+        chromaCols: Int,
+        chromaRows: Int,
+        u: android.media.Image.Plane,
+        v: android.media.Image.Plane,
+    ) {
+        if (chromaCols <= 0 || chromaRows <= 0) return
+        val rowBytes = chromaCols * 2
+        val span = rowBytes - 1
+        if (imageRowBuffer.size < rowBytes) imageRowBuffer = ByteArray(rowBytes)
+        val rowData = imageRowBuffer
+        val dstU = u.buffer.duplicate()
+        val dstV = v.buffer.duplicate()
+        val source = packed.duplicate()
+        for (row in 0 until chromaRows) {
+            source.clear()
+            source.position(uvOffset + row * srcRowStride)
+            source.get(rowData, 0, rowBytes)
+            dstU.position(row * u.rowStride)
+            dstU.put(rowData, 0, span)
+            dstV.put(row * v.rowStride + (chromaCols - 1) * 2, rowData[span])
+        }
+    }
+
+    /** Dự phòng khi không có Image: bố cục theo KEY_STRIDE/KEY_SLICE_HEIGHT. */
+    private fun copyPackedToStrided(packed: ByteBuffer, input: ByteBuffer, nv12: Boolean): Int {
+        val stride = encoderStride.coerceAtLeast(width)
+        val sliceHeight = encoderSliceHeight.coerceAtLeast(height)
+        val chromaW = width / 2
+        val chromaH = height / 2
+        val lumaSize = width * height
+        val chromaSize = chromaW * chromaH
+        val chromaBase = stride * sliceHeight
+        val chromaStride = stride / 2
+        val vBase = chromaBase + chromaStride * (sliceHeight / 2)
+        val required: Int
+        val queued: Int
+        if (nv12) {
+            required = chromaBase + stride * (chromaH - 1) + width
+            queued = chromaBase + stride * chromaH
+        } else {
+            required = vBase + chromaStride * (chromaH - 1) + chromaW
+            queued = vBase + chromaStride * chromaH
+        }
+        if (input.capacity() < required) {
+            throw IllegalStateException(
+                "Input buffer encoder ${input.capacity()} < $required (stride=$stride, slice=$sliceHeight)",
+            )
+        }
+        input.clear()
+        val source = packed.duplicate()
+        copyRows(source, 0, width, input, 0, stride, width, height)
+        if (nv12) {
+            copyRows(source, lumaSize, width, input, chromaBase, stride, width, chromaH)
+        } else {
+            copyRows(source, lumaSize, chromaW, input, chromaBase, chromaStride, chromaW, chromaH)
+            copyRows(source, lumaSize + chromaSize, chromaW, input, vBase, chromaStride, chromaW, chromaH)
+        }
+        return minOf(queued, input.capacity())
+    }
+
+    private fun copyRows(
+        source: ByteBuffer,
+        srcOffset: Int,
+        srcStride: Int,
+        target: ByteBuffer,
+        dstOffset: Int,
+        dstStride: Int,
+        rowBytes: Int,
+        rows: Int,
+    ) {
+        for (row in 0 until rows) {
+            val start = srcOffset + row * srcStride
+            source.clear()
+            source.position(start)
+            source.limit(start + rowBytes)
+            target.position(dstOffset + row * dstStride)
+            target.put(source)
         }
     }
 
@@ -898,6 +1192,9 @@ class VnvarRtspPublisher(
                 MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420SemiPlanar
             capabilities.colorFormats.contains(MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420Planar) ->
                 MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420Planar
+            // Chỉ nhận định dạng linh hoạt: ghi qua getInputImage (stride/plane thật).
+            capabilities.colorFormats.contains(MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420Flexible) ->
+                MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420Flexible
             else -> throw IllegalStateException(
                 "H.264 encoder ${codecInfo.name} không nhận I420/NV12 ByteBuffer",
             )
@@ -952,6 +1249,7 @@ class VnvarRtspPublisher(
             }
             created.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
             created.start()
+            readEncoderInputLayout(created)
         } catch (error: Exception) {
             // Codec vừa tạo chưa được gán vào `codec`: phải tự giải phóng.
             try { created.release() } catch (_: Exception) {}
@@ -1350,6 +1648,7 @@ class VnvarRtspPublisher(
 
     fun stop() {
         if (!running.compareAndSet(true, false)) return
+        activePublishersByPort.remove(port, this)
         try { track.removeSink(this) } catch (_: Exception) {}
         try { serverSocket?.close() } catch (_: Exception) {}
         sessions.values.forEach { session ->
@@ -1372,6 +1671,7 @@ class VnvarRtspPublisher(
             rotateScratch = null
             fitScratch = null
             blackCanvas = null
+            packedFrame = null
         }
     }
 
@@ -1402,7 +1702,7 @@ class VnvarRtspPublisher(
         // Relay FFmpeg (livestream RTMP/RTSP) đọc qua loopback: khi đường upload
         // nghẽn chốc lát nó ngừng đọc, nên cần hàng chờ dài như video thay vì bỏ
         // tiếng sau 0,5 giây như client Wi-Fi.
-        private val isLoopbackClient = socket.inetAddress?.isLoopbackAddress == true
+        val isLoopbackClient = isLoopbackRemote(socket.inetAddress)
         private val offersAudio: Boolean
             get() = audioAvailable && (isLoopbackClient || remoteAudioEnabled)
         private var videoPacketCount = 0L
@@ -1562,23 +1862,41 @@ class VnvarRtspPublisher(
         }
 
         /**
-         * Hàng chờ đã quá dài chưa. Client mạng: giới hạn theo THỜI GIAN (gói
-         * cũ nhất chờ quá [MAX_CLIENT_QUEUE_AGE_NANOS]) và theo byte (~0,5 giây
-         * ở bitrate hiện tại) để độ trễ không tích luỹ. Relay loopback giữ giới
-         * hạn rộng theo số gói như trước.
+         * Hàng chờ đã quá dài chưa: giới hạn theo THỜI GIAN (gói cũ nhất chờ quá
+         * hạn) và theo byte để độ trễ không tích luỹ, cộng trần an toàn theo số gói.
+         * - Client mạng (Tablet): 0,5 giây, byte theo bitrate hiện tại — giữ độ
+         *   trễ thấp.
+         * - Relay FFmpeg loopback: 2 giây, byte theo bitrate TỐI ĐA cấu hình —
+         *   FFmpeg khựng thoáng qua (upload RTMP) không làm mất hình livestream.
          */
         private fun queueWouldOverflowLocked(packetCount: Int, bytes: Long, now: Long): Boolean {
             if (pendingRtpPackets <= 0) return false
-            if (isLoopbackClient) {
-                return pendingRtpPackets + packetCount > MAX_PENDING_RTP_PACKETS_LOOPBACK
+            val packetLimit = if (isLoopbackClient) {
+                MAX_PENDING_RTP_PACKETS_LOOPBACK
+            } else {
+                MAX_PENDING_RTP_PACKETS
             }
-            if (pendingRtpPackets + packetCount > MAX_PENDING_RTP_PACKETS) return true
+            if (pendingRtpPackets + packetCount > packetLimit) return true
+            val ageLimit = if (isLoopbackClient) {
+                MAX_LOOPBACK_QUEUE_AGE_NANOS
+            } else {
+                MAX_CLIENT_QUEUE_AGE_NANOS
+            }
             val oldest = pendingUnitEnqueuedNanos.peekFirst()
-            if (oldest != null && now - oldest > MAX_CLIENT_QUEUE_AGE_NANOS) return true
-            val byteBudget = maxOf(
-                MIN_CLIENT_QUEUE_BYTES,
-                currentBitrate.toLong() * MAX_CLIENT_QUEUE_AGE_NANOS / 8L / 1_000_000_000L,
-            )
+            if (oldest != null && now - oldest > ageLimit) return true
+            val byteBudget = if (isLoopbackClient) {
+                // Dùng bitrate tối đa (không phải bitrate thích ứng hiện tại) để
+                // đủ chỗ cho ~2 giây kể cả khi bộ thích ứng vừa nâng bitrate.
+                maxOf(
+                    MIN_LOOPBACK_QUEUE_BYTES,
+                    bitrate.coerceAtLeast(MIN_RTSP_BITRATE).toLong() * ageLimit / 8L / 1_000_000_000L,
+                )
+            } else {
+                maxOf(
+                    MIN_CLIENT_QUEUE_BYTES,
+                    currentBitrate.toLong() * ageLimit / 8L / 1_000_000_000L,
+                )
+            }
             return pendingVideoBytes + bytes > byteBudget
         }
 
@@ -1618,8 +1936,10 @@ class VnvarRtspPublisher(
 
                 val now = System.nanoTime()
                 // Keyframe mới tới khi keyframe trước còn chờ: hàng chờ đã chậm
-                // hơn một GOP, nhảy thẳng tới keyframe mới nhất.
-                val overflow = (isKeyFrame && keyFrameQueued) ||
+                // hơn một GOP, nhảy thẳng tới keyframe mới nhất. Chỉ áp dụng cho
+                // client mạng: GOP = 1 giây nên với relay loopback luật này sẽ cắt
+                // ở ~1 giây, vô hiệu hoá hạn 2 giây ở queueWouldOverflowLocked.
+                val overflow = (isKeyFrame && keyFrameQueued && !isLoopbackClient) ||
                     queueWouldOverflowLocked(packetCount, bytes, now)
                 if (overflow) {
                     dropPendingVideoLocked()
@@ -1912,10 +2232,15 @@ class VnvarRtspPublisher(
         // Trần an toàn theo số gói cho client mạng (giới hạn chính là thời gian/byte).
         private const val MAX_PENDING_RTP_PACKETS = 2048
         private const val MAX_PENDING_RTP_PACKETS_LOOPBACK = 4096
-        // Gói cũ nhất chờ quá 0,5 giây thì bỏ tới keyframe kế tiếp.
+        // Gói cũ nhất chờ quá 0,5 giây thì bỏ tới keyframe kế tiếp (Tablet: trễ thấp).
         private const val MAX_CLIENT_QUEUE_AGE_NANOS = 500_000_000L
+        // Relay FFmpeg loopback: chịu được 2 giây khựng (upload livestream) trước
+        // khi bỏ tới keyframe, tránh mất 1–3,5 giây hình trên livestream.
+        private const val MAX_LOOPBACK_QUEUE_AGE_NANOS = 2_000_000_000L
         // Sàn đủ cho một IDR + vài P-frame ở bitrate thấp (không tự cắt IDR đang gửi).
         private const val MIN_CLIENT_QUEUE_BYTES = 256L * 1024L
+        // Sàn byte cho relay loopback (~2 giây ở 2 Mbps mặc định + dư cho IDR).
+        private const val MIN_LOOPBACK_QUEUE_BYTES = 1024L * 1024L
         // 50 gói × 10 ms = 0,5 giây âm thanh chờ gửi cho mỗi client.
         private const val MAX_PENDING_AUDIO_CHUNKS = 50
         // 800 gói × 10 ms = 8 giây cho relay livestream cục bộ.
@@ -1934,8 +2259,32 @@ class VnvarRtspPublisher(
         private const val VIDEO_SSRC = 0x564E5652
         private const val AUDIO_SSRC = 0x564E4155
         private const val MAX_RTSP_CLIENTS = 4
+        /**
+         * Số slot luôn để dành cho client loopback (relay FFmpeg livestream):
+         * client mạng LAN chỉ chiếm tối đa MAX_RTSP_CLIENTS - slot này.
+         */
+        private const val RESERVED_LOOPBACK_SLOTS = 1
         private const val MAX_RTSP_HEADER_BYTES = 64 * 1024
         private const val MIN_RTSP_BITRATE = 500_000
+
+        /**
+         * Địa chỉ remote là loopback: 127.0.0.0/8, ::1, hoặc IPv4-mapped
+         * ::ffff:127.x (phòng khi socket trả Inet6Address chưa quy đổi về IPv4).
+         */
+        private fun isLoopbackRemote(address: InetAddress?): Boolean {
+            if (address == null) return false
+            if (address.isLoopbackAddress) return true
+            val raw = address.address ?: return false
+            if (raw.size != 16) return false
+            for (i in 0 until 10) {
+                if (raw[i] != 0.toByte()) return false
+            }
+            return raw[10] == 0xFF.toByte() &&
+                raw[11] == 0xFF.toByte() &&
+                raw[12] == 127.toByte()
+        }
         private val nextPublisherId = AtomicLong(0L)
+        /** Publisher đang chạy theo cổng (cấp tiến trình) để không bao giờ có hai phiên giành một cổng. */
+        private val activePublishersByPort = ConcurrentHashMap<Int, VnvarRtspPublisher>()
     }
 }

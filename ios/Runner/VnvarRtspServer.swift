@@ -65,6 +65,25 @@ struct VnvarRtcpLossTracker {
   }
 }
 
+/// C6: chính sách thử bind lại cổng RTSP overlay khi listener lỗi lúc khởi
+/// động (EADDRINUSE: phiên vừa dừng chưa nhả hẳn cổng). Thuần để kiểm thử.
+enum VnvarListenerBindRetryPolicy {
+  /// Số lần thử lại tối đa (không tính lần đầu).
+  static let maximumRetries = 5
+  static let retryDelay: TimeInterval = 0.3
+  /// Không bắt đầu lần thử mới khi đã quá chừng này giây kể từ lần đầu (Dart
+  /// chờ `startOverlayRtsp` 8 s; còn phải chờ encoder ra SPS/PPS).
+  static let retryWindow: TimeInterval = 5.0
+
+  /// [failedAttempt]: số thứ tự lần thử vừa lỗi (1 = lần đầu).
+  /// [elapsed]: số giây kể từ lần thử đầu.
+  static func shouldRetry(failedAttempt: Int, elapsed: TimeInterval) -> Bool {
+    guard failedAttempt >= 1, failedAttempt <= maximumRetries else { return false }
+    guard elapsed.isFinite, elapsed >= 0 else { return false }
+    return elapsed + retryDelay < retryWindow
+  }
+}
+
 final class VnvarRtspServer {
   var onPlayRequested: (() -> Void)?
   var onReceiverReport: ((Double) -> Void)?
@@ -122,7 +141,9 @@ final class VnvarRtspServer {
     // restart iOS may keep the previous nexus flow alive briefly; endpoint
     // reuse then makes the new listener fail with errno 17 (File exists) and
     // every viewer sees Connection refused. A single exclusive listener is
-    // safer and the Dart retry path handles the short handoff window.
+    // safer and the Dart retry path handles the short handoff window. The
+    // loopback overlay server (C6) is re-bound by AppDelegate.startOverlayRtsp
+    // (VnvarListenerBindRetryPolicy) when the listener fails during startup.
     let listener: NWListener
     if loopbackOnly {
       // Cổng nằm trong requiredLocalEndpoint; không truyền thêm `on:` để hai

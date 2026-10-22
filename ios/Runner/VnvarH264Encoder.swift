@@ -2,6 +2,39 @@ import CoreMedia
 import Foundation
 import VideoToolbox
 
+/// Đếm số lần phiên VideoToolbox bị mất/hỏng (kVTInvalidSessionErr,
+/// kVTVideoEncoderMalfunctionErr) phải tạo lại liên tiếp mà không mã hoá được
+/// khung nào. Thuần (không phụ thuộc VT) để kiểm thử.
+struct VnvarEncoderResetMonitor {
+  /// Số lần tạo lại trong `window` giây thì coi là hỏng thật và báo lỗi.
+  let threshold: Int
+  let window: TimeInterval
+  private(set) var resetUptimes: [TimeInterval] = []
+
+  init(threshold: Int = 5, window: TimeInterval = 10) {
+    self.threshold = max(1, threshold)
+    self.window = max(0, window)
+  }
+
+  /// Ghi một lần tạo lại phiên. Trả true khi đã đủ `threshold` lần trong
+  /// `window` giây (bộ đếm được xoá để lần báo kế tiếp lại cần đủ ngưỡng).
+  mutating func recordReset(at now: TimeInterval) -> Bool {
+    // Chép ra biến cục bộ: closure đọc self.window trong lúc đang sửa
+    // self.resetUptimes là truy cập chồng lấn (lỗi exclusivity).
+    let window = self.window
+    resetUptimes.append(now)
+    resetUptimes.removeAll { now - $0 > window }
+    guard resetUptimes.count >= threshold else { return false }
+    resetUptimes.removeAll()
+    return true
+  }
+
+  /// Mã hoá thành công một khung: chuỗi lỗi liên tiếp kết thúc.
+  mutating func recordSuccess() {
+    if !resetUptimes.isEmpty { resetUptimes.removeAll() }
+  }
+}
+
 final class VnvarH264Encoder {
   typealias FormatHandler = (_ sps: Data, _ pps: Data) -> Void
   typealias AccessUnitHandler = (
@@ -37,6 +70,9 @@ final class VnvarH264Encoder {
   // sourceFrameRefcon để nhận ra callback muộn của phiên đã bị huỷ.
   private var pendingFrameToken: UInt = 0
   private var nextFrameToken: UInt = 0
+  // Bảo vệ bởi admissionLock (ghi nhận thành công chạy trên luồng callback VT,
+  // ghi nhận tạo lại phiên chạy trên `queue`).
+  private var sessionLossMonitor = VnvarEncoderResetMonitor()
 
   /// Khung chờ VideoToolbox lâu hơn chừng này coi như mất callback: nhả khung
   /// và tạo lại phiên, thay vì để RTSP đứng hình vĩnh viễn.
@@ -128,7 +164,7 @@ final class VnvarH264Encoder {
         // iOS huỷ phiên phần cứng (ví dụ khi app ra nền): tạo lại ở khung sau
         // thay vì lỗi mãi với cùng một phiên hỏng.
         NSLog("[VNVAR-RTSP] VideoToolbox session lost (%d); recreating", status)
-        self.resetSession()
+        self.recreateLostSession(status: status)
         self.finishPendingFrame(token: token)
       } catch {
         self.finishPendingFrame(token: token)
@@ -199,6 +235,19 @@ final class VnvarH264Encoder {
     dimensions = nil
     clearParameterSets()
     forceNextKeyFrame = true
+  }
+
+  /// Chạy trên `queue`. Phiên VT bị mất/hỏng: tạo lại ở khung sau; nếu lặp lại
+  /// quá ngưỡng mà không mã hoá được khung nào thì báo lỗi lên publisher (Dart).
+  private func recreateLostSession(status: OSStatus) {
+    resetSession()
+    guard !stopped else { return }
+    admissionLock.lock()
+    let exceeded = sessionLossMonitor.recordReset(at: ProcessInfo.processInfo.systemUptime)
+    admissionLock.unlock()
+    if exceeded {
+      report(EncoderError.repeatedSessionLoss(status))
+    }
   }
 
   /// Chạy trên `queue` sau `stallTimeout` kể từ khi khung [token] vào encoder.
@@ -338,7 +387,7 @@ final class VnvarH264Encoder {
     defer { finishPendingFrame(token: token) }
     if Self.isSessionLost(status) {
       NSLog("[VNVAR-RTSP] VideoToolbox session lost in callback (%d); recreating", status)
-      queue.async { [weak self] in self?.resetSession() }
+      queue.async { [weak self] in self?.recreateLostSession(status: status) }
       return
     }
     guard status == noErr,
@@ -385,6 +434,9 @@ final class VnvarH264Encoder {
     let timestamp = UInt32(
       truncatingIfNeeded: UInt64(max(0, seconds * 90_000))
     )
+    admissionLock.lock()
+    sessionLossMonitor.recordSuccess()
+    admissionLock.unlock()
     onAccessUnit?(nals, timestamp, isKeyFrame)
   }
 
@@ -474,11 +526,14 @@ final class VnvarH264Encoder {
     case operation(String, OSStatus)
     case invalidOutput
     case invalidTimestamp
+    case repeatedSessionLoss(OSStatus)
 
     var description: String {
       switch self {
       case let .operation(name, status):
         return "VideoToolbox \(name) failed (\(status))"
+      case let .repeatedSessionLoss(status):
+        return "VideoToolbox session was lost repeatedly (\(status))"
       case .invalidOutput:
         return "VideoToolbox returned an invalid H.264 sample"
       case .invalidTimestamp:

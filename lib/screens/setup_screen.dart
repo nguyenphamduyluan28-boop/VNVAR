@@ -453,25 +453,21 @@ class _SetupScreenState extends State<SetupScreen> {
         BrandTile(
           icon: Icons.stadium_rounded,
           title: 'Court ID',
-          trailing: Flexible(
-            child: Text(
-              _courtId,
-              maxLines: 1,
-              overflow: TextOverflow.ellipsis,
-              style: valueStyle,
-            ),
+          trailing: Text(
+            _courtId,
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+            style: valueStyle,
           ),
         ),
         BrandTile(
           icon: Icons.videocam_rounded,
           title: 'Camera ID',
-          trailing: Flexible(
-            child: Text(
-              _cameraId,
-              maxLines: 1,
-              overflow: TextOverflow.ellipsis,
-              style: valueStyle,
-            ),
+          trailing: Text(
+            _cameraId,
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+            style: valueStyle,
           ),
         ),
       ],

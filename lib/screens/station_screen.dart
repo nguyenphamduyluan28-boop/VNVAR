@@ -1246,7 +1246,15 @@ class _StationScreenState extends State<StationScreen>
       // Chỉ lưu sau khi sân mới chạy được: nếu khởi tạo lỗi, cấu hình đã lưu
       // vẫn khớp với sân đang hiển thị.
       _pendingIdentity = null;
-      await StationConfigService().saveIdentity(newIdentity);
+      // Camera đã chạy với cấu hình mới: lỗi LƯU không được rơi vào nhánh
+      // lỗi khởi động (dừng chạy nền + màn lỗi) — chỉ cảnh báo.
+      var saved = true;
+      try {
+        await StationConfigService().saveIdentity(newIdentity);
+      } catch (saveError) {
+        saved = false;
+        debugPrint('[CONFIG] Không thể lưu cấu hình mới: $saveError');
+      }
 
       if (!mounted) {
         return;
@@ -1258,6 +1266,13 @@ class _StationScreenState extends State<StationScreen>
       });
 
       widget.onIdentityChanged(newIdentity);
+      if (!saved) {
+        _showStationToast(
+          vi: 'Đã áp dụng nhưng chưa lưu; mở lại app có thể về cấu hình cũ.',
+          en: 'Applied but not saved; may revert after restart.',
+          kind: NoticeKind.warning,
+        );
+      }
     } catch (error, stackTrace) {
       debugPrint(
         '[CONFIG] APPLY ERROR: '

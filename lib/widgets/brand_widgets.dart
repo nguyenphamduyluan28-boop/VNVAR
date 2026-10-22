@@ -229,13 +229,19 @@ class BrandPill extends StatelessWidget {
         ],
       ),
     );
-    if (onTap != null) {
-      pill = Material(
-        type: MaterialType.transparency,
-        child: InkWell(
-          borderRadius: BorderRadius.circular(999),
-          onTap: onTap,
-          child: pill,
+    final tap = onTap;
+    if (tap != null) {
+      // Hình viên giữ 32 dp; vùng chạm mở rộng tối thiểu 48 dp bằng lề
+      // trong suốt (chạm vào lề cũng kích hoạt), hiệu ứng chạm vẽ trên viên.
+      pill = _MinTapTarget(
+        onTap: tap,
+        child: Material(
+          type: MaterialType.transparency,
+          child: InkWell(
+            borderRadius: BorderRadius.circular(999),
+            onTap: tap,
+            child: pill,
+          ),
         ),
       );
     }
@@ -348,50 +354,65 @@ class BrandTile extends StatelessWidget {
               horizontal: BrandSpace.lg,
               vertical: BrandSpace.md,
             ),
-            child: Row(
-              children: [
-                Container(
-                  width: 36,
-                  height: 36,
-                  decoration: BoxDecoration(
-                    color: iconColor.withValues(alpha: 0.14),
-                    borderRadius: BorderRadius.circular(BrandRadius.small),
-                  ),
-                  child: Icon(icon, color: iconColor, size: 20),
-                ),
-                const SizedBox(width: BrandSpace.md),
-                Expanded(
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    mainAxisSize: MainAxisSize.min,
-                    children: [
-                      Text(
-                        title,
-                        style: BrandText.body,
-                        maxLines: 2,
-                        overflow: TextOverflow.ellipsis,
+            // Phần đuôi đặt trực tiếp (không Flexible) để tiêu đề chiếm hết
+            // chỗ còn lại; chỉ giới hạn đuôi tối đa ~60% bề rộng dòng để chữ
+            // dài (mã, giá trị) tự cắt "…" thay vì tràn.
+            child: LayoutBuilder(
+              builder: (context, constraints) {
+                final tail = trailing;
+                return Row(
+                  children: [
+                    Container(
+                      width: 36,
+                      height: 36,
+                      decoration: BoxDecoration(
+                        color: iconColor.withValues(alpha: 0.14),
+                        borderRadius: BorderRadius.circular(BrandRadius.small),
                       ),
-                      if (sub != null) ...[
-                        const SizedBox(height: 2),
-                        Text(
-                          sub,
-                          style: BrandText.caption,
-                          maxLines: 1,
-                          overflow: TextOverflow.ellipsis,
+                      child: Icon(icon, color: iconColor, size: 20),
+                    ),
+                    const SizedBox(width: BrandSpace.md),
+                    Expanded(
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          Text(
+                            title,
+                            style: BrandText.body,
+                            maxLines: 2,
+                            overflow: TextOverflow.ellipsis,
+                          ),
+                          if (sub != null) ...[
+                            const SizedBox(height: 2),
+                            Text(
+                              sub,
+                              style: BrandText.caption,
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                            ),
+                          ],
+                        ],
+                      ),
+                    ),
+                    if (tail != null) ...[
+                      const SizedBox(width: BrandSpace.sm),
+                      ConstrainedBox(
+                        constraints: BoxConstraints(
+                          maxWidth: constraints.maxWidth.isFinite
+                              ? constraints.maxWidth * 0.6
+                              : double.infinity,
                         ),
-                      ],
-                    ],
-                  ),
-                ),
-                if (trailing != null) ...[
-                  const SizedBox(width: BrandSpace.sm),
-                  Flexible(child: trailing!),
-                ] else if (onTap != null)
-                  const Icon(
-                    Icons.chevron_right_rounded,
-                    color: BrandColors.textDisabled,
-                  ),
-              ],
+                        child: tail,
+                      ),
+                    ] else if (onTap != null)
+                      const Icon(
+                        Icons.chevron_right_rounded,
+                        color: BrandColors.textDisabled,
+                      ),
+                  ],
+                );
+              },
             ),
           ),
         ),
@@ -420,31 +441,65 @@ class BrandSegmented<T> extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return Container(
-      padding: const EdgeInsets.all(3),
-      decoration: BoxDecoration(
-        color: const Color(0x66000000),
-        borderRadius: BorderRadius.circular(999),
-        border: Border.all(color: const Color(0x24FFFFFF)),
-      ),
-      child: Row(
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          for (final value in values)
-            _segment(value, value == selected),
-        ],
-      ),
+    final track = BoxDecoration(
+      color: const Color(0x66000000),
+      borderRadius: BorderRadius.circular(999),
+      border: Border.all(color: const Color(0x24FFFFFF)),
+    );
+    if (!dense) {
+      return Container(
+        padding: const EdgeInsets.all(3),
+        decoration: track,
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            for (final value in values) _segment(value, value == selected),
+          ],
+        ),
+      );
+    }
+    // Dạng gọn: viên hiển thị 36 dp (rãnh 44 dp) nhưng mỗi ô có vùng chạm
+    // cao [_kMinTapTarget] dp nhờ lề trong suốt trên/dưới.
+    const trackHeight = 36.0 + 2 * (3 + 1);
+    const inset = (_kMinTapTarget - trackHeight) / 2;
+    return Stack(
+      children: [
+        Positioned.fill(
+          child: Padding(
+            padding: const EdgeInsets.symmetric(vertical: inset),
+            child: DecoratedBox(decoration: track),
+          ),
+        ),
+        Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 3 + 1),
+          child: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              for (final value in values)
+                _MinTapTarget(
+                  onTap: _tapHandler(value),
+                  minWidth: 0,
+                  child: _segment(value, value == selected),
+                ),
+            ],
+          ),
+        ),
+      ],
     );
   }
 
-  Widget _segment(T value, bool isSelected) {
+  VoidCallback? _tapHandler(T value) {
     final callback = onChanged;
+    return callback == null ? null : () => callback(value);
+  }
+
+  Widget _segment(T value, bool isSelected) {
     return Material(
       color: isSelected ? BrandColors.primary : Colors.transparent,
       borderRadius: BorderRadius.circular(999),
       child: InkWell(
         borderRadius: BorderRadius.circular(999),
-        onTap: callback == null ? null : () => callback(value),
+        onTap: _tapHandler(value),
         child: ConstrainedBox(
           constraints: BoxConstraints(
             minWidth: dense ? 40 : 48,
@@ -466,6 +521,43 @@ class BrandSegmented<T> extends StatelessWidget {
           ),
         ),
       ),
+    );
+  }
+}
+
+/// Vùng chạm tối thiểu theo Material (48 dp).
+const double _kMinTapTarget = 48;
+
+/// Mở rộng vùng chạm của [child] lên tối thiểu [minWidth]×[minHeight] bằng lề
+/// trong suốt. Chạm trên chính [child] do InkWell bên trong xử lý (thắng trong
+/// gesture arena vì nằm sâu hơn); chạm vào lề gọi [onTap].
+class _MinTapTarget extends StatelessWidget {
+  const _MinTapTarget({
+    required this.onTap,
+    required this.child,
+    this.minWidth = _kMinTapTarget,
+  });
+
+  final VoidCallback? onTap;
+  final Widget child;
+  final double minWidth;
+
+  @override
+  Widget build(BuildContext context) {
+    final box = ConstrainedBox(
+      constraints: BoxConstraints(
+        minWidth: minWidth,
+        minHeight: _kMinTapTarget,
+      ),
+      child: Center(widthFactor: 1, heightFactor: 1, child: child),
+    );
+    final tap = onTap;
+    if (tap == null) return box;
+    return GestureDetector(
+      behavior: HitTestBehavior.opaque,
+      excludeFromSemantics: true,
+      onTap: tap,
+      child: box,
     );
   }
 }
