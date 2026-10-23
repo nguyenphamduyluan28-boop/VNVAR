@@ -988,6 +988,16 @@ class CameraStationRuntime {
     unawaited(rtsp.restartIfPublishing());
   }
 
+  /// Bảng tỉ số hiện cần in vào livestream (burnIn && visible). Publisher
+  /// kiểm sau khi phiên khởi chạy để bắt lần bấm Hiện trong lúc phiên đang
+  /// chuẩn bị/kết nối lại (lúc đó [_handleScoreboardChange] so với phiên cũ).
+  bool _livestreamOverlayWantedNow() {
+    if (!Platform.isAndroid && !Platform.isIOS) return false;
+    return livestreamOverlayNeeded(
+      livestreamOverlayFlags(ScoreboardService.instance.snapshot()),
+    );
+  }
+
   /// Android, chồng từng vùng: bảng tỉ số mới (đổi vị trí, "Kích thước", số
   /// set, lần đầu dùng cảnh lớn) cần vùng lớn hơn vùng đã khoá cho phiên
   /// FFmpeg: phát lại để không bị cắt bảng.
@@ -1461,6 +1471,7 @@ class CameraStationRuntime {
         await _webRtcService?.waitForRtspReady() ?? false;
     _rtspPublisherService.prepareOverlay = _prepareLivestreamOverlay;
     _rtspPublisherService.releaseOverlay = _scoreboardBurnIn.stop;
+    _rtspPublisherService.overlayWanted = _livestreamOverlayWantedNow;
     // iOS: track camera cho luồng overlay native (cùng track với startRtsp)
     // và báo native nạp lại ảnh mỗi khi bảng tỉ số được vẽ lại.
     _rtspPublisherService.videoTrackId = () =>

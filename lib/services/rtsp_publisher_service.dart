@@ -713,6 +713,16 @@ class RtspPublisherService {
   /// Dừng cập nhật ảnh bảng tỉ số khi không còn phiên nào dùng.
   void Function()? releaseOverlay;
 
+  /// Trạng thái mong muốn HIỆN TẠI của bảng tỉ số: cần in vào livestream
+  /// (burnIn && visible; runtime cung cấp). Kiểm sau khi mỗi phiên khởi chạy
+  /// để bắt thay đổi xảy ra trong lúc phiên đang chuẩn bị/kết nối lại.
+  bool Function()? overlayWanted;
+
+  // Đã phát lại một lần vì phiên khởi chạy thiếu bảng tỉ số mà bảng cần in
+  // (xem [livestreamOverlayLaunchRestartNeeded]); xoá khi có phiên in được
+  // bảng hoặc người dùng phát/bật in lại.
+  bool _overlayLaunchRestartUsed = false;
+
   /// iOS: id track video WebRTC của camera (giống `trackId` của `startRtsp`),
   /// để native chồng bảng tỉ số lên cùng khung camera (runtime cung cấp).
   String? Function()? videoTrackId;
@@ -765,6 +775,7 @@ class RtspPublisherService {
     _hwDecodeEarlyFailures = 0;
     _nativeOverlaySourceFailures = 0;
     _nativeOverlayRecoverableRestarts = 0;
+    _overlayLaunchRestartUsed = false;
   }
 
   static Future<Object?> _invokeNative(
@@ -1587,6 +1598,7 @@ class RtspPublisherService {
 
       if (!aborted()) {
         _currentSession = session;
+        _checkOverlayAfterLaunch(sessionHasOverlay: usedOverlay);
       } else {
         // Phiên đã bị thay thế (hoặc người dùng bấm Dừng) trong lúc khởi
         // động: hủy để không chạy song song / không phát sau khi đã dừng.
@@ -1610,6 +1622,43 @@ class RtspPublisherService {
       );
       _scheduleReconnect(err);
     }
+  }
+
+  /// Phiên vừa khởi chạy: cờ bảng tỉ số có thể đã đổi trong lúc chuẩn bị
+  /// (sự kiện đổi cờ khi đó so với phiên cũ). Bảng cần in mà phiên không có
+  /// → phát lại một lần (không lặp; tôn trọng [overlayUnavailable]).
+  void _checkOverlayAfterLaunch({required bool sessionHasOverlay}) {
+    if (sessionHasOverlay) {
+      _overlayLaunchRestartUsed = false;
+      return;
+    }
+    final wantedNow = overlayWanted;
+    if (wantedNow == null) return;
+    var wanted = false;
+    try {
+      wanted = wantedNow();
+    } catch (error) {
+      developer.log(
+        '[RTSP_PUSH] Unable to read scoreboard overlay state: $error',
+        name: 'RtspPublisherService',
+      );
+      return;
+    }
+    if (!livestreamOverlayLaunchRestartNeeded(
+      sessionHasOverlay: sessionHasOverlay,
+      overlayWanted: wanted,
+      overlayUnavailable: _overlayUnavailable,
+      alreadyRestarted: _overlayLaunchRestartUsed,
+    )) {
+      return;
+    }
+    _overlayLaunchRestartUsed = true;
+    developer.log(
+      '[RTSP_PUSH] Scoreboard was shown while the session was starting; '
+      'restarting once to burn it in',
+      name: 'RtspPublisherService',
+    );
+    unawaited(restartIfPublishing());
   }
 
   void _resetNetworkHealth() {

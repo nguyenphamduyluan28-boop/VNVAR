@@ -371,4 +371,73 @@ void main() {
       }
     });
   });
+
+  test('only changed overlay regions are rewritten', () {
+    final a = Uint8List.fromList([1, 2, 3]);
+    final b = Uint8List.fromList([4, 5]);
+    final c = Uint8List.fromList([6]);
+    // Chưa ghi gì: ghi mọi vùng.
+    expect(livestreamChangedRegionIndices(const [], [a, b, c]), [0, 1, 2]);
+    expect(livestreamChangedRegionIndices([null, null, null], [a, b, c]), [0, 1, 2]);
+    // Cùng nội dung (khác đối tượng): bỏ qua.
+    expect(
+      livestreamChangedRegionIndices(
+        [Uint8List.fromList([1, 2, 3]), b, c],
+        [a, b, c],
+      ),
+      isEmpty,
+    );
+    // Một vùng đổi, một vùng chưa ghi.
+    expect(
+      livestreamChangedRegionIndices([a, b, null], [a, Uint8List.fromList([4, 6]), c]),
+      [1, 2],
+    );
+    // Danh sách cũ ngắn hơn.
+    expect(livestreamChangedRegionIndices([a], [a, b]), [1]);
+  });
+
+  test('a launched session without overlay restarts once when overlay is wanted', () {
+    // Bấm Hiện trong lúc phiên chuẩn bị (đã đọc cờ Ẩn): phát lại một lần.
+    expect(
+      livestreamOverlayLaunchRestartNeeded(
+        sessionHasOverlay: false,
+        overlayWanted: true,
+        overlayUnavailable: false,
+        alreadyRestarted: false,
+      ),
+      isTrue,
+    );
+    // Đã phát lại một lần mà vẫn không in được: không lặp.
+    expect(
+      livestreamOverlayLaunchRestartNeeded(
+        sessionHasOverlay: false,
+        overlayWanted: true,
+        overlayUnavailable: false,
+        alreadyRestarted: true,
+      ),
+      isFalse,
+    );
+    // Máy đã báo không in được bảng tỉ số.
+    expect(
+      livestreamOverlayLaunchRestartNeeded(
+        sessionHasOverlay: false,
+        overlayWanted: true,
+        overlayUnavailable: true,
+        alreadyRestarted: false,
+      ),
+      isFalse,
+    );
+    // Phiên đã in bảng tỉ số / không cần overlay / chỉ lệch theo hướng tắt.
+    for (final (hasOverlay, wanted) in [(true, true), (false, false), (true, false)]) {
+      expect(
+        livestreamOverlayLaunchRestartNeeded(
+          sessionHasOverlay: hasOverlay,
+          overlayWanted: wanted,
+          overlayUnavailable: false,
+          alreadyRestarted: false,
+        ),
+        isFalse,
+      );
+    }
+  });
 }

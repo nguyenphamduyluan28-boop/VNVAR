@@ -460,6 +460,9 @@ class CameraServer {
 
   /// Lượt dọn/khôi phục lưu trữ lúc khởi động server (null nếu chưa chạy).
   Future<void>? get startupMaintenance => _startupMaintenance;
+
+  /// stop() chờ lượt dọn/khôi phục lúc khởi động tối đa chừng này.
+  static const Duration startupMaintenanceStopTimeout = Duration(seconds: 10);
   int _pendingWebRtcOffers = 0;
   static const int maximumPendingWebRtcOffers = 4;
 
@@ -619,6 +622,24 @@ class CameraServer {
         stackTrace: stackTrace,
         name: 'CameraServer',
       );
+    }
+
+    // Lượt dọn/khôi phục file ghi dở lúc khởi động chạy nền: chờ nó xong
+    // (có hạn) để không còn chạy sau khi RecordingService bị giải phóng.
+    // RecordingService chưa có cơ chế huỷ lượt này nên chỉ chờ.
+    final maintenance = _startupMaintenance;
+    if (maintenance != null) {
+      try {
+        await maintenance.timeout(startupMaintenanceStopTimeout);
+      } on TimeoutException {
+        developer.log(
+          'Startup storage recovery still running after '
+          '${startupMaintenanceStopTimeout.inSeconds}s; continuing stop',
+          name: 'CameraServer',
+        );
+      } catch (_) {
+        // Lỗi đã được ghi log trong catchError của start().
+      }
     }
 
     try {

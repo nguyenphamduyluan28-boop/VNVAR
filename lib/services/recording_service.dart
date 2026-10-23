@@ -2051,7 +2051,39 @@ class RecordingService {
         'No directory available for recording temp files.',
       );
     }
+    if (Platform.isIOS) await _excludeStagingFromBackup(path);
     return Directory(path);
+  }
+
+  // Thư mục staging đã gửi excludeFromBackup (một lần cho mỗi đường dẫn).
+  static final Set<String> _backupExclusionRequested = <String>{};
+
+  /// iOS (hợp đồng C8): Application Support được sao lưu iCloud; file tạm ghi
+  /// hình (MP4/WAV lớn) không được sao lưu. Native tạo thư mục nếu chưa có
+  /// và đặt isExcludedFromBackup. Lỗi chỉ ghi log, không chặn ghi hình.
+  static Future<void> _excludeStagingFromBackup(String path) async {
+    if (!_backupExclusionRequested.add(path)) return;
+    try {
+      await _platformChannel.invokeMethod<bool>('excludeFromBackup', {
+        'path': path,
+      });
+    } on MissingPluginException catch (error) {
+      developer.log(
+        'excludeFromBackup not implemented: $error',
+        name: 'RecordingService',
+      );
+    } on PlatformException catch (error) {
+      developer.log(
+        'Unable to exclude the staging directory from backup: '
+        '${error.code} ${error.message}',
+        name: 'RecordingService',
+      );
+    } catch (error) {
+      developer.log(
+        'Unable to exclude the staging directory from backup: $error',
+        name: 'RecordingService',
+      );
+    }
   }
 
   /// Mọi thư mục staging cần quét khi dọn/khôi phục: thư mục hiện tại và

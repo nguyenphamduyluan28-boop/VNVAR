@@ -182,6 +182,8 @@ import UIKit
         result(nil)
       case "openAppSettings":
         self.openAppSettings(result)
+      case "excludeFromBackup":
+        self.excludeFromBackup(call, result)
       case "requestMicrophonePermission":
         self.requestMicrophonePermission(result)
       case "ensureCapturePermissions":
@@ -751,6 +753,42 @@ import UIKit
     audioPublisherLock.lock()
     defer { audioPublisherLock.unlock() }
     return audioPublisher
+  }
+
+  /// Hợp đồng C8: đặt isExcludedFromBackup cho thư mục `path` (tạo nếu chưa
+  /// có) để file tạm ghi hình trong Application Support không lên iCloud.
+  private func excludeFromBackup(_ call: FlutterMethodCall, _ result: FlutterResult) {
+    guard let path = (call.arguments as? [String: Any])?["path"] as? String,
+          !path.isEmpty else {
+      result(
+        FlutterError(
+          code: "EXCLUDE_FROM_BACKUP_FAILED",
+          message: "Directory path is required.",
+          details: nil
+        )
+      )
+      return
+    }
+    do {
+      try FileManager.default.createDirectory(
+        atPath: path,
+        withIntermediateDirectories: true,
+        attributes: nil
+      )
+      var url = URL(fileURLWithPath: path, isDirectory: true)
+      var values = URLResourceValues()
+      values.isExcludedFromBackup = true
+      try url.setResourceValues(values)
+      result(true)
+    } catch {
+      result(
+        FlutterError(
+          code: "EXCLUDE_FROM_BACKUP_FAILED",
+          message: error.localizedDescription,
+          details: nil
+        )
+      )
+    }
   }
 
   private func openAppSettings(_ result: @escaping FlutterResult) {

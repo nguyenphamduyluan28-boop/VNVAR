@@ -150,6 +150,40 @@ bool livestreamOverlayRestartNeeded({
   return livestreamOverlayNeeded(next) && !livestreamOverlayNeeded(previous);
 }
 
+/// Phiên phát vừa khởi chạy có cần phát lại một lần để in bảng tỉ số không.
+///
+/// Cờ "cần overlay" (burnIn && visible) có thể đổi trong lúc phiên đang
+/// chuẩn bị/kết nối lại (ví dụ bấm Hiện ngay khi phiên đã đọc cờ "Ẩn"), khi
+/// đó sự kiện đổi cờ so với trạng thái overlay của phiên CŨ nên có thể bỏ lỡ.
+/// Sau khi phiên khởi chạy: so trạng thái overlay mà phiên đã dùng
+/// ([sessionHasOverlay]) với trạng thái mong muốn hiện tại ([overlayWanted]).
+/// Chỉ phát lại theo hướng cần bật overlay mà phiên không có; không phát lại
+/// khi máy đã báo không in được ([overlayUnavailable]) hoặc đã phát lại vì lý
+/// do này mà chưa có phiên nào in được ([alreadyRestarted], chống vòng lặp).
+bool livestreamOverlayLaunchRestartNeeded({
+  required bool sessionHasOverlay,
+  required bool overlayWanted,
+  required bool overlayUnavailable,
+  required bool alreadyRestarted,
+}) =>
+    overlayWanted &&
+    !sessionHasOverlay &&
+    !overlayUnavailable &&
+    !alreadyRestarted;
+
+/// Chỉ số các vùng có ảnh mới ([images]) khác ảnh đã ghi ([previous]; thiếu
+/// hoặc null = chưa ghi), theo thứ tự tăng dần.
+List<int> livestreamChangedRegionIndices(
+  List<Uint8List?> previous,
+  List<Uint8List> images,
+) => [
+  for (var i = 0; i < images.length; i++)
+    if (i >= previous.length ||
+        previous[i] == null ||
+        !listEquals(previous[i], images[i]))
+      i,
+];
+
 /// [inner] nằm trọn trong [outer].
 bool livestreamRegionContains(ui.Rect outer, ui.Rect inner) =>
     inner.left >= outer.left &&
@@ -630,18 +664,7 @@ class ScoreboardBurnIn {
           written = List<Uint8List?>.filled(paths.length, null);
           _writtenBytes = written;
         }
-        for (var i = 0; i < paths.length; i++) {
-          final bytes = images[i];
-          final previous = written[i];
-          if (previous != null && listEquals(previous, bytes)) continue;
-          // Ghi file tạm rồi đổi tên: FFmpeg không bao giờ đọc phải ảnh ghi dở.
-          final path = paths[i];
-          final temp = File('$path.tmp');
-          await temp.writeAsBytes(bytes, flush: true);
-          await temp.rename(path);
-          written[i] = bytes;
-          _notifyImageWritten(path);
-        }
+        await _writeChangedImages(paths, images, written);
         _writtenKey = key;
         ok = true;
         if (regions != null) _checkRegions(state, width, height, regions);
@@ -656,6 +679,48 @@ class ScoreboardBurnIn {
       return false;
     }
     return ok;
+  }
+
+  /// Ghi các vùng đổi nội dung theo hai pha để các vùng của cùng một trạng
+  /// thái xuất hiện gần như cùng lúc: (1) ghi đủ PNG của MỌI vùng đổi vào file
+  /// tạm; (2) chỉ khi tất cả đã ghi xong mới đổi tên liên tiếp (FFmpeg/native
+  /// không bao giờ đọc ảnh ghi dở, và độ lệch giữa các vùng chỉ còn cỡ một
+  /// lần rename). Lỗi ở pha 1: xoá các file tạm, không đổi tên vùng nào (giữ
+  /// nguyên bộ ảnh cũ). [written] được cập nhật cho vùng đã đổi tên xong.
+  Future<void> _writeChangedImages(
+    List<String> paths,
+    List<Uint8List> images,
+    List<Uint8List?> written,
+  ) async {
+    final changed = livestreamChangedRegionIndices(written, images);
+    if (changed.isEmpty) return;
+    final pending = <int>[];
+    final renamed = <String>[];
+    try {
+      for (final i in changed) {
+        final temp = File('${paths[i]}.tmp');
+        pending.add(i);
+        await temp.writeAsBytes(images[i], flush: true);
+      }
+      for (final i in changed) {
+        await File('${paths[i]}.tmp').rename(paths[i]);
+        pending.remove(i);
+        written[i] = images[i];
+        renamed.add(paths[i]);
+      }
+    } finally {
+      // Lỗi giữa chừng: không để lại file tạm (lần vẽ sau ghi lại từ đầu các
+      // vùng chưa đổi tên vì [written] của chúng chưa được cập nhật).
+      for (final i in pending) {
+        try {
+          final temp = File('${paths[i]}.tmp');
+          if (await temp.exists()) await temp.delete();
+        } catch (_) {}
+      }
+      for (final path in renamed) {
+        _notifyImageWritten(path);
+      }
+    }
   }
 
   /// Lỗi của bên nhận không được làm hỏng vòng vẽ.
