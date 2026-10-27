@@ -11,6 +11,9 @@
 	<key>NSPhotoLibraryUsageDescription</key>
 	<string>VNVAR cần chọn ảnh mã QR trong thư viện để cấu hình livestream.</string>
 
+	<key>NSPhotoLibraryAddUsageDescription</key>
+	<string>SportO Cam lưu bản sao video vào Thư viện ảnh để bạn xem và chia sẻ.</string>
+
 	<key>NSLocalNetworkUsageDescription</key>
 	<string>VNVAR sử dụng mạng nội bộ để nhận lệnh điều khiển từ tablet.</string>
 

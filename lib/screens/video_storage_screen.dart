@@ -9,6 +9,7 @@ import 'package:video_player/video_player.dart';
 import '../services/recording_service.dart';
 import '../services/app_language_service.dart';
 import '../services/camera_server.dart';
+import '../services/video_export_service.dart';
 import '../theme/app_theme.dart';
 import '../widgets/app_notice.dart';
 import '../widgets/brand_widgets.dart';
@@ -184,6 +185,29 @@ class _VideoStorageScreenState extends State<VideoStorageScreen> {
     );
   }
 
+  /// Lưu một bản sao video vào Thư viện ảnh (album SportO Cam). Bản gốc
+  /// giữ nguyên trong kho; giữ lease đọc để dọn dung lượng không xoá file
+  /// trong lúc đang chép.
+  Future<void> _saveVideo(RecordedSegment video) async {
+    final service = widget.recordingService;
+    service.acquireFileRead(video.path);
+    try {
+      await VideoExportService.instance.saveToGallery(video.path);
+      if (!mounted) return;
+      showAppNotice(
+        context,
+        vi: 'Đã lưu vào ${galleryNameVi()} (album SportO Cam)',
+        en: 'Saved to ${galleryNameEn()} (SportO Cam album)',
+        kind: NoticeKind.success,
+      );
+    } catch (error) {
+      if (!mounted) return;
+      _showSaveError(context, error);
+    } finally {
+      service.releaseFileRead(video.path);
+    }
+  }
+
   String _time(DateTime value) {
     String two(int number) => number.toString().padLeft(2, '0');
     return '${two(value.hour)}:${two(value.minute)}:${two(value.second)}  '
@@ -257,6 +281,7 @@ class _VideoStorageScreenState extends State<VideoStorageScreen> {
       formatSize: _size,
       formatTime: _time,
       onView: _viewVideo,
+      onSave: _saveVideo,
       header: header,
     );
     return Scaffold(
@@ -365,6 +390,75 @@ const double _maxContentWidth = 840;
 
 double _sideGutter(double width) =>
     math.max(BrandSpace.lg, (width - _maxContentWidth) / 2);
+
+/// Báo lỗi lưu video vào Thư viện ảnh; thiếu quyền → nút "Mở Cài đặt".
+void _showSaveError(BuildContext context, Object error) {
+  if (error is VideoExportException && error.isPermissionDenied) {
+    showAppNotice(
+      context,
+      vi: 'Chưa có quyền lưu vào ${galleryNameVi()}',
+      en: 'No permission to save to ${galleryNameEn()}',
+      kind: NoticeKind.error,
+      actionVi: 'Mở Cài đặt',
+      actionEn: 'Open Settings',
+      onAction: () => unawaited(VideoExportService.instance.openAppSettings()),
+      duration: const Duration(seconds: 6),
+    );
+    return;
+  }
+  if (error is VideoExportException) {
+    showAppNotice(
+      context,
+      vi: error.messageVi,
+      en: error.messageEn,
+      kind: NoticeKind.error,
+    );
+    return;
+  }
+  showAppNotice(
+    context,
+    vi: 'Không lưu được video: ${localizedUserFacingError(error, english: false)}',
+    en: "Couldn't save video: ${localizedUserFacingError(error, english: true)}",
+    kind: NoticeKind.error,
+  );
+}
+
+/// Nút tròn "Lưu vào máy" cạnh nút xem; [saving] → vòng tiến trình, khoá bấm.
+class _SaveToDeviceButton extends StatelessWidget {
+  const _SaveToDeviceButton({required this.saving, required this.onPressed});
+
+  final bool saving;
+  final VoidCallback onPressed;
+
+  @override
+  Widget build(BuildContext context) {
+    return IconButton(
+      tooltip: saving
+          ? appText(context, 'Đang lưu…', 'Saving…')
+          : appText(
+                  context,
+                  'Lưu vào ${galleryNameVi()}',
+                  'Save to ${galleryNameEn()}',
+                ),
+      // Đang lưu: vẫn nhận chạm (không làm gì) để chạm không lọt xuống thẻ
+      // (mở trình phát); nút tắt hẳn sẽ để chạm rơi sang InkWell của thẻ.
+      onPressed: saving ? () {} : onPressed,
+      icon: saving
+          ? const SizedBox(
+              width: 20,
+              height: 20,
+              child: CircularProgressIndicator(
+                strokeWidth: 2.2,
+                color: BrandColors.primarySoft,
+              ),
+            )
+          : const Icon(
+              Icons.download_rounded,
+              color: BrandColors.primarySoft,
+            ),
+    );
+  }
+}
 
 String _two(int value) => value.toString().padLeft(2, '0');
 
@@ -682,6 +776,9 @@ class VideoList extends StatefulWidget {
   final String Function(DateTime) formatTime;
   final ValueChanged<RecordedSegment> onView;
 
+  /// Lưu bản sao video vào Thư viện ảnh; null → không hiện nút tải.
+  final Future<void> Function(RecordedSegment)? onSave;
+
   /// Khối đầu trang cuộn cùng danh sách (thẻ dung lượng, bộ chọn tab).
   final Widget? header;
 
@@ -695,6 +792,7 @@ class VideoList extends StatefulWidget {
     required this.formatSize,
     required this.formatTime,
     required this.onView,
+    this.onSave,
     this.header,
   });
 
@@ -715,6 +813,20 @@ class _ListEntry {
 
 class _VideoListState extends State<VideoList> {
   String? _camera;
+
+  /// Đường dẫn các video đang lưu vào Thư viện ảnh (khoá nút của thẻ đó).
+  final Set<String> _saving = <String>{};
+
+  Future<void> _save(RecordedSegment video) async {
+    final onSave = widget.onSave;
+    if (onSave == null || _saving.contains(video.path)) return;
+    setState(() => _saving.add(video.path));
+    try {
+      await onSave(video);
+    } finally {
+      if (mounted) setState(() => _saving.remove(video.path));
+    }
+  }
 
   String _cameraLabel(String cameraId) {
     final number = RegExp(r'\d+').firstMatch(cameraId)?.group(0);
@@ -894,13 +1006,23 @@ class _VideoListState extends State<VideoList> {
         formatSize: widget.formatSize,
         formatTime: widget.formatTime,
         onTap: () => widget.onView(video),
-        trailing: IconButton(
-          tooltip: appText(context, 'Xem video', 'Play video'),
-          onPressed: () => widget.onView(video),
-          icon: const Icon(
-            Icons.play_circle_outline_rounded,
-            color: BrandColors.primarySoft,
-          ),
+        trailing: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            if (widget.onSave != null)
+              _SaveToDeviceButton(
+                saving: _saving.contains(video.path),
+                onPressed: () => unawaited(_save(video)),
+              ),
+            IconButton(
+              tooltip: appText(context, 'Xem video', 'Play video'),
+              onPressed: () => widget.onView(video),
+              icon: const Icon(
+                Icons.play_circle_outline_rounded,
+                color: BrandColors.primarySoft,
+              ),
+            ),
+          ],
         ),
       ),
     );

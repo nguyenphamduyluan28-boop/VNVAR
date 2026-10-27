@@ -1,6 +1,7 @@
 import AVFoundation
 import CoreMedia
 import Flutter
+import Photos
 import UIKit
 
 @main
@@ -184,6 +185,8 @@ import UIKit
         self.openAppSettings(result)
       case "excludeFromBackup":
         self.excludeFromBackup(call, result)
+      case "saveVideoToGallery":
+        self.saveVideoToGallery(call, result)
       case "requestMicrophonePermission":
         self.requestMicrophonePermission(result)
       case "ensureCapturePermissions":
@@ -789,6 +792,149 @@ import UIKit
         )
       )
     }
+  }
+
+  // MARK: - C9: lưu bản sao video vào Thư viện ảnh
+
+  /// Lưu MỘT BẢN SAO video (MP4/MOV) vào Thư viện ảnh. Chỉ xin quyền "chỉ
+  /// thêm" (addOnly); album "SportO Cam" chỉ được dùng khi app ĐÃ có quyền
+  /// đọc/ghi đầy đủ (không hỏi thêm quyền chỉ để tạo album).
+  /// FlutterResult luôn được gọi đúng một lần, trên main thread.
+  private func saveVideoToGallery(_ call: FlutterMethodCall, _ result: @escaping FlutterResult) {
+    let arguments = call.arguments as? [String: Any]
+    guard let path = arguments?["path"] as? String, !path.isEmpty else {
+      result(FlutterError(code: "SAVE_FAILED", message: "Video path is required.", details: nil))
+      return
+    }
+    guard FileManager.default.fileExists(atPath: path) else {
+      result(FlutterError(code: "SAVE_FAILED", message: "Video file not found.", details: path))
+      return
+    }
+    let fileURL = URL(fileURLWithPath: path)
+    let rawName = arguments?["displayName"] as? String ?? ""
+    let requestedName = rawName.trimmingCharacters(in: .whitespacesAndNewlines)
+    let displayName = requestedName.isEmpty ? fileURL.lastPathComponent : requestedName
+    let rawAlbum = arguments?["album"] as? String ?? ""
+    let requestedAlbum = rawAlbum.trimmingCharacters(in: .whitespacesAndNewlines)
+    let albumTitle = requestedAlbum.isEmpty ? "SportO Cam" : requestedAlbum
+
+    // Mỗi nhánh dưới đây gọi reply đúng một lần.
+    let reply: (Any?) -> Void = { value in
+      DispatchQueue.main.async { result(value) }
+    }
+
+    requestPhotoAddAccess { granted in
+      guard granted else {
+        reply(
+          FlutterError(
+            code: "PERMISSION_DENIED",
+            message: "Photo library permission was denied.",
+            details: nil
+          )
+        )
+        return
+      }
+      let useAlbum = self.canUsePhotoAlbums()
+      let album = useAlbum ? self.fetchPhotoAlbum(titled: albumTitle) : nil
+      self.performVideoSave(
+        fileURL: fileURL,
+        displayName: displayName,
+        albumTitle: useAlbum ? albumTitle : nil,
+        existingAlbum: album
+      ) { success, error in
+        if success {
+          reply(true)
+          return
+        }
+        guard useAlbum else {
+          reply(self.gallerySaveError(error))
+          return
+        }
+        // Bước album lỗi (album bị xoá giữa chừng...): vẫn lưu vào Thư viện.
+        self.performVideoSave(
+          fileURL: fileURL,
+          displayName: displayName,
+          albumTitle: nil,
+          existingAlbum: nil
+        ) { retrySuccess, retryError in
+          if retrySuccess {
+            reply(true)
+          } else {
+            reply(self.gallerySaveError(retryError))
+          }
+        }
+      }
+    }
+  }
+
+  private func gallerySaveError(_ error: Error?) -> FlutterError {
+    return FlutterError(
+      code: "SAVE_FAILED",
+      message: error?.localizedDescription ?? "Unable to save the video.",
+      details: nil
+    )
+  }
+
+  /// Xin quyền chỉ thêm ảnh/video; completion chạy trên main thread.
+  private func requestPhotoAddAccess(_ completion: @escaping (Bool) -> Void) {
+    if #available(iOS 14, *) {
+      PHPhotoLibrary.requestAuthorization(for: .addOnly) { status in
+        DispatchQueue.main.async {
+          completion(status == .authorized || status == .limited)
+        }
+      }
+    } else {
+      PHPhotoLibrary.requestAuthorization { status in
+        DispatchQueue.main.async { completion(status == .authorized) }
+      }
+    }
+  }
+
+  /// Có quyền đọc/ghi ĐẦY ĐỦ (cần để tìm/tạo album) mà không cần hỏi thêm.
+  private func canUsePhotoAlbums() -> Bool {
+    if #available(iOS 14, *) {
+      return PHPhotoLibrary.authorizationStatus(for: .readWrite) == .authorized
+    }
+    return PHPhotoLibrary.authorizationStatus() == .authorized
+  }
+
+  private func fetchPhotoAlbum(titled title: String) -> PHAssetCollection? {
+    let options = PHFetchOptions()
+    options.predicate = NSPredicate(format: "title = %@", title)
+    options.fetchLimit = 1
+    return PHAssetCollection.fetchAssetCollections(
+      with: .album,
+      subtype: .albumRegular,
+      options: options
+    ).firstObject
+  }
+
+  /// [albumTitle] nil → chỉ lưu vào Thư viện. Completion chạy trên hàng đợi
+  /// bất kỳ của Photos.
+  private func performVideoSave(
+    fileURL: URL,
+    displayName: String,
+    albumTitle: String?,
+    existingAlbum: PHAssetCollection?,
+    completion: @escaping (Bool, Error?) -> Void
+  ) {
+    PHPhotoLibrary.shared().performChanges({
+      let creation = PHAssetCreationRequest.forAsset()
+      let options = PHAssetResourceCreationOptions()
+      options.originalFilename = displayName
+      options.shouldMoveFile = false
+      creation.addResource(with: .video, fileURL: fileURL, options: options)
+      guard let title = albumTitle,
+            let placeholder = creation.placeholderForCreatedAsset else { return }
+      let assets = [placeholder] as NSArray
+      if let album = existingAlbum {
+        PHAssetCollectionChangeRequest(for: album)?.addAssets(assets)
+      } else {
+        PHAssetCollectionChangeRequest
+          .creationRequestForAssetCollection(withTitle: title)
+          .addAssets(assets)
+      }
+    }, completionHandler: completion)
   }
 
   private func openAppSettings(_ result: @escaping FlutterResult) {

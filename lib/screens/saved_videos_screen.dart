@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:io';
 import 'dart:math' as math;
 
@@ -5,6 +6,7 @@ import 'package:flutter/material.dart';
 
 import '../services/recording_service.dart';
 import '../services/app_language_service.dart';
+import '../services/video_export_service.dart';
 import '../theme/app_theme.dart';
 import '../widgets/app_notice.dart';
 import '../widgets/brand_widgets.dart';
@@ -88,6 +90,56 @@ class _SavedVideosScreenState extends State<SavedVideosScreen> {
       );
     }
     await _refresh();
+  }
+
+  /// Lưu một bản sao video vào Thư viện ảnh (album SportO Cam); bản gốc giữ
+  /// nguyên. Giữ lease đọc để dọn dung lượng không xoá file đang chép.
+  Future<void> _saveToDevice(RecordedSegment video) async {
+    final service = widget.recordingService;
+    service.acquireFileRead(video.path);
+    try {
+      await VideoExportService.instance.saveToGallery(video.path);
+      if (!mounted) return;
+      showAppNotice(
+        context,
+        vi: 'Đã lưu vào ${galleryNameVi()} (album SportO Cam)',
+        en: 'Saved to ${galleryNameEn()} (SportO Cam album)',
+        kind: NoticeKind.success,
+      );
+    } catch (error) {
+      if (!mounted) return;
+      if (error is VideoExportException && error.isPermissionDenied) {
+        showAppNotice(
+          context,
+          vi: 'Chưa có quyền lưu vào ${galleryNameVi()}',
+          en: 'No permission to save to ${galleryNameEn()}',
+          kind: NoticeKind.error,
+          actionVi: 'Mở Cài đặt',
+          actionEn: 'Open Settings',
+          onAction: () =>
+              unawaited(VideoExportService.instance.openAppSettings()),
+          duration: const Duration(seconds: 6),
+        );
+      } else if (error is VideoExportException) {
+        showAppNotice(
+          context,
+          vi: error.messageVi,
+          en: error.messageEn,
+          kind: NoticeKind.error,
+        );
+      } else {
+        showAppNotice(
+          context,
+          vi: 'Không lưu được video: '
+              '${localizedUserFacingError(error, english: false)}',
+          en: "Couldn't save video: "
+              '${localizedUserFacingError(error, english: true)}',
+          kind: NoticeKind.error,
+        );
+      }
+    } finally {
+      service.releaseFileRead(video.path);
+    }
   }
 
   String _size(int bytes) {
@@ -315,6 +367,7 @@ class _SavedVideosScreenState extends State<SavedVideosScreen> {
                 formatSize: _size,
                 formatTime: _time,
                 onDelete: () => _delete(video),
+                onSave: () => _saveToDevice(video),
               ),
             );
           }, childCount: entries.length),
@@ -346,6 +399,7 @@ class _SavedVideoCard extends StatefulWidget {
     required this.formatSize,
     required this.formatTime,
     required this.onDelete,
+    required this.onSave,
   });
 
   final RecordedSegment video;
@@ -353,12 +407,26 @@ class _SavedVideoCard extends StatefulWidget {
   final String Function(DateTime) formatTime;
   final VoidCallback onDelete;
 
+  /// Lưu bản sao vào Thư viện ảnh; thẻ khoá nút tải tới khi xong.
+  final Future<void> Function() onSave;
+
   @override
   State<_SavedVideoCard> createState() => _SavedVideoCardState();
 }
 
 class _SavedVideoCardState extends State<_SavedVideoCard> {
   late Future<int> _sizeFuture;
+  bool _saving = false;
+
+  Future<void> _save() async {
+    if (_saving) return;
+    setState(() => _saving = true);
+    try {
+      await widget.onSave();
+    } finally {
+      if (mounted) setState(() => _saving = false);
+    }
+  }
 
   @override
   void initState() {
@@ -465,6 +533,29 @@ class _SavedVideoCardState extends State<_SavedVideoCard> {
                   ),
                 ],
               ),
+            ),
+            IconButton(
+              tooltip: _saving
+                  ? appText(context, 'Đang lưu…', 'Saving…')
+                  : appText(
+                  context,
+                  'Lưu vào ${galleryNameVi()}',
+                  'Save to ${galleryNameEn()}',
+                ),
+              onPressed: _saving ? null : () => unawaited(_save()),
+              icon: _saving
+                  ? const SizedBox(
+                      width: 20,
+                      height: 20,
+                      child: CircularProgressIndicator(
+                        strokeWidth: 2.2,
+                        color: BrandColors.primarySoft,
+                      ),
+                    )
+                  : const Icon(
+                      Icons.download_rounded,
+                      color: BrandColors.primarySoft,
+                    ),
             ),
             IconButton(
               tooltip: appText(context, 'Xoá', 'Delete'),

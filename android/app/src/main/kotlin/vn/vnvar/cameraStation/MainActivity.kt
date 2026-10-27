@@ -1,6 +1,7 @@
 package vn.vnvar.cameraStation
 
 import android.Manifest
+import android.content.ContentValues
 import android.content.Intent
 import android.content.pm.ActivityInfo
 import android.content.pm.PackageManager
@@ -18,10 +19,13 @@ import android.os.Looper
 import android.os.PowerManager
 import android.os.StatFs
 import android.provider.DocumentsContract
+import android.provider.MediaStore
 import android.provider.Settings
 import android.view.OrientationEventListener
 import android.view.Surface
 import android.view.WindowManager
+import androidx.annotation.RequiresApi
+import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
 import com.cloudwebrtc.webrtc.FlutterWebRTCPlugin
 import io.flutter.embedding.android.FlutterActivity
@@ -41,6 +45,11 @@ class MainActivity : FlutterActivity() {
      * requestPermissions lần hai; khi có kết quả trả cho tất cả.
      */
     private val pendingCapturePermissionResults = mutableListOf<MethodChannel.Result>()
+    /**
+     * Các lệnh `saveVideoToGallery` (C9) đang chờ quyền WRITE_EXTERNAL_STORAGE
+     * (chỉ Android 9 trở xuống). Chỉ truy cập trên main thread.
+     */
+    private val pendingGallerySaves = mutableListOf<PendingGallerySave>()
     private var activityResumed = false
     /**
      * Chính app vừa tự mở một màn hình khác (cài đặt ứng dụng, chọn thư mục):
@@ -500,6 +509,30 @@ class MainActivity : FlutterActivity() {
 
                 "ensurePublicVideoStorage" -> ensurePublicVideoStorage(result)
 
+                // C9: lưu MỘT BẢN SAO video vào Bộ sưu tập (Movies/SportO Cam).
+                // Bản gốc vẫn ở thư mục riêng (.nomedia), không bị quét.
+                "saveVideoToGallery" -> {
+                    val path = call.argument<String>("path")
+                    if (path.isNullOrBlank()) {
+                        result.error("SAVE_FAILED", "Video path is required.", null)
+                    } else {
+                        saveVideoToGallery(
+                            PendingGallerySave(
+                                path = path,
+                                displayName = sanitizeGalleryName(
+                                    call.argument<String>("displayName"),
+                                    java.io.File(path).name,
+                                ),
+                                album = sanitizeGalleryName(
+                                    call.argument<String>("album"),
+                                    DEFAULT_GALLERY_ALBUM,
+                                ),
+                                result = result,
+                            ),
+                        )
+                    }
+                }
+
                 "scanMediaFile" -> {
                     // Không scanMediaFile để tránh Android MediaStore đưa video vào Bộ sưu tập
                     result.success(true)
@@ -696,6 +729,11 @@ class MainActivity : FlutterActivity() {
             return
         }
 
+        if (requestCode == GALLERY_PERMISSION_REQUEST) {
+            completePendingGallerySaves()
+            return
+        }
+
         if (requestCode == STORAGE_PERMISSION_REQUEST) {
             if (grantResults.isNotEmpty() && grantResults.first() == PackageManager.PERMISSION_GRANTED) {
                 launchFolderPicker()
@@ -776,6 +814,209 @@ class MainActivity : FlutterActivity() {
             return
         }
         launchFolderPicker()
+    }
+
+    /**
+     * C9: Android 10+ chèn qua MediaStore (không cần quyền); Android 9 trở
+     * xuống cần WRITE_EXTERNAL_STORAGE: xin quyền nếu chưa có (gom các lệnh
+     * đến khi hộp thoại đang mở, giống ensureCapturePermissions).
+     */
+    private fun saveVideoToGallery(request: PendingGallerySave) {
+        if (hasLegacyGalleryWritePermission()) {
+            runGallerySave(request)
+            return
+        }
+        val dialogPending = pendingGallerySaves.isNotEmpty()
+        pendingGallerySaves.add(request)
+        if (dialogPending) return
+        // Hộp thoại quyền do app tự mở: không vào PiP.
+        suppressPipForOwnActivity = true
+        try {
+            ActivityCompat.requestPermissions(
+                this,
+                arrayOf(Manifest.permission.WRITE_EXTERNAL_STORAGE),
+                GALLERY_PERMISSION_REQUEST,
+            )
+        } catch (error: Exception) {
+            suppressPipForOwnActivity = false
+            android.util.Log.w("MainActivity", "Gallery permission request failed: ${error.message}")
+            completePendingGallerySaves()
+        }
+    }
+
+    private fun hasLegacyGalleryWritePermission(): Boolean =
+        Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q ||
+            ContextCompat.checkSelfPermission(this, Manifest.permission.WRITE_EXTERNAL_STORAGE) ==
+            PackageManager.PERMISSION_GRANTED
+
+    /** Có kết quả hộp thoại quyền: lưu tiếp hoặc trả PERMISSION_DENIED cho mọi lệnh chờ. */
+    private fun completePendingGallerySaves() {
+        if (pendingGallerySaves.isEmpty()) return
+        val waiting = pendingGallerySaves.toList()
+        pendingGallerySaves.clear()
+        val granted = hasLegacyGalleryWritePermission()
+        for (request in waiting) {
+            if (granted) {
+                runGallerySave(request)
+            } else {
+                replyGallerySave(request.result) {
+                    it.error(
+                        "PERMISSION_DENIED",
+                        "Storage permission is required to save videos.",
+                        null,
+                    )
+                }
+            }
+        }
+    }
+
+    /** Activity bị huỷ khi hộp thoại quyền còn mở: không bỏ rơi Future Dart. */
+    private fun failPendingGallerySaves() {
+        if (pendingGallerySaves.isEmpty()) return
+        val waiting = pendingGallerySaves.toList()
+        pendingGallerySaves.clear()
+        for (request in waiting) {
+            replyGallerySave(request.result) {
+                it.error("SAVE_FAILED", "Activity was destroyed.", null)
+            }
+        }
+    }
+
+    private fun replyGallerySave(
+        result: MethodChannel.Result,
+        reply: (MethodChannel.Result) -> Unit,
+    ) {
+        try {
+            reply(result)
+        } catch (error: Exception) {
+            android.util.Log.w("MainActivity", "saveVideoToGallery reply failed: ${error.message}")
+        }
+    }
+
+    /** Chép trên luồng I/O nền; kết quả trả đúng một lần trên main thread. */
+    private fun runGallerySave(request: PendingGallerySave) {
+        val context = applicationContext
+        try {
+            ioExecutor.execute {
+                val failure: Pair<String, String?>? = try {
+                    val source = java.io.File(request.path)
+                    if (!source.isFile) {
+                        throw java.io.FileNotFoundException("Video not found: ${request.path}")
+                    }
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                        insertVideoIntoMediaStore(context, source, request.displayName, request.album)
+                    } else {
+                        copyVideoToPublicMovies(context, source, request.displayName, request.album)
+                    }
+                    null
+                } catch (error: SecurityException) {
+                    Pair("PERMISSION_DENIED", error.message)
+                } catch (error: Throwable) {
+                    android.util.Log.w("MainActivity", "saveVideoToGallery failed: ${error.message}")
+                    Pair("SAVE_FAILED", error.message)
+                }
+                mainHandler.post {
+                    replyGallerySave(request.result) {
+                        if (failure == null) {
+                            it.success(true)
+                        } else {
+                            it.error(failure.first, failure.second, null)
+                        }
+                    }
+                }
+            }
+        } catch (error: Exception) {
+            replyGallerySave(request.result) {
+                it.error("SAVE_FAILED", error.message, null)
+            }
+        }
+    }
+
+    /** Android 10+: MediaStore với IS_PENDING; lỗi giữa chừng thì xoá bản ghi dở. */
+    @RequiresApi(Build.VERSION_CODES.Q)
+    private fun insertVideoIntoMediaStore(
+        context: android.content.Context,
+        source: java.io.File,
+        displayName: String,
+        album: String,
+    ) {
+        val resolver = context.contentResolver
+        val collection = MediaStore.Video.Media.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY)
+        val values = ContentValues().apply {
+            put(MediaStore.MediaColumns.DISPLAY_NAME, displayName)
+            put(MediaStore.MediaColumns.MIME_TYPE, galleryMimeType(displayName))
+            put(MediaStore.MediaColumns.RELATIVE_PATH, "${Environment.DIRECTORY_MOVIES}/$album")
+            put(MediaStore.MediaColumns.IS_PENDING, 1)
+        }
+        val uri = resolver.insert(collection, values)
+            ?: throw java.io.IOException("MediaStore insert failed.")
+        try {
+            resolver.openOutputStream(uri)?.use { output ->
+                source.inputStream().use { input -> input.copyTo(output, GALLERY_COPY_BUFFER) }
+            } ?: throw java.io.IOException("Cannot open MediaStore output stream.")
+            val published = ContentValues().apply {
+                put(MediaStore.MediaColumns.IS_PENDING, 0)
+            }
+            resolver.update(uri, published, null, null)
+        } catch (error: Throwable) {
+            try {
+                resolver.delete(uri, null, null)
+            } catch (_: Exception) {}
+            throw error
+        }
+    }
+
+    /** Android 9 trở xuống: chép vào Movies/<album>/ rồi quét để hiện trong Bộ sưu tập. */
+    private fun copyVideoToPublicMovies(
+        context: android.content.Context,
+        source: java.io.File,
+        displayName: String,
+        album: String,
+    ) {
+        @Suppress("DEPRECATION")
+        val movies = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_MOVIES)
+        val directory = java.io.File(movies, album)
+        if (!directory.isDirectory && !directory.mkdirs()) {
+            throw java.io.IOException("Cannot create ${directory.absolutePath}")
+        }
+        val base = displayName.substringBeforeLast('.')
+        val extension = displayName.substringAfterLast('.', "")
+        var target = java.io.File(directory, displayName)
+        var index = 1
+        while (target.exists()) {
+            val candidate = if (extension.isEmpty()) "${base}_$index" else "${base}_$index.$extension"
+            target = java.io.File(directory, candidate)
+            index++
+        }
+        try {
+            source.inputStream().use { input ->
+                target.outputStream().use { output -> input.copyTo(output, GALLERY_COPY_BUFFER) }
+            }
+        } catch (error: Throwable) {
+            try {
+                target.delete()
+            } catch (_: Exception) {}
+            throw error
+        }
+        MediaScannerConnection.scanFile(
+            context,
+            arrayOf(target.absolutePath),
+            arrayOf(galleryMimeType(displayName)),
+            null,
+        )
+    }
+
+    private fun galleryMimeType(displayName: String): String =
+        if (displayName.endsWith(".mov", ignoreCase = true)) "video/quicktime" else "video/mp4"
+
+    /** Tên file/album an toàn: bỏ ký tự đường dẫn và dấu chấm đầu (không cho "..", ẩn file). */
+    private fun sanitizeGalleryName(value: String?, fallback: String): String {
+        val cleaned = value.orEmpty()
+            .replace(Regex("[\\\\/:*?\"<>|\\x00-\\x1F]"), "_")
+            .trim()
+            .trimStart('.')
+            .trim()
+        return cleaned.ifEmpty { fallback }
     }
 
     private fun purgeMediaStoreForVnvar(folderPath: String) {
@@ -1183,6 +1424,13 @@ class MainActivity : FlutterActivity() {
         }
     }
 
+    private data class PendingGallerySave(
+        val path: String,
+        val displayName: String,
+        val album: String,
+        val result: MethodChannel.Result,
+    )
+
     private data class PendingStart(
         val cameraId: String,
         val courtId: String,
@@ -1214,6 +1462,9 @@ class MainActivity : FlutterActivity() {
         private const val PERMISSION_REQUEST = 4101
         private const val NOTIFICATION_PERMISSION_REQUEST = 4102
         private const val CAPTURE_PERMISSION_REQUEST = 4103
+        private const val GALLERY_PERMISSION_REQUEST = 4104
+        private const val DEFAULT_GALLERY_ALBUM = "SportO Cam"
+        private const val GALLERY_COPY_BUFFER = 64 * 1024
         private const val VIDEO_FOLDER_REQUEST = 45186
         private const val STORAGE_PERMISSION_REQUEST = 45187
     }
@@ -1405,6 +1656,7 @@ class MainActivity : FlutterActivity() {
         orientationListener = null
         // Lệnh xin quyền còn treo: trả trạng thái hiện tại thay vì bỏ rơi Future Dart.
         completeCapturePermissionRequests()
+        failPendingGallerySaves()
         // Không còn Activity chủ nào (null/đã thu hồi) cũng coi như là chủ.
         val currentOwner = activeActivity?.get()
         val ownsChannel = currentOwner == null || currentOwner === this
