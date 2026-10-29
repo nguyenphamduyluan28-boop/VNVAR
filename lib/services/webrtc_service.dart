@@ -146,6 +146,10 @@ class AvailableCameraDevice {
   final double maxZoom;
   final bool isUltraWide;
 
+  /// FPS tối đa camera này thật sự mở được theo kích thước ("1920x1080" →
+  /// 60), native báo (iOS và Android). Rỗng khi native không báo (bản cũ).
+  final Map<String, int> maxFpsBySize;
+
   const AvailableCameraDevice({
     required this.id,
     required this.facing,
@@ -154,7 +158,11 @@ class AvailableCameraDevice {
     required this.minZoom,
     required this.maxZoom,
     required this.isUltraWide,
+    this.maxFpsBySize = const {},
   });
+
+  /// FPS tối đa ở [width]x[height]; null khi không biết.
+  int? maxFpsFor(int width, int height) => maxFpsBySize['${width}x$height'];
 
   bool get isBack => facing == 'environment' || facing == 'back';
   bool get isFront => facing == 'user' || facing == 'front';
@@ -172,7 +180,19 @@ class AvailableCameraDevice {
       minZoom: (map['minZoom'] as num?)?.toDouble() ?? 1,
       maxZoom: (map['maxZoom'] as num?)?.toDouble() ?? 1,
       isUltraWide: map['isUltraWide'] == true,
+      maxFpsBySize: parseMaxFpsBySize(map['maxFps']),
     );
+  }
+
+  static Map<String, int> parseMaxFpsBySize(Object? raw) {
+    if (raw is! Map) return const {};
+    final result = <String, int>{};
+    raw.forEach((key, value) {
+      if (key is String && value is num && value > 0) {
+        result[key] = value.toInt();
+      }
+    });
+    return result;
   }
 }
 
@@ -460,6 +480,11 @@ class WebRtcService {
   bool _rtspAudio = false;
   bool _rtspServerStarted = false;
   String? _rtspError;
+  // Chế độ thể thao: màn trập nhanh + khử nhiễu nhẹ (native) và bitrate RTSP
+  // cao (áp khi encoder RTSP khởi động).
+  int _sportsShutter = 0;
+  // Bitrate tối đa mà encoder RTSP đang chạy đã được mở với; null khi dừng.
+  int? _rtspEncoderBitrate;
   CameraResolutionProfile _resolutionProfile =
       CameraResolutionProfile.fullHd1080;
 
@@ -510,6 +535,44 @@ class WebRtcService {
       return true;
     } on TimeoutException {
       return _rtspRunning;
+    }
+  }
+
+  /// Android: trạng thái ống kính thực tế (FPS đo được, zoom thực áp dụng,
+  /// ống vật lý đang chạy). null khi không lấy được.
+  Future<Map<String, Object?>?> getCaptureLensStatus() async {
+    if (!Platform.isAndroid || localVideoTrack == null) return null;
+    try {
+      final status = await _platformChannel
+          .invokeMapMethod<String, Object?>('getCaptureLensStatus')
+          .timeout(const Duration(seconds: 2));
+      return status;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  /// Android: bỏ số đo FPS cũ (vừa đổi ống kính/zoom).
+  Future<void> resetCaptureFps() async {
+    if (!Platform.isAndroid) return;
+    try {
+      await _platformChannel
+          .invokeMethod<void>('resetCaptureFps')
+          .timeout(const Duration(seconds: 2));
+    } catch (_) {}
+  }
+
+  /// Android: FPS camera thật sự xuất ra (đo trên track); null khi chưa đo
+  /// được hoặc không phải Android.
+  Future<double?> getAndroidCaptureFps() async {
+    if (!Platform.isAndroid || localVideoTrack == null) return null;
+    try {
+      final fps = await _platformChannel
+          .invokeMethod<num>('getCaptureFps')
+          .timeout(const Duration(seconds: 2));
+      return fps?.toDouble();
+    } catch (_) {
+      return null;
     }
   }
 
@@ -1217,6 +1280,37 @@ class WebRtcService {
 
   double get exposureBiasEv => _exposureBiasEv;
 
+  bool get sportsMode => _sportsShutter > 0;
+
+  /// Mức màn trập chế độ thể thao (1/N s); 0 = tắt.
+  int get sportsShutter => _sportsShutter;
+
+  /// Bitrate RTSP tối đa thực tế: của encoder đang chạy, hoặc mức sẽ dùng ở
+  /// lần khởi động tới.
+  int get rtspBitrateBps =>
+      _rtspEncoderBitrate ??
+      _resolutionProfile.rtspBitrateFor(sportsMode: sportsMode);
+
+  /// Encoder RTSP đang chạy với bitrate khác cài đặt hiện tại (vừa đổi chế độ
+  /// thể thao): mức mới áp từ lần mở camera / RTSP kế tiếp.
+  bool get rtspBitratePending {
+    final running = _rtspEncoderBitrate;
+    return running != null &&
+        running != _resolutionProfile.rtspBitrateFor(sportsMode: sportsMode);
+  }
+
+  /// Đặt mức chế độ thể thao (0 = tắt). Màn trập/khử nhiễu áp ngay cho camera
+  /// đang mở (và mỗi lần mở/đổi camera); bitrate RTSP và tinh chỉnh bộ nén áp
+  /// khi encoder RTSP khởi động lại.
+  Future<void> setSportsShutter(int denominator) async {
+    final next = denominator > 0 ? denominator : 0;
+    if (_sportsShutter == next) return;
+    _sportsShutter = next;
+    final track = localVideoTrack;
+    if (track == null || (!Platform.isAndroid && !Platform.isIOS)) return;
+    await _applyExposureBias(track);
+  }
+
   /// Đổi độ sáng (bù sáng EV) mượt mà trong chế độ Auto Exposure liên tục.
   Future<void> setExposureBias(double ev) async {
     _exposureBiasEv = ev.clamp(-2.0, 2.0).toDouble();
@@ -1341,6 +1435,8 @@ class WebRtcService {
             .invokeMapMethod<String, dynamic>('setCameraExposureBoost', {
               'trackId': track.id,
               'targetEv': targetEv,
+              'sportsMode': sportsMode,
+              'sportsShutter': _sportsShutter,
             })
             .timeout(const Duration(seconds: 2));
         if (lastResult?['applied'] == true) {
@@ -1421,17 +1517,23 @@ class WebRtcService {
       // Phải gán null: _scheduleRtspRetry bỏ qua khi timer khác null, nên timer
       // đã huỷ nhưng còn tham chiếu khiến RTSP không bao giờ tự thử lại.
       _rtspRetryTimer = null;
+      // RTSP/TCP cannot adapt to congestion like WebRTC. Use the
+      // profile's LAN-safe budget while WebRTC keeps its higher ceiling
+      // (chế độ thể thao: bằng bitrate ghi hình).
+      final rtspBitrate =
+          _resolutionProfile.rtspBitrateFor(sportsMode: sportsMode);
+      _rtspEncoderBitrate = rtspBitrate;
       final result = await _platformChannel.invokeMethod<Map<Object?, Object?>>(
         'startRtsp',
         {
           'trackId': track.id,
           'audioTrackId': localAudioTrack?.id,
           'port': 8554,
-          // RTSP/TCP cannot adapt to congestion like WebRTC. Use the
-          // profile's LAN-safe budget while WebRTC keeps its higher ceiling.
-          'bitrate': _resolutionProfile.rtspBitrate,
+          'bitrate': rtspBitrate,
           'fps': _resolutionProfile.fps,
           'remoteAudio': _rtspTabletAudio,
+          // Android: High profile + trần QP cho bóng nhỏ (iOS đã dùng Main).
+          'sportsTuning': sportsMode,
         },
       // Native có thể không trả lời (ví dụ iOS bị dừng trước khi server sẵn
       // sàng); không để _rtspStarting kẹt true mãi.
@@ -1520,6 +1622,7 @@ class WebRtcService {
     _rtspServerStarted = false;
     _rtspRunning = false;
     _rtspAudio = false;
+    _rtspEncoderBitrate = null;
     try {
       await _platformChannel.invokeMethod<void>('stopRtsp');
     } catch (error) {

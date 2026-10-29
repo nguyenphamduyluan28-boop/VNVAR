@@ -108,4 +108,46 @@ void main() {
     await config.saveResolutionLocked(false);
     expect(await config.loadResolutionLocked(), isFalse);
   });
+
+  test('sports mode raises RTSP bitrate to the recording bitrate', () {
+    expect(CameraResolutionProfile.hd720.sportsRtspBitrate, 4000000);
+    expect(CameraResolutionProfile.fullHd1080.sportsRtspBitrate, 8000000);
+    // 60 FPS không nhân bitrate RTSP thể thao (dùng mức chuẩn 30 FPS).
+    expect(
+      CameraResolutionProfile.fullHd1080.withFps(60).sportsRtspBitrate,
+      8000000,
+    );
+    expect(
+      CameraResolutionProfile.fullHd1080.rtspBitrateFor(sportsMode: false),
+      5000000,
+    );
+    expect(
+      CameraResolutionProfile.fullHd1080.rtspBitrateFor(sportsMode: true),
+      8000000,
+    );
+  });
+
+  test('sports shutter defaults off, persists and migrates', () async {
+    final config = StationConfigService();
+    expect(await config.loadSportsShutter(), 0);
+    await config.saveSportsShutter(250);
+    expect(await config.loadSportsShutter(), 250);
+    await config.saveSportsShutter(500);
+    expect(await config.loadSportsShutter(), 500);
+    await config.saveSportsShutter(0);
+    expect(await config.loadSportsShutter(), 0);
+
+    // Bản trước lưu bật/tắt: bật = 1/500 s.
+    SharedPreferences.setMockInitialValues({'camera_sports_mode': true});
+    expect(await StationConfigService().loadSportsShutter(), 500);
+  });
+
+  test('sports shutter values snap to supported levels', () {
+    expect(StationConfigService.normalizeSportsShutter(-1), 0);
+    expect(StationConfigService.normalizeSportsShutter(0), 0);
+    expect(StationConfigService.normalizeSportsShutter(200), 250);
+    expect(StationConfigService.normalizeSportsShutter(250), 250);
+    expect(StationConfigService.normalizeSportsShutter(1000), 500);
+    expect(StationConfigService.sportsShutterOptions, [0, 250, 500]);
+  });
 }

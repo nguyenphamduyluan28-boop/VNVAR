@@ -23,6 +23,11 @@ NS_ASSUME_NONNULL_BEGIN
     NS_SWIFT_NAME(releaseConversionResources());
 + (AVCaptureDevice * _Nullable)activeVideoDeviceForTrackId:(NSString *)trackId
     NS_SWIFT_NAME(activeVideoDevice(forTrackId:));
+/// FPS tối đa thực sự mở được của [device] theo từng kích thước ("1920x1080"
+/// → 60), cùng quy tắc chọn định dạng với capturer (8-bit 4:2:0; phiên
+/// multi-cam chỉ xét định dạng multi-cam). Trần 60.
++ (NSDictionary<NSString *, NSNumber *> *)maxFpsBySizeForDevice:(AVCaptureDevice *)device
+    NS_SWIFT_NAME(maxFpsBySize(for:));
 + (void)switchCameraForTrackId:(NSString *)trackId
                     toDeviceId:(NSString *)deviceId
                     completion:(void (^)(BOOL success, NSString * _Nullable error))completion
@@ -35,6 +40,15 @@ NS_ASSUME_NONNULL_BEGIN
 + (BOOL)setCameraLockForTrackId:(NSString *)trackId
                          locked:(BOOL)locked
     NS_SWIFT_NAME(setCameraLock(forTrackId:locked:));
+
+/// Chế độ thể thao: giới hạn thời gian phơi sáng tối đa 1/[shutterDenominator] s
+/// (0 = tắt). AE vẫn tự động và tăng ISO bù sáng; ISO đã kịch trần mà hình
+/// vẫn tối thì tự nới dần giới hạn (không chậm hơn một khung hình), đủ sáng thì
+/// siết lại. Dart gửi lại cùng lệnh EV sau mỗi lần mở / đổi camera (activeFormat
+/// đổi thì iOS tự bỏ giới hạn). Trả NO khi lỗi.
++ (BOOL)setSportsModeForTrackId:(NSString *)trackId
+             shutterDenominator:(NSInteger)shutterDenominator
+    NS_SWIFT_NAME(setSportsMode(forTrackId:shutterDenominator:));
 
 @end
 

@@ -8,257 +8,253 @@ const String scoreboardControlPageHtml = r'''<!doctype html>
 <meta charset="utf-8">
 <link rel="icon" href="data:,">
 <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
-<meta name="theme-color" content="#0E1726">
+<meta name="theme-color" content="#0B1220">
 <title>Bảng điểm · VNVAR</title>
 <style>
-:root{--bg:#0E1726;--panel:#16223A;--panel2:#1D2B47;--line:#2A3A5C;--text:#F2F5FA;--muted:#9FB0CC;--ok:#2ECC71;--bad:#FF5A5F;--warn:#FFC107;--accent:#3D8BFD;--a:#1565C0;--b:#C62828}
+:root{--bg:#0B1220;--p1:#111A2B;--p2:#16223A;--p3:#1D2B47;--line:#26365A;--pri:#1565C0;--pri2:#42A5F5;--text:#F1F5F9;--muted:#94A3B8;--red:#E53935;--green:#00C853;--orange:#FFA726;--r1:10px;--r2:14px;--r3:20px;
+ --sl:max(12px,env(safe-area-inset-left));--sr:max(12px,env(safe-area-inset-right))}
 *{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
-html,body{margin:0;height:100%;background:var(--bg);color:var(--text);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Arial,sans-serif;font-size:15px}
-body{display:flex;flex-direction:column;min-height:100%;padding-bottom:env(safe-area-inset-bottom)}
+[hidden]{display:none!important}
+html,body{margin:0;height:100%;overflow:hidden;background:var(--bg);color:var(--text);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Arial,sans-serif;font-size:15px}
+body{height:100dvh;display:grid;grid-template-columns:minmax(0,1fr);grid-template-rows:auto auto minmax(0,1fr) auto;grid-template-areas:"head" "dock" "main" "nav"}
 button,input,select,textarea{font:inherit;color:inherit}
-button{cursor:pointer;border:0;border-radius:12px;background:var(--panel2);padding:12px 14px;font-weight:700;touch-action:manipulation;user-select:none;-webkit-user-select:none}
-button:active{filter:brightness(1.25)}
-button.primary{background:var(--accent);color:#fff}
-button.danger{background:#5A1F27;color:#FFD6D8}
-button.ghost{background:transparent;border:1px solid var(--line)}
+button{cursor:pointer;border:0;border-radius:var(--r2);background:var(--p3);padding:12px 14px;min-height:48px;font-weight:700;touch-action:manipulation;user-select:none;-webkit-user-select:none;transition:filter .12s,transform .12s}
+button:active{filter:brightness(1.25);transform:scale(.98)}
+button.primary{background:var(--pri);color:#fff}
+button.danger{background:rgba(229,57,53,.18);color:#FFB4B2;box-shadow:inset 0 0 0 1px rgba(229,57,53,.55)}
+button.ghost{background:transparent;box-shadow:inset 0 0 0 1px var(--line)}
 button[disabled]{opacity:.45;pointer-events:none}
-header{display:flex;align-items:center;gap:10px;padding:10px 14px 6px;padding-top:max(10px,env(safe-area-inset-top))}
+svg.i{width:22px;height:22px;flex:none;fill:none;stroke:currentColor;stroke-width:2.2;stroke-linecap:round;stroke-linejoin:round}
+
+/* ---------- HEADER ---------- */
+header{grid-area:head;display:flex;align-items:center;gap:10px;padding:max(8px,env(safe-area-inset-top)) var(--sr) 6px var(--sl);min-width:0}
 header .title{flex:1;min-width:0}
-header .title b{display:block;font-size:16px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+header .title b{display:block;font-size:16px;line-height:1.25;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 header .title small{display:block;color:var(--muted);font-size:12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.conn{display:flex;align-items:center;gap:6px;font-size:12px;color:var(--muted);white-space:nowrap}
-.conn i{width:10px;height:10px;border-radius:50%;background:var(--bad);box-shadow:0 0 0 3px rgba(255,90,95,.2)}
-.conn.on i{background:var(--ok);box-shadow:0 0 0 3px rgba(46,204,113,.2)}
-nav{display:grid;grid-template-columns:repeat(4,1fr);gap:6px;padding:4px 10px 8px}
-nav button{padding:10px 4px;font-size:13px;background:var(--panel);color:var(--muted)}
-nav button.on{background:var(--accent);color:#fff}
-main{flex:1;display:flex;flex-direction:column;padding:0 10px 12px;min-height:0}
-section.tab{display:none;flex:1;flex-direction:column;gap:10px;min-height:0}
+.conn{display:flex;align-items:center;gap:6px;font-size:12px;font-weight:700;color:var(--orange);white-space:nowrap;background:var(--p1);border-radius:999px;padding:6px 10px}
+.conn i{width:10px;height:10px;border-radius:50%;background:currentColor;box-shadow:0 0 0 3px rgba(255,167,38,.2)}
+.conn.on{color:var(--green)}.conn.on i{box-shadow:0 0 0 3px rgba(0,200,83,.22)}
+.conn.off{color:#FF8A86}.conn.off i{animation:blink 1s infinite}
+@keyframes blink{50%{opacity:.25}}
+
+/* ---------- OVERLAY DOCK (luôn thấy) ---------- */
+.dock{grid-area:dock;display:flex;gap:8px;padding:2px var(--sr) 8px var(--sl);min-width:0}
+.ovl{flex:none;display:flex;align-items:center;gap:8px;width:118px;padding:6px 10px;border-radius:var(--r2);background:rgba(0,200,83,.16);color:#7CF0A9;box-shadow:inset 0 0 0 2px var(--green);text-align:left}
+.ovl .t{display:flex;flex-direction:column;line-height:1.1;min-width:0}
+.ovl small{font-size:10px;font-weight:700;letter-spacing:.6px;opacity:.85;text-transform:uppercase}
+.ovl b{font-size:17px;font-weight:900;white-space:nowrap;letter-spacing:.5px}
+.ovl .eye-off{display:none}
+.ovl.off{background:rgba(229,57,53,.16);color:#FF9C99;box-shadow:inset 0 0 0 2px var(--red)}
+.ovl.off .eye-on{display:none}.ovl.off .eye-off{display:block}
+.qscenes{flex:1;min-width:0;display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:6px}
+.qscenes button{padding:4px 4px;font-size:12px;line-height:1.15;font-weight:700;background:var(--p2);color:var(--muted);border-radius:var(--r1);overflow:hidden}
+.qscenes button.on{background:var(--pri);color:#fff;box-shadow:inset 0 0 0 2px var(--pri2)}
+.dock.hid .qscenes button.on{background:var(--p3);color:var(--text);box-shadow:inset 0 0 0 2px var(--muted)}
+
+/* ---------- NAV (dưới / thanh dọc khi ngang) ---------- */
+nav{grid-area:nav;display:grid;grid-template-columns:repeat(3,1fr);gap:4px;padding:6px var(--sr) max(6px,env(safe-area-inset-bottom)) var(--sl);background:var(--p1);border-top:1px solid var(--line)}
+nav button{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:2px;padding:6px 4px;min-height:52px;font-size:12px;background:transparent;color:var(--muted);border-radius:var(--r1)}
+nav button.on{color:var(--pri2);background:rgba(66,165,245,.12)}
+
+/* ---------- MAIN ---------- */
+main{grid-area:main;min-height:0;min-width:0;display:flex;flex-direction:column;padding:0 var(--sr) 8px var(--sl);overflow:hidden}
+section.tab{display:none;flex:1;flex-direction:column;gap:10px;min-height:0;overflow-y:auto;overflow-x:hidden;-webkit-overflow-scrolling:touch;overscroll-behavior:contain}
 section.tab.on{display:flex}
 section.tab>*{flex-shrink:0}
-/* SCORE */
-.board{flex:1;display:grid;grid-template-rows:1fr auto 1fr;gap:8px;min-height:360px}
-.team{position:relative;border-radius:18px;padding:12px 14px;display:flex;flex-direction:column;justify-content:space-between;overflow:hidden;cursor:pointer;user-select:none;-webkit-user-select:none;touch-action:manipulation;min-height:150px}
-.team::after{content:"";position:absolute;inset:0;background:linear-gradient(180deg,rgba(255,255,255,.08),rgba(0,0,0,.18));pointer-events:none}
-.team.flash{animation:flash .35s ease}
-@keyframes flash{0%{filter:brightness(1.6)}100%{filter:none}}
-.team .row{display:flex;align-items:center;gap:8px;position:relative;z-index:1}
-.team .name{font-size:20px;font-weight:800;flex:1;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.team .players{font-size:12px;opacity:.85;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.serve{display:none;align-items:center;gap:4px;background:rgba(0,0,0,.35);border-radius:999px;padding:3px 9px;font-size:12px;font-weight:800;color:var(--warn)}
+#tab-score{overflow:hidden;gap:8px}
+
+/* ---------- SCORE ---------- */
+.finished{background:rgba(0,200,83,.14);box-shadow:inset 0 0 0 1px var(--green);color:#B9F6CA;border-radius:var(--r2);padding:10px 12px;text-align:center;font-weight:800;display:none}
+.finished.on{display:block}
+.board{flex:1 1 0;min-height:0;display:grid;grid-template-columns:minmax(0,1fr);grid-template-rows:minmax(0,1fr) auto minmax(0,1fr);gap:8px}
+.team{position:relative;container-type:size;min-height:0;border-radius:var(--r3);padding:10px 12px;display:flex;flex-direction:column;overflow:hidden;cursor:pointer;user-select:none;-webkit-user-select:none;touch-action:manipulation;transition:box-shadow .2s}
+.team::after{content:"";position:absolute;inset:0;background:linear-gradient(180deg,rgba(255,255,255,.10),rgba(0,0,0,.28));pointer-events:none}
+.team.serving{box-shadow:inset 0 0 0 4px var(--orange),0 0 0 2px rgba(255,167,38,.25)}
+.team.flash::before{content:"";position:absolute;inset:0;background:#fff;opacity:0;z-index:3;pointer-events:none;animation:flash .35s ease-out}
+@keyframes flash{0%{opacity:.45}100%{opacity:0}}
+.team>*{position:relative;z-index:1}
+.team .row{display:flex;align-items:center;gap:8px;min-width:0}
+.team .logo{width:28px;height:28px;border-radius:8px;object-fit:contain;background:rgba(255,255,255,.9);flex:none}
+.team .name{font-size:20px;font-weight:800;flex:1;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;text-shadow:0 1px 4px rgba(0,0,0,.3)}
+.team .players{font-size:13px;opacity:.85;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-top:2px}
+.serve{display:none;align-items:center;gap:6px;background:var(--orange);color:#1A1200;border-radius:999px;padding:4px 10px 4px 6px;font-size:13px;font-weight:900;flex:none;letter-spacing:.3px}
 .serve.on{display:inline-flex}
-.serve::before{content:"";width:9px;height:9px;border-radius:50%;background:var(--warn)}
-.pts{font-size:min(30vw,150px);line-height:1;font-weight:900;text-align:center;font-variant-numeric:tabular-nums;position:relative;z-index:1;text-shadow:0 4px 18px rgba(0,0,0,.35)}
-.chips{display:flex;gap:6px;flex-wrap:wrap}
-.chip{background:rgba(0,0,0,.3);border-radius:8px;padding:2px 8px;font-size:12px;font-weight:700}
-.minus{position:relative;z-index:2;background:rgba(0,0,0,.35);border-radius:10px;padding:8px 12px;font-size:13px;overflow:hidden}
-.minus .fill{position:absolute;left:0;top:0;bottom:0;width:0;background:rgba(255,255,255,.35)}
+.serve::before{content:"";width:14px;height:14px;border-radius:50%;background:#D4F33A;box-shadow:inset -2px -2px 0 rgba(0,0,0,.18),0 0 0 2px #1A1200}
+.pts{flex:1;min-height:0;display:flex;align-items:center;justify-content:center;font-size:min(26vw,17vh);font-size:min(56cqh,52cqw);line-height:1;font-weight:900;font-variant-numeric:tabular-nums;text-shadow:0 4px 18px rgba(0,0,0,.35);letter-spacing:-2px}
+.pts.bump{animation:bump .3s ease-out}
+@keyframes bump{40%{transform:scale(1.12)}}
+.plus{position:absolute;z-index:4;right:50%;top:40%;font-size:34px;font-weight:900;color:#fff;pointer-events:none;animation:plus .7s ease-out forwards;text-shadow:0 2px 10px rgba(0,0,0,.4)}
+@keyframes plus{0%{opacity:0;transform:translate(50%,10px) scale(.8)}20%{opacity:1}100%{opacity:0;transform:translate(50%,-50px) scale(1.1)}}
+.foot{position:absolute;left:10px;right:10px;bottom:10px;display:flex;align-items:flex-end;gap:8px;z-index:2;pointer-events:none}
+.chips{display:flex;gap:6px;flex-wrap:wrap;flex:1;min-width:0}
+.chip{background:rgba(0,0,0,.32);border-radius:8px;padding:3px 8px;font-size:12px;font-weight:800;white-space:nowrap}
+.minus{pointer-events:auto;position:relative;width:64px;min-height:48px;height:48px;padding:0;border-radius:var(--r2);background:rgba(0,0,0,.38);color:#fff;overflow:hidden;display:flex;flex-direction:column;align-items:center;justify-content:center;line-height:1;box-shadow:inset 0 0 0 1px rgba(255,255,255,.25)}
+.minus b{font-size:19px;position:relative}
+.minus small{font-size:10px;font-weight:700;opacity:.8;position:relative;margin-top:2px}
+.minus .fill{position:absolute;left:0;top:0;bottom:0;width:0;background:rgba(229,57,53,.85)}
 .minus.holding .fill{animation:fill .6s linear forwards}
 @keyframes fill{to{width:100%}}
-.mid{display:flex;align-items:center;justify-content:space-between;gap:8px;background:var(--panel);border-radius:14px;padding:8px 12px}
-.mid .set{font-weight:800}
-.mid .callout{font-size:22px;font-weight:900;letter-spacing:1px;color:var(--warn);font-variant-numeric:tabular-nums}
-.mid .hint{font-size:11px;color:var(--muted)}
+@container (max-height:170px){.team .players{display:none}}
+@container (max-height:120px){.chips{display:none}}
+.mid{display:flex;align-items:center;gap:10px;background:var(--p1);border-radius:var(--r2);padding:6px 12px;min-height:52px}
+.mid .l{flex:1;min-width:0}
+.mid .set{font-weight:900;font-size:15px;letter-spacing:.5px;white-space:nowrap}
+.mid .hist{font-size:12px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.mid .hint{display:none;font-size:11px;color:var(--muted)}
+.mid .callout{font-size:28px;font-weight:900;letter-spacing:1px;color:var(--orange);font-variant-numeric:tabular-nums;white-space:nowrap}
+.mid .clock{flex:1;text-align:right;font-size:13px;font-weight:700;color:var(--muted);font-variant-numeric:tabular-nums;white-space:nowrap}
 .actions{display:grid;grid-template-columns:2fr 1fr 1fr;gap:8px}
-.actions button{padding:16px 8px;font-size:15px}
-.finished{background:#203a24;border:1px solid #2ECC71;border-radius:14px;padding:10px 12px;text-align:center;font-weight:800;display:none}
-.finished.on{display:block}
-@media (orientation:landscape) and (min-width:600px){
- .board{grid-template-columns:1fr auto 1fr;grid-template-rows:1fr}
- .mid{flex-direction:column;justify-content:center;min-width:120px;text-align:center}
-}
-@media (orientation:landscape) and (max-height:500px){
- .board{min-height:0;flex:1 1 0}
- .team{min-height:0;padding:8px 12px}
- .pts{font-size:min(24vw,22vh);font-size:min(24vw,30dvh)}
- .actions button{padding:10px 8px}
-}
-/* FORMS */
-.card{background:var(--panel);border-radius:16px;padding:12px;display:flex;flex-direction:column;gap:10px}
-.card h3{margin:0;font-size:15px;display:flex;align-items:center;gap:8px}
-.card h3 .dot{width:12px;height:12px;border-radius:50%}
-label.f{display:flex;flex-direction:column;gap:4px;font-size:12px;color:var(--muted)}
-label.f input,label.f select,label.f textarea{background:var(--bg);border:1px solid var(--line);border-radius:10px;padding:11px 10px;color:var(--text);font-size:15px;width:100%}
-label.f input[type=color]{padding:2px;height:44px}
-.grid2{display:grid;grid-template-columns:1fr 1fr;gap:8px}
-.grid3{display:grid;grid-template-columns:repeat(3,1fr);gap:8px}
-.check{display:flex;align-items:center;gap:10px;font-size:14px;padding:6px 2px}
-.check input{width:22px;height:22px}
-.logo-row{display:flex;align-items:center;gap:10px}
-.logo-row img{width:52px;height:52px;object-fit:contain;background:var(--bg);border-radius:10px;border:1px solid var(--line)}
+.actions button{display:flex;align-items:center;justify-content:center;gap:6px;min-height:56px;font-size:16px;padding:8px}
+.actions .undo{font-size:18px}
+@media (min-height:760px) and (min-width:600px){.mid .hint{display:block}}
+
+/* ---------- FORMS ---------- */
+.card{background:var(--p1);border-radius:var(--r3);padding:14px;display:flex;flex-direction:column;gap:12px;min-width:0}
+.card h3{margin:0;font-size:16px;display:flex;align-items:center;gap:8px}
+.card h3 .dot{width:14px;height:14px;border-radius:50%}
+label.f{display:flex;flex-direction:column;gap:5px;font-size:13px;font-weight:600;color:var(--muted);min-width:0}
+label.f input,label.f select,label.f textarea{background:var(--bg);border:1px solid var(--line);border-radius:var(--r1);padding:12px;min-height:48px;color:var(--text);font-size:16px;width:100%;min-width:0}
+label.f input:focus,label.f select:focus,label.f textarea:focus{outline:none;border-color:var(--pri2);box-shadow:0 0 0 3px rgba(66,165,245,.25)}
+label.f input[type=color]{padding:3px;height:48px}
+label.f input[type=range]{padding:0;border:0;background:transparent;accent-color:var(--pri2)}
+.grid2{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:10px}
+.grid3{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px}
+.check{display:flex;align-items:center;gap:12px;font-size:15px;min-height:48px;padding:4px 2px;cursor:pointer}
+.check input{width:24px;height:24px;flex:none;accent-color:var(--pri2)}
+.switch{display:flex;align-items:center;gap:12px;font-size:15px;font-weight:700;min-height:56px;padding:6px 12px;border-radius:var(--r2);background:var(--p2);cursor:pointer}
+.switch span{flex:1}
+.switch input{appearance:none;-webkit-appearance:none;width:56px;height:32px;border-radius:999px;background:var(--red);position:relative;flex:none;margin:0;cursor:pointer;transition:background .2s}
+.switch input::after{content:"";position:absolute;top:3px;left:3px;width:26px;height:26px;border-radius:50%;background:#fff;transition:left .2s}
+.switch input:checked{background:var(--green)}
+.switch input:checked::after{left:27px}
+.logo-row{display:flex;align-items:center;gap:10px;min-width:0}
+.logo-row img{width:56px;height:56px;flex:none;object-fit:contain;background:var(--bg);border-radius:var(--r1);border:1px solid var(--line)}
+.logo-row .btns{display:flex;flex-direction:column;gap:6px;flex:1;min-width:0}
+.logo-row button{padding:8px;font-size:13px}
 .seg{display:grid;gap:6px}
-.seg button{padding:12px 6px;font-size:13px;background:var(--panel2)}
-.seg button.on{background:var(--accent);color:#fff}
-.preview{position:relative;width:100%;aspect-ratio:16/9;border-radius:12px;overflow:hidden;background:#333 repeating-conic-gradient(#3b3b3b 0 25%,#2b2b2b 0 50%) 0 0/24px 24px}
+.seg button{padding:10px 6px;font-size:14px;background:var(--p2)}
+.seg button.on{background:var(--pri);color:#fff;box-shadow:inset 0 0 0 2px var(--pri2)}
+.preview{position:relative;width:100%;aspect-ratio:16/9;border-radius:var(--r2);overflow:hidden;background:#333 repeating-conic-gradient(#3b3b3b 0 25%,#2b2b2b 0 50%) 0 0/24px 24px}
 .preview iframe{position:absolute;left:0;top:0;width:1920px;height:1080px;border:0;transform-origin:0 0;pointer-events:none;background:transparent}
-.timerv{font-size:34px;font-weight:900;text-align:center;font-variant-numeric:tabular-nums}
-.mono{font-family:ui-monospace,Menlo,Consolas,monospace;word-break:break-all;font-size:13px;background:var(--bg);border:1px solid var(--line);border-radius:10px;padding:10px}
-.muted{color:var(--muted);font-size:12px}
-/* OVERLAYS */
-.shade{position:fixed;inset:0;background:rgba(0,0,0,.6);display:none;align-items:flex-end;justify-content:center;z-index:50}
-.shade.on{display:flex}
-.sheet{background:var(--panel);width:100%;max-width:520px;border-radius:20px 20px 0 0;padding:16px 14px max(16px,env(safe-area-inset-bottom));display:flex;flex-direction:column;gap:8px}
-.sheet h3{margin:0 0 4px;font-size:16px}
-.sheet p{margin:0;color:var(--muted)}
-.toast{position:fixed;left:50%;top:14px;transform:translateX(-50%) translateY(calc(-100% - 24px));visibility:hidden;background:#253555;color:#fff;padding:10px 16px;border-radius:12px;font-weight:700;transition:transform .25s,visibility .25s;z-index:60;max-width:92vw;text-align:center}
-.toast.on{transform:translateX(-50%) translateY(0);visibility:visible}
-.toast.err{background:#7A2430}
-.offline-msg{display:none;position:fixed;left:0;right:0;bottom:0;background:#7A2430;color:#fff;text-align:center;padding:10px;font-weight:700;z-index:40}
-body.offline .offline-msg{display:block}
-body.offline .needs-conn{opacity:.4;pointer-events:none}
-/* ---------- BỐ CỤC: thanh trên + tab cố định, nội dung tab tự cuộn ---------- */
-[hidden]{display:none!important}
-.subnav{display:flex;gap:6px;overflow-x:auto;scrollbar-width:none;position:sticky;top:0;z-index:3;background:var(--bg);padding:2px 0 6px;margin-bottom:-4px}
+.timerv{font-size:40px;font-weight:900;text-align:center;font-variant-numeric:tabular-nums}
+.mono{font-family:ui-monospace,Menlo,Consolas,monospace;word-break:break-all;font-size:13px;background:var(--bg);border:1px solid var(--line);border-radius:var(--r1);padding:10px}
+.muted{color:var(--muted);font-size:13px;line-height:1.4}
+.subnav{display:flex;gap:6px;overflow-x:auto;scrollbar-width:none;position:sticky;top:0;z-index:3;background:var(--bg);padding:2px 0 8px;margin-bottom:-2px}
 .subnav::-webkit-scrollbar{display:none}
-.subnav button{flex:1 0 auto;padding:9px 12px;font-size:13px;border-radius:999px;background:var(--panel);color:var(--muted);white-space:nowrap}
-.subnav button.on{background:#25406E;color:#fff;box-shadow:inset 0 0 0 1px var(--accent)}
-html,body{overflow:hidden}
-body{height:100%;height:100dvh;min-height:0}
-main{min-height:0;overflow:hidden}
-section.tab{overflow-y:auto;overflow-x:hidden;-webkit-overflow-scrolling:touch;overscroll-behavior:contain;padding-bottom:6px}
-.sheet{max-height:calc(100% - 10px);overflow-y:auto}
-.vis{display:flex;align-items:center;gap:6px;padding:7px 10px;font-size:12px;border-radius:999px;background:#1E5631;color:#C9F7D5;white-space:nowrap}
-.vis.off{background:#5A1F27;color:#FFD6D8}
-.vis i{width:8px;height:8px;border-radius:50%;background:currentColor}
-/* Màn ngang: các thẻ chia cột, xem trước overlay nằm cố định bên trái. */
+.subnav button{flex:1 0 auto;min-height:44px;padding:8px 12px;font-size:14px;border-radius:999px;background:var(--p1);color:var(--muted);white-space:nowrap}
+.subnav button.on{background:var(--pri);color:#fff}
+
+/* ---------- SHEETS / TOAST ---------- */
+.shade{position:fixed;inset:0;background:rgba(3,7,15,.66);display:none;align-items:flex-end;justify-content:center;z-index:50}
+.shade.on{display:flex}
+.sheet{background:var(--p1);width:100%;max-width:560px;max-height:calc(100% - 10px);overflow-y:auto;border-radius:var(--r3) var(--r3) 0 0;padding:16px var(--sr) max(16px,env(safe-area-inset-bottom)) var(--sl);display:flex;flex-direction:column;gap:8px;animation:up .2s ease-out}
+@keyframes up{from{transform:translateY(30px);opacity:.4}}
+.sheet h3{margin:0 0 2px;font-size:18px}
+.sheet h4{margin:6px 0 0;font-size:12px;color:var(--muted);text-transform:uppercase;letter-spacing:.6px}
+.sheet p{margin:0;color:var(--muted);line-height:1.45}
+.toast{position:fixed;left:50%;top:max(12px,env(safe-area-inset-top));transform:translateX(-50%) translateY(calc(-100% - 24px));visibility:hidden;background:#1F3B66;color:#fff;padding:12px 18px;border-radius:var(--r2);font-weight:700;transition:transform .25s,visibility .25s;z-index:60;max-width:92vw;text-align:center;box-shadow:0 8px 24px rgba(0,0,0,.4)}
+.toast.on{transform:translateX(-50%) translateY(0);visibility:visible}
+.toast.err{background:#B3261E}
+.offline-msg{display:none;position:fixed;left:0;right:0;top:0;padding:max(8px,env(safe-area-inset-top)) 12px 8px;background:#B3261E;color:#fff;text-align:center;font-weight:800;z-index:40;box-shadow:0 4px 16px rgba(0,0,0,.4)}
+body.offline .offline-msg{display:block}
+body.offline .needs-conn,body.wait .needs-conn{opacity:.4;pointer-events:none;filter:grayscale(.5)}
+
+/* ---------- NGANG: thanh tab dọc bên phải, đội trái/phải ---------- */
 @media (orientation:landscape) and (min-width:600px){
- #tab-info.on,#tab-system.on{display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));align-content:start;align-items:start;gap:10px}
- #tab-info>.subnav{grid-column:1/-1}
+ body{grid-template-columns:minmax(0,1fr) minmax(0,1.9fr) 84px;grid-template-rows:auto minmax(0,1fr);grid-template-areas:"head dock nav" "main main nav"}
+ nav{grid-template-columns:1fr;grid-auto-rows:min-content;align-content:start;gap:6px;border-top:0;border-left:1px solid var(--line);padding:max(8px,env(safe-area-inset-top)) max(6px,env(safe-area-inset-right)) max(8px,env(safe-area-inset-bottom)) 6px}
+ nav button{min-height:64px}
+ header{padding-right:4px}
+ .dock{padding:max(8px,env(safe-area-inset-top)) 12px 6px 4px}
+ main{padding-right:12px}
+ .board{grid-template-columns:minmax(0,1fr) auto minmax(0,1fr);grid-template-rows:minmax(0,1fr)}
+ .mid{flex-direction:column;justify-content:center;text-align:center;min-width:130px;max-width:170px;gap:6px;padding:10px}
+ .mid .l{flex:none}
+ .mid .hist{white-space:normal}
+ .mid .clock{flex:none;text-align:center}
+ .mid .callout{font-size:30px}
+ .mid .set{font-size:18px}
+ #tab-settings.on{display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));align-content:start;align-items:start;gap:10px}
+ #tab-settings>.subnav{grid-column:1/-1}
  #tab-overlay.on{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);align-content:start;align-items:start;gap:10px}
- #tab-overlay>.preview{grid-column:1;grid-row:1/span 5;position:sticky;top:0}
+ #tab-overlay>.preview{grid-column:1;grid-row:1/span 6;position:sticky;top:0}
  #tab-overlay>.subnav,#tab-overlay>.card{grid-column:2}
 }
-/* Điện thoại xoay ngang (thấp): tiêu đề và tab chung một hàng. */
+/* Điện thoại xoay ngang (thấp) */
 @media (orientation:landscape) and (max-height:500px){
- body{display:grid;grid-template-columns:auto minmax(0,1fr);grid-template-rows:auto minmax(0,1fr)}
- header{grid-column:1;grid-row:1;padding:6px 6px 6px max(10px,env(safe-area-inset-left))}
  header .title small{display:none}
- header .title b{font-size:15px;max-width:22vw}
  .conn span{display:none}
- nav{grid-column:2;grid-row:1;padding:6px max(10px,env(safe-area-inset-right)) 6px 4px}
- nav button{padding:8px 4px}
- main{grid-column:1/-1;grid-row:2;padding:0 max(10px,env(safe-area-inset-right)) 8px max(10px,env(safe-area-inset-left))}
- .sheet{display:grid;grid-template-columns:1fr 1fr;max-width:640px;padding-top:12px}
- .sheet>h3,.sheet>p,.sheet>label,.sheet>.grid2{grid-column:1/-1}
+ .dock{gap:6px}
+ .ovl{width:108px;min-height:44px;padding:4px 8px}
+ .qscenes button{min-height:44px}
+ nav{gap:4px}
+ nav button{min-height:48px;font-size:11px;padding:4px 2px}
+ nav button svg.i{width:20px;height:20px}
+ .actions button{min-height:48px}
+ .mid .hint{display:none}
+ .mid{min-width:120px}
+ .sheet{display:grid;grid-template-columns:1fr 1fr;max-width:680px;padding-top:12px}
+ .sheet>h3,.sheet>h4,.sheet>p,.sheet>label,.sheet>.grid2,.sheet>.full{grid-column:1/-1}
+}
+@media (min-width:1000px) and (min-height:700px){
+ .team .name{font-size:28px}
+ .team .players{font-size:16px}
+ .serve{font-size:16px;padding:6px 14px 6px 8px}
+ body .mid .callout{font-size:40px}
+ body .mid .set{font-size:20px}
+ body .mid .clock{font-size:16px}
+ .qscenes button{font-size:14px}
 }
 </style>
 </head>
-<body>
+<body class="wait">
 <header>
   <div class="title"><b id="hTitle">Bảng điểm</b><small id="hSub">VNVAR Camera Station</small></div>
-  <button class="vis needs-conn" id="hVisible" title="Hiện/ẩn overlay trên OBS và livestream"><i></i><span id="hVisibleText">Overlay</span></button>
-  <div class="conn" id="conn"><i></i><span id="connText">Đang kết nối…</span></div>
+  <div class="conn" id="conn" role="status"><i></i><span id="connText">Đang kết nối…</span></div>
 </header>
-<nav id="nav">
-  <button data-tab="score" class="on">Tỉ số</button>
-  <button data-tab="info">Trận đấu</button>
-  <button data-tab="overlay">Overlay</button>
-  <button data-tab="system">Hệ thống</button>
-</nav>
+
+<!-- Điều khiển overlay nhanh: luôn thấy ở mọi tab -->
+<div class="dock needs-conn" id="dock">
+  <button class="ovl" id="hVisible" aria-pressed="true" title="Hiện/ẩn overlay trên OBS và livestream">
+    <svg class="i eye-on" viewBox="0 0 24 24"><path d="M2 12s3.6-7 10-7 10 7 10 7-3.6 7-10 7S2 12 2 12z"/><circle cx="12" cy="12" r="3"/></svg>
+    <svg class="i eye-off" viewBox="0 0 24 24"><path d="M3 3l18 18M10.6 5.1A10 10 0 0 1 12 5c6.4 0 10 7 10 7a17 17 0 0 1-3.2 4M6.6 6.6C3.7 8.4 2 12 2 12s3.6 7 10 7a9.6 9.6 0 0 0 5.4-1.6"/><path d="M9.9 9.9a3 3 0 0 0 4.2 4.2"/></svg>
+    <span class="t"><small>Overlay</small><b id="hVisibleText">HIỆN</b></span>
+  </button>
+  <div class="qscenes" id="quickScenes" role="group" aria-label="Cảnh overlay">
+    <button data-scene="scorebar">Thanh tỉ số</button>
+    <button data-scene="full">Bảng lớn</button>
+    <button data-scene="intro">Giới thiệu</button>
+    <button data-scene="result">Kết quả</button>
+  </div>
+</div>
+
 <main>
   <!-- ===================== SCORE ===================== -->
   <section class="tab on" id="tab-score">
     <div class="finished" id="finishedBox"></div>
     <div class="board needs-conn" id="board">
       <div class="team" id="teamA" data-team="A">
-        <div class="row"><span class="name" id="nameA">Đội A</span><span class="serve" id="serveA">GIAO</span></div>
+        <div class="row"><img class="logo" id="logoA" alt="" hidden><span class="name" id="nameA">Đội A</span><span class="serve" id="serveA">GIAO</span></div>
         <div class="players" id="playersA"></div>
         <div class="pts" id="ptsA">0</div>
-        <div class="row"><div class="chips" id="chipsA"></div><span style="flex:1"></span><button class="minus" data-minus="A"><span class="fill"></span><span style="position:relative">Giữ −1</span></button></div>
+        <div class="foot"><div class="chips" id="chipsA"></div><button class="minus" data-minus="A" aria-label="Giữ để trừ 1 điểm"><span class="fill"></span><b>−1</b><small>giữ</small></button></div>
       </div>
       <div class="mid">
-        <div><div class="set" id="setLabel">Set 1</div><div class="hint" id="ruleHint"></div></div>
+        <div class="l"><div class="set" id="setLabel">Set 1</div><div class="hist" id="setHist"></div><div class="hint" id="ruleHint"></div></div>
         <div class="callout" id="callout">0-0</div>
+        <div class="clock" id="timerMini">00:00</div>
       </div>
       <div class="team" id="teamB" data-team="B">
-        <div class="row"><span class="name" id="nameB">Đội B</span><span class="serve" id="serveB">GIAO</span></div>
+        <div class="row"><img class="logo" id="logoB" alt="" hidden><span class="name" id="nameB">Đội B</span><span class="serve" id="serveB">GIAO</span></div>
         <div class="players" id="playersB"></div>
         <div class="pts" id="ptsB">0</div>
-        <div class="row"><div class="chips" id="chipsB"></div><span style="flex:1"></span><button class="minus" data-minus="B"><span class="fill"></span><span style="position:relative">Giữ −1</span></button></div>
+        <div class="foot"><div class="chips" id="chipsB"></div><button class="minus" data-minus="B" aria-label="Giữ để trừ 1 điểm"><span class="fill"></span><b>−1</b><small>giữ</small></button></div>
       </div>
     </div>
     <div class="actions needs-conn">
-      <button class="primary" id="btnUndo">↶ Hoàn tác</button>
-      <button id="btnServe">Đổi giao</button>
-      <button id="btnMore">Thêm…</button>
-    </div>
-  </section>
-
-  <!-- ===================== INFO ===================== -->
-  <section class="tab" id="tab-info">
-    <div class="subnav" role="tablist">
-      <button data-sub="match" class="on">Thông tin trận</button>
-      <button data-sub="teams">Hai đội</button>
-      <button data-sub="rules">Môn &amp; luật</button>
-    </div>
-    <div class="card needs-conn" id="formMatch" data-sub="match">
-      <h3>Thông tin trận</h3>
-      <label class="f">Tên giải<input id="fTournament" maxlength="60" placeholder="VD: Giải Pickleball Mở rộng"></label>
-      <div class="grid2">
-        <label class="f">Vòng đấu<input id="fRound" maxlength="40" placeholder="VD: Bán kết"></label>
-        <label class="f">Sân<input id="fCourt" maxlength="30" placeholder="VD: Sân 2"></label>
-      </div>
-      <button class="primary" id="saveMatch">Lưu thông tin trận</button>
-    </div>
-    <div class="card needs-conn" id="formTeamA" data-team="A" data-sub="teams">
-      <h3><span class="dot" id="dotA"></span>Đội A</h3>
-      <div class="grid2">
-        <label class="f">Tên đội<input data-k="name" maxlength="40"></label>
-        <label class="f">Tên ngắn (≤6)<input data-k="short" maxlength="6"></label>
-      </div>
-      <div class="grid2">
-        <label class="f">VĐV 1<input data-k="p1" maxlength="40"></label>
-        <label class="f">VĐV 2<input data-k="p2" maxlength="40"></label>
-      </div>
-      <div class="grid2">
-        <label class="f">Màu đội<input type="color" data-k="color"></label>
-        <div class="logo-row"><img alt="" data-logo><div style="display:flex;flex-direction:column;gap:6px;flex:1"><button class="ghost" data-pick>Chọn logo</button><button class="ghost" data-remove>Gỡ logo</button></div></div>
-      </div>
-      <input type="file" accept="image/*" data-file hidden>
-      <button class="primary" data-save>Lưu Đội A</button>
-    </div>
-    <div class="card needs-conn" id="formTeamB" data-team="B" data-sub="teams">
-      <h3><span class="dot" id="dotB"></span>Đội B</h3>
-      <div class="grid2">
-        <label class="f">Tên đội<input data-k="name" maxlength="40"></label>
-        <label class="f">Tên ngắn (≤6)<input data-k="short" maxlength="6"></label>
-      </div>
-      <div class="grid2">
-        <label class="f">VĐV 1<input data-k="p1" maxlength="40"></label>
-        <label class="f">VĐV 2<input data-k="p2" maxlength="40"></label>
-      </div>
-      <div class="grid2">
-        <label class="f">Màu đội<input type="color" data-k="color"></label>
-        <div class="logo-row"><img alt="" data-logo><div style="display:flex;flex-direction:column;gap:6px;flex:1"><button class="ghost" data-pick>Chọn logo</button><button class="ghost" data-remove>Gỡ logo</button></div></div>
-      </div>
-      <input type="file" accept="image/*" data-file hidden>
-      <button class="primary" data-save>Lưu Đội B</button>
-    </div>
-    <div class="card needs-conn" id="formRules" data-sub="rules">
-      <h3>Môn &amp; luật</h3>
-      <label class="f">Môn thi đấu<select id="rSport"><option value="pickleball">Pickleball</option><option value="badminton">Cầu lông</option><option value="tennis">Tennis</option><option value="custom">Tùy chỉnh</option></select></label>
-      <div class="grid2 r-points">
-        <label class="f">Điểm thắng set<input id="rPoints" type="number" inputmode="numeric" min="1" max="99"></label>
-        <label class="f">Cách biệt<input id="rWinBy" type="number" inputmode="numeric" min="1" max="5"></label>
-      </div>
-      <div class="grid2 r-points">
-        <label class="f">Điểm trần (trống = không)<input id="rCap" type="number" inputmode="numeric" min="1" max="199"></label>
-        <label class="f">Cách tính điểm<select id="rScoring"><option value="sideout">Chỉ đội giao được điểm</option><option value="rally">Pha nào cũng có điểm</option></select></label>
-      </div>
-      <div class="grid3 r-tennis">
-        <label class="f">Game/set<input id="rGames" type="number" inputmode="numeric" min="1" max="10"></label>
-        <label class="f">Tie-break khi<input id="rTbAt" type="number" inputmode="numeric" min="1" max="10"></label>
-        <label class="f">Điểm tie-break<input id="rTbPts" type="number" inputmode="numeric" min="1" max="20"></label>
-      </div>
-      <div class="grid2">
-        <label class="f">Số set<select id="rBestOf"><option value="1">1 set</option><option value="3">Thắng 2/3</option><option value="5">Thắng 3/5</option><option value="7">Thắng 4/7</option></select></label>
-        <label class="check"><input type="checkbox" id="rDoubles">Đánh đôi</label>
-      </div>
-      <div class="grid2">
-        <button class="ghost" id="rPreset">Luật chuẩn</button>
-        <button class="primary" id="rApply">Áp dụng luật</button>
-      </div>
-      <div class="muted">Đổi luật khi trận đang có điểm sẽ bắt đầu lại trận.</div>
+      <button class="primary undo" id="btnUndo"><svg class="i" viewBox="0 0 24 24"><path d="M9 14L4 9l5-5"/><path d="M4 9h10.5a5.5 5.5 0 0 1 0 11H11"/></svg>Hoàn tác</button>
+      <button id="btnServe"><svg class="i" viewBox="0 0 24 24"><path d="M7 7h13l-4-4M17 17H4l4 4"/></svg>Giao</button>
+      <button id="btnMore"><svg class="i" viewBox="0 0 24 24"><circle cx="5" cy="12" r="1.3"/><circle cx="12" cy="12" r="1.3"/><circle cx="19" cy="12" r="1.3"/></svg>Thêm</button>
     </div>
   </section>
 
@@ -271,11 +267,10 @@ section.tab{overflow-y:auto;overflow-x:hidden;-webkit-overflow-scrolling:touch;o
       <button data-sub="ticker">Chữ chạy</button>
       <button data-sub="stream">Livestream</button>
     </div>
-    <!-- Trực tiếp: thao tác trong lúc trận đấu -->
     <div class="card needs-conn" data-sub="live">
       <h3>Cảnh đang phát</h3>
-      <label class="check"><input type="checkbox" id="oVisible">Hiện overlay (bảng tỉ số, thông báo, chữ chạy)</label>
-      <div class="seg" id="scenes" style="grid-template-columns:repeat(3,1fr)">
+      <label class="switch"><span>Hiện overlay</span><input type="checkbox" id="oVisible"></label>
+      <div class="seg" id="scenes" style="grid-template-columns:repeat(3,minmax(0,1fr))">
         <button data-scene="scorebar">Thanh tỉ số</button>
         <button data-scene="full">Bảng lớn</button>
         <button data-scene="intro">Giới thiệu</button>
@@ -285,7 +280,7 @@ section.tab{overflow-y:auto;overflow-x:hidden;-webkit-overflow-scrolling:touch;o
     </div>
     <div class="card needs-conn" data-sub="live">
       <h3>Thông báo nhanh</h3>
-      <div class="seg" style="grid-template-columns:1fr 1fr">
+      <div class="seg" style="grid-template-columns:minmax(0,1fr) minmax(0,1fr)">
         <button data-banner="TẠM DỪNG · TIMEOUT">Timeout</button>
         <button data-banner="NGHỈ GIỮA SET">Nghỉ giữa set</button>
         <button data-banner="ĐANG KIỂM TRA VAR">Kiểm tra VAR</button>
@@ -302,10 +297,9 @@ section.tab{overflow-y:auto;overflow-x:hidden;-webkit-overflow-scrolling:touch;o
       <div class="timerv" id="timerView">00:00</div>
       <div class="grid3"><button class="primary" data-timer="start">Bắt đầu</button><button data-timer="pause">Tạm dừng</button><button class="danger" data-timer="reset">Đặt lại</button></div>
     </div>
-    <!-- Giao diện: chỉnh trước trận -->
     <div class="card needs-conn" data-sub="look">
       <h3>Vị trí &amp; kích thước</h3>
-      <div class="seg" id="positions" style="grid-template-columns:repeat(3,1fr)">
+      <div class="seg" id="positions" style="grid-template-columns:repeat(3,minmax(0,1fr))">
         <button data-pos="tl">↖ Trên trái</button><button data-pos="tc">↑ Trên giữa</button><button data-pos="tr">↗ Trên phải</button>
         <button data-pos="bl">↙ Dưới trái</button><button data-pos="bc">↓ Dưới giữa</button><button data-pos="br">↘ Dưới phải</button>
       </div>
@@ -313,50 +307,123 @@ section.tab{overflow-y:auto;overflow-x:hidden;-webkit-overflow-scrolling:touch;o
     </div>
     <div class="card needs-conn" data-sub="look">
       <h3>Màu sắc</h3>
-      <div class="seg" id="themes" style="grid-template-columns:repeat(3,1fr)">
+      <div class="seg" id="themes" style="grid-template-columns:repeat(3,minmax(0,1fr))">
         <button data-theme="dark">Tối</button><button data-theme="light">Sáng</button><button data-theme="glass">Kính mờ</button>
       </div>
       <label class="f">Màu nhấn<input type="color" id="oAccent"></label>
     </div>
     <div class="card needs-conn" data-sub="look">
       <h3>Thông tin hiển thị</h3>
-      <label class="check"><input type="checkbox" data-show="sets">Hiện điểm các set</label>
-      <label class="check"><input type="checkbox" data-show="serve">Hiện đội giao bóng</label>
-      <label class="check"><input type="checkbox" data-show="tournament">Hiện tên giải / sân</label>
-      <label class="check"><input type="checkbox" data-show="timer">Hiện đồng hồ trận</label>
+      <label class="check"><input type="checkbox" data-show="sets">Điểm các set</label>
+      <label class="check"><input type="checkbox" data-show="serve">Đội giao bóng</label>
+      <label class="check"><input type="checkbox" data-show="tournament">Tên giải / sân</label>
+      <label class="check"><input type="checkbox" data-show="timer">Đồng hồ trận</label>
     </div>
-    <!-- Chữ chạy -->
     <div class="card needs-conn" id="formTicker" data-sub="ticker">
       <h3>Chữ chạy</h3>
-      <label class="check"><input type="checkbox" id="tEnabled">Bật chữ chạy</label>
+      <label class="switch"><span>Bật chữ chạy</span><input type="checkbox" id="tEnabled"></label>
       <label class="f">Nội dung<textarea id="tText" rows="2" maxlength="200" placeholder="VD: Tài trợ bởi ..."></textarea></label>
       <label class="f">Tốc độ<select id="tSpeed"><option value="1">Chậm</option><option value="2">Vừa</option><option value="3">Nhanh</option></select></label>
       <button class="primary" id="tSave">Cập nhật chữ chạy</button>
       <div class="muted">Livestream từ điện thoại: nội dung đổi ngay; tốc độ mới áp dụng từ lần phát hoặc kết nối lại sau.</div>
     </div>
-    <!-- Livestream từ điện thoại camera -->
     <div class="card needs-conn" data-sub="stream">
       <h3>Livestream từ điện thoại</h3>
-      <label class="check"><input type="checkbox" id="oBurnIn">In bảng tỉ số vào video livestream</label>
-      <div class="muted">Áp dụng cho phát RTMP/RTSP trên điện thoại Android và iPhone, không cần OBS. Bật/tắt khi đang phát sẽ khởi động lại luồng vài giây. Video ghi và Tablet không bị ảnh hưởng.</div>
+      <label class="switch"><span>In bảng tỉ số vào video</span><input type="checkbox" id="oBurnIn"></label>
+      <div class="muted">Cho phát RTMP/RTSP trên Android và iPhone, không cần OBS. Bật/tắt khi đang phát sẽ khởi động lại luồng vài giây. Video ghi và Tablet không bị ảnh hưởng.</div>
     </div>
   </section>
 
-  <!-- ===================== SYSTEM ===================== -->
-  <section class="tab" id="tab-system">
-    <div class="card">
+  <!-- ===================== SETTINGS ===================== -->
+  <section class="tab" id="tab-settings">
+    <div class="subnav" role="tablist">
+      <button data-sub="match" class="on">Trận</button>
+      <button data-sub="teams">Hai đội</button>
+      <button data-sub="rules">Luật</button>
+      <button data-sub="system">Hệ thống</button>
+    </div>
+    <div class="card needs-conn" id="formMatch" data-sub="match">
+      <h3>Thông tin trận</h3>
+      <label class="f">Tên giải<input id="fTournament" maxlength="60" placeholder="VD: Giải Pickleball Mở rộng"></label>
+      <div class="grid2">
+        <label class="f">Vòng<input id="fRound" maxlength="40" placeholder="VD: Bán kết"></label>
+        <label class="f">Sân<input id="fCourt" maxlength="30" placeholder="VD: Sân 2"></label>
+      </div>
+      <button class="primary" id="saveMatch">Lưu</button>
+    </div>
+    <div class="card needs-conn" id="formTeamA" data-team="A" data-sub="teams">
+      <h3><span class="dot" id="dotA"></span>Đội A</h3>
+      <div class="grid2">
+        <label class="f">Tên đội<input data-k="name" maxlength="40"></label>
+        <label class="f">Tên ngắn<input data-k="short" maxlength="6" placeholder="≤ 6 ký tự"></label>
+      </div>
+      <div class="grid2">
+        <label class="f">VĐV 1<input data-k="p1" maxlength="40"></label>
+        <label class="f">VĐV 2<input data-k="p2" maxlength="40"></label>
+      </div>
+      <div class="grid2">
+        <label class="f">Màu<input type="color" data-k="color"></label>
+        <div class="logo-row"><img alt="" data-logo><div class="btns"><button class="ghost" data-pick>Chọn logo</button><button class="ghost" data-remove>Gỡ logo</button></div></div>
+      </div>
+      <input type="file" accept="image/*" data-file hidden>
+      <button class="primary" data-save>Lưu Đội A</button>
+    </div>
+    <div class="card needs-conn" id="formTeamB" data-team="B" data-sub="teams">
+      <h3><span class="dot" id="dotB"></span>Đội B</h3>
+      <div class="grid2">
+        <label class="f">Tên đội<input data-k="name" maxlength="40"></label>
+        <label class="f">Tên ngắn<input data-k="short" maxlength="6" placeholder="≤ 6 ký tự"></label>
+      </div>
+      <div class="grid2">
+        <label class="f">VĐV 1<input data-k="p1" maxlength="40"></label>
+        <label class="f">VĐV 2<input data-k="p2" maxlength="40"></label>
+      </div>
+      <div class="grid2">
+        <label class="f">Màu<input type="color" data-k="color"></label>
+        <div class="logo-row"><img alt="" data-logo><div class="btns"><button class="ghost" data-pick>Chọn logo</button><button class="ghost" data-remove>Gỡ logo</button></div></div>
+      </div>
+      <input type="file" accept="image/*" data-file hidden>
+      <button class="primary" data-save>Lưu Đội B</button>
+    </div>
+    <div class="card needs-conn" id="formRules" data-sub="rules">
+      <h3>Môn &amp; luật</h3>
+      <label class="f">Môn<select id="rSport"><option value="pickleball">Pickleball</option><option value="badminton">Cầu lông</option><option value="tennis">Tennis</option><option value="custom">Tùy chỉnh</option></select></label>
+      <div class="grid2 r-points">
+        <label class="f">Điểm thắng set<input id="rPoints" type="number" inputmode="numeric" min="1" max="99"></label>
+        <label class="f">Cách biệt<input id="rWinBy" type="number" inputmode="numeric" min="1" max="5"></label>
+      </div>
+      <div class="grid2 r-points">
+        <label class="f">Điểm trần<input id="rCap" type="number" inputmode="numeric" min="1" max="199" placeholder="Không"></label>
+        <label class="f">Tính điểm<select id="rScoring"><option value="sideout">Chỉ đội giao</option><option value="rally">Mọi pha bóng</option></select></label>
+      </div>
+      <div class="grid3 r-tennis">
+        <label class="f">Game/set<input id="rGames" type="number" inputmode="numeric" min="1" max="10"></label>
+        <label class="f">Tie-break khi<input id="rTbAt" type="number" inputmode="numeric" min="1" max="10"></label>
+        <label class="f">Điểm TB<input id="rTbPts" type="number" inputmode="numeric" min="1" max="20"></label>
+      </div>
+      <div class="grid2">
+        <label class="f">Số set<select id="rBestOf"><option value="1">1 set</option><option value="3">Thắng 2/3</option><option value="5">Thắng 3/5</option><option value="7">Thắng 4/7</option></select></label>
+        <label class="check" style="align-self:end"><input type="checkbox" id="rDoubles">Đánh đôi</label>
+      </div>
+      <div class="grid2">
+        <button class="ghost" id="rPreset">Luật chuẩn</button>
+        <button class="primary" id="rApply">Áp dụng</button>
+      </div>
+      <div class="muted">Đổi luật khi trận đang có điểm sẽ bắt đầu lại trận.</div>
+    </div>
+    <div class="card" data-sub="system">
       <h3>Link overlay cho OBS</h3>
       <div class="mono" id="sOverlay"></div>
       <button class="primary" data-copy="sOverlay">Sao chép link overlay</button>
-      <div class="muted">OBS → Sources → + → Browser → dán link, Width 1920, Height 1080. Nền overlay trong suốt.</div>
+      <div class="muted">OBS → Sources → + → Browser → dán link, 1920 × 1080. Nền trong suốt.</div>
     </div>
-    <div class="card">
+    <div class="card" data-sub="system">
       <h3>Link điều khiển (có mã)</h3>
       <div class="mono" id="sControl"></div>
       <button data-copy="sControl">Sao chép link điều khiển</button>
       <div class="muted">Ai có link này đều chỉnh được tỉ số. Đổi mã trong app Camera Station nếu bị lộ.</div>
     </div>
-    <div class="card">
+    <div class="card" data-sub="system">
       <h3>Kết nối</h3>
       <div class="muted" id="sInfo"></div>
       <button class="ghost" id="sKey">Nhập mã điều khiển khác</button>
@@ -365,18 +432,26 @@ section.tab{overflow-y:auto;overflow-x:hidden;-webkit-overflow-scrolling:touch;o
   </section>
 </main>
 
-<div class="offline-msg">Mất kết nối với camera · đang thử lại…</div>
-<div class="toast" id="toast"></div>
+<nav id="nav">
+  <button data-tab="score" class="on"><svg class="i" viewBox="0 0 24 24"><rect x="3" y="5" width="18" height="14" rx="3"/><path d="M12 5v14M7.5 10v4M15.5 10h2v4h-2z"/></svg>Tỉ số</button>
+  <button data-tab="overlay"><svg class="i" viewBox="0 0 24 24"><rect x="2" y="4" width="20" height="14" rx="2.5"/><path d="M5 14h9M8 21h8"/></svg>Overlay</button>
+  <button data-tab="settings"><svg class="i" viewBox="0 0 24 24"><path d="M4 6h10M18 6h2M4 12h4M12 12h8M4 18h12M20 18h0"/><circle cx="16" cy="6" r="2"/><circle cx="10" cy="12" r="2"/><circle cx="18" cy="18" r="2"/></svg>Cài đặt</button>
+</nav>
+
+<div class="offline-msg" role="alert">Mất kết nối với camera · đang thử lại… Thao tác tạm khoá.</div>
+<div class="toast" id="toast" role="status"></div>
 
 <div class="shade" id="moreSheet"><div class="sheet">
   <h3>Thao tác</h3>
+  <h4>Người giao bóng</h4>
   <div class="grid2" id="serveBtns"></div>
+  <h4>Trận đấu</h4>
   <button id="mSwapSides">Đổi bên sân</button>
   <button id="mEndSet">Kết thúc set hiện tại</button>
-  <button id="mFinish" class="danger">Kết thúc trận</button>
   <button id="mReopen">Mở lại trận</button>
+  <button id="mFinish" class="danger">Kết thúc trận</button>
   <button id="mNew" class="danger">Trận mới (về 0)</button>
-  <button class="ghost" data-close>Đóng</button>
+  <button class="ghost full" data-close>Đóng</button>
 </div></div>
 
 <div class="shade" id="confirmSheet"><div class="sheet">
@@ -400,6 +475,7 @@ var state=null, key='', es=null, lastSeen=0, connected=false, offset=0, seq=0;
 var dirty={match:false,A:false,B:false,rules:false,ticker:false};
 var $=function(id){return document.getElementById(id);};
 var qsa=function(sel,root){return Array.prototype.slice.call((root||document).querySelectorAll(sel));};
+function buzz(ms){try{if(navigator.vibrate)navigator.vibrate(ms);}catch(e){}}
 
 // ---------- key ----------
 function readKey(){
@@ -415,7 +491,7 @@ key=readKey();
 
 // ---------- ui helpers ----------
 var toastTimer=0;
-function toast(msg,err){var t=$('toast');t.textContent=msg;t.className='toast on'+(err?' err':'');clearTimeout(toastTimer);toastTimer=setTimeout(function(){t.className='toast'+(err?' err':'');},2600);}
+function toast(msg,err){var t=$('toast');t.textContent=msg;t.className='toast on'+(err?' err':'');if(err)buzz([40,60,40]);clearTimeout(toastTimer);toastTimer=setTimeout(function(){t.className='toast'+(err?' err':'');},err?3500:2200);}
 function openSheet(id){$(id).classList.add('on');}
 function closeSheets(){qsa('.shade').forEach(function(s){s.classList.remove('on');});}
 qsa('.shade').forEach(function(s){s.addEventListener('click',function(e){if(e.target===s||e.target.hasAttribute('data-close'))s.classList.remove('on');});});
@@ -426,11 +502,17 @@ $('cYes').onclick=function(){var cb=confirmCb;confirmCb=null;closeSheets();if(cb
 function setText(id,v){var el=$(id);if(el&&el.textContent!==v)el.textContent=v;}
 
 // ---------- tabs ----------
-qsa('#nav button').forEach(function(b){b.onclick=function(){
-  qsa('#nav button').forEach(function(x){x.classList.toggle('on',x===b);});
-  qsa('section.tab').forEach(function(s){s.classList.toggle('on',s.id==='tab-'+b.dataset.tab);});
-  if(b.dataset.tab==='overlay')ensurePreview();
-};});
+var TAB_STORE='vnvarTab';
+function showTab(name){
+  var ok=false;
+  qsa('#nav button').forEach(function(x){var on=x.dataset.tab===name;x.classList.toggle('on',on);if(on)ok=true;});
+  if(!ok)return false;
+  qsa('section.tab').forEach(function(s){s.classList.toggle('on',s.id==='tab-'+name);});
+  if(name==='overlay')ensurePreview();
+  try{sessionStorage.setItem(TAB_STORE,name);}catch(e){}
+  return true;
+}
+qsa('#nav button').forEach(function(b){b.onclick=function(){showTab(b.dataset.tab);};});
 
 // ---------- sub tabs (mỗi tab chia nhóm, nhớ nhóm đang mở) ----------
 qsa('section.tab').forEach(function(sec){
@@ -461,12 +543,12 @@ function send(action){
     .then(function(x){
       if(x.r.ok){if(x.d&&x.d.state)applyState(x.d.state);return true;}
       if(x.r.status===401){openKey();return false;}
-      if(x.r.status===429){toast('Bấm quá nhanh, vui lòng chờ một chút',true);return false;}
+      if(x.r.status===429){toast('Bấm quá nhanh, chờ một chút rồi thử lại',true);return false;}
       if(x.r.status===503&&attempt<3){attempt+=1;return sleep(600*attempt).then(once);}
-      toast((x.d&&x.d.message)||('Lỗi '+x.r.status),true);return false;
+      toast((x.d&&x.d.message)||('Camera báo lỗi '+x.r.status+', thử lại'),true);return false;
     },function(){
       if(attempt<3){attempt+=1;return sleep(500*attempt).then(once);}
-      toast('Không gửi được lệnh tới camera',true);return false;
+      toast('Không gửi được lệnh — kiểm tra Wi-Fi với camera',true);return false;
     });
   }
   return once();
@@ -475,11 +557,12 @@ function applyState(s){
   if(!s||typeof s.rev!=='number')return;
   if(state&&s.epoch===state.epoch&&s.rev<state.rev)return;
   if(typeof s.serverNowMs==='number')offset=s.serverNowMs-Date.now();
-  state=s;render();
+  state=s;document.body.classList.remove('wait');render();
 }
 function setConn(on){
   connected=on;
   $('conn').classList.toggle('on',on);
+  $('conn').classList.toggle('off',!on);
   setText('connText',on?'Đã kết nối':'Mất kết nối');
   document.body.classList.toggle('offline',!on&&state!==null);
 }
@@ -500,6 +583,12 @@ connect();poll();
 
 // ---------- render ----------
 function teamOf(id){return id==='A'?state.teamA:state.teamB;}
+function setLabelOf(st){
+  if(st.synthetic)return '–';
+  var t=st.a+'-'+st.b;
+  if(st.tbA!=null&&st.tbB!=null)t+='('+Math.min(st.tbA,st.tbB)+')';
+  return t;
+}
 function render(){
   var s=state, sport=s.sport, tennis=sport==='tennis';
   var m=s.match||{};
@@ -513,25 +602,32 @@ function render(){
   ['A','B'].forEach(function(id){
     var t=teamOf(id), el=$('team'+id), low=id.toLowerCase();
     el.style.background=t.color;
+    el.classList.toggle('serving',s.serving===id&&s.status!=='finished');
     setText('name'+id,t.name);
     setText('players'+id,(t.players||[]).join(' · '));
+    var logo=$('logo'+id);
+    if(t.logoId){var src='/api/score/logo/'+encodeURIComponent(t.logoId);if(logo.getAttribute('src')!==src){logo.hidden=false;logo.setAttribute('src',src);}}
+    else{logo.hidden=true;logo.removeAttribute('src');}
     var pts=s.display[low];
     var ptsEl=$('pts'+id);
-    if(ptsEl.textContent!==pts){ptsEl.textContent=pts;}
+    if(ptsEl.textContent!==pts){ptsEl.textContent=pts;ptsEl.classList.remove('bump');void ptsEl.offsetWidth;ptsEl.classList.add('bump');}
     $('serve'+id).classList.toggle('on',s.serving===id);
     $('serve'+id).textContent=(s.rules.doubles&&s.rules.scoring==='sideout'&&!tennis)?('GIAO '+s.serverNumber):'GIAO';
     var chips=$('chips'+id);chips.textContent='';
     var won=s.setsWon[low];
-    var c=document.createElement('span');c.className='chip';c.textContent='Set thắng: '+won;chips.appendChild(c);
+    var c=document.createElement('span');c.className='chip';c.textContent='Set: '+won;chips.appendChild(c);
     if(tennis){var g=document.createElement('span');g.className='chip';g.textContent='Game: '+s.games[low];chips.appendChild(g);}
     $('dot'+id).style.background=t.color;
   });
-  setText('setLabel',s.status==='finished'?'Hết trận':('Set '+s.currentSet+(tennis&&s.tiebreak?' · Tie-break':'')));
+  setText('setLabel',s.status==='finished'?'HẾT TRẬN':('SET '+s.currentSet+(tennis&&s.tiebreak?' · TB':'')));
+  var hist=(s.sets||[]).map(function(st,i){return 'S'+(i+1)+' '+setLabelOf(st);}).join(' · ');
+  if(tennis&&s.status!=='finished')hist=(hist?hist+' · ':'')+'Game '+s.games.a+'-'+s.games.b;
+  setText('setHist',hist);
   setText('callout',s.display.callout);
   var hint='';
   if(sport==='pickleball'&&s.rules.scoring==='sideout')hint='Chạm vào đội thắng pha bóng';
   else if(tennis)hint='Chạm vào người thắng điểm';
-  else hint='Chạm để +1 điểm';
+  else hint='Chạm ô đội để +1 điểm';
   setText('ruleHint',hint);
   var fb=$('finishedBox');
   if(s.status==='finished'){var w=s.winner?teamOf(s.winner).name:'';fb.textContent=w?('🏆 '+w+' thắng '+s.setsWon.a+'–'+s.setsWon.b):'Trận đã kết thúc';fb.classList.add('on');}
@@ -549,13 +645,12 @@ function renderServeButtons(){
     var nums=doubles?[1,2]:[null];
     nums.forEach(function(n){
       var b=document.createElement('button');
-      b.textContent='Giao: '+teamOf(id).short+(n?(' · '+n):'');
+      b.textContent=teamOf(id).short+(n?(' · người '+n):'');
       if(s.serving===id&&(!n||s.serverNumber===n))b.className='primary';
       b.onclick=function(){closeSheets();var a={action:'setServe',team:id};if(n)a.serverNumber=n;send(a);};
       box.appendChild(b);
     });
   });
-  box.style.gridTemplateColumns=doubles?'1fr 1fr':'1fr 1fr';
 }
 
 // ---------- score input ----------
@@ -565,22 +660,24 @@ var lastTap={A:0,B:0};
   el.addEventListener('click',function(e){
     if(e.target.closest('.minus'))return;
     var now=Date.now();if(now-lastTap[id]<350)return;lastTap[id]=now;
-    if(!state||state.status==='finished'){if(state)toast('Trận đã kết thúc',true);return;}
+    if(!state||state.status==='finished'){if(state)toast('Trận đã kết thúc — mở lại trong "Thêm"',true);return;}
     el.classList.remove('flash');void el.offsetWidth;el.classList.add('flash');
+    var p=document.createElement('span');p.className='plus';p.textContent='+1';el.appendChild(p);setTimeout(function(){if(p.parentNode)p.parentNode.removeChild(p);},750);
+    buzz(25);
     send({action:'point',team:id});
   });
 });
 qsa('.minus').forEach(function(btn){
-  var timer=0;
+  var timer=0, fired=0;
   function cancel(){clearTimeout(timer);timer=0;btn.classList.remove('holding');}
-  btn.addEventListener('pointerdown',function(e){e.preventDefault();e.stopPropagation();cancel();btn.classList.add('holding');
-    timer=setTimeout(function(){cancel();send({action:'adjust',team:btn.dataset.minus,delta:-1});toast('Đã trừ 1 điểm');},600);});
+  btn.addEventListener('pointerdown',function(e){e.preventDefault();e.stopPropagation();cancel();btn.classList.add('holding');buzz(10);
+    timer=setTimeout(function(){cancel();fired=Date.now();buzz([30,40,30]);send({action:'adjust',team:btn.dataset.minus,delta:-1});toast('Đã trừ 1 điểm');},600);});
   ['pointerup','pointerleave','pointercancel'].forEach(function(ev){btn.addEventListener(ev,cancel);});
-  btn.addEventListener('click',function(e){e.stopPropagation();});
+  btn.addEventListener('click',function(e){e.stopPropagation();if(Date.now()-fired>1000)toast('Giữ nút −1 để trừ điểm');});
   btn.addEventListener('contextmenu',function(e){e.preventDefault();});
 });
-$('btnUndo').onclick=function(){send({action:'undo'});};
-$('btnServe').onclick=function(){send({action:'swapServe'});};
+$('btnUndo').onclick=function(){buzz(20);send({action:'undo'}).then(function(ok){if(ok)toast('Đã hoàn tác');});};
+$('btnServe').onclick=function(){buzz(15);send({action:'swapServe'});};
 $('btnMore').onclick=function(){openSheet('moreSheet');};
 $('mSwapSides').onclick=function(){closeSheets();send({action:'swapSides'});};
 $('mEndSet').onclick=function(){confirmBox('Kết thúc set?','Set hiện tại sẽ được chốt theo tỉ số đang có.','Kết thúc set',function(){send({action:'endSet'});});};
@@ -598,7 +695,7 @@ function fillForms(){
   ['A','B'].forEach(function(id){
     var form=$('formTeam'+id), t=teamOf(id);
     var img=form.querySelector('[data-logo]');
-    if(t.logoId){var src='/api/score/logo/'+encodeURIComponent(t.logoId);if(img.getAttribute('src')!==src)img.setAttribute('src',src);img.style.visibility='visible';}
+    if(t.logoId){var src='/api/score/logo/'+encodeURIComponent(t.logoId);if(img.getAttribute('src')!==src){img.setAttribute('src',src);img.style.visibility='visible';}}
     else{img.removeAttribute('src');img.style.visibility='hidden';}
     if(dirty[id])return;
     form.querySelector('[data-k=name]').value=t.name;
@@ -633,7 +730,10 @@ $('saveMatch').onclick=function(){send({action:'setMatchInfo',tournament:$('fTou
   };
   var file=form.querySelector('[data-file]');
   form.querySelector('[data-pick]').onclick=function(){file.click();};
-  form.querySelector('[data-remove]').onclick=function(){send({action:'removeLogo',team:id});};
+  form.querySelector('[data-remove]').onclick=function(){
+    if(!state||!teamOf(id).logoId){toast('Đội chưa có logo');return;}
+    confirmBox('Gỡ logo?','Logo của '+teamOf(id).name+' sẽ bị xoá khỏi bảng tỉ số.','Gỡ logo',function(){send({action:'removeLogo',team:id});});
+  };
   file.onchange=function(){var f=file.files&&file.files[0];file.value='';if(f)uploadLogo(id,f);};
 });
 function uploadLogo(team,f){
@@ -674,7 +774,7 @@ $('rApply').onclick=function(){
 };
 $('rPreset').onclick=function(){sendConfig({preset:true});};
 
-// ---------- overlay tab ----------
+// ---------- overlay ----------
 var previewLoaded=false;
 function ensurePreview(){
   if(!previewLoaded){previewLoaded=true;$('previewFrame').src='/overlay?preview=1';}
@@ -682,9 +782,10 @@ function ensurePreview(){
 }
 function fitPreview(){var box=$('preview');var k=box.clientWidth/1920;$('previewFrame').style.transform='scale('+k+')';}
 window.addEventListener('resize',fitPreview);
+var SCENE_NAMES={scorebar:'Thanh tỉ số',full:'Bảng lớn',intro:'Giới thiệu',result:'Kết quả',hidden:'Ẩn tất cả'};
 function renderOverlayTab(){
-  var o=state.overlay;
-  qsa('#scenes button').forEach(function(b){b.classList.toggle('on',b.dataset.scene===o.scene);});
+  var o=state.overlay, hid=o.visible===false;
+  qsa('[data-scene]').forEach(function(b){b.classList.toggle('on',b.dataset.scene===o.scene);});
   qsa('#themes button').forEach(function(b){b.classList.toggle('on',b.dataset.theme===o.theme);});
   qsa('#positions button').forEach(function(b){b.classList.toggle('on',b.dataset.pos===o.position);});
   if(document.activeElement!==$('oAccent'))val($('oAccent'),o.accent.toLowerCase());
@@ -692,11 +793,13 @@ function renderOverlayTab(){
   setText('oScaleV',Math.round(Number(o.scale)*100)+'%');
   qsa('[data-show]').forEach(function(c){c.checked=!!o.show[c.dataset.show];});
   $('oBurnIn').checked=o.burnIn!==false;
-  $('oVisible').checked=o.visible!==false;
-  $('hVisible').classList.toggle('off',o.visible===false);
-  setText('hVisibleText',o.visible===false?'Overlay: Ẩn':'Overlay: Hiện');
+  $('oVisible').checked=!hid;
+  $('hVisible').classList.toggle('off',hid);
+  $('hVisible').setAttribute('aria-pressed',hid?'false':'true');
+  $('dock').classList.toggle('hid',hid);
+  setText('hVisibleText',hid?'ẨN':'HIỆN');
 }
-qsa('#scenes button').forEach(function(b){b.onclick=function(){send({action:'overlay',scene:b.dataset.scene});};});
+qsa('[data-scene]').forEach(function(b){b.onclick=function(){buzz(15);var sc=b.dataset.scene;send({action:'overlay',scene:sc}).then(function(ok){if(ok&&b.closest('#quickScenes')){toast('Cảnh: '+SCENE_NAMES[sc]+(state&&state.overlay.visible===false?' (overlay đang ẩn)':''));}});};});
 qsa('#themes button').forEach(function(b){b.onclick=function(){send({action:'overlay',theme:b.dataset.theme});};});
 qsa('#positions button').forEach(function(b){b.onclick=function(){send({action:'overlay',position:b.dataset.pos});};});
 $('oAccent').addEventListener('change',function(){send({action:'overlay',accent:$('oAccent').value.toUpperCase()});});
@@ -704,7 +807,7 @@ $('oScale').addEventListener('input',function(){setText('oScaleV',Math.round(Num
 $('oScale').addEventListener('change',function(){send({action:'overlay',scale:Number($('oScale').value)});});
 $('oBurnIn').addEventListener('change',function(){send({action:'overlay',burnIn:$('oBurnIn').checked});});
 $('oVisible').addEventListener('change',function(){send({action:'overlay',visible:$('oVisible').checked});});
-$('hVisible').onclick=function(){var hide=!(state&&state.overlay&&state.overlay.visible===false);send({action:'overlay',visible:!hide}).then(function(ok){if(ok)toast(hide?'Đã ẩn overlay':'Đã hiện overlay');});};
+$('hVisible').onclick=function(){buzz(20);var hide=!(state&&state.overlay&&state.overlay.visible===false);send({action:'overlay',visible:!hide}).then(function(ok){if(ok)toast(hide?'Đã ẩn overlay':'Đã hiện overlay');});};
 qsa('[data-show]').forEach(function(c){c.addEventListener('change',function(){var show={};show[c.dataset.show]=c.checked;send({action:'overlay',show:show});});});
 $('tSave').onclick=function(){send({action:'overlay',ticker:{enabled:$('tEnabled').checked,text:$('tText').value,speed:Number($('tSpeed').value)}}).then(function(ok){if(ok){dirty.ticker=false;toast('Đã cập nhật chữ chạy');render();}});};
 function showBanner(text){text=(text||'').trim();if(!text){toast('Nhập nội dung thông báo',true);return;}send({action:'banner',text:text,seconds:Number($('bSeconds').value)}).then(function(ok){if(ok)toast('Đang hiện: '+text);});}
@@ -717,7 +820,7 @@ qsa('[data-timer]').forEach(function(b){b.onclick=function(){
   else send({action:'timer',op:op});
 };});
 function fmt(ms){var t=Math.max(0,Math.floor(ms/1000)),h=Math.floor(t/3600),m=Math.floor(t%3600/60),s=t%60;var p=function(x){return(x<10?'0':'')+x;};return(h?h+':'+p(m):p(m))+':'+p(s);}
-setInterval(function(){if(!state)return;var tm=state.timer;var ms=tm.accumulatedMs+(tm.running?Math.max(0,Date.now()+offset-tm.startedAtMs):0);setText('timerView',fmt(ms));},500);
+setInterval(function(){if(!state)return;var tm=state.timer;var ms=tm.accumulatedMs+(tm.running?Math.max(0,Date.now()+offset-tm.startedAtMs):0);var v=fmt(ms);setText('timerView',v);setText('timerMini',(tm.running?'⏱ ':'⏸ ')+v);},500);
 
 // ---------- system ----------
 function renderSystem(){
@@ -735,6 +838,10 @@ function openKey(){$('keyInput').value=key;closeSheets();openSheet('keySheet');}
 $('sKey').onclick=openKey;
 $('sReload').onclick=function(){location.reload();};
 $('keySave').onclick=function(){var k=$('keyInput').value.trim().toUpperCase();if(!/^[A-Z0-9]{6}$/.test(k)){toast('Mã gồm 6 ký tự chữ/số',true);return;}key=k;try{localStorage.setItem(KEY_STORE,k);}catch(e){}closeSheets();toast('Đã lưu mã');if(state)renderSystem();};
+['logoA','logoB'].forEach(function(id){$(id).addEventListener('error',function(){$(id).hidden=true;});});
+qsa('[data-logo]').forEach(function(img){img.addEventListener('error',function(){img.style.visibility='hidden';});});
+var savedTab=null;try{savedTab=sessionStorage.getItem(TAB_STORE);}catch(e){}
+if(savedTab&&savedTab!=='score')showTab(savedTab);
 if(!key)setTimeout(openKey,600);
 })();
 </script>

@@ -1340,7 +1340,9 @@ class CameraServer {
         'height': webRtcService.resolutionProfile.height,
         'fps': webRtcService.resolutionProfile.fps,
         'bitrate': webRtcService.resolutionProfile.bitrate,
-        'rtspBitrate': webRtcService.resolutionProfile.rtspBitrate,
+        'rtspBitrate': webRtcService.rtspBitrateBps,
+        'sportsMode': webRtcService.sportsMode,
+        'sportsShutter': webRtcService.sportsShutter,
       },
 
       'segmentCount': recordingService.segments.length,

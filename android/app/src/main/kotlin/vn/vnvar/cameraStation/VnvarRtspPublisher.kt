@@ -39,6 +39,12 @@ class VnvarRtspPublisher(
     private val bitrate: Int = 2_000_000,
     private val fps: Int = 30,
     remoteAudioEnabled: Boolean = false,
+    /**
+     * Chế độ thể thao: H.264 High/Main profile (CABAC, nén hiệu quả hơn
+     * Baseline mặc định) và trần QP (Android 12+) để bộ nén không xoá quả bóng
+     * vài pixel ở các khung chuyển động mạnh.
+     */
+    private val sportsTuning: Boolean = false,
     /** Nhận [publisherId] để bên gọi bỏ qua callback trễ của phiên đã dừng. */
     private val onEncoderConfigured: (Long) -> Unit = {},
     private val onEncoderError: (Long, String) -> Unit = { _, _ -> },
@@ -1232,8 +1238,7 @@ class VnvarRtspPublisher(
             "H264 encoder=${codecInfo.name}, ${width}x$height@${supportedFps}, " +
                 "bitrate=$supportedBitrate, colorFormat=0x${encoderColorFormat.toString(16)}",
         )
-        val created = MediaCodec.createByCodecName(codecInfo.name)
-        try {
+        fun buildFormat(tuned: Boolean): MediaFormat {
             val format = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, width, height)
             format.setInteger(MediaFormat.KEY_COLOR_FORMAT, encoderColorFormat)
             format.setInteger(MediaFormat.KEY_BIT_RATE, startBitrate)
@@ -1247,19 +1252,75 @@ class VnvarRtspPublisher(
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
                 format.setInteger(MediaFormat.KEY_LOW_LATENCY, 1)
             }
-            created.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
-            created.start()
-            readEncoderInputLayout(created)
-        } catch (error: Exception) {
-            // Codec vừa tạo chưa được gán vào `codec`: phải tự giải phóng.
-            try { created.release() } catch (_: Exception) {}
-            throw error
+            if (tuned) applySportsEncoderTuning(format, capabilities)
+            return format
+        }
+
+        fun configureCodec(tuned: Boolean): MediaCodec {
+            val created = MediaCodec.createByCodecName(codecInfo.name)
+            try {
+                created.configure(buildFormat(tuned), null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
+                created.start()
+                readEncoderInputLayout(created)
+            } catch (error: Exception) {
+                // Codec vừa tạo chưa được gán vào `codec`: phải tự giải phóng.
+                try { created.release() } catch (_: Exception) {}
+                throw error
+            }
+            return created
+        }
+
+        val created = if (sportsTuning) {
+            try {
+                configureCodec(tuned = true)
+            } catch (error: Exception) {
+                // Vài encoder từ chối profile/QP dù báo hỗ trợ: dùng cấu hình chuẩn.
+                Log.w(TAG, "Sports encoder tuning rejected by ${codecInfo.name}; using defaults", error)
+                configureCodec(tuned = false)
+            }
+        } else {
+            configureCodec(tuned = false)
         }
         codec = created
         encoderErrorReported.set(false)
         if (encoderReady.compareAndSet(false, true) && running.get()) {
             onEncoderConfigured(publisherId)
         }
+    }
+
+    /**
+     * Thể thao: High profile (hoặc Main) nếu encoder hỗ trợ, không B-frame
+     * (độ trễ thấp, RTP không cần sắp xếp lại khung); Android 12+: trần QP 40
+     * để khung chuyển động mạnh không bị nén "nhoè khối" mất bóng (vượt bitrate
+     * ngắn hạn thay vì mất chi tiết).
+     */
+    private fun applySportsEncoderTuning(
+        format: MediaFormat,
+        capabilities: MediaCodecInfo.CodecCapabilities,
+    ) {
+        val levels = capabilities.profileLevels
+        val profile = when {
+            levels.any { it.profile == MediaCodecInfo.CodecProfileLevel.AVCProfileHigh } ->
+                MediaCodecInfo.CodecProfileLevel.AVCProfileHigh
+            levels.any { it.profile == MediaCodecInfo.CodecProfileLevel.AVCProfileMain } ->
+                MediaCodecInfo.CodecProfileLevel.AVCProfileMain
+            else -> null
+        }
+        if (profile != null) {
+            format.setInteger(MediaFormat.KEY_PROFILE, profile)
+            // Level cao nhất encoder hỗ trợ cho profile này (đủ cho 1080p60).
+            levels.filter { it.profile == profile }.maxOfOrNull { it.level }?.let {
+                format.setInteger(MediaFormat.KEY_LEVEL, it)
+            }
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                format.setInteger(MediaFormat.KEY_MAX_B_FRAMES, 0)
+            }
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            format.setInteger(MediaFormat.KEY_VIDEO_QP_MAX, SPORTS_MAX_QP)
+        }
+        Log.i(TAG, "Sports encoder tuning: profile=$profile, qpMax=" +
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) SPORTS_MAX_QP else "n/a")
     }
 
     private fun drainEncoder() {
@@ -2266,6 +2327,8 @@ class VnvarRtspPublisher(
         private const val RESERVED_LOOPBACK_SLOTS = 1
         private const val MAX_RTSP_HEADER_BYTES = 64 * 1024
         private const val MIN_RTSP_BITRATE = 500_000
+        /** Trần QP H.264 của chế độ thể thao (51 = không giới hạn). */
+        private const val SPORTS_MAX_QP = 40
 
         /**
          * Địa chỉ remote là loopback: 127.0.0.0/8, ::1, hoặc IPv4-mapped

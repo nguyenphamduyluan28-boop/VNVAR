@@ -16,6 +16,11 @@ class StationConfigService {
   static const String _resolutionProfileKey = 'camera_resolution_profile';
   static const String _resolutionFpsKey = 'camera_resolution_fps';
   static const String _resolutionLockedKey = 'camera_resolution_locked';
+  static const String _sportsModeKey = 'camera_sports_mode';
+  static const String _sportsShutterKey = 'camera_sports_shutter';
+
+  /// Mức màn trập chế độ thể thao: 0 = tắt, 250 = 1/250 s, 500 = 1/500 s.
+  static const List<int> sportsShutterOptions = [0, 250, 500];
   static const String _apiPortKey = 'camera_api_port';
   static const String _cameraQuarterTurnsKey = 'camera_quarter_turns';
   static const String _cameraLensUltraWideKey = 'camera_lens_ultra_wide';
@@ -261,6 +266,27 @@ class StationConfigService {
   Future<bool> loadRtspTabletAudio() async {
     final prefs = await SharedPreferences.getInstance();
     return prefs.getBool(_rtspTabletAudioKey) ?? false;
+  }
+
+  /// Chế độ thể thao: mức màn trập (xem [sportsShutterOptions]). Mặc định tắt.
+  Future<void> saveSportsShutter(int denominator) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setInt(_sportsShutterKey, normalizeSportsShutter(denominator));
+    await prefs.remove(_sportsModeKey);
+  }
+
+  Future<int> loadSportsShutter() async {
+    final prefs = await SharedPreferences.getInstance();
+    final saved = prefs.getInt(_sportsShutterKey);
+    if (saved != null) return normalizeSportsShutter(saved);
+    // Bản trước chỉ lưu bật/tắt (bật = 1/500 s).
+    return (prefs.getBool(_sportsModeKey) ?? false) ? 500 : 0;
+  }
+
+  /// Giá trị lạ → mức gần nhất trong [sportsShutterOptions].
+  static int normalizeSportsShutter(int denominator) {
+    if (denominator <= 0) return 0;
+    return denominator < 375 ? 250 : 500;
   }
 
   Future<void> saveResolutionLocked(bool locked) async {

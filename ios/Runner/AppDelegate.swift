@@ -240,6 +240,16 @@ import UIKit
         }
         let target = (arguments["targetEv"] as? NSNumber)?.floatValue ?? 0
         let applied = VnvarWebRtcTrackBridge.setExposureBias(forTrackId: trackId, bias: target)
+        // Chế độ thể thao áp lại cùng lúc với EV: lệnh này chạy sau mỗi lần mở /
+        // đổi camera, mà iOS tự bỏ giới hạn màn trập khi activeFormat đổi.
+        let sportsShutter = (arguments["sportsShutter"] as? NSNumber)?.intValue
+          ?? ((arguments["sportsMode"] as? Bool).map { $0 ? 500 : 0 })
+        if let sportsShutter = sportsShutter {
+          _ = VnvarWebRtcTrackBridge.setSportsMode(
+            forTrackId: trackId,
+            shutterDenominator: sportsShutter
+          )
+        }
         if applied.isNaN {
           result(["applied": false, "reason": "unsupported_capturer"])
         } else {
@@ -314,6 +324,9 @@ import UIKit
         "minZoom": minZoom,
         "maxZoom": maxZoom,
         "isUltraWide": isUltraWide,
+        // FPS tối đa mở được theo kích thước ("1920x1080": 60), cùng quy tắc
+        // chọn định dạng của capturer: Dart dùng để biết ống 0.5x có 60 FPS.
+        "maxFps": VnvarWebRtcTrackBridge.maxFpsBySize(for: device),
       ])
     }
     result(cameras)
@@ -1138,19 +1151,12 @@ import UIKit
       ("qhd2k", 2560, 1440),
       ("ultraHd4k", 3840, 2160),
     ]
+    // Cùng quy tắc chọn định dạng với capturer (định dạng phiên chụp mở được),
+    // để FPS liệt kê đúng bằng FPS camera thật sự chạy.
+    let fpsBySize = VnvarWebRtcTrackBridge.maxFpsBySize(for: device)
     var profiles: [[String: Any]] = []
     for candidate in candidates {
-      var supportedFps = 0
-      for format in device.formats {
-        let dimensions = CMVideoFormatDescriptionGetDimensions(format.formatDescription)
-        guard dimensions.width == candidate.width,
-              dimensions.height == candidate.height else { continue }
-        let formatFps = format.videoSupportedFrameRateRanges.compactMap { range -> Int? in
-          let maxRate = Int(range.maxFrameRate.rounded(.down))
-          return Double(maxRate) >= range.minFrameRate ? min(maxRate, 60) : nil
-        }.max() ?? 0
-        supportedFps = max(supportedFps, formatFps)
-      }
+      let supportedFps = fpsBySize["\(candidate.width)x\(candidate.height)"]?.intValue ?? 0
       if supportedFps > 0 {
         profiles.append([
           "id": candidate.id,

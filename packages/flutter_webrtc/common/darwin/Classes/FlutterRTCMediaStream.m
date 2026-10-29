@@ -35,6 +35,26 @@
 
 @end
 
+// VNVAR: initializer có sẵn trong RTCCameraVideoCapturer (WebRTC-SDK) nhưng có
+// thể không khai báo trong header; chỉ gọi khi runtime có selector này.
+@interface RTCCameraVideoCapturer (VnvarPlainSession)
+- (instancetype)initWithDelegate:(__weak id<RTCVideoCapturerDelegate>)delegate
+                  captureSession:(AVCaptureSession*)captureSession;
+@end
+
+/// VNVAR: trạm chỉ dùng một camera mỗi lúc. WebRTC-SDK mới tạo
+/// AVCaptureMultiCamSession khi máy hỗ trợ, khiến chỉ dùng được các định dạng
+/// "multi-cam" (ống góc rộng 0.5x thường không có 1080p 60 FPS). Dùng
+/// AVCaptureSession thường để mở được mọi định dạng của camera.
+static RTCCameraVideoCapturer* VnvarCreateCameraCapturer(id<RTCVideoCapturerDelegate> delegate) {
+  SEL plainInit = @selector(initWithDelegate:captureSession:);
+  if ([RTCCameraVideoCapturer instancesRespondToSelector:plainInit]) {
+    return [[RTCCameraVideoCapturer alloc] initWithDelegate:delegate
+                                             captureSession:[[AVCaptureSession alloc] init]];
+  }
+  return [[RTCCameraVideoCapturer alloc] initWithDelegate:delegate];
+}
+
 @implementation FlutterWebRTCPlugin (RTCMediaStream)
 
 /**
@@ -487,11 +507,14 @@ typedef void (^NavigatorUserMediaSuccessCallback)(RTCMediaStream* mediaStream);
 #endif
       
     VideoProcessingAdapter *videoProcessingAdapter = [[VideoProcessingAdapter alloc] initWithRTCVideoSource:videoSource];
-    self.videoCapturer = [[RTCCameraVideoCapturer alloc] initWithDelegate:videoProcessingAdapter];
+    self.videoCapturer = VnvarCreateCameraCapturer(videoProcessingAdapter);
       
+    // VNVAR: chọn định dạng theo kích thước VÀ FPS (trước đây chỉ theo kích
+    // thước nên có thể lấy định dạng tối đa 30 FPS dù máy có bản 60 FPS).
     AVCaptureDeviceFormat* selectedFormat = [self selectFormatForDevice:videoDevice
                                                             targetWidth:targetWidth
-                                                           targetHeight:targetHeight];
+                                                           targetHeight:targetHeight
+                                                              targetFps:targetFps];
 
     CMVideoDimensions selectedDimension = CMVideoFormatDescriptionGetDimensions(selectedFormat.formatDescription);
     NSInteger selectedWidth = (NSInteger) selectedDimension.width;
@@ -960,42 +983,8 @@ typedef void (^NavigatorUserMediaSuccessCallback)(RTCMediaStream* mediaStream);
   return nil;
 }
 
-- (AVCaptureDeviceFormat*)selectFormatForDevice:(AVCaptureDevice*)device
-                                    targetWidth:(NSInteger)targetWidth
-                                   targetHeight:(NSInteger)targetHeight {
-  NSArray<AVCaptureDeviceFormat*>* formats =
-      [RTCCameraVideoCapturer supportedFormatsForDevice:device];
-  AVCaptureDeviceFormat* selectedFormat = nil;
-  long currentDiff = INT_MAX;
-  for (AVCaptureDeviceFormat* format in formats) {
-    CMVideoDimensions dimension = CMVideoFormatDescriptionGetDimensions(format.formatDescription);
-    FourCharCode pixelFormat = CMFormatDescriptionGetMediaSubType(format.formatDescription);
-#if TARGET_OS_IPHONE
-    if (@available(iOS 13.0, *)) {
-      if(format.isMultiCamSupported != AVCaptureMultiCamSession.multiCamSupported) {
-        continue;
-      }
-    }
-#endif
-    //NSLog(@"AVCaptureDeviceFormats,fps %d, dimension: %dx%d", format.videoSupportedFrameRateRanges, dimension.width, dimension.height);
-    long diff = labs(targetWidth - dimension.width) + labs(targetHeight - dimension.height);
-    if (diff < currentDiff) {
-      selectedFormat = format;
-      currentDiff = diff;
-    } else if (diff == currentDiff &&
-               pixelFormat == [self.videoCapturer preferredOutputPixelFormat]) {
-      selectedFormat = format;
-    }
-  }
-  return selectedFormat;
-}
-
-- (NSInteger)selectFpsForFormat:(AVCaptureDeviceFormat*)format targetFps:(NSInteger)targetFps {
-  Float64 maxSupportedFramerate = 0;
-  for (AVFrameRateRange* fpsRange in format.videoSupportedFrameRateRanges) {
-    maxSupportedFramerate = fmax(maxSupportedFramerate, fpsRange.maxFrameRate);
-  }
-  return fmin(maxSupportedFramerate, targetFps);
-}
+// VNVAR: selectFormatForDevice / selectFpsForFormat chỉ còn một bản trong
+// CameraUtils.m (hai category cùng định nghĩa một selector thì runtime chọn
+// ngẫu nhiên một bản).
 
 @end

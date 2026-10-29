@@ -33,6 +33,7 @@ import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.math.abs
 import kotlin.math.max
 import kotlin.math.min
+import kotlin.math.pow
 import kotlin.math.roundToInt
 
 /** Applies a conservative exposure bias to flutter_webrtc's active camera. */
@@ -81,6 +82,44 @@ object CameraExposureController {
      */
     private const val PERIODIC_REMETER_MS = 10 * 60 * 1_000L
     private const val PERIODIC_MIN_DRIFT = 0.10
+    // ---- Chế độ thể thao (phơi sáng tay, vòng điều khiển ISO riêng) ----
+    /**
+     * Lấy mốc sáng nhanh: AE/AWB hội tụ liên tục chừng này (hoặc quá
+     * [SPORTS_SEED_TIMEOUT_MS]) và phiên đã mở ít nhất [SPORTS_SEED_AFTER_SESSION_MS]
+     * là chuyển sang phơi sáng tay ngay (không chờ khoá tiêu cự như khoá AE thường).
+     */
+    private const val SPORTS_SEED_STABLE_MS = 500L
+    private const val SPORTS_SEED_AFTER_SESSION_MS = 1_000L
+    private const val SPORTS_SEED_TIMEOUT_MS = 3_000L
+    /** Độ sáng lệch mốc dưới ±12% coi như đúng (người chơi đi qua không làm "thở" sáng). */
+    private const val SPORTS_LUMA_DEADBAND = 0.12
+    /** Lệch quá ×1,6 (bật/tắt đèn) coi là đổi sáng lớn: chỉnh nhanh hơn. */
+    private const val SPORTS_LUMA_LARGE_ERROR = 1.6
+    /** Lệch phải kéo dài chừng này mới chỉnh (thường / đổi sáng lớn). */
+    private const val SPORTS_ADJUST_AFTER_MS = 4_000L
+    private const val SPORTS_LARGE_ADJUST_AFTER_MS = 1_500L
+    /** Sau mỗi lần chỉnh, chờ bộ đo sáng (đã làm mượt ~1 s) bắt kịp. */
+    private const val SPORTS_ADJUST_COOLDOWN_MS = 1_500L
+
+    /** Thông số phơi sáng AE tự động đã đo (dùng làm mốc độ sáng cho chế độ thể thao). */
+    private data class AutoExposure(val exposureNs: Long, val iso: Int, val boost: Int?)
+
+    /** Thông số phơi sáng tay áp cho chế độ thể thao. */
+    private data class ManualExposure(val exposureNs: Long, val iso: Int, val boost: Int?) {
+        val total: Double get() = exposureNs.toDouble() * iso
+    }
+
+    /**
+     * Giới hạn của phiên hiện tại. [maxExposureNs]: màn trập chậm nhất được
+     * phép khi thiếu sáng (không chậm hơn mức AE tự động đã chọn, không quá
+     * một khung hình).
+     */
+    private data class SportsLimits(
+        val minExposureNs: Long,
+        val maxExposureNs: Long,
+        val minIso: Int,
+        val maxIso: Int,
+    )
 
     @Volatile
     private var activeTrackId: String? = null
@@ -168,6 +207,46 @@ object CameraExposureController {
     /** Đã tự kiểm tra các trường private của flutter_webrtc dùng qua reflection. */
     @Volatile
     private var reflectionChecked = false
+    /**
+     * Chế độ thể thao (mặc định tắt). Bật: sau khi AE hội tụ và khoá, thay khoá
+     * AE bằng phơi sáng tay cùng độ sáng nhưng màn trập nhanh (ISO bù lại), và
+     * giảm khử nhiễu/làm nét xuống FAST để không xoá vật nhỏ di chuyển nhanh.
+     */
+    @Volatile
+    private var sportsShutterNs = 0L
+    private val sportsModeEnabled: Boolean get() = sportsShutterNs > 0L
+    /** Máy hiện tại cho phơi sáng tay (MANUAL_SENSOR + AE OFF). */
+    @Volatile
+    private var activeSportsCapable = false
+    /** Phơi sáng tay đang áp (null = chưa vào / đã thoát chế độ tay). */
+    @Volatile
+    private var sportsManual: ManualExposure? = null
+    @Volatile
+    private var sportsLimits: SportsLimits? = null
+    /** Độ sáng khung hình mục tiêu (đo lúc AE tự động hội tụ). */
+    @Volatile
+    private var sportsLumaTarget: Double? = null
+    @Volatile
+    private var sportsErrorSinceMs = 0L
+    @Volatile
+    private var sportsAdjustedAtMs = 0L
+    /**
+     * Mức zoom camera THỰC SỰ áp dụng (CaptureResult, Android 11+) và ống vật lý
+     * đang chạy của camera logic (Android 10+). Xin 0.6x mà kết quả vẫn 1.0x
+     * nghĩa là hệ điều hành không bật ống góc rộng (thường khi đang 60 FPS).
+     */
+    @Volatile
+    private var lastAppliedZoomRatio: Float? = null
+    @Volatile
+    private var lastActivePhysicalId: String? = null
+    @Volatile
+    private var activeCameraDeviceId: String? = null
+    /** Thông số AE tự động mới nhất (camera thread ghi, khi AE chưa tắt). */
+    @Volatile
+    private var latestAutoExposure: AutoExposure? = null
+    /** Thông số AE tự động tại lúc khoá; null khi chưa khoá. */
+    @Volatile
+    private var lockedAutoExposure: AutoExposure? = null
     private val lumaMeter = LumaMeter { trackId, luma ->
         lifecycleHandler.post { onLuma(trackId, luma) }
     }
@@ -217,7 +296,17 @@ object CameraExposureController {
         lifecycleHandler.postDelayed(captureWatchdog, delayMs)
     }
 
-    fun apply(trackId: String, targetEv: Double, requestCallback: (Map<String, Any>) -> Unit) {
+    /**
+     * [sportsShutter]: null = giữ nguyên chế độ thể thao hiện tại (watchdog,
+     * vòng đời...); 0 = tắt; N > 0 = màn trập mục tiêu 1/N s (Dart đặt theo
+     * cài đặt người dùng).
+     */
+    fun apply(
+        trackId: String,
+        targetEv: Double,
+        sportsShutter: Int? = null,
+        requestCallback: (Map<String, Any>) -> Unit,
+    ) {
         // Apply thành công (từ bất kỳ nguồn nào) đưa watchdog về nhịp 1,5 s.
         val callback: (Map<String, Any>) -> Unit = { response ->
             if (response["applied"] == true) watchdogFailures = 0
@@ -226,8 +315,29 @@ object CameraExposureController {
         if (activeTrackId != trackId) {
             requestGeneration++
             lastCaptureHeartbeatMs = 0L
+            latestAutoExposure = null
             releaseAutoLock()
             lumaMeter.attach(trackId)
+        }
+        if (sportsShutter != null) {
+            val shutterNs = if (sportsShutter > 0) 1_000_000_000L / sportsShutter else 0L
+            if (shutterNs != sportsShutterNs) {
+                val wasOn = sportsShutterNs > 0L
+                sportsShutterNs = shutterNs
+                Log.i(TAG, if (shutterNs > 0L) "Sports mode: shutter 1/$sportsShutter s" else "Sports mode off")
+                val manual = sportsManual
+                val limits = sportsLimits
+                if (shutterNs == 0L) {
+                    // Tắt khi đang khoá: AE đo lại từ đầu (giữ nét) thay vì khoá AE
+                    // ở trạng thái nội bộ cũ.
+                    if (autoLocked) releaseAutoLock(keepFocus = true)
+                } else if (wasOn && manual != null && limits != null) {
+                    // Đổi mức màn trập: giữ nguyên độ sáng, chỉ đổi màn trập/ISO.
+                    sportsManual = solveSportsExposure(manual.total, limits, shutterNs, manual.boost)
+                }
+                // Bật khi đang khoá AE thường: request kế tiếp tự chuyển sang
+                // phơi sáng tay từ mốc đã đo lúc khoá.
+            }
         }
         if (autoLocked && abs(targetEv - activeTargetEv) > 1e-6) {
             // Người dùng đổi độ sáng (EV) khi đang khoá: đo lại NGAY với mức mới
@@ -380,6 +490,10 @@ object CameraExposureController {
         activeCameraLock = false
         activeMeteringPoint = null
         lastAppliedKey = null
+        latestAutoExposure = null
+        activeCameraDeviceId = null
+        lastAppliedZoomRatio = null
+        lastActivePhysicalId = null
         releaseAutoLock()
         lumaMeter.detach()
         lastCaptureHeartbeatMs = 0L
@@ -392,7 +506,7 @@ object CameraExposureController {
     fun setStableExposure(trackId: String, enabled: Boolean, callback: (Map<String, Any>) -> Unit) {
         stableExposureEnabled = enabled
         releaseAutoLock()
-        apply(trackId, activeTargetEv, callback)
+        apply(trackId, activeTargetEv, requestCallback = callback)
     }
 
     /**
@@ -435,6 +549,12 @@ object CameraExposureController {
         }
         aeReleasedAtMs = now
         convergedSinceMs = 0L
+        lockedAutoExposure = null
+        sportsManual = null
+        sportsLimits = null
+        sportsLumaTarget = null
+        sportsErrorSinceMs = 0L
+        sportsAdjustedAtMs = 0L
         lumaRefAtLock = null
         lumaDriftSinceMs = 0L
         lockedAtMs = 0L
@@ -515,15 +635,26 @@ object CameraExposureController {
         val ae = result.get(CaptureResult.CONTROL_AE_STATE) ?: return
         val sinceAeReleaseMs =
             if (aeReleasedAtMs > 0L) now - aeReleasedAtMs else sinceSessionMs
+        // Thể thao trên máy chỉnh tay được: lấy mốc sáng sớm (~1,5 s) rồi tự
+        // điều khiển phơi sáng, không chờ khoá tiêu cự / 5 s như khoá AE thường.
+        val fastSports = sportsModeEnabled && activeSportsCapable
+        val settleTimeoutMs = if (fastSports) SPORTS_SEED_TIMEOUT_MS else AE_SETTLE_TIMEOUT_MS
+        val timedOut = min(sinceSessionMs, sinceAeReleaseMs) >= settleTimeoutMs
         val aeSettled = ae == CaptureResult.CONTROL_AE_STATE_CONVERGED ||
             ae == CaptureResult.CONTROL_AE_STATE_FLASH_REQUIRED ||
-            (min(sinceSessionMs, sinceAeReleaseMs) >= AE_SETTLE_TIMEOUT_MS &&
-                ae != CaptureResult.CONTROL_AE_STATE_PRECAPTURE)
+            (timedOut && ae != CaptureResult.CONTROL_AE_STATE_PRECAPTURE)
+        // Lấy mốc sớm thì cũng khoá AWB sớm: chờ AWB hội tụ để không khoá sai màu.
+        val awb = result.get(CaptureResult.CONTROL_AWB_STATE)
+        val awbSettled = !fastSports || timedOut || awb == null ||
+            awb == CaptureResult.CONTROL_AWB_STATE_CONVERGED ||
+            awb == CaptureResult.CONTROL_AWB_STATE_LOCKED
         // Chờ tiêu cự khoá trước (hoặc hết hạn) để lần khoá AE không bị request
         // khoá tiêu cự thay ngay sau đó.
-        val focusReady = !activeHasAutoFocus || af == null ||
+        val focusReady = fastSports || !activeHasAutoFocus || af == null ||
             lockedFocusDistance != null || afTimedOut
-        if (!aeSettled || !focusReady || sinceSessionMs < MIN_LOCK_AFTER_SESSION_MS) {
+        val minAfterSessionMs =
+            if (fastSports) SPORTS_SEED_AFTER_SESSION_MS else MIN_LOCK_AFTER_SESSION_MS
+        if (!aeSettled || !awbSettled || !focusReady || sinceSessionMs < minAfterSessionMs) {
             convergedSinceMs = 0L
             return
         }
@@ -531,7 +662,8 @@ object CameraExposureController {
             convergedSinceMs = now
             return
         }
-        if (now - convergedSinceMs < STABLE_LOCK_AFTER_MS) return
+        val stableMs = if (fastSports) SPORTS_SEED_STABLE_MS else STABLE_LOCK_AFTER_MS
+        if (now - convergedSinceMs < stableMs) return
         lockPending = true
         lifecycleHandler.post {
             lockPending = false
@@ -539,11 +671,18 @@ object CameraExposureController {
                 autoLocked || activeCameraLock || !stableExposureEnabled
             ) return@post
             autoLocked = true
+            // Mốc độ sáng cho chế độ thể thao (bật lúc này hoặc sau này).
+            lockedAutoExposure = latestAutoExposure
+            sportsManual = null
+            sportsLumaTarget = lumaMeter.current
+            sportsErrorSinceMs = 0L
             lumaRefAtLock = lumaMeter.current
             lumaDriftSinceMs = 0L
             lockedAtMs = SystemClock.elapsedRealtime()
             lockedSessionHash = currentSessionHash
-            Log.i(TAG, "Exposure settled; locking AE/AWB")
+            Log.i(TAG, if (sportsModeEnabled && activeSportsCapable) {
+                "Exposure seeded; switching to sports manual exposure"
+            } else "Exposure settled; locking AE/AWB")
             apply(trackId, activeTargetEv) {}
         }
     }
@@ -552,6 +691,13 @@ object CameraExposureController {
     private fun onLuma(trackId: String, luma: Double) {
         if (activeTrackId != trackId || !autoLocked) {
             lumaDriftSinceMs = 0L
+            return
+        }
+        val manual = sportsManual
+        if (manual != null && sportsModeEnabled && !activeCameraLock) {
+            // Đang phơi sáng tay: tự giữ độ sáng bằng ISO (màn trập cố định),
+            // không mở khoá về AE tự động (màn trập chậm) như khoá thường.
+            controlSportsExposure(trackId, luma, manual)
             return
         }
         val reference = lumaRefAtLock
@@ -591,15 +737,121 @@ object CameraExposureController {
     }
 
     /**
+     * Main thread: vòng điều khiển phơi sáng tay của chế độ thể thao. Giữ độ
+     * sáng khung hình quanh mốc đo lúc AE hội tụ; chỉ chỉnh khi lệch rõ và kéo
+     * dài (người chơi đi qua không làm hình "thở"), đổi sáng lớn thì chỉnh nhanh.
+     */
+    private fun controlSportsExposure(trackId: String, luma: Double, manual: ManualExposure) {
+        val target = sportsLumaTarget ?: run {
+            sportsLumaTarget = luma
+            return
+        }
+        val limits = sportsLimits ?: return
+        val now = SystemClock.elapsedRealtime()
+        if (sportsAdjustedAtMs > 0L && now - sportsAdjustedAtMs < SPORTS_ADJUST_COOLDOWN_MS) return
+        val ratio = target.coerceAtLeast(4.0) / luma.coerceAtLeast(4.0)
+        val large = ratio >= SPORTS_LUMA_LARGE_ERROR || ratio <= 1.0 / SPORTS_LUMA_LARGE_ERROR
+        if (!large && abs(ratio - 1.0) < SPORTS_LUMA_DEADBAND) {
+            sportsErrorSinceMs = 0L
+            return
+        }
+        if (sportsErrorSinceMs == 0L) {
+            sportsErrorSinceMs = now
+            return
+        }
+        val waitMs = if (large) SPORTS_LARGE_ADJUST_AFTER_MS else SPORTS_ADJUST_AFTER_MS
+        if (now - sportsErrorSinceMs < waitMs) return
+        sportsErrorSinceMs = 0L
+        // Độ sáng ảnh (đã qua gamma) không tỉ lệ thẳng với phơi sáng: bước
+        // ratio^1.3 nằm giữa tuyến tính và gamma 2.2; các lần sau tự tinh chỉnh.
+        val step = ratio.pow(1.3).coerceIn(0.5, 2.0)
+        val next = solveSportsExposure(manual.total * step, limits, sportsShutterNs, manual.boost)
+        if (next == manual) return // đã chạm giới hạn ISO/màn trập
+        Log.i(
+            TAG,
+            "Sports exposure ${manual.exposureNs / 1000}us/ISO${manual.iso} -> " +
+                "${next.exposureNs / 1000}us/ISO${next.iso} (luma ${luma.roundToInt()}/${target.roundToInt()})",
+        )
+        sportsManual = next
+        sportsAdjustedAtMs = now
+        apply(trackId, activeTargetEv) {}
+    }
+
+    /**
      * Đo sáng theo điểm chạm mà vẫn giữ nguyên toàn bộ cấu hình request của app
      * (EV, FPS, zoom, NR/EIS). Thay cho Helper.setExposurePoint của flutter_webrtc,
      * vốn thay request bằng TEMPLATE_RECORD trần (sáng/zoom nhảy rồi watchdog trả lại).
      */
+    /** Bắt đầu lại cửa sổ đo FPS (vừa đổi ống kính/zoom: bỏ số đo cũ). */
+    fun resetCaptureFps() {
+        lumaMeter.resetFps()
+    }
+
+    /**
+     * Trạng thái ống kính thực tế cho Dart kiểm tra sau khi đổi sang 0.5x:
+     * FPS đo được, zoom xin / zoom thực áp dụng, camera và ống vật lý đang chạy.
+     * Giá trị null = máy không báo / chưa có.
+     */
+    fun lensStatus(): Map<String, Any?> = mapOf(
+        "fps" to measuredCaptureFps(),
+        "requestedZoom" to activeZoom,
+        "appliedZoom" to lastAppliedZoomRatio?.toDouble(),
+        "cameraId" to activeCameraDeviceId,
+        "activePhysicalId" to lastActivePhysicalId,
+    )
+
+    /**
+     * FPS camera thật sự xuất ra (đo trên track, sau giới hạn do nhiệt); null
+     * khi chưa đo được hoặc số đo đã cũ (> 10 s).
+     */
+    fun measuredCaptureFps(): Double? {
+        val fps = lumaMeter.measuredFps ?: return null
+        val age = SystemClock.elapsedRealtime() - lumaMeter.measuredAtMs
+        return if (age <= 10_000L) fps else null
+    }
+
+    /**
+     * FPS tối đa camera [characteristics] thật sự mở được ở [width]x[height]
+     * qua WebRTC: Camera2Session chọn dải trong CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES
+     * gần nhất với FPS yêu cầu (repeating request cũng đặt đúng dải đó), nên FPS
+     * thật = min(khả năng cảm biến ở kích thước này, dải AE cao nhất). Trước đây
+     * chỉ xét cảm biến nên nhiều máy hiện "60 FPS" nhưng chạy 30. 0 = không có
+     * kích thước này. Trần 60.
+     */
+    fun maxCaptureFps(characteristics: CameraCharacteristics, width: Int, height: Int): Int {
+        val configuration = characteristics.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
+            ?: return 0
+        val size = configuration.getOutputSizes(SurfaceTexture::class.java)
+            ?.firstOrNull { it.width == width && it.height == height }
+            ?: return 0
+        val minFrameDurationNs = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            configuration.getOutputMinFrameDuration(SurfaceTexture::class.java, size)
+        } else 0L
+        val sensorFps = if (minFrameDurationNs > 0L) {
+            Math.round(1_000_000_000.0 / minFrameDurationNs).toInt().coerceAtLeast(1)
+        } else Int.MAX_VALUE
+        val aeRanges = characteristics.get(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES)
+        val aeUpperRaw = aeRanges?.maxOfOrNull { it.upper } ?: 30
+        // Vài máy báo dải theo đơn vị 1/1000 FPS (WebRTC: fpsUnitFactor).
+        val aeFps = if (aeUpperRaw >= 1000) aeUpperRaw / 1000 else aeUpperRaw
+        return min(sensorFps, aeFps).coerceIn(1, 60)
+    }
+
+    /** FPS tối đa theo kích thước của [characteristics] ("1920x1080" → 60). */
+    private fun maxFpsBySize(characteristics: CameraCharacteristics): Map<String, Int> {
+        val result = mutableMapOf<String, Int>()
+        for ((width, height) in listOf(1280 to 720, 1920 to 1080)) {
+            val fps = try { maxCaptureFps(characteristics, width, height) } catch (_: Throwable) { 0 }
+            if (fps > 0) result["${width}x$height"] = fps
+        }
+        return result
+    }
+
     fun setMeteringPoint(trackId: String, x: Double, y: Double, callback: (Map<String, Any>) -> Unit) {
         activeMeteringPoint = Pair(x.coerceIn(0.0, 1.0), y.coerceIn(0.0, 1.0))
         activeCameraLock = false
         releaseAutoLock()
-        apply(trackId, activeTargetEv, callback)
+        apply(trackId, activeTargetEv, requestCallback = callback)
     }
 
     fun setLock(trackId: String, locked: Boolean, callback: (Map<String, Any>) -> Unit) {
@@ -679,6 +931,7 @@ object CameraExposureController {
         val minZoom: Double,
         val maxZoom: Double,
         var isUltraWide: Boolean,
+        val maxFps: Map<String, Int>,
     )
 
     fun getAvailableCameras(context: Context): List<Map<String, Any>> {
@@ -752,7 +1005,12 @@ object CameraExposureController {
                     val isUltraWide = (id != "0") && (facing == CameraCharacteristics.LENS_FACING_BACK) &&
                         (minZoom <= 0.85 || (minFocal in 0.1f..3.5f) || fov >= 82f)
 
-                    parsedList.add(ParsedCamera(id, facing, facingStr, minFocal, fov, minZoom, maxZoom, isUltraWide))
+                    parsedList.add(
+                        ParsedCamera(
+                            id, facing, facingStr, minFocal, fov, minZoom, maxZoom, isUltraWide,
+                            maxFpsBySize(chars),
+                        ),
+                    )
                 } catch (_: Throwable) {}
             }
 
@@ -781,6 +1039,9 @@ object CameraExposureController {
                 "minZoom" to it.minZoom,
                 "maxZoom" to it.maxZoom,
                 "isUltraWide" to it.isUltraWide,
+                // FPS thật mở được theo kích thước: Dart dùng để biết ống 0.5x
+                // có chạy 60 FPS không.
+                "maxFps" to it.maxFps,
             )
         }
     }
@@ -928,6 +1189,11 @@ object CameraExposureController {
         }
         val cameraManager = readField(capturer, "cameraManager") as CameraManager
         val characteristics = cameraManager.getCameraCharacteristics(cameraDevice.id)
+        if (activeCameraDeviceId != cameraDevice.id) {
+            activeCameraDeviceId = cameraDevice.id
+            lastAppliedZoomRatio = null
+            lastActivePhysicalId = null
+        }
         val availableAfModes = characteristics.get(CameraCharacteristics.CONTROL_AF_AVAILABLE_MODES)
         activeHasAutoFocus = (characteristics.get(
             CameraCharacteristics.LENS_INFO_MINIMUM_FOCUS_DISTANCE,
@@ -950,6 +1216,13 @@ object CameraExposureController {
                 compensationRange.upper,
             )
         } else 0
+        val maxCaptureFps = (captureFormat.framerate.max / fpsUnitFactor).coerceAtLeast(1)
+        val sportsMode = sportsModeEnabled
+        activeSportsCapable = supportsManualExposure(characteristics)
+        val manualExposure = if (sportsMode && activeSportsCapable && autoLocked && !activeCameraLock) {
+            sportsManual ?: initialSportsExposure(characteristics, lockedAutoExposure, maxCaptureFps)
+                ?.also { sportsManual = it }
+        } else null
         val appliedKey = listOf(
             trackId,
             sessionHash,
@@ -960,6 +1233,8 @@ object CameraExposureController {
             activeZoom,
             activeMeteringPoint,
             activeRotationDegrees,
+            sportsMode,
+            manualExposure,
         ).joinToString("|")
         if (appliedKey == lastAppliedKey &&
             SystemClock.elapsedRealtime() - lastCaptureHeartbeatMs < CAPTURE_HEARTBEAT_TIMEOUT_MS
@@ -1088,18 +1363,36 @@ object CameraExposureController {
                             set(CaptureRequest.CONTROL_AF_REGIONS, arrayOf(region))
                         }
                     }
+                    // Thể thao: khử nhiễu/làm nét FAST. HIGH_QUALITY trên nhiều máy
+                    // khử nhiễu theo thời gian (trộn nhiều khung) nên xoá/làm nhoè
+                    // quả bóng vài pixel đang bay; FAST vẫn khử nhiễu nhẹ để ISO
+                    // cao không thành hạt (hạt làm tốn bitrate và gây đốm giả).
                     setFirstSupportedMode(
                         this,
                         CaptureRequest.NOISE_REDUCTION_MODE,
                         characteristics.get(CameraCharacteristics.NOISE_REDUCTION_AVAILABLE_NOISE_REDUCTION_MODES),
-                        CaptureRequest.NOISE_REDUCTION_MODE_HIGH_QUALITY,
+                        if (sportsMode) CaptureRequest.NOISE_REDUCTION_MODE_FAST
+                        else CaptureRequest.NOISE_REDUCTION_MODE_HIGH_QUALITY,
                     )
                     setFirstSupportedMode(
                         this,
                         CaptureRequest.EDGE_MODE,
                         characteristics.get(CameraCharacteristics.EDGE_AVAILABLE_EDGE_MODES),
-                        CaptureRequest.EDGE_MODE_HIGH_QUALITY,
+                        if (sportsMode) CaptureRequest.EDGE_MODE_FAST
+                        else CaptureRequest.EDGE_MODE_HIGH_QUALITY,
                     )
+                    if (manualExposure != null) {
+                        // Phơi sáng tay = cùng độ sáng lúc AE khoá (thời gian × ISO),
+                        // màn trập nhanh. AF/AWB vẫn theo cấu hình ở trên.
+                        set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_OFF)
+                        set(CaptureRequest.SENSOR_EXPOSURE_TIME, manualExposure.exposureNs)
+                        set(CaptureRequest.SENSOR_SENSITIVITY, manualExposure.iso)
+                        set(CaptureRequest.SENSOR_FRAME_DURATION, 1_000_000_000L / maxCaptureFps)
+                        val boost = manualExposure.boost
+                        if (boost != null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+                            set(CaptureRequest.CONTROL_POST_RAW_SENSITIVITY_BOOST, boost)
+                        }
+                    }
                     // Trạm đặt cố định trên chân máy: chống rung điện tử (EIS) chỉ cắt
                     // bớt khung hình và làm giảm độ nét/gây trôi hình nhẹ. Tắt EIS;
                     // chống rung quang học (OIS) của ống kính không bị ảnh hưởng.
@@ -1128,6 +1421,8 @@ object CameraExposureController {
                         ) {
                             if (activeTrackId == trackId && requestGeneration == generation) {
                                 lastCaptureHeartbeatMs = SystemClock.elapsedRealtime()
+                                recordAutoExposure(result)
+                                recordLensState(result)
                                 observeConvergence(trackId, generation, result)
                             }
                         }
@@ -1264,6 +1559,107 @@ object CameraExposureController {
         error("Field $name not found in ${instance.javaClass.name}")
     }
 
+    /** Camera thread: zoom thực áp dụng + ống vật lý đang chạy (nếu máy báo). */
+    private fun recordLensState(result: TotalCaptureResult) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            result.get(CaptureResult.CONTROL_ZOOM_RATIO)?.let { lastAppliedZoomRatio = it }
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            result.get(CaptureResult.LOGICAL_MULTI_CAMERA_ACTIVE_PHYSICAL_ID)?.let {
+                lastActivePhysicalId = it
+            }
+        }
+    }
+
+    /** Camera thread: ghi thông số phơi sáng do AE tự động chọn (bỏ qua khi đang phơi sáng tay). */
+    private fun recordAutoExposure(result: TotalCaptureResult) {
+        if (result.get(CaptureResult.CONTROL_AE_MODE) == CaptureResult.CONTROL_AE_MODE_OFF) return
+        val exposureNs = result.get(CaptureResult.SENSOR_EXPOSURE_TIME) ?: return
+        val iso = result.get(CaptureResult.SENSOR_SENSITIVITY) ?: return
+        if (exposureNs <= 0L || iso <= 0) return
+        val boost = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+            result.get(CaptureResult.CONTROL_POST_RAW_SENSITIVITY_BOOST)
+        } else null
+        latestAutoExposure = AutoExposure(exposureNs, iso, boost)
+    }
+
+    private fun supportsManualExposure(characteristics: CameraCharacteristics): Boolean {
+        val capabilities = characteristics.get(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES)
+        return capabilities?.contains(
+            CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES_MANUAL_SENSOR,
+        ) == true &&
+            characteristics.get(CameraCharacteristics.CONTROL_AE_AVAILABLE_MODES)
+                ?.contains(CaptureRequest.CONTROL_AE_MODE_OFF) == true &&
+            characteristics.get(CameraCharacteristics.SENSOR_INFO_EXPOSURE_TIME_RANGE) != null &&
+            characteristics.get(CameraCharacteristics.SENSOR_INFO_SENSITIVITY_RANGE) != null
+    }
+
+    /**
+     * Phơi sáng tay đầu tiên của chế độ thể thao: cùng độ sáng AE đã chọn
+     * (thời gian × ISO không đổi), màn trập mục tiêu. Ghi lại giới hạn của phiên
+     * cho vòng điều khiển. null = chưa có số đo AE (giữ khoá AE thường).
+     */
+    private fun initialSportsExposure(
+        characteristics: CameraCharacteristics,
+        auto: AutoExposure?,
+        maxFps: Int,
+    ): ManualExposure? {
+        auto ?: return null
+        val targetNs = sportsShutterNs.takeIf { it > 0L } ?: return null
+        val exposureRange = characteristics.get(CameraCharacteristics.SENSOR_INFO_EXPOSURE_TIME_RANGE)
+            ?: return null
+        val isoRange = characteristics.get(CameraCharacteristics.SENSOR_INFO_SENSITIVITY_RANGE)
+            ?: return null
+        val frameNs = 1_000_000_000L / maxFps.coerceAtLeast(1)
+        val minExposureNs: Long = exposureRange.lower
+        val maxExposureNs = max(targetNs, min(auto.exposureNs, frameNs))
+            .coerceIn(minExposureNs, exposureRange.upper)
+        val limits = SportsLimits(
+            minExposureNs = minExposureNs,
+            maxExposureNs = maxExposureNs,
+            minIso = isoRange.lower,
+            maxIso = isoRange.upper,
+        )
+        sportsLimits = limits
+        val boostRange = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+            characteristics.get(CameraCharacteristics.CONTROL_POST_RAW_SENSITIVITY_BOOST_RANGE)
+        } else null
+        val boost = auto.boost?.let { value ->
+            boostRange?.let { value.coerceIn(it.lower, it.upper) }
+        }
+        return solveSportsExposure(auto.exposureNs.toDouble() * auto.iso, limits, targetNs, boost)
+    }
+
+    /**
+     * Chia "độ phơi sáng" [total] (thời gian ns × ISO) thành màn trập + ISO:
+     * ưu tiên màn trập [targetNs]; ISO chạm trần thì nới màn trập (tối đa
+     * [SportsLimits.maxExposureNs]); ISO chạm sàn (quá sáng) thì màn trập nhanh hơn nữa.
+     */
+    private fun solveSportsExposure(
+        total: Double,
+        limits: SportsLimits,
+        targetNs: Long,
+        boost: Int?,
+    ): ManualExposure {
+        val minTotal = limits.minExposureNs.toDouble() * limits.minIso
+        val maxTotal = limits.maxExposureNs.toDouble() * limits.maxIso
+        val wanted = total.coerceIn(minTotal, maxTotal)
+        var exposureNs = targetNs.coerceIn(limits.minExposureNs, limits.maxExposureNs)
+        var iso = wanted / exposureNs
+        if (iso > limits.maxIso) {
+            iso = limits.maxIso.toDouble()
+            exposureNs = (wanted / iso).toLong().coerceIn(exposureNs, limits.maxExposureNs)
+        } else if (iso < limits.minIso) {
+            iso = limits.minIso.toDouble()
+            exposureNs = (wanted / iso).toLong().coerceIn(limits.minExposureNs, exposureNs)
+        }
+        return ManualExposure(
+            exposureNs,
+            iso.roundToInt().coerceIn(limits.minIso, limits.maxIso),
+            boost,
+        )
+    }
+
     private fun setFirstSupportedMode(
         request: CaptureRequest.Builder,
         key: CaptureRequest.Key<Int>,
@@ -1383,6 +1779,14 @@ private class LumaMeter(private val onLuma: (String, Double) -> Unit) : VideoSin
     @Volatile private var trackId: String? = null
     @Volatile var current: Double? = null
         private set
+    // Đếm khung hình thật sự đi ra từ camera (sau giới hạn FPS do nhiệt).
+    // onFrame chạy trên một luồng camera nên không cần khoá.
+    @Volatile private var fpsWindowStartMs = 0L
+    @Volatile private var fpsFrames = 0
+    @Volatile var measuredFps: Double? = null
+        private set
+    @Volatile var measuredAtMs = 0L
+        private set
 
     fun attach(id: String) {
         detach()
@@ -1405,6 +1809,10 @@ private class LumaMeter(private val onLuma: (String, Double) -> Unit) : VideoSin
         track = null
         trackId = null
         current = null
+        fpsWindowStartMs = 0L
+        fpsFrames = 0
+        measuredFps = null
+        measuredAtMs = 0L
         if (previous != null) {
             try { previous.removeSink(this) } catch (_: Throwable) {}
         }
@@ -1413,6 +1821,7 @@ private class LumaMeter(private val onLuma: (String, Double) -> Unit) : VideoSin
     override fun onFrame(frame: VideoFrame) {
         val id = trackId ?: return
         val now = SystemClock.elapsedRealtime()
+        countFrame(now)
         if (now - lastSampleMs < 500L || !busy.compareAndSet(false, true)) return
         lastSampleMs = now
         frame.retain()
@@ -1429,6 +1838,30 @@ private class LumaMeter(private val onLuma: (String, Double) -> Unit) : VideoSin
         } catch (_: Throwable) {
             frame.release()
             busy.set(false)
+        }
+    }
+
+    fun resetFps() {
+        fpsWindowStartMs = 0L
+        fpsFrames = 0
+        measuredFps = null
+        measuredAtMs = 0L
+    }
+
+    /** FPS đo trên cửa sổ 3 s. */
+    private fun countFrame(now: Long) {
+        if (fpsWindowStartMs == 0L) {
+            fpsWindowStartMs = now
+            fpsFrames = 0
+            return
+        }
+        fpsFrames++
+        val elapsed = now - fpsWindowStartMs
+        if (elapsed >= 3_000L) {
+            measuredFps = fpsFrames * 1000.0 / elapsed
+            measuredAtMs = now
+            fpsWindowStartMs = now
+            fpsFrames = 0
         }
     }
 

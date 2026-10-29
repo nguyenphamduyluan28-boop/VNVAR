@@ -32,6 +32,7 @@ class _ResolutionPickerSheet extends StatefulWidget {
 class _ResolutionPickerSheetState extends State<_ResolutionPickerSheet> {
   StreamSubscription<void>? _stateSubscription;
   bool _lockChanging = false;
+  bool _sportsChanging = false;
 
   @override
   void initState() {
@@ -82,6 +83,59 @@ class _ResolutionPickerSheetState extends State<_ResolutionPickerSheet> {
     );
   }
 
+  Future<void> _setSportsShutter(int denominator) async {
+    final runtime = widget.runtime;
+    if (_sportsChanging || denominator == runtime.sportsShutter) return;
+    final wasOn = runtime.sportsMode;
+    setState(() => _sportsChanging = true);
+    try {
+      await runtime.setSportsShutter(denominator);
+    } catch (error) {
+      String reason(bool english) =>
+          compactErrorText(stationErrorMessage(error, english: english));
+      widget.showToast(
+        vi: 'Không đổi được chế độ thể thao: ${reason(false)}',
+        en: "Couldn't change sports mode: ${reason(true)}",
+        kind: NoticeKind.error,
+      );
+      return;
+    } finally {
+      if (mounted) setState(() => _sportsChanging = false);
+    }
+    widget.onChanged();
+    if (denominator <= 0) {
+      widget.showToast(
+        vi: 'Đã tắt chế độ thể thao.',
+        en: 'Sports mode off.',
+        kind: NoticeKind.success,
+      );
+      return;
+    }
+    final pending = !wasOn && runtime.sportsBitratePending;
+    widget.showToast(
+      vi: pending
+          ? 'Màn trập 1/$denominator s. Bitrate cao áp dụng khi mở lại camera.'
+          : 'Thể thao: màn trập 1/$denominator s.',
+      en: pending
+          ? 'Shutter 1/$denominator s. Higher bitrate after camera restart.'
+          : 'Sports: shutter 1/$denominator s.',
+      kind: NoticeKind.success,
+    );
+  }
+
+  /// Cấu hình 50–60 FPS cùng độ phân giải hiện tại (nếu máy hỗ trợ).
+  CameraResolutionProfile? _highFpsProfile() {
+    final runtime = widget.runtime;
+    final current = runtime.resolutionProfile;
+    if (current.fps >= 50) return null;
+    for (final profile in runtime.supportedResolutionProfiles) {
+      if (profile.preset == current.preset && profile.fps >= 50) {
+        return profile;
+      }
+    }
+    return null;
+  }
+
   @override
   Widget build(BuildContext context) {
     final runtime = widget.runtime;
@@ -94,7 +148,10 @@ class _ResolutionPickerSheetState extends State<_ResolutionPickerSheet> {
         (runtime.temperatureC != null && runtime.temperatureC! >= 38.0) ||
         runtime.justCooledDown;
     const tileExtent = 72.0;
+    const sportsExtent = 104.0;
     final contentHeight = 56.0 +
+        sportsExtent +
+        BrandSpace.sm +
         (rows * tileExtent) +
         ((rows - 1) * BrandSpace.sm) +
         (hasThermalBanner ? 58.0 : 16.0);
@@ -191,6 +248,26 @@ class _ResolutionPickerSheetState extends State<_ResolutionPickerSheet> {
                 ),
               ],
               const SizedBox(height: BrandSpace.md),
+              // Không cố định chiều cao: chữ hệ thống phóng to thì khối tự cao
+              // lên, lưới chất lượng bên dưới (cuộn được) nhường chỗ.
+              _SportsModeTile(
+                shutter: runtime.sportsShutter,
+                busy: _sportsChanging,
+                onChanged: _setSportsShutter,
+                highFpsProfile: runtime.sportsMode ? _highFpsProfile() : null,
+                onUseHighFps: (profile) {
+                  if (isLocked) {
+                    widget.showToast(
+                      vi: 'Đang khoá chất lượng. Mở khoá ở góc trên để đổi.',
+                      en: 'Quality is locked. Unlock at the top to change.',
+                      kind: NoticeKind.warning,
+                    );
+                    return;
+                  }
+                  Navigator.pop(context, profile);
+                },
+              ),
+              const SizedBox(height: BrandSpace.sm),
               Expanded(
                 child: GridView.builder(
                   padding: EdgeInsets.zero,
@@ -225,6 +302,100 @@ class _ResolutionPickerSheetState extends State<_ResolutionPickerSheet> {
             ],
           ),
         ),
+      ),
+    );
+  }
+}
+
+/// Chế độ thể thao: chọn mức màn trập (Tắt / 1/250 / 1/500) + gợi ý 60 FPS.
+class _SportsModeTile extends StatelessWidget {
+  const _SportsModeTile({
+    required this.shutter,
+    required this.busy,
+    required this.onChanged,
+    required this.highFpsProfile,
+    required this.onUseHighFps,
+  });
+
+  final int shutter;
+  final bool busy;
+  final ValueChanged<int> onChanged;
+
+  /// Cấu hình 60 FPS cùng độ phân giải (null = đã 60 FPS / máy không hỗ trợ).
+  final CameraResolutionProfile? highFpsProfile;
+  final ValueChanged<CameraResolutionProfile> onUseHighFps;
+
+  @override
+  Widget build(BuildContext context) {
+    final enabled = shutter > 0;
+    final accent =
+        enabled ? BrandColors.primaryBright : BrandColors.textSecondary;
+    final fpsProfile = highFpsProfile;
+    return Container(
+      padding: const EdgeInsets.fromLTRB(
+        BrandSpace.md,
+        BrandSpace.sm,
+        BrandSpace.sm,
+        BrandSpace.sm,
+      ),
+      decoration: BoxDecoration(
+        color: BrandColors.surfaceRaised,
+        borderRadius: BorderRadius.circular(BrandRadius.medium),
+        border: Border.all(
+          color: enabled ? BrandColors.primaryBright : BrandColors.border,
+        ),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        mainAxisAlignment: MainAxisAlignment.center,
+        children: [
+          Row(
+            children: [
+              Icon(Icons.sports_tennis_rounded, color: accent, size: 20),
+              const SizedBox(width: BrandSpace.sm),
+              Expanded(
+                child: Text(
+                  appText(context, 'Thể thao', 'Sports mode'),
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: BrandText.body.copyWith(
+                    color: BrandColors.textPrimary,
+                    fontWeight: FontWeight.w700,
+                  ),
+                ),
+              ),
+              if (fpsProfile != null)
+                BrandPill(
+                  icon: Icons.speed_rounded,
+                  text: '${fpsProfile.fps} FPS',
+                  color: BrandColors.successSoft,
+                  tooltip: appText(
+                    context,
+                    'Chuyển ${fpsProfile.shortLabel} ${fpsProfile.fps} FPS: bóng ít mất dấu hơn',
+                    'Switch to ${fpsProfile.shortLabel} ${fpsProfile.fps} FPS: steadier ball tracking',
+                  ),
+                  onTap: busy ? null : () => onUseHighFps(fpsProfile),
+                ),
+            ],
+          ),
+          const SizedBox(height: BrandSpace.sm),
+          Align(
+            alignment: Alignment.centerLeft,
+            child: FittedBox(
+              fit: BoxFit.scaleDown,
+              alignment: Alignment.centerLeft,
+              child: BrandSegmented<int>(
+                values: StationConfigService.sportsShutterOptions,
+                selected: shutter,
+                dense: true,
+                labelOf: (value) => value <= 0
+                    ? appText(context, 'Tắt', 'Off')
+                    : '1/$value s',
+                onChanged: busy ? null : onChanged,
+              ),
+            ),
+          ),
+        ],
       ),
     );
   }

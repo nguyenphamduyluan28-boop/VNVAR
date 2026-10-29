@@ -407,6 +407,111 @@ static CIImage *VnvarCanvasImageFromNativeBuffer(RTCCVPixelBuffer *buffer,
   return nil;
 }
 
+// ---- Chọn định dạng camera (cùng quy tắc với flutter_webrtc đã vá) ----
+static Float64 VnvarFormatMaxFps(AVCaptureDeviceFormat *format) {
+  Float64 maxFps = 0;
+  for (AVFrameRateRange *range in format.videoSupportedFrameRateRanges) {
+    maxFps = fmax(maxFps, range.maxFrameRate);
+  }
+  return maxFps;
+}
+
+static BOOL VnvarIs8Bit420(FourCharCode pixelFormat) {
+  return pixelFormat == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange ||
+         pixelFormat == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange;
+}
+
+static BOOL VnvarIsMultiCamSession(AVCaptureSession *session) {
+  if (@available(iOS 13.0, *)) {
+    return session != nil && [session isKindOfClass:[AVCaptureMultiCamSession class]];
+  }
+  return NO;
+}
+
+/// Phiên chụp mà capturer (sẽ) dùng có phải multi-cam không: có capturer thì
+/// xem phiên thật; chưa có thì đoán như flutter_webrtc đã vá (dùng
+/// AVCaptureSession thường khi WebRTC-SDK có initWithDelegate:captureSession:).
+static BOOL VnvarExpectMultiCamSession(void) {
+  FlutterWebRTCPlugin *plugin = [FlutterWebRTCPlugin sharedSingleton];
+  if (plugin.videoCapturer.captureSession != nil) {
+    return VnvarIsMultiCamSession(plugin.videoCapturer.captureSession);
+  }
+  if ([RTCCameraVideoCapturer instancesRespondToSelector:
+          NSSelectorFromString(@"initWithDelegate:captureSession:")]) {
+    return NO;
+  }
+  if (@available(iOS 13.0, *)) {
+    return AVCaptureMultiCamSession.isMultiCamSupported;
+  }
+  return NO;
+}
+
+static BOOL VnvarFormatUsable(AVCaptureDeviceFormat *format, BOOL multiCam) {
+  if (@available(iOS 13.0, *)) {
+    if (multiCam && !format.isMultiCamSupported) return NO;
+  }
+  return YES;
+}
+
+/// Gần kích thước nhất → 8-bit 4:2:0 → đạt [fps] (lấy FPS tối đa thấp nhất vẫn
+/// đạt, tránh định dạng quay chậm) → pixel format capturer ưa dùng.
+static AVCaptureDeviceFormat *VnvarBestFormat(AVCaptureDevice *device, NSInteger width,
+                                              NSInteger height, NSInteger fps,
+                                              BOOL multiCam, FourCharCode preferredPixel) {
+  Float64 wantedFps = fps > 0 ? (Float64)fps : 30;
+  AVCaptureDeviceFormat *best = nil;
+  long bestDiff = LONG_MAX;
+  BOOL best420 = NO, bestMeets = NO, bestPreferred = NO;
+  Float64 bestFps = 0;
+  for (AVCaptureDeviceFormat *format in [RTCCameraVideoCapturer supportedFormatsForDevice:device]) {
+    if (!VnvarFormatUsable(format, multiCam)) continue;
+    CMVideoDimensions dimension = CMVideoFormatDescriptionGetDimensions(format.formatDescription);
+    FourCharCode pixelFormat = CMFormatDescriptionGetMediaSubType(format.formatDescription);
+    long diff = labs(width - dimension.width) + labs(height - dimension.height);
+    BOOL is420 = VnvarIs8Bit420(pixelFormat);
+    Float64 formatFps = VnvarFormatMaxFps(format);
+    BOOL meets = formatFps + 0.5 >= wantedFps;
+    BOOL preferred = pixelFormat == preferredPixel;
+    BOOL better;
+    if (best == nil || diff < bestDiff) {
+      better = YES;
+    } else if (diff > bestDiff) {
+      better = NO;
+    } else if (is420 != best420) {
+      better = is420;
+    } else if (meets != bestMeets) {
+      better = meets;
+    } else if (fabs(formatFps - bestFps) > 0.5) {
+      better = meets ? formatFps < bestFps : formatFps > bestFps;
+    } else {
+      better = preferred && !bestPreferred;
+    }
+    if (better) {
+      best = format;
+      bestDiff = diff;
+      best420 = is420;
+      bestMeets = meets;
+      bestFps = formatFps;
+      bestPreferred = preferred;
+    }
+  }
+  return best;
+}
+
++ (NSDictionary<NSString *, NSNumber *> *)maxFpsBySizeForDevice:(AVCaptureDevice *)device {
+  BOOL multiCam = VnvarExpectMultiCamSession();
+  NSMutableDictionary<NSString *, NSNumber *> *result = [NSMutableDictionary dictionary];
+  for (AVCaptureDeviceFormat *format in [RTCCameraVideoCapturer supportedFormatsForDevice:device]) {
+    if (!VnvarFormatUsable(format, multiCam)) continue;
+    if (!VnvarIs8Bit420(CMFormatDescriptionGetMediaSubType(format.formatDescription))) continue;
+    CMVideoDimensions dimension = CMVideoFormatDescriptionGetDimensions(format.formatDescription);
+    NSString *key = [NSString stringWithFormat:@"%dx%d", dimension.width, dimension.height];
+    NSInteger fps = MIN((NSInteger)floor(VnvarFormatMaxFps(format)), 60);
+    if (fps > [result[key] integerValue]) result[key] = @(fps);
+  }
+  return result;
+}
+
 + (void)switchCameraForTrackId:(NSString *)trackId
                     toDeviceId:(NSString *)deviceId
                     completion:(void (^)(BOOL success, NSString * _Nullable error))completion {
@@ -445,29 +550,22 @@ static CIImage *VnvarCanvasImageFromNativeBuffer(RTCCVPixelBuffer *buffer,
   NSInteger targetHeight = plugin._lastTargetHeight > 0 ? plugin._lastTargetHeight : 1080;
   NSInteger targetFps = plugin._lastTargetFps > 0 ? plugin._lastTargetFps : 30;
 
-  NSArray<AVCaptureDeviceFormat *> *formats = [RTCCameraVideoCapturer supportedFormatsForDevice:targetDevice];
-  AVCaptureDeviceFormat *selectedFormat = nil;
-  long currentDiff = INT_MAX;
-  for (AVCaptureDeviceFormat *format in formats) {
-    CMVideoDimensions dimension = CMVideoFormatDescriptionGetDimensions(format.formatDescription);
-    long diff = labs(targetWidth - dimension.width) + labs(targetHeight - dimension.height);
-    if (diff < currentDiff) {
-      selectedFormat = format;
-      currentDiff = diff;
-    }
+  // Chọn theo kích thước VÀ FPS, chỉ trong các định dạng phiên chụp hiện tại
+  // mở được (trước đây chỉ theo kích thước: ống 0.5x lấy nhầm định dạng tối đa
+  // 30 FPS, và có thể lấy định dạng không hỗ trợ multi-cam → iOS ném lỗi).
+  BOOL multiCam = VnvarIsMultiCamSession(capturer.captureSession);
+  AVCaptureDeviceFormat *selectedFormat =
+      VnvarBestFormat(targetDevice, targetWidth, targetHeight, targetFps, multiCam,
+                      [capturer preferredOutputPixelFormat]);
+  if (selectedFormat == nil) {
+    if (completion) completion(NO, @"No usable capture format");
+    return;
   }
-  if (selectedFormat == nil && formats.count > 0) {
-    selectedFormat = formats.firstObject;
-  }
-
-  Float64 maxSupportedFps = 0;
-  for (AVFrameRateRange *range in selectedFormat.videoSupportedFrameRateRanges) {
-    if (range.maxFrameRate > maxSupportedFps) {
-      maxSupportedFps = range.maxFrameRate;
-    }
-  }
+  Float64 maxSupportedFps = VnvarFormatMaxFps(selectedFormat);
   NSInteger fps = MIN(targetFps, (NSInteger)maxSupportedFps);
   if (fps <= 0) fps = 30;
+  NSLog(@"[CAMERA] Switch format %@ fps %ld (target %ldx%ld@%ld, multiCam %d)",
+        selectedFormat, (long)fps, (long)targetWidth, (long)targetHeight, (long)targetFps, multiCam);
 
 #if TARGET_OS_IPHONE
   [capturer stopCapture];
@@ -509,6 +607,132 @@ static CIImage *VnvarCanvasImageFromNativeBuffer(RTCCVPixelBuffer *buffer,
   }
   [device unlockForConfiguration];
   return clamped;
+}
+
+// ---- Chế độ thể thao (main queue) ----
+/// Màn trập mục tiêu (giây); 0 = tắt.
+static double gVnvarSportsTargetSeconds = 0;
+/// Giới hạn đang áp (có thể đã nới khi thiếu sáng).
+static double gVnvarSportsCurrentSeconds = 0;
+static NSString *gVnvarSportsTrackId = nil;
+static dispatch_source_t gVnvarSportsTimer = nil;
+
+/// Thời lượng một khung hình của định dạng đang chạy (giới hạn nới tối đa).
+static double VnvarFrameSeconds(AVCaptureDevice *device) {
+  CMTime frame = device.activeVideoMinFrameDuration;
+  double seconds = CMTIME_IS_VALID(frame) ? CMTimeGetSeconds(frame) : 0;
+  return seconds > 0 ? seconds : 1.0 / 30.0;
+}
+
+/// Đặt activeMaxExposureDuration (đã kẹp vào [min, max] của activeFormat, nếu
+/// không iOS ném NSRangeException). Gọi khi device đã lockForConfiguration.
+static double VnvarApplyMaxExposure(AVCaptureDevice *device, double seconds) {
+  CMTime target = CMTimeMakeWithSeconds(seconds, 1000000);
+  CMTime minimum = device.activeFormat.minExposureDuration;
+  CMTime maximum = device.activeFormat.maxExposureDuration;
+  if (CMTIME_IS_VALID(minimum) && CMTimeCompare(target, minimum) < 0) target = minimum;
+  if (CMTIME_IS_VALID(maximum) && CMTimeCompare(target, maximum) > 0) target = maximum;
+  device.activeMaxExposureDuration = target;
+  return CMTimeGetSeconds(target);
+}
+
++ (void)sportsTick {
+  if (gVnvarSportsTargetSeconds <= 0 || gVnvarSportsTrackId == nil) return;
+  AVCaptureDevice *device = [self activeVideoDeviceForTrackId:gVnvarSportsTrackId];
+  if (device == nil) return;
+  float maxIso = device.activeFormat.maxISO;
+  if (maxIso <= 0) return;
+  float offset = device.exposureTargetOffset;  // EV; âm = tối hơn mức AE muốn
+  float iso = device.ISO;
+  double exposure = CMTimeGetSeconds(device.exposureDuration);
+  double current = gVnvarSportsCurrentSeconds > 0 ? gVnvarSportsCurrentSeconds
+                                                  : gVnvarSportsTargetSeconds;
+  double next = current;
+  if (offset < -0.5f && iso >= maxIso * 0.95f) {
+    // ISO kịch trần mà vẫn thiếu sáng: nới màn trập (tối đa một khung hình).
+    next = MIN(current * 1.5, MAX(gVnvarSportsTargetSeconds, VnvarFrameSeconds(device)));
+  } else if (current > gVnvarSportsTargetSeconds * 1.01 && offset > -0.2f && exposure > 0) {
+    // Đủ sáng trở lại: siết dần về mục tiêu nếu ISO cần thiết vẫn còn dư địa.
+    double tighter = MAX(gVnvarSportsTargetSeconds, current / 1.5);
+    double requiredIso = iso * exposure / tighter;
+    if (requiredIso < maxIso * 0.7) next = tighter;
+  }
+  if (fabs(next - current) < current * 0.01) return;
+  NSError *error = nil;
+  if (![device lockForConfiguration:&error]) return;
+  @try {
+    gVnvarSportsCurrentSeconds = VnvarApplyMaxExposure(device, next);
+    NSLog(@"[CAMERA_SPORTS] Max exposure %.5f s (ISO %.0f/%.0f, offset %.2f EV)",
+          gVnvarSportsCurrentSeconds, iso, maxIso, offset);
+  } @catch (NSException *exception) {
+    NSLog(@"[CAMERA_SPORTS] Exception while adapting max exposure: %@", exception);
+  }
+  [device unlockForConfiguration];
+}
+
++ (void)updateSportsTimer {
+  if (gVnvarSportsTargetSeconds > 0) {
+    if (gVnvarSportsTimer != nil) return;
+    gVnvarSportsTimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0,
+                                               dispatch_get_main_queue());
+    dispatch_source_set_timer(gVnvarSportsTimer,
+                              dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2 * NSEC_PER_SEC)),
+                              (uint64_t)(1 * NSEC_PER_SEC), (uint64_t)(200 * NSEC_PER_MSEC));
+    dispatch_source_set_event_handler(gVnvarSportsTimer, ^{
+      [VnvarWebRtcTrackBridge sportsTick];
+    });
+    dispatch_resume(gVnvarSportsTimer);
+  } else if (gVnvarSportsTimer != nil) {
+    dispatch_source_cancel(gVnvarSportsTimer);
+    gVnvarSportsTimer = nil;
+  }
+}
+
++ (BOOL)setSportsModeForTrackId:(NSString *)trackId
+             shutterDenominator:(NSInteger)shutterDenominator {
+  if (![NSThread isMainThread]) {
+    __block BOOL result = NO;
+    dispatch_sync(dispatch_get_main_queue(), ^{
+      result = [self setSportsModeForTrackId:trackId shutterDenominator:shutterDenominator];
+    });
+    return result;
+  }
+  double target = shutterDenominator > 0 ? 1.0 / (double)shutterDenominator : 0;
+  if (fabs(target - gVnvarSportsTargetSeconds) > 1e-9) {
+    // Đổi mức: bắt đầu lại từ màn trập mục tiêu.
+    gVnvarSportsCurrentSeconds = target;
+  }
+  gVnvarSportsTargetSeconds = target;
+  gVnvarSportsTrackId = target > 0 ? [trackId copy] : nil;
+  [self updateSportsTimer];
+
+  AVCaptureDevice *device = [self activeVideoDeviceForTrackId:trackId];
+  if (device == nil) {
+    NSLog(@"[CAMERA_SPORTS] No active AVCaptureDevice found for trackId %@", trackId);
+    return NO;
+  }
+  NSError *error = nil;
+  if (![device lockForConfiguration:&error]) {
+    NSLog(@"[CAMERA_SPORTS] lockForConfiguration failed: %@", error);
+    return NO;
+  }
+  BOOL ok = YES;
+  @try {
+    if (target > 0) {
+      // Áp lại mức đang dùng (giữ phần đã nới khi thiếu sáng) cho camera vừa mở.
+      double seconds = gVnvarSportsCurrentSeconds > 0 ? gVnvarSportsCurrentSeconds : target;
+      gVnvarSportsCurrentSeconds = VnvarApplyMaxExposure(device, seconds);
+      NSLog(@"[CAMERA_SPORTS] Max exposure limited to %.5f s", gVnvarSportsCurrentSeconds);
+    } else {
+      // kCMTimeInvalid: trả về giới hạn mặc định của iOS.
+      device.activeMaxExposureDuration = kCMTimeInvalid;
+    }
+  } @catch (NSException *exception) {
+    NSLog(@"[CAMERA_SPORTS] Exception while setting max exposure: %@", exception);
+    ok = NO;
+  }
+  [device unlockForConfiguration];
+  return ok;
 }
 
 + (BOOL)setCameraLockForTrackId:(NSString *)trackId locked:(BOOL)locked {

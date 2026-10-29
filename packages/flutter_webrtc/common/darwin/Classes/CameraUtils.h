@@ -37,6 +37,15 @@
                                     targetWidth:(NSInteger)targetWidth
                                    targetHeight:(NSInteger)targetHeight;
 
+/// VNVAR: chọn định dạng gần kích thước nhất, rồi ưu tiên 8-bit 4:2:0, rồi
+/// định dạng đạt [targetFps] (lấy bản FPS tối đa thấp nhất vẫn đạt, tránh định
+/// dạng quay chậm), rồi pixel format capturer ưa dùng. Phiên multi-cam chỉ xét
+/// định dạng hỗ trợ multi-cam.
+- (nullable AVCaptureDeviceFormat*)selectFormatForDevice:(nonnull AVCaptureDevice*)device
+                                    targetWidth:(NSInteger)targetWidth
+                                   targetHeight:(NSInteger)targetHeight
+                                      targetFps:(NSInteger)targetFps;
+
 - (nullable AVCaptureDevice*)findDeviceForPosition:(AVCaptureDevicePosition)position;
 
 

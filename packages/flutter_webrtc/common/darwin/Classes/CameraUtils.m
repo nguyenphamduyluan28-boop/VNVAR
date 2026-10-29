@@ -285,7 +285,8 @@
   AVCaptureDevice* videoDevice = [self findDeviceForPosition:position];
   AVCaptureDeviceFormat* selectedFormat = [self selectFormatForDevice:videoDevice
                                                           targetWidth:self._lastTargetWidth
-                                                         targetHeight:self._lastTargetHeight];
+                                                         targetHeight:self._lastTargetHeight
+                                                            targetFps:self._lastTargetFps];
   [self.videoCapturer startCaptureWithDevice:videoDevice
                                       format:selectedFormat
                                          fps:[self selectFpsForFormat:selectedFormat
@@ -318,24 +319,83 @@
 - (AVCaptureDeviceFormat*)selectFormatForDevice:(AVCaptureDevice*)device
                                     targetWidth:(NSInteger)targetWidth
                                    targetHeight:(NSInteger)targetHeight {
+  return [self selectFormatForDevice:device
+                         targetWidth:targetWidth
+                        targetHeight:targetHeight
+                           targetFps:self._lastTargetFps > 0 ? self._lastTargetFps : 30];
+}
+
+static Float64 VnvarFormatMaxFps(AVCaptureDeviceFormat* format) {
+  Float64 maxFps = 0;
+  for (AVFrameRateRange* range in format.videoSupportedFrameRateRanges) {
+    maxFps = fmax(maxFps, range.maxFrameRate);
+  }
+  return maxFps;
+}
+
+static BOOL VnvarIs8Bit420(FourCharCode pixelFormat) {
+  return pixelFormat == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange ||
+         pixelFormat == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange;
+}
+
+- (AVCaptureDeviceFormat*)selectFormatForDevice:(AVCaptureDevice*)device
+                                    targetWidth:(NSInteger)targetWidth
+                                   targetHeight:(NSInteger)targetHeight
+                                      targetFps:(NSInteger)targetFps {
   NSArray<AVCaptureDeviceFormat*>* formats =
       [RTCCameraVideoCapturer supportedFormatsForDevice:device];
-  AVCaptureDeviceFormat* selectedFormat = nil;
-  long currentDiff = INT_MAX;
+  BOOL multiCamSession = NO;
+#if TARGET_OS_IPHONE
+  if (@available(iOS 13.0, *)) {
+    multiCamSession =
+        [self.videoCapturer.captureSession isKindOfClass:[AVCaptureMultiCamSession class]];
+  }
+#endif
+  FourCharCode preferredPixel = [self.videoCapturer preferredOutputPixelFormat];
+  Float64 wantedFps = targetFps > 0 ? (Float64)targetFps : 30;
+  AVCaptureDeviceFormat* best = nil;
+  long bestDiff = LONG_MAX;
+  BOOL best420 = NO, bestMeets = NO, bestPreferred = NO;
+  Float64 bestFps = 0;
   for (AVCaptureDeviceFormat* format in formats) {
+#if TARGET_OS_IPHONE
+    if (@available(iOS 13.0, *)) {
+      if (multiCamSession && !format.isMultiCamSupported) continue;
+    }
+#endif
     CMVideoDimensions dimension = CMVideoFormatDescriptionGetDimensions(format.formatDescription);
     FourCharCode pixelFormat = CMFormatDescriptionGetMediaSubType(format.formatDescription);
-    //NSLog(@"AVCaptureDeviceFormats,fps %d, dimension: %dx%d", format.videoSupportedFrameRateRanges, dimension.width, dimension.height);
-      long diff = labs(targetWidth - dimension.width) + labs(targetHeight - dimension.height);
-    if (diff < currentDiff) {
-      selectedFormat = format;
-      currentDiff = diff;
-    } else if (diff == currentDiff &&
-               pixelFormat == [self.videoCapturer preferredOutputPixelFormat]) {
-      selectedFormat = format;
+    long diff = labs(targetWidth - dimension.width) + labs(targetHeight - dimension.height);
+    BOOL is420 = VnvarIs8Bit420(pixelFormat);
+    Float64 fps = VnvarFormatMaxFps(format);
+    BOOL meets = fps + 0.5 >= wantedFps;
+    BOOL preferred = pixelFormat == preferredPixel;
+    BOOL better;
+    if (best == nil || diff < bestDiff) {
+      better = YES;
+    } else if (diff > bestDiff) {
+      better = NO;
+    } else if (is420 != best420) {
+      better = is420;
+    } else if (meets != bestMeets) {
+      better = meets;
+    } else if (fabs(fps - bestFps) > 0.5) {
+      // Đều đạt: lấy FPS tối đa thấp nhất (tránh định dạng quay chậm 120/240);
+      // đều không đạt: lấy FPS cao nhất.
+      better = meets ? fps < bestFps : fps > bestFps;
+    } else {
+      better = preferred && !bestPreferred;
+    }
+    if (better) {
+      best = format;
+      bestDiff = diff;
+      best420 = is420;
+      bestMeets = meets;
+      bestFps = fps;
+      bestPreferred = preferred;
     }
   }
-  return selectedFormat;
+  return best;
 }
 
 - (NSInteger)selectFpsForFormat:(AVCaptureDeviceFormat*)format targetFps:(NSInteger)targetFps {

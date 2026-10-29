@@ -273,6 +273,32 @@ class _StationScreenState extends State<StationScreen>
     );
   }
 
+  /// Kết quả kiểm tra nền sau khi sang 0.5x (Android).
+  void _handleLensNotice(LensNotice notice) {
+    switch (notice.kind) {
+      case LensNoticeKind.fpsChanged:
+        _notifyLensFps(notice.fps);
+      case LensNoticeKind.ultraWideUnavailable:
+        _showStationToast(
+          vi: 'Máy không bật được ống 0.5x. Đã về 1x.',
+          en: "This phone can't use the 0.5x lens. Back to 1x.",
+          kind: NoticeKind.warning,
+        );
+    }
+  }
+
+  /// Ống kính vừa đổi buộc đổi FPS (ống 0.5x không chạy được 60, hoặc về ống
+  /// 1x trả lại 60): báo cho người dùng biết camera đang chạy mức nào.
+  void _notifyLensFps(int? fps) {
+    if (fps == null) return;
+    final label = _runtime.resolutionProfile.shortLabel;
+    _showStationToast(
+      vi: 'Ống kính này: $label $fps FPS.',
+      en: 'This lens: $label $fps FPS.',
+      kind: NoticeKind.info,
+    );
+  }
+
   /// Thông báo nổi chuẩn của app (song ngữ, icon theo loại). Bỏ qua khi màn
   /// hình Station không còn hiển thị.
   void _showStationToast({
@@ -411,7 +437,7 @@ class _StationScreenState extends State<StationScreen>
     try {
       if (target < 0.95) {
         if (webRtc.hasUltraWideCamera) {
-          await _runtime.switchToLensMode('ultra_wide');
+          _notifyLensFps(await _runtime.switchToLensMode('ultra_wide'));
           final actualRatio = webRtc.ultraWideZoomRatio;
           await _runtime.setCameraZoom(actualRatio);
           _showZoomResult(actualRatio);
@@ -421,13 +447,13 @@ class _StationScreenState extends State<StationScreen>
         }
       } else if (target >= 0.95 && target < 1.5) {
         if (webRtc.isCurrentUltraWide || webRtc.currentFacingMode == 'user') {
-          await _runtime.switchToLensMode('wide');
+          _notifyLensFps(await _runtime.switchToLensMode('wide'));
         }
         await _runtime.setCameraZoom(1.0);
         _showZoomResult(1.0);
       } else if (target >= 1.5) {
         if (webRtc.isCurrentUltraWide || webRtc.currentFacingMode == 'user') {
-          await _runtime.switchToLensMode('wide');
+          _notifyLensFps(await _runtime.switchToLensMode('wide'));
         }
         await _runtime.setCameraZoom(target);
         _showZoomResult(target);
@@ -452,14 +478,14 @@ class _StationScreenState extends State<StationScreen>
     if (willSwitchHardwareToUW) {
       _setZoomLensSwitching(true);
       try {
-        await _runtime.switchToLensMode('ultra_wide');
+        _notifyLensFps(await _runtime.switchToLensMode('ultra_wide'));
       } finally {
         _setZoomLensSwitching(false);
       }
     } else if (willSwitchHardwareToWide) {
       _setZoomLensSwitching(true);
       try {
-        await _runtime.switchToLensMode('wide');
+        _notifyLensFps(await _runtime.switchToLensMode('wide'));
       } finally {
         _setZoomLensSwitching(false);
       }
@@ -569,6 +595,7 @@ class _StationScreenState extends State<StationScreen>
     _schedulePreviewRest();
     _cameraQuarterTurns = _runtime.cameraQuarterTurns;
     _runtime.setStationDisplayAttached(true);
+    _runtime.onLensNotice = _handleLensNotice;
 
     _runtimeSubscription = _runtime.stateChanges.listen((_) {
       if (!mounted) {
@@ -1455,6 +1482,9 @@ class _StationScreenState extends State<StationScreen>
   @override
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
+    if (_runtime.onLensNotice == _handleLensNotice) {
+      _runtime.onLensNotice = null;
+    }
     _previewRestTimer?.cancel();
     _runtimeSubscription?.cancel();
     _whipSubscription?.cancel();

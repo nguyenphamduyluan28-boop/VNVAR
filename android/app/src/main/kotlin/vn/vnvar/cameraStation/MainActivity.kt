@@ -276,10 +276,14 @@ class MainActivity : FlutterActivity() {
                 "setCameraExposureBoost" -> {
                     val trackId = call.argument<String>("trackId")
                     val targetEv = call.argument<Double>("targetEv") ?: 0.0
+                    // Màn trập thể thao 1/N s (0 = tắt); null (Dart cũ không gửi) =
+                    // giữ nguyên chế độ hiện tại.
+                    val sportsShutter = call.argument<Int>("sportsShutter")
+                        ?: call.argument<Boolean>("sportsMode")?.let { if (it) 500 else 0 }
                     if (trackId.isNullOrBlank()) {
                         result.error("INVALID_TRACK", "Thiếu video track để chỉnh exposure.", null)
                     } else {
-                        CameraExposureController.apply(trackId, targetEv) { response ->
+                        CameraExposureController.apply(trackId, targetEv, sportsShutter) { response ->
                             runOnUiThread { result.success(response) }
                         }
                     }
@@ -363,6 +367,20 @@ class MainActivity : FlutterActivity() {
                     }
                 }
 
+                "getCaptureLensStatus" -> {
+                    result.success(CameraExposureController.lensStatus())
+                }
+
+                "resetCaptureFps" -> {
+                    CameraExposureController.resetCaptureFps()
+                    result.success(null)
+                }
+
+                "getCaptureFps" -> {
+                    // FPS camera thật sự xuất ra (null khi chưa đo được).
+                    result.success(CameraExposureController.measuredCaptureFps())
+                }
+
                 "setCaptureFpsCap" -> {
                     val trackId = call.argument<String>("trackId")
                     val fps = call.argument<Int>("fps")
@@ -379,6 +397,7 @@ class MainActivity : FlutterActivity() {
                     val bitrate = call.argument<Int>("bitrate") ?: 2_000_000
                     val fps = call.argument<Int>("fps") ?: 30
                     val remoteAudio = call.argument<Boolean>("remoteAudio") ?: false
+                    val sportsTuning = call.argument<Boolean>("sportsTuning") ?: false
                     val track = trackId?.let {
                         FlutterWebRTCPlugin.sharedSingleton?.getTrackForId(it, null)
                     }
@@ -398,6 +417,7 @@ class MainActivity : FlutterActivity() {
                                 bitrate = bitrate,
                                 fps = fps,
                                 remoteAudioEnabled = remoteAudio,
+                                sportsTuning = sportsTuning,
                                 onEncoderConfigured = { publisherId ->
                                     mainHandler.post {
                                         if (rtspPublisher?.publisherId == publisherId &&
@@ -1250,38 +1270,24 @@ class MainActivity : FlutterActivity() {
             val size = sizes.firstOrNull { it.width == width && it.height == height }
                 ?: return@mapNotNull null
 
-            // ── 1. minFrameDuration từ SCALER_STREAM_CONFIGURATION_MAP ──────────
-            // Đây là khả năng phần cứng thực: thời gian tối thiểu (ns) để cảm biến
-            // phơi sáng 1 frame ở kích thước này. Giá trị này chính xác và đáng tin.
+            // FPS thật WebRTC mở được = min(khả năng cảm biến, dải AE cao nhất):
+            // Camera2Session chọn dải CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES gần
+            // nhất, nên máy chỉ khai báo dải tối đa 30 thì chạy 30 dù cảm biến
+            // làm được 60 (trước đây vẫn liệt kê "60 FPS").
             val minFrameDurationNs: Long = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
                 configuration.getOutputMinFrameDuration(SurfaceTexture::class.java, size)
             } else {
                 0L
             }
             val sensorMaxFps: Int = if (minFrameDurationNs > 0L) {
-                (1_000_000_000L / minFrameDurationNs).toInt().coerceAtLeast(1)
+                Math.round(1_000_000_000.0 / minFrameDurationNs).toInt().coerceAtLeast(1)
             } else {
                 0
             }
-
-            // ── 2. AE ranges chỉ dùng làm fallback / cross-check ────────────────
-            // CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES phản ánh khả năng auto-exposure,
-            // không nhất thiết là FPS hardware tối đa. Nhiều máy chỉ khai báo [15, 30]
-            // hoặc [8, 30] dù sensor 1080p60 thực sự hỗ trợ 60 FPS qua camera2.
-            val aeFpsRanges = characteristics.get(
+            val maxAeFps = characteristics.get(
                 CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES
-            )
-            val maxAeFps = aeFpsRanges?.map { it.upper }?.maxOrNull() ?: 30
-
-            // ── 3. Quyết định FPS thực ──────────────────────────────────────────
-            // Ưu tiên sensorMaxFps (từ minFrameDuration) vì đây là ground truth.
-            // Nếu không có (thiết bị cũ, API < M), dùng maxAeFps làm fallback.
-            // Không cap theo maxAeFps vì AE range thường thấp hơn khả năng thực.
-            val actualFps = if (sensorMaxFps > 0) {
-                sensorMaxFps.coerceIn(1, 60)
-            } else {
-                maxAeFps.coerceIn(1, 60)
-            }
+            )?.map { it.upper }?.maxOrNull() ?: 30
+            val actualFps = CameraExposureController.maxCaptureFps(characteristics, width, height)
 
             android.util.Log.i(
                 "MainActivity",

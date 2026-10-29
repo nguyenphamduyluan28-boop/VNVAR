@@ -544,6 +544,76 @@ const _ThermalSnapshot _unknownThermalSnapshot = (
 /// Lens/zoom của camera sau để mở lại đúng góc quay.
 typedef _LensState = ({bool isUltraWide, double zoom, String? deviceId});
 
+/// Kết quả kiểm tra ống 0.5x sau khi đổi (Android).
+enum UltraWideCheck {
+  /// Đúng góc rộng và đạt FPS.
+  ok,
+
+  /// Góc rộng nhưng FPS thật thấp hơn FPS đang chọn.
+  lowerFps,
+
+  /// Hệ điều hành không bật ống góc rộng (zoom thực vẫn ~1x).
+  notWide,
+
+  /// Chưa đủ số liệu để kết luận.
+  unknown,
+}
+
+/// Đánh giá ống 0.5x theo số liệu camera tự báo. [physicalUltraWide]: đang mở
+/// đúng camera góc rộng riêng (không qua zoom). [appliedZoom]: zoom camera thực
+/// áp dụng (null = máy không báo). [expectedFps]: FPS phải đạt (đã tính giới
+/// hạn do nhiệt).
+@visibleForTesting
+UltraWideCheck evaluateUltraWide({
+  required bool physicalUltraWide,
+  required double? appliedZoom,
+  required double? measuredFps,
+  required int expectedFps,
+}) {
+  final zoomKnown = physicalUltraWide || appliedZoom != null;
+  final wide = physicalUltraWide || (appliedZoom != null && appliedZoom < 0.95);
+  if (zoomKnown && !wide) return UltraWideCheck.notWide;
+  if (measuredFps == null) {
+    return zoomKnown ? UltraWideCheck.ok : UltraWideCheck.unknown;
+  }
+  if (measuredFps < expectedFps * 0.85) return UltraWideCheck.lowerFps;
+  return UltraWideCheck.ok;
+}
+
+/// FPS đặt cho ống 0.5x khi đo được [measuredFps] thấp hơn mức chọn: mức cao
+/// nhất trong [options] không vượt quá số đo (+3 bù sai số), tối thiểu 30.
+@visibleForTesting
+int ultraWideFpsFromMeasurement(double measuredFps, Iterable<int> options) {
+  var best = 30;
+  for (final fps in options) {
+    if (fps <= measuredFps + 3 && fps > best) best = fps;
+  }
+  return best;
+}
+
+/// Thông báo cho màn hình Trạm về ống kính (chạy nền sau khi đổi sang 0.5x).
+enum LensNoticeKind { fpsChanged, ultraWideUnavailable }
+
+class LensNotice {
+  const LensNotice(this.kind, {this.fps});
+
+  final LensNoticeKind kind;
+  final int? fps;
+}
+
+/// FPS tối đa của ống góc rộng theo số native báo ([reported]). Không có số
+/// liệu: iOS 30 (hành vi cũ, an toàn), Android giữ FPS yêu cầu (WebRTC tự chọn
+/// mức gần nhất, không lỗi).
+@visibleForTesting
+int ultraWideMaxFps({
+  required bool isIos,
+  required int? reported,
+  required int requested,
+}) {
+  if (reported != null && reported > 0) return reported;
+  return isIos ? 30 : requested;
+}
+
 class CameraStationRuntime {
   CameraStationRuntime._();
 
@@ -645,6 +715,20 @@ class CameraStationRuntime {
   double? _iosActualFps;
   int? _iosRequestedFps;
   DateTime? _iosPerformanceMeasuredAt;
+  // Android: FPS camera thật sự xuất ra (đo mỗi 10 s, chỉ để hiển thị/API).
+  double? _androidActualFps;
+  DateTime? _androidFpsMeasuredAt;
+  // Ống 0.5x không chạy được FPS đã chọn: profile người dùng chọn trước khi
+  // tự hạ, để trả lại khi về ống 1x.
+  CameraResolutionProfile? _profileBeforeLensFpsCap;
+  // FPS tối đa ống 0.5x đo được thực tế (Android, theo độ phân giải): lần sau
+  // hạ ngay, không phải mở lại camera để thử.
+  final Map<CameraResolutionPreset, int> _learnedUltraWideMaxFps = {};
+  // Tăng mỗi lần đổi ống kính: lượt kiểm tra nền của lần đổi cũ tự dừng.
+  int _lensVerifyGeneration = 0;
+
+  /// Màn hình Trạm đăng ký để hiện thông báo kết quả kiểm tra ống kính.
+  void Function(LensNotice notice)? onLensNotice;
   String? _lastRecordingPath;
   int? _lastRecordingBytes;
   DateTime? _lastRecordingProgressAt;
@@ -920,10 +1004,11 @@ class CameraStationRuntime {
   }
 
   Map<String, dynamic> get captureMetrics => {
-    'actualFps': _iosActualFps,
+    'actualFps': _iosActualFps ?? _androidActualFps,
     'requestedFps': _iosRequestedFps ?? _resolutionProfile.fps,
     'lowFpsReports': 0,
-    'lastMeasuredAt': _iosPerformanceMeasuredAt?.toIso8601String(),
+    'lastMeasuredAt': (_iosPerformanceMeasuredAt ?? _androidFpsMeasuredAt)
+        ?.toIso8601String(),
     'lastAdaptedAt': null,
     'adaptive': false,
   };
@@ -1495,6 +1580,12 @@ class CameraStationRuntime {
       }
     } catch (_) {}
     try {
+      // Trước khi mở camera: lần đo sáng và encoder RTSP đầu tiên đã đúng chế độ.
+      await webRtc.setSportsShutter(
+        await StationConfigService().loadSportsShutter(),
+      );
+    } catch (_) {}
+    try {
       await webRtc.setRtspTabletAudio(
         await StationConfigService().loadRtspTabletAudio(),
       );
@@ -1761,6 +1852,8 @@ class CameraStationRuntime {
     _iosActualFps = null;
     _iosRequestedFps = null;
     _iosPerformanceMeasuredAt = null;
+    _androidActualFps = null;
+    _androidFpsMeasuredAt = null;
     _resetRecordingProgressWatchdog();
 
     final server = _cameraServer;
@@ -2266,7 +2359,174 @@ class CameraStationRuntime {
     });
   }
 
-  Future<void> switchToLensMode(String mode) {
+  /// Đổi ống kính. Trả FPS mới khi phải đổi FPS theo ống kính (ống 0.5x không
+  /// chạy được FPS đang chọn → hạ; về ống 1x → trả lại FPS đã chọn), null khi
+  /// không đổi.
+  Future<int?> switchToLensMode(String mode) async {
+    final generation = ++_lensVerifyGeneration;
+    await _switchLensOnly(mode);
+    final changedFps = await _matchProfileFpsToLens();
+    if (Platform.isAndroid && mode == 'ultra_wide') {
+      // Kiểm tra nền (không giữ nút zoom bận ~5 s): máy có thật sự bật ống
+      // góc rộng và đạt FPS không.
+      unawaited(_verifyUltraWide(generation));
+    }
+    return changedFps;
+  }
+
+  /// Android: sau khi sang 0.5x, đối chiếu số liệu camera tự báo (zoom thực
+  /// áp dụng, FPS đo được) với điều người dùng chọn:
+  /// - góc rộng nhưng FPS thấp → hạ FPS cho đúng (nhớ để trả lại ở 1x);
+  /// - hệ điều hành không bật ống góc rộng ở FPS cao → hạ 30 FPS rồi thử lại;
+  ///   vẫn không được → về ống 1x và báo máy không hỗ trợ 0.5x.
+  Future<void> _verifyUltraWide(int generation, {bool retried = false}) async {
+    bool stale() =>
+        generation != _lensVerifyGeneration || _stopping || !_cameraEnabled;
+    final webRtc = _webRtcService;
+    if (webRtc == null || !webRtc.isCurrentUltraWide) return;
+    await Future<void>.delayed(const Duration(seconds: 1));
+    if (stale()) return;
+    await webRtc.resetCaptureFps();
+    Map<String, Object?>? status;
+    for (var attempt = 0; attempt < 8; attempt++) {
+      await Future<void>.delayed(const Duration(seconds: 1));
+      if (stale()) return;
+      status = await webRtc.getCaptureLensStatus();
+      if (status?['fps'] is num) break;
+    }
+    if (status == null || stale()) return;
+    final profile = _resolutionProfile;
+    final thermalCap = thermalFpsCap;
+    final expectedFps =
+        thermalCap == null ? profile.fps : math.min(thermalCap, profile.fps);
+    final uw = webRtc.ultraWideCamera;
+    final physical = uw != null && webRtc.activeCameraId == uw.id;
+    final appliedZoom = (status['appliedZoom'] as num?)?.toDouble();
+    final measuredFps = (status['fps'] as num?)?.toDouble();
+    final check = evaluateUltraWide(
+      physicalUltraWide: physical,
+      appliedZoom: appliedZoom,
+      measuredFps: measuredFps,
+      expectedFps: expectedFps,
+    );
+    developer.log(
+      '[CAMERA] Ultra-wide check: $check (physical=$physical, '
+      'zoom=${status['requestedZoom']}→$appliedZoom, '
+      'lens=${status['activePhysicalId']}, fps=$measuredFps/$expectedFps)',
+      name: 'CameraStationRuntime',
+    );
+    switch (check) {
+      case UltraWideCheck.ok:
+      case UltraWideCheck.unknown:
+        return;
+      case UltraWideCheck.lowerFps:
+        // FPS thấp do nhiệt không phải giới hạn của ống kính.
+        if (thermalCap != null || measuredFps == null) return;
+        final options = _supportedResolutionProfiles
+            .where((p) => p.preset == profile.preset)
+            .map((p) => p.fps);
+        final realFps = ultraWideFpsFromMeasurement(measuredFps, options);
+        _learnedUltraWideMaxFps[profile.preset] = realFps;
+        if (realFps < profile.fps) {
+          await _lowerFpsForUltraWide(profile, realFps);
+        }
+        return;
+      case UltraWideCheck.notWide:
+        if (!retried && profile.fps > 30) {
+          // Nhiều máy chỉ bật ống góc rộng ở 30 FPS: hạ rồi thử lại một lần.
+          _learnedUltraWideMaxFps[profile.preset] = 30;
+          if (!await _lowerFpsForUltraWide(profile, 30)) return;
+          if (stale()) return;
+          await _verifyUltraWide(generation, retried: true);
+          return;
+        }
+        // Máy không bật được ống góc rộng: không để app ghi "0.5x" trong khi
+        // hình vẫn là 1x. Về ống 1x (trả lại FPS đã chọn nếu có) và báo.
+        try {
+          await switchToLensMode('wide');
+        } catch (error) {
+          developer.log(
+            '[CAMERA] Unable to return to the 1x lens: $error',
+            name: 'CameraStationRuntime',
+          );
+        }
+        onLensNotice?.call(
+          const LensNotice(LensNoticeKind.ultraWideUnavailable),
+        );
+        return;
+    }
+  }
+
+  /// Hạ FPS khi ở ống 0.5x (mở lại camera, giữ ống 0.5x) và báo màn hình.
+  Future<bool> _lowerFpsForUltraWide(
+    CameraResolutionProfile profile,
+    int fps,
+  ) async {
+    final target = profile.withFps(fps);
+    if (resolveSupportedResolutionProfile(_supportedResolutionProfiles, target) ==
+        null) {
+      return false;
+    }
+    _profileBeforeLensFpsCap ??= profile;
+    try {
+      await setResolutionProfile(target, ignoreLock: true, userInitiated: false);
+    } catch (error) {
+      developer.log(
+        '[CAMERA] Unable to lower FPS for the ultra-wide lens: $error',
+        name: 'CameraStationRuntime',
+      );
+      return false;
+    }
+    onLensNotice?.call(LensNotice(LensNoticeKind.fpsChanged, fps: fps));
+    return true;
+  }
+
+  /// Sau khi đổi ống kính: giữ profile đúng với FPS camera thật sự chạy (mở
+  /// lại camera như khi đổi chất lượng). Trước đây ống 0.5x có thể chạy 30 FPS
+  /// mà app vẫn ghi 60 (và đặt bitrate theo 60).
+  Future<int?> _matchProfileFpsToLens() async {
+    final webRtc = _webRtcService;
+    if (webRtc == null) return null;
+    final current = _resolutionProfile;
+    CameraResolutionProfile? target;
+    if (webRtc.isCurrentUltraWide) {
+      final maxFps = _ultraWideMaxFpsFor(current);
+      if (current.fps > maxFps) {
+        target = current.withFps(maxFps);
+        _profileBeforeLensFpsCap ??= current;
+      }
+    } else {
+      final previous = _profileBeforeLensFpsCap;
+      _profileBeforeLensFpsCap = null;
+      if (previous != null &&
+          previous.preset == current.preset &&
+          previous.fps > current.fps) {
+        target = previous;
+      }
+    }
+    if (target == null || target == current) return null;
+    if (resolveSupportedResolutionProfile(_supportedResolutionProfiles, target) ==
+        null) {
+      return null;
+    }
+    developer.log(
+      '[CAMERA] Lens ${webRtc.isCurrentUltraWide ? 'ultra-wide' : 'wide'}: '
+      '${current.fps} -> ${target.fps} FPS',
+      name: 'CameraStationRuntime',
+    );
+    try {
+      await setResolutionProfile(target, ignoreLock: true, userInitiated: false);
+    } catch (error) {
+      developer.log(
+        '[CAMERA] Unable to match FPS to lens: $error',
+        name: 'CameraStationRuntime',
+      );
+      return null;
+    }
+    return _resolutionProfile.fps == current.fps ? null : _resolutionProfile.fps;
+  }
+
+  Future<void> _switchLensOnly(String mode) {
     final current = _lensSwitchOperation;
     if (current != null) return current;
     // Camera tắt / bị chặn: thao tác sẽ bị từ chối, không huỷ recovery.
@@ -2726,6 +2986,8 @@ class CameraStationRuntime {
     // Nếu máy đang nóng hoặc đang có hẹn giờ hạ độ phân giải, ghi nhận quyền
     // ưu tiên của khách hàng (user override) và hủy lệnh tự động ép về 720p.
     if (userInitiated) {
+      // Người dùng tự chọn chất lượng: bỏ mốc FPS "trả lại khi về ống 1x".
+      _profileBeforeLensFpsCap = null;
       if (_thermalThrottled ||
           _pendingThermalThrottleTimer != null ||
           thermalWarning) {
@@ -2807,12 +3069,16 @@ class CameraStationRuntime {
     }
 
     final lens = _currentLensState(webRtc);
-    // Camera góc rộng (Ultra-Wide) phần cứng trên iPhone chỉ hỗ trợ tối đa 30 FPS.
-    // Giới hạn ở 30 FPS để tránh ngoại lệ phần cứng AVFoundation làm thoát app.
-    if (lens.isUltraWide && Platform.isIOS && selected.fps > 30) {
-      selected = selected.withFps(30);
+    // Ống góc rộng 0.5x giữ đúng FPS nó thật sự mở được ở độ phân giải này
+    // (iPhone đa số có 1080p 60; nhiều máy Android chỉ 30). Chỉ hạ khi cần.
+    final ultraWideMaxFps = _ultraWideMaxFpsFor(selected);
+    if (lens.isUltraWide && selected.fps > ultraWideMaxFps) {
+      // Nhớ FPS đã chọn để trả lại khi về ống 1x.
+      _profileBeforeLensFpsCap ??= selected;
+      selected = selected.withFps(ultraWideMaxFps);
       developer.log(
-        '[CAMERA] Capping iOS ultra-wide to 30 FPS to prevent hardware exception',
+        '[CAMERA] Ultra-wide supports up to $ultraWideMaxFps FPS at '
+        '${selected.width}x${selected.height}; using ${selected.fps} FPS',
         name: 'CameraStationRuntime',
       );
     }
@@ -2988,10 +3254,21 @@ class CameraStationRuntime {
     }
   }
 
-  /// Camera góc rộng (Ultra-Wide) phần cứng trên iPhone chỉ hỗ trợ tối đa
-  /// 30 FPS: không tự mở ultra-wide ở cấu hình cao hơn.
+  /// FPS tối đa ống góc rộng mở được ở độ phân giải của [profile].
+  int _ultraWideMaxFpsFor(CameraResolutionProfile profile) {
+    final base = ultraWideMaxFps(
+      isIos: Platform.isIOS,
+      reported: _webRtcService?.ultraWideCamera
+          ?.maxFpsFor(profile.width, profile.height),
+      requested: profile.fps,
+    );
+    final learned = _learnedUltraWideMaxFps[profile.preset];
+    return learned != null && learned < base ? learned : base;
+  }
+
+  /// Ống góc rộng mở được đúng FPS của [profile] thì mới tự mở lại ống đó.
   bool _ultraWideAllowedFor(CameraResolutionProfile profile) =>
-      !Platform.isIOS || profile.fps <= 30;
+      profile.fps <= _ultraWideMaxFpsFor(profile);
 
   /// Trước initializeCamera: chọn sẵn thiết bị ultra-wide để camera mở đúng
   /// lens ngay từ đầu (không cần đổi lens sau khi mở).
@@ -3229,6 +3506,24 @@ class CameraStationRuntime {
 
   double get exposureBiasEv => _webRtcService?.exposureBiasEv ?? 0;
 
+  bool get sportsMode => _webRtcService?.sportsMode ?? false;
+
+  /// Mức màn trập chế độ thể thao (1/N s); 0 = tắt.
+  int get sportsShutter => _webRtcService?.sportsShutter ?? 0;
+
+  /// Bitrate cao của chế độ thể thao chưa áp cho RTSP đang chạy.
+  bool get sportsBitratePending => _webRtcService?.rtspBitratePending ?? false;
+
+  /// Chế độ thể thao (0 = tắt, 250/500 = màn trập 1/N s): lưu lại; màn
+  /// trập/khử nhiễu áp ngay, bitrate RTSP áp từ lần mở camera kế tiếp (không
+  /// ngắt ghi hình/livestream đang chạy).
+  Future<void> setSportsShutter(int denominator) async {
+    final normalized = StationConfigService.normalizeSportsShutter(denominator);
+    await StationConfigService().saveSportsShutter(normalized);
+    await _webRtcService?.setSportsShutter(normalized);
+    _emitState();
+  }
+
   /// Người dùng chỉnh độ sáng hình: lưu lại và áp ngay cho camera đang mở.
   Future<void> setExposureBias(double ev) async {
     await StationConfigService().saveExposureBias(ev);
@@ -3258,7 +3553,8 @@ class CameraStationRuntime {
         ? _resolutionProfile.fps
         : math.min(fpsCap, _resolutionProfile.fps);
     _rtspPublisherService.maxBitrateBps =
-        (_resolutionProfile.rtspBitrate * _thermalLoadPlan.bitrateFactor)
+        ((_webRtcService?.rtspBitrateBps ?? _resolutionProfile.rtspBitrate) *
+                _thermalLoadPlan.bitrateFactor)
             .round();
     if (!_stateController.isClosed) _stateController.add(null);
   }
@@ -3486,6 +3782,16 @@ class CameraStationRuntime {
     return Future<void>.delayed(delay);
   }
 
+  /// Android: đọc FPS camera thật sự xuất ra (chỉ hiển thị/API, không dùng
+  /// để đánh giá sức khoẻ như iOS).
+  Future<void> _pollAndroidCaptureFps() async {
+    if (!Platform.isAndroid) return;
+    final fps = await _webRtcService?.getAndroidCaptureFps();
+    if (fps == null || fps <= 0) return;
+    _androidActualFps = double.parse(fps.toStringAsFixed(1));
+    _androidFpsMeasuredAt = DateTime.now();
+  }
+
   /// FPS thực tế iOS báo về: dùng cho /status và health monitor.
   void _handleIosCapturePerformance(double actualFps, int requestedFps) {
     _iosActualFps = actualFps;
@@ -3498,6 +3804,7 @@ class CameraStationRuntime {
     _healthTimer?.cancel();
     _healthTimer = Timer.periodic(const Duration(seconds: 10), (_) {
       unawaited(_checkRuntimeHealth());
+      unawaited(_pollAndroidCaptureFps());
     });
     unawaited(_checkRuntimeHealth());
 
