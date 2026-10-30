@@ -704,7 +704,7 @@ class WebRtcService {
     }
     track.enabled = true;
     developer.log(
-      '[MICROPHONE] Enabled (required by Camera Station)',
+      '[MICROPHONE] Enabled (required by SportO Cam)',
       name: 'WebRtcService',
     );
   }
@@ -988,8 +988,8 @@ class WebRtcService {
       _localStream = null;
 
       throw const BilingualException(
-        'Camera Station không tạo được video track.',
-        'Camera Station could not create a video track.',
+        'SportO Cam không tạo được video track.',
+        'SportO Cam could not create a video track.',
       );
     }
 
@@ -2054,13 +2054,13 @@ class WebRtcService {
     final stream = _localStream;
 
     if (stream == null) {
-      throw Exception('Camera Station local stream chưa sẵn sàng.');
+      throw Exception('SportO Cam local stream chưa sẵn sàng.');
     }
 
     final tracks = stream.getVideoTracks();
 
     if (tracks.isEmpty) {
-      throw Exception('Camera Station không có video track.');
+      throw Exception('SportO Cam không có video track.');
     }
 
     for (final track in tracks) {

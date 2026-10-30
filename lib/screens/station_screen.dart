@@ -793,8 +793,8 @@ class _StationScreenState extends State<StationScreen>
       await _commitPendingIdentity(identity);
       if (!mounted) return;
       _showStationToast(
-        vi: 'Camera Station đã tự khởi động lại.',
-        en: 'Camera Station restarted automatically.',
+        vi: 'SportO Cam đã tự khởi động lại.',
+        en: 'SportO Cam restarted automatically.',
         kind: NoticeKind.success,
       );
     } finally {
@@ -1892,8 +1892,8 @@ class _StationScreenState extends State<StationScreen>
             label: appText(context, 'Cài đặt', 'Settings'),
             tooltip: appText(
               context,
-              'Cấu hình Camera Station',
-              'Camera Station settings',
+              'Cấu hình SportO Cam',
+              'SportO Cam settings',
             ),
             dense: dense,
             onTap: _openSettings,

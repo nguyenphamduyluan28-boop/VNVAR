@@ -76,7 +76,7 @@ class _StationSplashScreenState extends State<StationSplashScreen> {
                     ),
                     const SizedBox(height: BrandSpace.xs),
                     const Text(
-                      'VNVAR Camera Station',
+                      'SportO Cam',
                       textAlign: TextAlign.center,
                       style: BrandText.caption,
                     ),

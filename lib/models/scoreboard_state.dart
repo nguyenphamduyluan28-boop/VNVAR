@@ -37,6 +37,9 @@ const Map<String, String> scoreboardErrorMessagesEn = {
   'unknown_action': 'Unsupported command.',
   'invalid_logo_size': 'Logo must be smaller than 512 KB.',
   'invalid_logo_type': 'Logo must be a PNG, JPG or WebP image.',
+  'invalid_sponsors': 'Invalid sponsor setting.',
+  'too_many_sponsors': 'Up to 8 sponsor logos.',
+  'sponsor_not_found': 'Sponsor logo not found.',
   'match_finished': 'Match finished. Tap "New match" to restart.',
   'match_decided': 'Match already decided. Use Undo to fix scores.',
   'match_in_progress': 'Match in progress. Reset to change rules.',
@@ -384,7 +387,11 @@ class ScoreTeam {
                 .take(2)
                 .toList()
           : <String>[],
-      logoId: logo != null && isValidScoreboardLogoId(logo) ? logo : null,
+      logoId: logo != null &&
+              isValidScoreboardLogoId(logo) &&
+              logo.startsWith('${team}_')
+          ? logo
+          : null,
     );
   }
 
@@ -430,8 +437,154 @@ class ScoreTeam {
   };
 }
 
+/// Ảnh do service lưu: logo đội A/B (`A_…`, `B_…`) và logo nhà tài trợ
+/// (`S_…`).
 bool isValidScoreboardLogoId(String id) =>
-    RegExp(r'^[AB]_\d{1,16}\.(png|jpg|webp)$').hasMatch(id);
+    RegExp(r'^[ABS]_\d{1,16}\.(png|jpg|webp)$').hasMatch(id);
+
+bool isValidSponsorLogoId(String id) =>
+    id.startsWith('S_') && isValidScoreboardLogoId(id);
+
+/// Kiểu hiển thị logo nhà tài trợ: lần lượt từng logo / dải tất cả logo.
+const List<String> scoreboardSponsorModes = ['rotate', 'strip'];
+
+/// Nền sau logo nhà tài trợ.
+/// Nền sau logo nhà tài trợ. Mặc định không nền: giữ nguyên logo PNG trong
+/// suốt.
+const List<String> scoreboardSponsorPlates = ['none', 'light', 'dark'];
+
+/// Logo nhà tài trợ trên overlay/livestream.
+class ScoreSponsors {
+  ScoreSponsors({
+    this.enabled = false,
+    this.mode = 'rotate',
+    this.position = 'tr',
+    this.scale = 1.0,
+    this.intervalSec = 8,
+    this.offsetX = 0,
+    this.offsetY = 0,
+    this.plate = 'none',
+    List<String>? items,
+  }) : items = items ?? <String>[];
+
+  static const int maximumItems = 8;
+  static const int minimumInterval = 3;
+  static const int maximumInterval = 60;
+
+  /// Dịch chuyển thêm so với vị trí chuẩn (đơn vị khung 1920×1080).
+  static const int maximumOffset = 960;
+
+  bool enabled;
+  String mode;
+  String position;
+  double scale;
+  int intervalSec;
+  int offsetX;
+  int offsetY;
+  String plate;
+
+  /// Id ảnh (`S_…`) theo thứ tự hiển thị.
+  List<String> items;
+
+  factory ScoreSponsors.fromJson(Object? value) {
+    final json = _readMap(value);
+    final sponsors = ScoreSponsors();
+    for (final entry in json.entries) {
+      if (entry.key == 'items') continue;
+      try {
+        sponsors.patch({entry.key: entry.value});
+      } on ScoreboardException {
+        // Trường hỏng: giữ mặc định.
+      }
+    }
+    final items = json['items'];
+    if (items is List) {
+      sponsors.items = items
+          .map((item) => item?.toString() ?? '')
+          .where(isValidSponsorLogoId)
+          .toSet()
+          .take(maximumItems)
+          .toList();
+    }
+    return sponsors;
+  }
+
+  /// Áp các trường có trong [json]. `order`: danh sách id mới (đúng các id
+  /// đang có) để sắp xếp lại.
+  void patch(Map<String, dynamic> json) {
+    void fail(String message) =>
+        throw ScoreboardException(422, 'invalid_sponsors', message);
+
+    if (json.containsKey('enabled')) {
+      enabled = _readBool(json['enabled'], enabled);
+    }
+    if (json.containsKey('mode')) {
+      final value = json['mode']?.toString() ?? '';
+      if (!scoreboardSponsorModes.contains(value)) fail('Kiểu hiển thị không hợp lệ.');
+      mode = value;
+    }
+    if (json.containsKey('position')) {
+      final value = json['position']?.toString() ?? '';
+      if (!scoreboardPositions.contains(value)) fail('Vị trí không hợp lệ.');
+      position = value;
+    }
+    if (json.containsKey('scale')) {
+      final raw = json['scale'];
+      final value = raw is num ? raw.toDouble() : double.tryParse('$raw');
+      if (value == null || value.isNaN || value < 0.5 || value > 2.0) {
+        fail('Kích thước phải từ 0.5 đến 2.');
+      }
+      scale = (value! * 100).roundToDouble() / 100;
+    }
+    if (json.containsKey('interval')) {
+      final value = _readNullableInt(json['interval']);
+      if (value == null || value < minimumInterval || value > maximumInterval) {
+        fail('Thời gian đổi logo phải từ $minimumInterval đến $maximumInterval giây.');
+      }
+      intervalSec = value!;
+    }
+    for (final key in const ['offsetX', 'offsetY']) {
+      if (!json.containsKey(key)) continue;
+      final value = _readNullableInt(json[key]);
+      if (value == null || value.abs() > maximumOffset) {
+        fail('Độ lệch vị trí không hợp lệ.');
+      }
+      if (key == 'offsetX') {
+        offsetX = value!;
+      } else {
+        offsetY = value!;
+      }
+    }
+    if (json.containsKey('plate')) {
+      final value = json['plate']?.toString() ?? '';
+      if (!scoreboardSponsorPlates.contains(value)) fail('Kiểu nền không hợp lệ.');
+      plate = value;
+    }
+    if (json.containsKey('order')) {
+      final raw = json['order'];
+      if (raw is! List) fail('Thứ tự logo không hợp lệ.');
+      final order = (raw as List).map((item) => item?.toString() ?? '').toList();
+      if (order.length != items.length ||
+          order.toSet().length != order.length ||
+          !order.every(items.contains)) {
+        fail('Thứ tự logo không khớp danh sách hiện tại.');
+      }
+      items = order;
+    }
+  }
+
+  Map<String, dynamic> toJson() => {
+    'enabled': enabled,
+    'mode': mode,
+    'position': position,
+    'scale': scale,
+    'interval': intervalSec,
+    'offsetX': offsetX,
+    'offsetY': offsetY,
+    'plate': plate,
+    'items': List<String>.from(items),
+  };
+}
 
 class ScoreMatchInfo {
   String tournament;
@@ -469,6 +622,10 @@ class ScoreMatchInfo {
 }
 
 class ScoreOverlayConfig {
+  /// "Kích thước" mặc định của bảng tỉ số: 70% khung thiết kế (thanh tỉ số
+  /// khoảng 22–32% bề rộng video), vừa mắt trên livestream mà không cần chỉnh.
+  static const double defaultScale = 0.7;
+
   String scene;
   String theme;
   String accent;
@@ -499,7 +656,7 @@ class ScoreOverlayConfig {
     this.theme = 'dark',
     this.accent = '#FFC107',
     this.position = 'tl',
-    this.scale = 1.0,
+    this.scale = defaultScale,
     this.showSets = true,
     this.showServe = true,
     this.showTournament = true,
@@ -1376,6 +1533,7 @@ class ScoreboardState {
   ScoreMatchInfo match;
   ScoreOverlayConfig overlay;
   ScoreMatchTimer timer;
+  ScoreSponsors sponsors;
 
   ScoreboardState({
     required this.rev,
@@ -1387,7 +1545,8 @@ class ScoreboardState {
     required this.match,
     required this.overlay,
     required this.timer,
-  });
+    ScoreSponsors? sponsors,
+  }) : sponsors = sponsors ?? ScoreSponsors();
 
   factory ScoreboardState.initial({required int nowMs, String sport = 'pickleball'}) {
     return ScoreboardState(
@@ -1400,6 +1559,7 @@ class ScoreboardState {
       match: ScoreMatchInfo(),
       overlay: ScoreOverlayConfig(),
       timer: ScoreMatchTimer(),
+      sponsors: ScoreSponsors(),
     );
   }
 
@@ -1415,6 +1575,7 @@ class ScoreboardState {
       match: ScoreMatchInfo.fromJson(json['match']),
       overlay: ScoreOverlayConfig.fromJson(json['overlay']),
       timer: ScoreMatchTimer.fromJson(json['timer']),
+      sponsors: ScoreSponsors.fromJson(json['sponsors']),
     );
   }
 
@@ -1451,6 +1612,7 @@ class ScoreboardState {
       'winner': core.winner,
       'overlay': overlay.toJson(),
       'timer': {...timer.toJson(), 'elapsedMs': timer.elapsedMs(nowMs)},
+      'sponsors': sponsors.toJson(),
       'display': display,
       // Trường phẳng tương thích bản đặc tả đầu tiên / tablet CheckVAR.
       'teamAName': teamA.name,
@@ -1627,6 +1789,19 @@ ScoreboardChange applyScoreboardAction(
       return ScoreboardChange.meta;
     case 'removeLogo':
       state.team(_readTeam(action['team'])).logoId = null;
+      return ScoreboardChange.meta;
+    case 'sponsors':
+      // Áp trên bản sao: một trường lỗi không làm đổi các trường khác.
+      final copy = ScoreSponsors.fromJson(state.sponsors.toJson());
+      copy.patch(action);
+      state.sponsors = copy;
+      return ScoreboardChange.meta;
+    case 'removeSponsor':
+      // `logo` (không dùng `id`: `id` là mã chống gửi trùng của lệnh).
+      final id = action['logo']?.toString() ?? '';
+      if (!state.sponsors.items.remove(id)) {
+        throw const ScoreboardException(404, 'sponsor_not_found', 'Không tìm thấy logo nhà tài trợ.');
+      }
       return ScoreboardChange.meta;
     default:
       throw ScoreboardException(422, 'unknown_action', 'Lệnh "$name" không được hỗ trợ.');

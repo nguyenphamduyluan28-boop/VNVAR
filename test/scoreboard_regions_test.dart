@@ -178,6 +178,7 @@ void main() {
     test('top-left scorebar with ticker: two regions (top, bottom band)', () {
       final state = sampleState(
         overlay: {
+          'scale': 1.0,
           'ticker': {'enabled': true, 'text': 'Tài trợ'},
         },
       );

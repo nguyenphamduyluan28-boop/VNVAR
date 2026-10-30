@@ -778,7 +778,7 @@ class MainActivity : FlutterActivity() {
             pendingStart = null
             pending.result.error(
                 "CAMERA_PERMISSION_DENIED",
-                "Camera permission is required to run Camera Station.",
+                "Camera permission is required to run SportO Cam.",
                 null,
             )
             return

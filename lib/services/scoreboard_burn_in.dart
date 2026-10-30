@@ -1,5 +1,4 @@
 import 'dart:async';
-import 'dart:developer' as developer;
 import 'dart:io';
 import 'dart:math' as math;
 import 'dart:typed_data';
@@ -10,6 +9,7 @@ import 'package:ffmpeg_kit_flutter_new_video/ffprobe_session.dart';
 import 'package:flutter/foundation.dart' show listEquals;
 import 'package:path_provider/path_provider.dart';
 
+import '../utils/station_log.dart';
 import 'scoreboard_frame_renderer.dart';
 import 'scoreboard_service.dart';
 
@@ -303,7 +303,7 @@ Future<({int width, int height})?> probeRtspVideoSize(
     } catch (_) {}
     return null;
   } catch (error) {
-    developer.log(
+    stationLog(
       '[SCOREBOARD] Unable to probe livestream size: $error',
       name: 'ScoreboardBurnIn',
     );
@@ -346,6 +346,8 @@ class ScoreboardBurnIn {
   List<Uint8List?> _writtenBytes = const [];
   Future<bool>? _inFlight;
   bool _dirty = false;
+  // Lúc nhận thay đổi bảng tỉ số đầu tiên chưa vẽ (đo độ trễ bấm → ảnh mới).
+  DateTime? _changeAt;
   bool _active = false;
   bool _regionOutgrownReported = false;
 
@@ -354,6 +356,7 @@ class ScoreboardBurnIn {
   bool _reserveScenes = false;
   int _logoDecodeSize = 0;
   final Map<String, ui.Image> _logos = {};
+  int _lastSponsorSlot = -1;
 
   /// Chế độ chồng từng vùng ([start] với `cropToRegions`): gọi một lần khi
   /// nội dung mới (đổi vị trí, "Kích thước", số set, lần đầu dùng cảnh lớn)
@@ -478,7 +481,7 @@ class ScoreboardBurnIn {
       try {
         await _writeTicker(_service.snapshot());
       } catch (error) {
-        developer.log(
+        stationLog(
           '[SCOREBOARD] Unable to write livestream ticker: $error',
           name: 'ScoreboardBurnIn',
         );
@@ -487,7 +490,10 @@ class ScoreboardBurnIn {
         await _render();
       }
     }
-    _subscription ??= _service.changes.listen((_) => _schedule());
+    _subscription ??= _service.changes.listen((_) {
+      _changeAt ??= DateTime.now();
+      _schedule();
+    });
     // Đồng hồ trận và thông báo có hạn giờ cần vẽ lại theo thời gian.
     _ticker ??= Timer.periodic(const Duration(seconds: 1), (_) {
       if (_needsClockRefresh()) _schedule();
@@ -563,6 +569,7 @@ class ScoreboardBurnIn {
   void stop() {
     _active = false;
     _reserveScenes = false;
+    _changeAt = null;
     _subscription?.cancel();
     _subscription = null;
     _ticker?.cancel();
@@ -575,6 +582,12 @@ class ScoreboardBurnIn {
 
   bool _needsClockRefresh() {
     final state = _service.snapshot();
+    // Logo nhà tài trợ kiểu lần lượt: vẽ lại khi tới lượt logo kế tiếp.
+    final slot = ScoreboardFrameRenderer.sponsorSlot(state, _service.nowMs);
+    if (slot != _lastSponsorSlot) {
+      _lastSponsorSlot = slot;
+      if (slot >= 0) return true;
+    }
     final overlay = state['overlay'];
     final timer = state['timer'];
     if (overlay is! Map) return false;
@@ -628,7 +641,7 @@ class ScoreboardBurnIn {
           try {
             await _writeTicker(state);
           } catch (error) {
-            developer.log(
+            stationLog(
               '[SCOREBOARD] Unable to write livestream ticker: $error',
               name: 'ScoreboardBurnIn',
             );
@@ -664,13 +677,22 @@ class ScoreboardBurnIn {
           written = List<Uint8List?>.filled(paths.length, null);
           _writtenBytes = written;
         }
+        final changeAt = _changeAt;
+        _changeAt = null;
         await _writeChangedImages(paths, images, written);
         _writtenKey = key;
         ok = true;
+        if (changeAt != null) {
+          stationLog(
+            '[SCOREBOARD] Overlay image ready '
+            '${DateTime.now().difference(changeAt).inMilliseconds} ms after change',
+            name: 'ScoreboardBurnIn',
+          );
+        }
         if (regions != null) _checkRegions(state, width, height, regions);
       } while (_dirty && _active);
     } catch (error, stackTrace) {
-      developer.log(
+      stationLog(
         '[SCOREBOARD] Unable to render livestream overlay',
         error: error,
         stackTrace: stackTrace,
@@ -730,7 +752,7 @@ class ScoreboardBurnIn {
     try {
       callback(path);
     } catch (error) {
-      developer.log(
+      stationLog(
         '[SCOREBOARD] Overlay image listener failed: $error',
         name: 'ScoreboardBurnIn',
       );
@@ -759,7 +781,7 @@ class ScoreboardBurnIn {
     );
     if (ScoreboardFrameRenderer.overlayRegionsCover(regions, needed)) return;
     _regionOutgrownReported = true;
-    developer.log(
+    stationLog(
       '[SCOREBOARD] Overlay regions $regions are too small for the '
       'scoreboard; livestream needs a restart',
       name: 'ScoreboardBurnIn',
@@ -802,6 +824,13 @@ class ScoreboardBurnIn {
       final id = team is Map ? team['logoId']?.toString() : null;
       if (id != null && id.isNotEmpty) wanted.add(id);
     }
+    final sponsors = state['sponsors'];
+    if (sponsors is Map && sponsors['enabled'] == true && sponsors['items'] is List) {
+      for (final item in sponsors['items'] as List) {
+        final id = item?.toString() ?? '';
+        if (id.isNotEmpty) wanted.add(id);
+      }
+    }
     for (final id in _logos.keys.toList()) {
       if (!wanted.contains(id)) _logos.remove(id)?.dispose();
     }
@@ -837,7 +866,7 @@ class ScoreboardBurnIn {
         }
         _logos[id] = frame.image;
       } catch (error) {
-        developer.log(
+        stationLog(
           '[SCOREBOARD] Unable to load logo $id: $error',
           name: 'ScoreboardBurnIn',
         );
@@ -854,13 +883,22 @@ List<String> livestreamOverlayInputArgs(String imagePath) => [
   '-re',
   '-f',
   'image2',
+  // Đọc lại ảnh 5 lần/giây (trước 2): bảng tỉ số đổi trên livestream chậm
+  // tối đa ~0,2 s thay vì ~0,5 s. Ảnh nhỏ nên tốn thêm rất ít CPU.
   '-framerate',
-  '2',
+  '$livestreamOverlayReadFps',
+  // Hàng đợi ngắn: ảnh đọc sẵn chờ ghép không quá ~0,8 s (mặc định 8 khung
+  // có thể giữ ảnh cũ vài giây nếu video chính chậm hơn).
+  '-thread_queue_size',
+  '4',
   '-stream_loop',
   '-1',
   '-i',
   imagePath,
 ];
+
+/// Số lần FFmpeg đọc lại ảnh bảng tỉ số mỗi giây (Android, livestream).
+const int livestreamOverlayReadFps = 5;
 
 /// [overlayX]/[overlayY]: vị trí ảnh overlay ([LivestreamOverlay.x]/`y`);
 /// mặc định 0:0 (ảnh phủ cả khung). [regions]: chồng nhiều ảnh (input 1..N,
@@ -885,13 +923,23 @@ List<String> livestreamOverlayVideoArgs({
   ),
   '-map',
   '[vout]',
+  // Cố định nhịp khung đầu ra = FPS cấu hình. Không đặt thì FFmpeg lấy nhịp
+  // đoán từ luồng RTSP cục bộ; sau khi phát lại phiên (đổi độ phân giải, bật
+  // logo khi đang live) phép đoán có thể ra hàng chục nghìn khung/giây →
+  // FFmpeg chèn hàng chục nghìn khung lặp, thời gian video gần như đứng yên
+  // và màn hình live đen (A07, log 30/10/2026: dup=28866, time=0.38s).
+  '-r',
+  '${livestreamOutputFps(fps)}',
   '-c:v',
   'h264_mediacodec',
   '-b:v',
   '$bitrateBps',
   '-g',
-  '${(fps.clamp(1, 60)) * 2}',
+  '${livestreamOutputFps(fps) * 2}',
 ];
+
+/// Nhịp khung đầu ra của luồng in bảng tỉ số (1–60).
+int livestreamOutputFps(int fps) => fps.clamp(1, 60);
 
 /// Bộ lọc: chồng ảnh overlay (input 1) lên video (input 0); có [ticker] thì
 /// vẽ thêm chữ chạy bằng drawtext (đọc lại file chữ mỗi khung hình, chạy từ

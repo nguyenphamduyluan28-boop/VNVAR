@@ -1325,7 +1325,7 @@ class RecordingService {
     if (!priority && _normalPendingTrimCount >= maxPendingTrims) {
       return Future<RecordedSegment>.error(
         const TrimInProgressException(
-          'Camera Station đang xử lý nhiều video; vui lòng thử lại sau ít phút.',
+          'SportO Cam đang xử lý nhiều video; vui lòng thử lại sau ít phút.',
         ),
       );
     }

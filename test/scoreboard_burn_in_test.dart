@@ -51,6 +51,8 @@ void main() {
   test('overlay FFmpeg arguments re-read the image and re-encode on Android', () {
     final input = livestreamOverlayInputArgs('/tmp/overlay.png');
     expect(input, containsAllInOrder(['-stream_loop', '-1', '-i', '/tmp/overlay.png']));
+    // Đọc lại ảnh 5 lần/giây, hàng đợi ngắn: bảng tỉ số cập nhật nhanh.
+    expect(input, containsAllInOrder(['-framerate', '5', '-thread_queue_size', '4']));
     final video = livestreamOverlayVideoArgs(bitrateBps: 4000000, fps: 30);
     expect(video, contains('h264_mediacodec'));
     expect(video, containsAllInOrder(['-b:v', '4000000', '-g', '60']));
@@ -63,6 +65,8 @@ void main() {
       livestreamOverlayFilter(null),
       '-map',
       '[vout]',
+      '-r',
+      '30',
       '-c:v',
       'h264_mediacodec',
       '-b:v',
@@ -70,6 +74,16 @@ void main() {
       '-g',
       '60',
     ]);
+  });
+
+  test('output frame rate is pinned to the configured FPS (no guessed rate)', () {
+    // Sau khi phát lại phiên, FFmpeg có thể đoán nhịp khung của luồng RTSP
+    // cục bộ sai (hàng chục nghìn khung/giây) → khung lặp vô hạn, live đen.
+    final video = livestreamOverlayVideoArgs(bitrateBps: 4000000, fps: 25);
+    expect(video, containsAllInOrder(['-map', '[vout]', '-r', '25', '-c:v']));
+    expect(video, containsAllInOrder(['-g', '50']));
+    expect(livestreamOverlayVideoArgs(bitrateBps: 1, fps: 0), containsAllInOrder(['-r', '1']));
+    expect(livestreamOverlayVideoArgs(bitrateBps: 1, fps: 120), containsAllInOrder(['-r', '60', '-g', '120']));
   });
 
   test('only encoder/filter errors disable the scoreboard overlay', () {
@@ -288,7 +302,7 @@ void main() {
 
     test('content bounds come from the layout', () {
       final bounds = ScoreboardFrameRenderer.contentBounds(
-        sampleState(),
+        sampleState(overlay: {'scale': 1.0}),
         width: 1920,
         height: 1080,
         nowMs: 0,
@@ -296,6 +310,16 @@ void main() {
       // Thanh tỉ số góc trên trái: lề 48, rộng tối đa 820, cao tối đa 194,
       // cộng bóng đổ 48 (dưới thêm 12).
       expect(bounds, const Rect.fromLTRB(0, 0, 916, 302));
+      // "Kích thước" mặc định 70%: cùng bố cục, nhỏ lại theo tỉ lệ.
+      expect(
+        ScoreboardFrameRenderer.contentBounds(
+          sampleState(),
+          width: 1920,
+          height: 1080,
+          nowMs: 0,
+        ),
+        const Rect.fromLTRB(14, 14, 656, 226),
+      );
       expect(
         ScoreboardFrameRenderer.contentBounds(
           sampleState(overlay: {'visible': false}),

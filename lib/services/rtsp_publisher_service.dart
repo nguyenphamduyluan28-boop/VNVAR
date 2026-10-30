@@ -1,14 +1,14 @@
 import 'dart:async';
 import 'dart:io';
-import 'dart:developer' as developer;
 import 'package:ffmpeg_kit_flutter_new_video/ffmpeg_kit.dart';
 import 'package:ffmpeg_kit_flutter_new_video/ffmpeg_session.dart';
 import 'package:ffmpeg_kit_flutter_new_video/return_code.dart';
 import 'package:ffmpeg_kit_flutter_new_video/statistics.dart';
 import 'package:flutter/foundation.dart'
-    show ValueListenable, ValueNotifier, visibleForTesting;
+    show ValueListenable, ValueNotifier, debugPrint, visibleForTesting;
 import 'package:flutter/services.dart' show MethodCall, PlatformException;
 
+import '../utils/station_log.dart';
 import 'audio_cleanup.dart';
 import 'cellular_uplink_service.dart';
 import 'scoreboard_burn_in.dart';
@@ -20,6 +20,44 @@ const int nativeOverlayRtspPort = 8555;
 /// Luồng RTSP overlay native iOS: video H.264 đã chồng bảng tỉ số, không audio.
 const String nativeOverlayRtspUrl =
     'rtsp://127.0.0.1:$nativeOverlayRtspPort/camera';
+
+/// Chọn dòng log FFmpeg để in ra logcat: các dòng thông tin/cảnh báo/lỗi
+/// (mở luồng, ánh xạ stream, lỗi codec/bộ lọc), tối đa [maxLines] dòng mỗi
+/// phiên; dòng tiến độ (`frame=… speed=…`) chỉ in mỗi [progressEvery]. Che
+/// mọi chuỗi trong [secrets] (URL có khóa phát).
+class FfmpegLogcatSampler {
+  FfmpegLogcatSampler({
+    Set<String> secrets = const {},
+    this.maxLines = 200,
+    this.progressEvery = const Duration(seconds: 10),
+  }) : _secrets = secrets.where((s) => s.length >= 8).toList();
+
+  final List<String> _secrets;
+  final int maxLines;
+  final Duration progressEvery;
+  int _lines = 0;
+  DateTime? _lastProgress;
+
+  /// [level]: mức log FFmpeg (16 lỗi, 24 cảnh báo, 32 thông tin).
+  String? lineFor(String message, int level, DateTime now) {
+    final trimmed = message.trimRight();
+    if (trimmed.trim().isEmpty) return null;
+    final progress = trimmed.contains('frame=') && trimmed.contains('speed=');
+    if (progress) {
+      final last = _lastProgress;
+      if (last != null && now.difference(last) < progressEvery) return null;
+      _lastProgress = now;
+    } else {
+      if (level > 32 || _lines >= maxLines) return null;
+      _lines++;
+    }
+    var line = trimmed;
+    for (final secret in _secrets) {
+      line = line.replaceAll(secret, '<stream-url>');
+    }
+    return line;
+  }
+}
 
 /// Thời gian chờ native mở luồng overlay.
 const Duration nativeOverlayStartTimeout = Duration(seconds: 8);
@@ -815,7 +853,7 @@ class RtspPublisherService {
         ? 'restarting with scoreboard ($_nativeOverlayRecoverableRestarts/'
               '$nativeOverlayRecoverableRestartLimit restarts used)'
         : 'continuing without scoreboard';
-    developer.log(
+    stationLog(
       '[RTSP_PUSH] Native overlay stream failed: ${error ?? 'unknown'} '
       '(recoverable=${isRecoverableNativeOverlayError(arguments)}); $next',
       name: 'RtspPublisherService',
@@ -846,7 +884,7 @@ class RtspPublisherService {
     if (trackId == null || trackId.isEmpty) {
       // Camera chưa có track (đang mở lại): phiên này không in, lần kết nối
       // sau thử lại.
-      developer.log(
+      stationLog(
         '[RTSP_PUSH] No camera track for the native overlay; '
         'publishing without scoreboard',
         name: 'RtspPublisherService',
@@ -872,7 +910,7 @@ class RtspPublisherService {
       );
       return token == _nativeOverlayStartToken && _nativeOverlayMayRun;
     }
-    developer.log(
+    stationLog(
       '[RTSP_PUSH] $error; publishing without scoreboard',
       name: 'RtspPublisherService',
     );
@@ -893,7 +931,7 @@ class RtspPublisherService {
     try {
       await _invokeNative('stopOverlayRtsp', null);
     } catch (error) {
-      developer.log(
+      stationLog(
         '[RTSP_PUSH] stopOverlayRtsp failed (ignored): $error',
         name: 'RtspPublisherService',
       );
@@ -923,7 +961,7 @@ class RtspPublisherService {
     try {
       await _invokeNative(method, arguments);
     } catch (error) {
-      developer.log(
+      stationLog(
         '[RTSP_PUSH] $method failed (ignored): $error',
         name: 'RtspPublisherService',
       );
@@ -1033,7 +1071,7 @@ class RtspPublisherService {
     final bps = _nativeEncoderBitrateBps;
     unawaited(
       callback(bps).catchError((Object error) {
-        developer.log(
+        stationLog(
           '[RTSP_PUSH] Unable to apply bitrate $bps: $error',
           name: 'RtspPublisherService',
         );
@@ -1192,7 +1230,7 @@ class RtspPublisherService {
           scrollingTicker: !_tickerScrollUnavailable,
         );
       } catch (error) {
-        developer.log(
+        stationLog(
           '[RTSP_PUSH] Scoreboard overlay unavailable: $error',
           name: 'RtspPublisherService',
         );
@@ -1252,7 +1290,7 @@ class RtspPublisherService {
       _reconnectTimer?.cancel();
       _setError(null);
       _setState(RtspPublishState.publishing);
-      developer.log(
+      stationLog(
         '[RTSP_PUSH] Stream is now LIVE on ${maskStreamUrlForLog(_targetUrl)} '
         '(${_cellularActive ? '4G/5G fallback' : 'default network'})',
         name: 'RtspPublisherService',
@@ -1359,12 +1397,20 @@ class RtspPublisherService {
       outputUrl,
     ];
 
-    developer.log(
+    stationLog(
       '[RTSP_PUSH] Starting FFmpeg push to ${maskStreamUrlForLog(_targetUrl)}',
       name: 'RtspPublisherService',
     );
 
     final instantRates = InstantStreamRates();
+    final ffmpegLog = FfmpegLogcatSampler(
+      secrets: {outputUrl, _targetUrl!},
+    );
+    // Toàn bộ lệnh FFmpeg (đã che URL có khóa phát): xem bộ lọc/vùng overlay.
+    stationLog(
+      '[RTSP_PUSH] FFmpeg args: ${args.map((arg) => arg == outputUrl || arg == _targetUrl ? '<stream-url>' : arg).join(' ')}',
+      name: 'RtspPublisherService',
+    );
     debugOnFfmpegLaunch?.call(args);
     try {
       final session = await FFmpegKit.executeWithArgumentsAsync(
@@ -1376,7 +1422,7 @@ class RtspPublisherService {
           final isSuccess = ReturnCode.isSuccess(returnCode);
           final isCancel = ReturnCode.isCancel(returnCode);
 
-          developer.log(
+          stationLog(
             '[RTSP_PUSH] Session ended: returnCode=$returnCode (success=$isSuccess, cancel=$isCancel)',
             name: 'RtspPublisherService',
           );
@@ -1418,7 +1464,7 @@ class RtspPublisherService {
               _hwDecodeEarlyFailures = 0;
             }
             if (_hwDecodeUnavailable && !sawOutput) {
-              developer.log(
+              stationLog(
                 '[RTSP_PUSH] Hardware decoding unavailable; retrying with CPU decoding',
                 name: 'RtspPublisherService',
               );
@@ -1436,7 +1482,7 @@ class RtspPublisherService {
               isLivestreamTickerFailure(output)) {
             // Không vẽ được chữ chạy: vẫn in bảng tỉ số, chữ chạy đứng yên.
             _tickerScrollUnavailable = true;
-            developer.log(
+            stationLog(
               '[RTSP_PUSH] Scrolling ticker unavailable; using a static ticker',
               name: 'RtspPublisherService',
             );
@@ -1459,7 +1505,7 @@ class RtspPublisherService {
               _nativeOverlaySourceFailures = 0;
               _markOverlayUnavailable();
             }
-            developer.log(
+            stationLog(
               '[RTSP_PUSH] Native overlay stream unreadable; retrying '
               '${_overlayUnavailable ? 'without scoreboard' : 'with scoreboard'}',
               name: 'RtspPublisherService',
@@ -1482,7 +1528,7 @@ class RtspPublisherService {
             _overlayIssue =
                 'Máy này không in được bảng tỉ số vào livestream; đang phát không có bảng tỉ số.';
             releaseOverlay?.call();
-            developer.log(
+            stationLog(
               '[RTSP_PUSH] Overlay encoding failed; retrying without scoreboard',
               name: 'RtspPublisherService',
             );
@@ -1502,7 +1548,7 @@ class RtspPublisherService {
           if (!isSuccess && isPermanentRelayRejection(output)) {
             // Sai stream key / không có quyền / không có luồng: thử lại vô
             // ích (và có thể bị server chặn). Dừng hẳn, giữ thông báo lỗi.
-            developer.log(
+            stationLog(
               '[RTSP_PUSH] Server rejected the stream; not retrying: ${failureReason.en}',
               name: 'RtspPublisherService',
             );
@@ -1510,7 +1556,7 @@ class RtspPublisherService {
             _haltWithError(failureReason);
             return;
           }
-          developer.log(
+          stationLog(
             '[RTSP_PUSH] Session ended unexpectedly: ${failureReason.en}',
             name: 'RtspPublisherService',
           );
@@ -1527,6 +1573,10 @@ class RtspPublisherService {
         (log) {
           if (!isCurrent()) return;
           final message = log.getMessage();
+          // Ghi log FFmpeg ra logcat (đã che URL/khóa phát) để chẩn đoán lỗi
+          // livestream trên máy thật bằng `adb logcat`.
+          final line = ffmpegLog.lineFor(message, log.getLevel(), DateTime.now());
+          if (line != null) debugPrint('[FFMPEG] $line');
           // Detect active streaming
           if (message.contains('frame=') || message.contains('bitrate=')) {
             if (!sawOutput) outputStartedAt = DateTime.now();
@@ -1577,7 +1627,7 @@ class RtspPublisherService {
               now: now,
             );
             if (next != null) {
-              developer.log(
+              stationLog(
                 '[RTSP_PUSH] Upload speed ${_currentSpeed.toStringAsFixed(2)}x, '
                 'FPS ${_currentFps.toStringAsFixed(1)}; bitrate -> ${next ~/ 1000} kbps',
                 name: 'RtspPublisherService',
@@ -1616,7 +1666,7 @@ class RtspPublisherService {
         en: 'Unable to start the stream relay: $e',
       );
       _setError(err.vi, err.en);
-      developer.log(
+      stationLog(
         '[RTSP_PUSH] Exception: ${err.en}',
         name: 'RtspPublisherService',
       );
@@ -1638,7 +1688,7 @@ class RtspPublisherService {
     try {
       wanted = wantedNow();
     } catch (error) {
-      developer.log(
+      stationLog(
         '[RTSP_PUSH] Unable to read scoreboard overlay state: $error',
         name: 'RtspPublisherService',
       );
@@ -1653,7 +1703,7 @@ class RtspPublisherService {
       return;
     }
     _overlayLaunchRestartUsed = true;
-    developer.log(
+    stationLog(
       '[RTSP_PUSH] Scoreboard was shown while the session was starting; '
       'restarting once to burn it in',
       name: 'RtspPublisherService',
@@ -1688,7 +1738,7 @@ class RtspPublisherService {
       if (isStruggling && congestionSec >= 10) {
         if (_networkQuality != StreamNetworkQuality.poor) {
           _networkQuality = StreamNetworkQuality.poor;
-          developer.log(
+          stationLog(
             '[RTSP_PUSH] Mạng nghẽn kéo dài ${congestionSec}s '
             '(FPS: $fps/$_expectedFps, Bitrate: ${bitrateKbps}kbps).',
             name: 'RtspPublisherService',
@@ -1823,7 +1873,7 @@ class RtspPublisherService {
     if (_routeFailures >= routeFailuresBeforeSwitch) {
       _routeFailures = 0;
       _preferCellular = !_preferCellular;
-      developer.log(
+      stationLog(
         '[RTSP_PUSH] Switching livestream route to '
         '${_preferCellular ? '4G/5G fallback' : 'the default network'}',
         name: 'RtspPublisherService',
@@ -1848,7 +1898,7 @@ class RtspPublisherService {
             _retryAttempt.clamp(0, _backoffDelaysSeconds.length - 1)];
     _retryAttempt++;
 
-    developer.log(
+    stationLog(
       '[RTSP_PUSH] Reconnecting in ${delaySeconds}s (attempt $_retryAttempt/$maxReconnectAttempts)...',
       name: 'RtspPublisherService',
     );
@@ -1879,7 +1929,7 @@ class RtspPublisherService {
     final staleRoute =
         interfaceLost && _state == RtspPublishState.publishing;
     if (!waiting && !staleRoute) return;
-    developer.log(
+    stationLog(
       '[RTSP_PUSH] Network changed; reconnecting now',
       name: 'RtspPublisherService',
     );
@@ -1928,7 +1978,7 @@ class RtspPublisherService {
           _intentionalStop) {
         return;
       }
-      developer.log(
+      stationLog(
         '[RTSP_PUSH] Wi-Fi reaches the server again; leaving 4G/5G fallback',
         name: 'RtspPublisherService',
       );
@@ -1967,7 +2017,7 @@ class RtspPublisherService {
   /// Gracefully stops active stream before camera hardware resets to avoid broken frames
   Future<void> prepareForReconfiguration() async {
     if (!wantsPublishing) return;
-    developer.log(
+    stationLog(
       '[RTSP_PUSH] Preparing for camera reconfiguration (pausing stream)...',
       name: 'RtspPublisherService',
     );
@@ -1984,7 +2034,7 @@ class RtspPublisherService {
     // Người dùng đã bấm dừng trong lúc camera đang đổi cấu hình: không tự phát lại.
     if (_intentionalStop) return;
 
-    developer.log(
+    stationLog(
       '[RTSP_PUSH] Restarting publish session due to camera reconfiguration...',
       name: 'RtspPublisherService',
     );
@@ -2023,7 +2073,7 @@ class RtspPublisherService {
       try {
         await session.cancel();
       } catch (e) {
-        developer.log(
+        stationLog(
           '[RTSP_PUSH] Cancel session error (ignored): $e',
           name: 'RtspPublisherService',
         );
@@ -2045,7 +2095,7 @@ class RtspPublisherService {
     }
     unawaited(
       _cancelActiveSession().catchError((Object error) {
-        developer.log(
+        stationLog(
           '[RTSP_PUSH] Cancel session during dispose failed: $error',
           name: 'RtspPublisherService',
         );

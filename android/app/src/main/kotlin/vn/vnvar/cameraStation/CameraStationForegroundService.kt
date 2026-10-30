@@ -34,7 +34,7 @@ class CameraStationForegroundService : Service() {
         super.onCreate()
         isRunning = true
         createNotificationChannel()
-        Log.i(TAG, "[SERVICE] Camera Station foreground service created")
+        Log.i(TAG, "[SERVICE] SportO Cam foreground service created")
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -213,7 +213,7 @@ class CameraStationForegroundService : Service() {
         isRunning = false
         appliedForegroundTypes = 0
         stopForeground(STOP_FOREGROUND_REMOVE)
-        Log.i(TAG, "[SERVICE] Camera Station foreground service destroyed")
+        Log.i(TAG, "[SERVICE] SportO Cam foreground service destroyed")
         super.onDestroy()
     }
 

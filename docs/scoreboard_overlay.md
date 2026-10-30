@@ -4,7 +4,7 @@ Chạy hoàn toàn trong mạng Wi-Fi nội bộ, do `CameraServer` (cổng API,
 
 ## Cách dùng
 
-1. Trên app Camera Station bấm nút **Bảng tỉ số** (biểu tượng scoreboard) ở thanh trên cùng. Hub chỉ hiện mã QR, link và mã điều khiển; mọi thao tác tỉ số và overlay làm trên trang web.
+1. Trên app SportO Cam bấm nút **Bảng tỉ số** (biểu tượng scoreboard) ở thanh trên cùng. Hub chỉ hiện mã QR, link và mã điều khiển; mọi thao tác tỉ số và overlay làm trên trang web.
 2. Trọng tài quét mã QR → mở `http://<IP>:<PORT>/control` trên trình duyệt điện thoại. Mã điều khiển được nhớ trong trình duyệt.
 3. Máy OBS: Sources → + → **Browser** → URL `http://<IP>:<PORT>/overlay`, Width 1920, Height 1080. Nền trong suốt.
 4. Mọi thay đổi trên trang điều khiển hiện lên overlay ngay (Server-Sent Events).
@@ -38,7 +38,7 @@ Khi phát RTMP/RTSP từ điện thoại **Android** hoặc **iPhone**, app tự
 | GET | `/api/score` | — | Trạng thái hiện tại (JSON) |
 | GET | `/api/score/events` | — | SSE: `event: state` khi đổi, `event: ping` mỗi 15 giây |
 | POST | `/api/score` | Có | Gửi lệnh, trả `{ok, state}` |
-| POST | `/api/score/logo?team=A` | Có | Body là ảnh PNG/JPG/WebP ≤ 512 KB |
+| POST | `/api/score/logo?team=A` | Có | Body là ảnh PNG/JPG/WebP ≤ 512 KB. `team=S`: thêm logo nhà tài trợ (tối đa 8) |
 | GET | `/api/score/logo/<id>` | — | Ảnh logo |
 
 Mã khóa gửi bằng header `X-Score-Key: <mã>` hoặc query `?k=<mã>`. Mã nằm trong link QR; đổi mã trong Hub của app.
@@ -64,6 +64,8 @@ Mỗi lệnh nên có `id` duy nhất; gửi lại cùng `id` (khi mạng chập
 | `banner` | `text`, `seconds` (0 = đến khi tắt) | `text` rỗng để tắt |
 | `timer` | `op`: start/pause/reset | |
 | `removeLogo` | `team` | |
+| `sponsors` | `enabled`, `mode` (rotate/strip), `position` (tl/tc/tr/bl/bc/br), `scale` (0.5–2), `interval` (3–60 giây), `offsetX`, `offsetY` (±960, đơn vị khung 1920×1080), `plate` (light/dark/none), `order` [id] | Logo nhà tài trợ; `order` phải gồm đúng các id hiện có |
+| `removeSponsor` | `logo` (id ảnh `S_…`) | Xoá logo nhà tài trợ |
 | `setScore` | `scoreA`, `scoreB`, `setsA`, `setsB`, `gamesA`, `gamesB`, `serving`, `matchFinished`, `teamA`, `teamB` | Ghi đè trực tiếp, không áp luật (tích hợp tablet) |
 
 Body không có `action` nhưng có các trường phẳng (`scoreA`, `teamA`…) được hiểu là `setScore` (tương thích đặc tả ban đầu).
@@ -83,5 +85,5 @@ X-Score-Key: AB12CD
 ## Lưu ý vận hành
 
 - Điện thoại trọng tài và máy OBS phải cùng mạng Wi-Fi với điện thoại camera. IP điện thoại đổi thì cập nhật lại link trong OBS.
-- iPhone: giữ app Camera Station mở; khi app xuống nền server tạm dừng, overlay giữ tỉ số cuối và tự cập nhật lại khi app mở.
+- iPhone: giữ app SportO Cam mở; khi app xuống nền server tạm dừng, overlay giữ tỉ số cuối và tự cập nhật lại khi app mở.
 - Trạng thái bảng tỉ số được lưu trong máy, khởi động lại app không mất điểm.

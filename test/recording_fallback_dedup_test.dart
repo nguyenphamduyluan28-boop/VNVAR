@@ -287,12 +287,12 @@ void main() {
     test('nội dung 503: Service Unavailable + retryable, 500 giữ nguyên', () {
       expect(transientRequestErrorBody(transient: true), {
         'error': 'Service Unavailable',
-        'message': 'Camera Station không thể xử lý yêu cầu.',
+        'message': 'SportO Cam không thể xử lý yêu cầu.',
         'retryable': true,
       });
       expect(transientRequestErrorBody(transient: false), {
         'error': 'Internal Server Error',
-        'message': 'Camera Station không thể xử lý yêu cầu.',
+        'message': 'SportO Cam không thể xử lý yêu cầu.',
       });
     });
 

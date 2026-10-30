@@ -1,4 +1,4 @@
-# VNVAR Camera Station (SportO-Cam)
+# SportO Cam
 
 Ứng dụng Flutter biến điện thoại thành trạm camera cho sân thể thao: ghi hình theo segment, cắt clip
 CheckVAR cho tablet trọng tài, phát RTSP nội bộ, livestream RTMP/WHIP, và bảng tỉ số in lên livestream.

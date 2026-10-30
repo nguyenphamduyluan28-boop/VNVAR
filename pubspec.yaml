@@ -1,5 +1,5 @@
 name: camera_station
-description: "VNVAR Camera Station"
+description: "SportO Cam"
 publish_to: 'none'
 
 version: 1.0.1+5

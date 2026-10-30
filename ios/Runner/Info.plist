@@ -3,19 +3,19 @@
 <plist version="1.0">
 <dict>
 	<key>NSCameraUsageDescription</key>
-	<string>VNVAR sử dụng camera để ghi hình sân pickleball.</string>
+	<string>SportO Cam sử dụng camera để ghi hình sân pickleball.</string>
 
 	<key>NSMicrophoneUsageDescription</key>
-	<string>VNVAR sử dụng microphone để ghi âm cùng video.</string>
+	<string>SportO Cam sử dụng microphone để ghi âm cùng video.</string>
 
 	<key>NSPhotoLibraryUsageDescription</key>
-	<string>VNVAR cần chọn ảnh mã QR trong thư viện để cấu hình livestream.</string>
+	<string>SportO Cam cần chọn ảnh mã QR trong thư viện để cấu hình livestream.</string>
 
 	<key>NSPhotoLibraryAddUsageDescription</key>
 	<string>SportO Cam lưu bản sao video vào ứng dụng Ảnh để bạn xem và chia sẻ.</string>
 
 	<key>NSLocalNetworkUsageDescription</key>
-	<string>VNVAR sử dụng mạng nội bộ để nhận lệnh điều khiển từ tablet.</string>
+	<string>SportO Cam sử dụng mạng nội bộ để nhận lệnh điều khiển từ tablet.</string>
 
 	<key>NSBonjourServices</key>
 	<array>

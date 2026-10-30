@@ -9,7 +9,7 @@ const String scoreboardControlPageHtml = r'''<!doctype html>
 <link rel="icon" href="data:,">
 <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
 <meta name="theme-color" content="#0B1220">
-<title>Bảng điểm · VNVAR</title>
+<title>Bảng điểm · SportO Cam</title>
 <style>
 :root{--bg:#0B1220;--p1:#111A2B;--p2:#16223A;--p3:#1D2B47;--line:#26365A;--pri:#1565C0;--pri2:#42A5F5;--text:#F1F5F9;--muted:#94A3B8;--red:#E53935;--green:#00C853;--orange:#FFA726;--r1:10px;--r2:14px;--r3:20px;
  --sl:max(12px,env(safe-area-inset-left));--sr:max(12px,env(safe-area-inset-right))}
@@ -131,6 +131,13 @@ label.f input[type=range]{padding:0;border:0;background:transparent;accent-color
 .logo-row img{width:56px;height:56px;flex:none;object-fit:contain;background:var(--bg);border-radius:var(--r1);border:1px solid var(--line)}
 .logo-row .btns{display:flex;flex-direction:column;gap:6px;flex:1;min-width:0}
 .logo-row button{padding:8px;font-size:13px}
+.sp-list{display:grid;grid-template-columns:repeat(auto-fill,minmax(132px,1fr));gap:8px}
+.sp-item{background:var(--p2);border-radius:var(--r2);padding:8px;display:flex;flex-direction:column;gap:6px;min-width:0}
+/* Nền ô vuông xám: thấy rõ phần trong suốt của logo PNG. */
+.sp-item img{width:100%;height:64px;object-fit:contain;border-radius:var(--r1);background:#3a3a3a repeating-conic-gradient(#4a4a4a 0 25%,#333 0 50%) 0 0/16px 16px}
+.sp-item .row{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:4px}
+.sp-item button{padding:6px 0;min-height:40px;font-size:15px}
+.sp-empty{color:var(--muted);font-size:13px;padding:6px 2px}
 .seg{display:grid;gap:6px}
 .seg button{padding:10px 6px;font-size:14px;background:var(--p2)}
 .seg button.on{background:var(--pri);color:#fff;box-shadow:inset 0 0 0 2px var(--pri2)}
@@ -209,7 +216,7 @@ body.offline .needs-conn,body.wait .needs-conn{opacity:.4;pointer-events:none;fi
 </head>
 <body class="wait">
 <header>
-  <div class="title"><b id="hTitle">Bảng điểm</b><small id="hSub">VNVAR Camera Station</small></div>
+  <div class="title"><b id="hTitle">Bảng điểm</b><small id="hSub">SportO Cam</small></div>
   <div class="conn" id="conn" role="status"><i></i><span id="connText">Đang kết nối…</span></div>
 </header>
 
@@ -265,6 +272,7 @@ body.offline .needs-conn,body.wait .needs-conn{opacity:.4;pointer-events:none;fi
       <button data-sub="live" class="on">Trực tiếp</button>
       <button data-sub="look">Giao diện</button>
       <button data-sub="ticker">Chữ chạy</button>
+      <button data-sub="sponsors">Nhà tài trợ</button>
       <button data-sub="stream">Livestream</button>
     </div>
     <div class="card needs-conn" data-sub="live">
@@ -303,7 +311,7 @@ body.offline .needs-conn,body.wait .needs-conn{opacity:.4;pointer-events:none;fi
         <button data-pos="tl">↖ Trên trái</button><button data-pos="tc">↑ Trên giữa</button><button data-pos="tr">↗ Trên phải</button>
         <button data-pos="bl">↙ Dưới trái</button><button data-pos="bc">↓ Dưới giữa</button><button data-pos="br">↘ Dưới phải</button>
       </div>
-      <label class="f"><span>Kích thước: <b id="oScaleV">100%</b></span><input type="range" id="oScale" min="0.5" max="2" step="0.05"></label>
+      <label class="f"><span>Kích thước: <b id="oScaleV">70%</b></span><input type="range" id="oScale" min="0.5" max="2" step="0.05"></label>
     </div>
     <div class="card needs-conn" data-sub="look">
       <h3>Màu sắc</h3>
@@ -326,6 +334,37 @@ body.offline .needs-conn,body.wait .needs-conn{opacity:.4;pointer-events:none;fi
       <label class="f">Tốc độ<select id="tSpeed"><option value="1">Chậm</option><option value="2">Vừa</option><option value="3">Nhanh</option></select></label>
       <button class="primary" id="tSave">Cập nhật chữ chạy</button>
       <div class="muted">Livestream từ điện thoại: nội dung đổi ngay; tốc độ mới áp dụng từ lần phát hoặc kết nối lại sau.</div>
+    </div>
+    <div class="card needs-conn" data-sub="sponsors">
+      <h3>Logo nhà tài trợ</h3>
+      <label class="switch"><span>Hiện logo nhà tài trợ</span><input type="checkbox" id="spEnabled"></label>
+      <div class="sp-list" id="spList"></div>
+      <button class="primary" id="spAdd">+ Thêm logo</button>
+      <input type="file" accept="image/png,image/webp,image/jpeg" id="spFile" hidden>
+      <div class="muted">Nhận PNG nền trong suốt (giữ nguyên phần trong suốt), WebP hoặc JPG. Tối đa 8 logo. Logo hiện cùng bảng tỉ số (theo nút Hiện/Ẩn overlay).</div>
+    </div>
+    <div class="card needs-conn" data-sub="sponsors">
+      <h3>Cách hiển thị</h3>
+      <div class="seg" style="grid-template-columns:minmax(0,1fr) minmax(0,1fr)">
+        <button data-spmode="rotate">Lần lượt từng logo</button>
+        <button data-spmode="strip">Dải tất cả logo</button>
+      </div>
+      <label class="f" id="spIntervalBox">Đổi logo sau<select id="spInterval"><option value="5">5 giây</option><option value="8">8 giây</option><option value="10">10 giây</option><option value="15">15 giây</option><option value="30">30 giây</option><option value="60">1 phút</option></select></label>
+      <div class="seg" id="spPlates" style="grid-template-columns:repeat(3,minmax(0,1fr))">
+        <button data-spplate="none">Không nền</button><button data-spplate="light">Nền trắng</button><button data-spplate="dark">Nền tối</button>
+      </div>
+    </div>
+    <div class="card needs-conn" data-sub="sponsors">
+      <h3>Vị trí &amp; kích thước logo</h3>
+      <div class="seg" id="spPositions" style="grid-template-columns:repeat(3,minmax(0,1fr))">
+        <button data-sppos="tl">↖ Trên trái</button><button data-sppos="tc">↑ Trên giữa</button><button data-sppos="tr">↗ Trên phải</button>
+        <button data-sppos="bl">↙ Dưới trái</button><button data-sppos="bc">↓ Dưới giữa</button><button data-sppos="br">↘ Dưới phải</button>
+      </div>
+      <label class="f"><span>Kích thước: <b id="spScaleV">100%</b></span><input type="range" id="spScale" min="0.5" max="2" step="0.05"></label>
+      <label class="f"><span>Dịch ngang: <b id="spXV">0</b></span><input type="range" id="spX" min="-480" max="480" step="4"></label>
+      <label class="f"><span>Dịch dọc: <b id="spYV">0</b></span><input type="range" id="spY" min="-300" max="300" step="4"></label>
+      <button id="spReset">Về vị trí chuẩn</button>
+      <div class="muted">Chung góc với bảng tỉ số thì logo tự xếp bên dưới (hoặc bên trên) bảng. Đổi vị trí khi đang livestream có thể làm luồng khởi động lại vài giây.</div>
     </div>
     <div class="card needs-conn" data-sub="stream">
       <h3>Livestream từ điện thoại</h3>
@@ -421,7 +460,7 @@ body.offline .needs-conn,body.wait .needs-conn{opacity:.4;pointer-events:none;fi
       <h3>Link điều khiển (có mã)</h3>
       <div class="mono" id="sControl"></div>
       <button data-copy="sControl">Sao chép link điều khiển</button>
-      <div class="muted">Ai có link này đều chỉnh được tỉ số. Đổi mã trong app Camera Station nếu bị lộ.</div>
+      <div class="muted">Ai có link này đều chỉnh được tỉ số. Đổi mã trong app SportO Cam nếu bị lộ.</div>
     </div>
     <div class="card" data-sub="system">
       <h3>Kết nối</h3>
@@ -462,7 +501,7 @@ body.offline .needs-conn,body.wait .needs-conn{opacity:.4;pointer-events:none;fi
 
 <div class="shade" id="keySheet"><div class="sheet">
   <h3>Mã điều khiển</h3>
-  <p>Mã không đúng hoặc đã được đổi. Quét lại mã QR trên app Camera Station hoặc nhập mã 6 ký tự.</p>
+  <p>Mã không đúng hoặc đã được đổi. Quét lại mã QR trên app SportO Cam hoặc nhập mã 6 ký tự.</p>
   <label class="f"><input id="keyInput" maxlength="6" autocapitalize="characters" autocomplete="off" placeholder="VD: AB12CD"></label>
   <div class="grid2"><button class="ghost" data-close>Đóng</button><button class="primary" id="keySave">Lưu mã</button></div>
 </div></div>
@@ -594,7 +633,7 @@ function render(){
   var m=s.match||{};
   setText('hTitle',m.tournament||'Bảng điểm');
   var sub=[m.round,m.court].filter(Boolean).join(' · ');
-  setText('hSub',sub||'VNVAR Camera Station');
+  setText('hSub',sub||'SportO Cam');
   // panels order
   var board=$('board'), A=$('teamA'), B=$('teamB'), mid=board.querySelector('.mid');
   if(s.sidesSwapped){if(board.firstElementChild!==B){board.insertBefore(B,A);board.insertBefore(mid,A);}}
@@ -636,6 +675,7 @@ function render(){
   renderServeButtons();
   fillForms();
   renderOverlayTab();
+  renderSponsorsTab();
   renderSystem();
 }
 function renderServeButtons(){
@@ -740,18 +780,26 @@ function uploadLogo(team,f){
   toast('Đang xử lý logo…');
   var url=URL.createObjectURL(f), img=new Image();
   img.onload=function(){
-    var max=256, w=img.naturalWidth, h=img.naturalHeight, k=Math.min(1,max/Math.max(w,h));
-    var c=document.createElement('canvas');c.width=Math.max(1,Math.round(w*k));c.height=Math.max(1,Math.round(h*k));
-    c.getContext('2d').drawImage(img,0,0,c.width,c.height);URL.revokeObjectURL(url);
-    c.toBlob(function(blob){
-      if(!blob){toast('Không đọc được ảnh',true);return;}
-      fetch('/api/score/logo?team='+team,{method:'POST',headers:{'Content-Type':'image/png','X-Score-Key':key},body:blob})
-      .then(function(r){return r.json().catch(function(){return null;}).then(function(d){
-        if(r.ok){if(d&&d.state)applyState(d.state);toast('Đã cập nhật logo');}
-        else if(r.status===401)openKey();
-        else toast((d&&d.message)||('Lỗi '+r.status),true);
-      });}).catch(function(){toast('Không tải được logo lên',true);});
-    },'image/png');
+    URL.revokeObjectURL(url);
+    // Vẽ lại vào canvas (nền trong suốt) rồi xuất PNG: giữ nguyên kênh trong
+    // suốt của PNG/WebP. Ảnh quá nặng (> ~500 KB) thì thu nhỏ thêm.
+    var sizes=team==='S'?[512,384,256]:[256,192];
+    function attempt(i){
+      var max=sizes[i], w=img.naturalWidth, h=img.naturalHeight, k=Math.min(1,max/Math.max(w,h));
+      var c=document.createElement('canvas');c.width=Math.max(1,Math.round(w*k));c.height=Math.max(1,Math.round(h*k));
+      var g=c.getContext('2d');g.clearRect(0,0,c.width,c.height);g.drawImage(img,0,0,c.width,c.height);
+      c.toBlob(function(blob){
+        if(!blob){toast('Không đọc được ảnh',true);return;}
+        if(blob.size>500*1024&&i+1<sizes.length){attempt(i+1);return;}
+        fetch('/api/score/logo?team='+team,{method:'POST',headers:{'Content-Type':'image/png','X-Score-Key':key},body:blob})
+        .then(function(r){return r.json().catch(function(){return null;}).then(function(d){
+          if(r.ok){if(d&&d.state)applyState(d.state);toast(team==='S'?'Đã thêm logo nhà tài trợ':'Đã cập nhật logo');}
+          else if(r.status===401)openKey();
+          else toast((d&&d.message)||('Lỗi '+r.status),true);
+        });}).catch(function(){toast('Không tải được logo lên',true);});
+      },'image/png');
+    }
+    attempt(0);
   };
   img.onerror=function(){URL.revokeObjectURL(url);toast('File không phải ảnh',true);};
   img.src=url;
@@ -810,6 +858,66 @@ $('oVisible').addEventListener('change',function(){send({action:'overlay',visibl
 $('hVisible').onclick=function(){buzz(20);var hide=!(state&&state.overlay&&state.overlay.visible===false);send({action:'overlay',visible:!hide}).then(function(ok){if(ok)toast(hide?'Đã ẩn overlay':'Đã hiện overlay');});};
 qsa('[data-show]').forEach(function(c){c.addEventListener('change',function(){var show={};show[c.dataset.show]=c.checked;send({action:'overlay',show:show});});});
 $('tSave').onclick=function(){send({action:'overlay',ticker:{enabled:$('tEnabled').checked,text:$('tText').value,speed:Number($('tSpeed').value)}}).then(function(ok){if(ok){dirty.ticker=false;toast('Đã cập nhật chữ chạy');render();}});};
+// ---------- nhà tài trợ ----------
+function sponsorsOf(){return (state&&state.sponsors)||{enabled:false,mode:'rotate',position:'tr',scale:1,interval:8,offsetX:0,offsetY:0,plate:'none',items:[]};}
+function sendSponsors(patch){return send(Object.assign({action:'sponsors'},patch));}
+var spListSig='';
+function renderSponsorsTab(){
+  var sp=sponsorsOf(), items=sp.items||[];
+  $('spEnabled').checked=!!sp.enabled;
+  qsa('[data-spmode]').forEach(function(b){b.classList.toggle('on',b.dataset.spmode===sp.mode);});
+  qsa('[data-spplate]').forEach(function(b){b.classList.toggle('on',b.dataset.spplate===sp.plate);});
+  qsa('[data-sppos]').forEach(function(b){b.classList.toggle('on',b.dataset.sppos===sp.position);});
+  $('spIntervalBox').style.display=sp.mode==='strip'?'none':'';
+  if(document.activeElement!==$('spInterval'))val($('spInterval'),sp.interval);
+  if(document.activeElement!==$('spScale'))val($('spScale'),sp.scale);
+  if(document.activeElement!==$('spX'))val($('spX'),sp.offsetX);
+  if(document.activeElement!==$('spY'))val($('spY'),sp.offsetY);
+  setText('spScaleV',Math.round(Number(sp.scale)*100)+'%');
+  setText('spXV',String(sp.offsetX));setText('spYV',String(sp.offsetY));
+  $('spAdd').disabled=items.length>=8;
+  var sig=items.join(',');
+  if(sig===spListSig)return;
+  spListSig=sig;
+  var list=$('spList');list.textContent='';
+  if(!items.length){var e=document.createElement('div');e.className='sp-empty';e.textContent='Chưa có logo nào.';list.appendChild(e);return;}
+  items.forEach(function(id,i){
+    var box=document.createElement('div');box.className='sp-item';
+    var img=document.createElement('img');img.alt='';img.src='/api/score/logo/'+encodeURIComponent(id);box.appendChild(img);
+    var row=document.createElement('div');row.className='row';
+    var mk=function(label,title,fn,dis){var b=document.createElement('button');b.textContent=label;b.title=title;b.setAttribute('aria-label',title);b.disabled=!!dis;b.onclick=fn;row.appendChild(b);return b;};
+    mk('◀','Đưa lên trước',function(){moveSponsor(i,-1);},i===0);
+    mk('▶','Đưa ra sau',function(){moveSponsor(i,1);},i===items.length-1);
+    var del=mk('✕','Xoá logo',function(){confirmBox('Xoá logo này?','Logo nhà tài trợ sẽ bị xoá khỏi overlay.','Xoá',function(){send({action:'removeSponsor',logo:id});});});
+    del.className='danger';
+    box.appendChild(row);list.appendChild(box);
+  });
+}
+function moveSponsor(i,d){
+  var items=(sponsorsOf().items||[]).slice(), j=i+d;
+  if(j<0||j>=items.length)return;
+  var t=items[i];items[i]=items[j];items[j]=t;
+  sendSponsors({order:items});
+}
+$('spEnabled').addEventListener('change',function(){
+  var on=$('spEnabled').checked;
+  if(on&&!(sponsorsOf().items||[]).length){$('spEnabled').checked=false;toast('Thêm ít nhất một logo trước',true);return;}
+  sendSponsors({enabled:on}).then(function(ok){if(ok)toast(on?(state&&state.overlay.visible===false?'Đã bật logo (overlay đang ẩn)':'Đã hiện logo nhà tài trợ'):'Đã ẩn logo nhà tài trợ');});
+});
+$('spAdd').onclick=function(){if((sponsorsOf().items||[]).length>=8){toast('Tối đa 8 logo',true);return;}$('spFile').click();};
+$('spFile').onchange=function(){var f=$('spFile').files&&$('spFile').files[0];$('spFile').value='';if(f)uploadLogo('S',f);};
+qsa('[data-spmode]').forEach(function(b){b.onclick=function(){sendSponsors({mode:b.dataset.spmode});};});
+qsa('[data-spplate]').forEach(function(b){b.onclick=function(){sendSponsors({plate:b.dataset.spplate});};});
+qsa('[data-sppos]').forEach(function(b){b.onclick=function(){sendSponsors({position:b.dataset.sppos,offsetX:0,offsetY:0});};});
+$('spInterval').addEventListener('change',function(){sendSponsors({interval:Number($('spInterval').value)});});
+$('spScale').addEventListener('input',function(){setText('spScaleV',Math.round(Number($('spScale').value)*100)+'%');});
+$('spScale').addEventListener('change',function(){sendSponsors({scale:Number($('spScale').value)});});
+['X','Y'].forEach(function(a){
+  var el=$('sp'+a);
+  el.addEventListener('input',function(){setText('sp'+a+'V',el.value);});
+  el.addEventListener('change',function(){var p={};p['offset'+a]=Number(el.value);sendSponsors(p);});
+});
+$('spReset').onclick=function(){sendSponsors({offsetX:0,offsetY:0,scale:1}).then(function(ok){if(ok)toast('Đã về vị trí chuẩn');});};
 function showBanner(text){text=(text||'').trim();if(!text){toast('Nhập nội dung thông báo',true);return;}send({action:'banner',text:text,seconds:Number($('bSeconds').value)}).then(function(ok){if(ok)toast('Đang hiện: '+text);});}
 qsa('[data-banner]').forEach(function(b){b.onclick=function(){showBanner(b.dataset.banner);};});
 $('bShow').onclick=function(){showBanner($('bText').value);};
@@ -856,7 +964,7 @@ const String scoreboardOverlayPageHtml = r'''<!doctype html>
 <meta charset="utf-8">
 <link rel="icon" href="data:,">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Overlay · VNVAR</title>
+<title>Overlay · SportO Cam</title>
 <style>
 html,body{margin:0;padding:0;background:transparent;overflow:hidden;width:100%;height:100%}
 *{box-sizing:border-box}
@@ -938,6 +1046,15 @@ html,body{margin:0;padding:0;background:transparent;overflow:hidden;width:100%;h
 @keyframes tick{from{transform:translateX(0)}to{transform:translateX(calc(-100% - 1920px))}}
 #conn{position:absolute;right:10px;bottom:10px;width:12px;height:12px;border-radius:50%;background:#FF5A5F;opacity:0;transition:opacity .3s}
 #conn.on{opacity:.9}
+
+/* ---------- NHÀ TÀI TRỢ ---------- */
+#sponsors{position:absolute;display:flex;align-items:center;opacity:0;transition:opacity .35s;pointer-events:none}
+#sponsors.on{opacity:1}
+#sponsors.plate-light{background:rgba(255,255,255,.95);box-shadow:0 4px 12px rgba(0,0,0,.25)}
+#sponsors.plate-dark{background:rgba(10,16,28,.9);box-shadow:0 4px 12px rgba(0,0,0,.35)}
+#sponsors .cell{display:flex;align-items:center;justify-content:center;flex:none;animation:spin .45s ease}
+#sponsors .cell img{max-width:100%;max-height:100%;object-fit:contain}
+@keyframes spin{from{opacity:0}to{opacity:1}}
 </style>
 </head>
 <body>
@@ -968,6 +1085,7 @@ html,body{margin:0;padding:0;background:transparent;overflow:hidden;width:100%;h
   </div></div>
   <div id="banner"><span id="bannerText"></span></div>
   <div id="ticker"><div class="track"><span id="tickerText"></span></div></div>
+  <div id="sponsors"></div>
   <div id="conn"></div>
 </div>
 <script>
@@ -1004,7 +1122,7 @@ function render(){
   var theme=['dark','light','glass'].indexOf(ov.theme)>=0?ov.theme:o.theme;
   stage.className='theme-'+theme;
   stage.style.setProperty('--accent',o.accent||'#FFC107');
-  var scale=(ov.scale>=0.5&&ov.scale<=2)?ov.scale:(o.scale||1);
+  var scale=(ov.scale>=0.5&&ov.scale<=2)?ov.scale:(o.scale||0.7);
   stage.style.setProperty('--u',scale);
   // "Ẩn overlay" trên app/trang điều khiển thắng cả tham số ?scene= của OBS.
   var scene=o.visible===false?'hidden':(ov.scene||o.scene);
@@ -1015,8 +1133,60 @@ function render(){
   var p=ov.pos||o.position;
   $('banner').style.top=(scene==='scorebar'&&p==='tc')?'auto':'150px';
   $('banner').style.bottom=(scene==='scorebar'&&p==='tc')?'150px':'auto';
-  renderBanner(scene);renderTicker(scene);
+  renderBanner(scene);renderTicker(scene);renderSponsors(scene);
   tickClock();
+}
+
+// Cùng công thức với ScoreboardFrameRenderer.sponsorBox (khung 1920×1080).
+function sponsorBox(tickerOn){
+  var s=state, sp=s.sponsors||{}, n=(sp.items||[]).length;
+  if(!n)return null;
+  var k=sp.scale||1, strip=sp.mode==='strip';
+  var cw=(strip?200:240)*k, ch=(strip?100:120)*k, shown=strip?n:1;
+  var pad=sp.plate==='none'?0:14*k;
+  var w=shown*cw+(shown-1)*14*k+2*pad, h=ch+2*pad, m=48, pos=sp.position||'tr';
+  var left=pos.charAt(1)==='l'?m:(pos.charAt(1)==='r'?1920-m-w:(1920-w)/2);
+  var bottom=pos.charAt(0)==='b';
+  var top=bottom?1080-m-h-(tickerOn?72:0):m;
+  if(pos===(ov.pos||s.overlay.position)){
+    var u=(ov.scale>=0.5&&ov.scale<=2)?ov.scale:(s.overlay.scale||0.7);
+    var bar=(36+62*2+30+4)*u+16;
+    top=bottom?top-bar:top+bar;
+  }
+  left+=sp.offsetX||0;top+=sp.offsetY||0;
+  left=w>=1920?0:Math.min(Math.max(left,0),1920-w);
+  top=h>=1080?0:Math.min(Math.max(top,0),1080-h);
+  return {left:left,top:top,w:w,h:h,cw:cw,ch:ch,pad:pad,gap:14*k,r:12*k};
+}
+
+var sponsorSig='';
+function renderSponsors(scene){
+  var sp=state.sponsors||{}, items=sp.items||[], el=$('sponsors');
+  var on=scene!=='hidden'&&!!sp.enabled&&items.length>0;
+  var tk=state.overlay.ticker||{}, box=sponsorBox(!!(tk.enabled&&tk.text));
+  el.className='plate-'+(sp.plate||'none')+(on?' on':'');
+  if(!box){el.textContent='';sponsorSig='';return;}
+  var st=el.style;
+  st.left=box.left+'px';st.top=box.top+'px';st.width=box.w+'px';st.height=box.h+'px';
+  st.padding=box.pad+'px';st.gap=box.gap+'px';st.borderRadius=box.r+'px';
+  var sig=sp.mode+'|'+items.join(',')+'|'+box.cw;
+  if(sig!==sponsorSig){
+    sponsorSig=sig;el.textContent='';
+    items.forEach(function(id){
+      var c=document.createElement('div');c.className='cell';
+      c.style.width=box.cw+'px';c.style.height=box.ch+'px';
+      var img=document.createElement('img');img.alt='';img.src='/api/score/logo/'+encodeURIComponent(id);
+      c.appendChild(img);el.appendChild(c);
+    });
+  }
+  rotateSponsors();
+}
+// Kiểu lần lượt: chỉ hiện logo tới lượt (cùng nhịp với video livestream).
+function rotateSponsors(){
+  var sp=state&&state.sponsors, cells=$('sponsors').children;
+  if(!sp||!cells.length)return;
+  var idx=sp.mode==='strip'?-1:Math.floor(now()/((sp.interval||8)*1000))%cells.length;
+  for(var i=0;i<cells.length;i++){var show=idx<0||i===idx;var d=show?'flex':'none';if(cells[i].style.display!==d)cells[i].style.display=d;}
 }
 
 function rowsOrder(){return state.sidesSwapped?['B','A']:['A','B'];}
@@ -1146,6 +1316,7 @@ function tickClock(){
   setText($('sbClock'),fmt(ms));
   var b=state.overlay.banner||{};
   if(b.untilMs&&$('banner').classList.contains('on')&&now()>=b.untilMs)$('banner').classList.remove('on');
+  rotateSponsors();
 }
 setInterval(tickClock,500);
 

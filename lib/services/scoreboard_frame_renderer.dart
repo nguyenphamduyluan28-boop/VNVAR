@@ -31,6 +31,84 @@ class ScoreboardFrameRenderer {
   /// Logo lớn nhất được vẽ (cảnh giới thiệu), đơn vị khung thiết kế.
   static const double maxLogoDesignSize = 180;
 
+  /// Logo nhà tài trợ (đơn vị khung thiết kế, nhân "Kích thước" của logo):
+  /// ô logo kiểu lần lượt / kiểu dải, đệm nền và khoảng cách giữa các ô.
+  static const Size sponsorRotateCell = Size(240, 120);
+  static const Size sponsorStripCell = Size(200, 100);
+  static const double sponsorPad = 14;
+  static const double sponsorGap = 14;
+
+  /// Khoảng cách giữa thanh tỉ số và khối logo khi chung một góc.
+  static const double sponsorStackGap = 16;
+
+  /// Vị trí khối logo nhà tài trợ (đơn vị khung thiết kế, khung [size] =
+  /// video chia hệ số [baseScale]) theo kiểu [mode]; null khi không có logo.
+  /// Kích thước khối cố định theo số logo (không phụ thuộc tỉ lệ ảnh) để vùng
+  /// overlay của phiên livestream ổn định.
+  static Rect? sponsorBox(
+    Map<String, dynamic> state,
+    Size size, {
+    String? mode,
+    bool? tickerOn,
+  }) =>
+      _sponsorBox(
+        _ScoreView(state, nowMs: 0, logos: const {}),
+        size,
+        mode: mode,
+        tickerOn: tickerOn,
+      );
+
+  static Rect? _sponsorBox(
+    _ScoreView view,
+    Size size, {
+    String? mode,
+    bool? tickerOn,
+  }) {
+    final sp = view.sponsors;
+    final count = sp.items.length;
+    if (count == 0 || size.isEmpty) return null;
+    final kind = mode ?? sp.mode;
+    final s = sp.scale;
+    final cell = kind == 'strip' ? sponsorStripCell : sponsorRotateCell;
+    final shown = kind == 'strip' ? count : 1;
+    final pad = sp.plate == 'none' ? 0.0 : sponsorPad * s;
+    final width = shown * cell.width * s + (shown - 1) * sponsorGap * s + 2 * pad;
+    final height = cell.height * s + 2 * pad;
+    const m = _Painter.margin;
+    final pos = sp.position;
+    var left = pos.endsWith('l')
+        ? m
+        : pos.endsWith('r')
+        ? size.width - m - width
+        : (size.width - width) / 2;
+    final bottom = pos.startsWith('b');
+    final ticker = tickerOn ?? view.tickerText().isNotEmpty;
+    var top = bottom ? size.height - m - height - (ticker ? 72 : 0) : m;
+    if (pos == view.position) {
+      // Chung góc với thanh tỉ số: xếp ngay dưới (hoặc trên) thanh tỉ số lớn
+      // nhất để không che nhau.
+      final bar = _Painter.scorebarMaxHeight * view.scale + sponsorStackGap;
+      top = bottom ? top - bar : top + bar;
+    }
+    left += sp.offsetX;
+    top += sp.offsetY;
+    left = width >= size.width
+        ? 0
+        : left.clamp(0.0, size.width - width).toDouble();
+    top = height >= size.height
+        ? 0
+        : top.clamp(0.0, size.height - height).toDouble();
+    return Rect.fromLTWH(left, top, width, height);
+  }
+
+  /// Ô lần lượt hiện tại (logo nào đang hiện) tại [nowMs]; -1 khi không xoay.
+  static int sponsorSlot(Map<String, dynamic> state, int nowMs) {
+    final view = _ScoreView(state, nowMs: nowMs, logos: const {});
+    final sp = view.sponsors;
+    if (!sp.enabled || sp.mode != 'rotate' || sp.items.length < 2) return -1;
+    return (nowMs ~/ (sp.intervalSec * 1000)) % sp.items.length;
+  }
+
   /// Tỉ lệ từ khung thiết kế sang video [width]×[height].
   static double baseScale(int width, int height) =>
       math.min(width / designWidth, height / designHeight);
@@ -82,6 +160,7 @@ class ScoreboardFrameRenderer {
       tickerOptions: [tickerOn],
       banner: view.bannerText().isNotEmpty,
       tickerBand: tickerOn,
+      sponsorModes: view.sponsors.enabled ? [view.sponsors.mode] : const [],
     );
   }
 
@@ -106,6 +185,7 @@ class ScoreboardFrameRenderer {
           tickerOptions: const [false, true],
           banner: true,
           tickerBand: true,
+          sponsorModes: view.sponsors.enabled ? _sponsorModes : const [],
         ) ??
         frame;
   }
@@ -118,6 +198,7 @@ class ScoreboardFrameRenderer {
     required List<bool> tickerOptions,
     required bool banner,
     required bool tickerBand,
+    List<String> sponsorModes = const [],
   }) {
     final rects = _pixelRects(
       view,
@@ -127,6 +208,7 @@ class ScoreboardFrameRenderer {
       tickerOptions: tickerOptions,
       banner: banner,
       tickerBand: tickerBand,
+      sponsorModes: sponsorModes,
     );
     if (rects.isEmpty) return null;
     var union = rects.first;
@@ -154,10 +236,28 @@ class ScoreboardFrameRenderer {
     required List<bool> tickerOptions,
     required bool banner,
     required bool tickerBand,
+    List<String> sponsorModes = const [],
   }) {
     final base = math.min(size.width / designWidth, size.height / designHeight);
     if (base <= 0) return const [];
     final rects = <Rect>[];
+    // Logo nhà tài trợ: vẽ theo khung thiết kế × base (không theo "Kích thước"
+    // của bảng tỉ số), nới 2 px phòng làm tròn.
+    final design = Size(size.width / base, size.height / base);
+    for (final mode in sponsorModes) {
+      for (final tickerOn in tickerOptions) {
+        final box = _sponsorBox(view, design, mode: mode, tickerOn: tickerOn);
+        if (box == null) continue;
+        rects.add(
+          Rect.fromLTRB(
+            box.left * base - 2,
+            box.top * base - 2,
+            box.right * base + 2,
+            box.bottom * base + 2,
+          ),
+        );
+      }
+    }
     for (final scene in scenes) {
       for (final hasLogo in logoOptions) {
         final k = fitScale(
@@ -217,6 +317,9 @@ class ScoreboardFrameRenderer {
 
   static const List<String> _allScenes = ['scorebar', 'full', 'intro', 'result'];
 
+  /// Cả hai kiểu logo nhà tài trợ: đổi kiểu khi đang phát không cần phát lại.
+  static const List<String> _sponsorModes = ['rotate', 'strip'];
+
   /// Cảnh bảng lớn ở giữa màn hình.
   static bool isLargeScene(String scene) =>
       scene == 'full' || scene == 'intro' || scene == 'result';
@@ -254,6 +357,7 @@ class ScoreboardFrameRenderer {
         tickerOptions: const [false, true],
         banner: true,
         tickerBand: true,
+        sponsorModes: view.sponsors.enabled ? _sponsorModes : const [],
       ))
         if (rect.overlaps(frame)) rect.intersect(frame),
     ];
@@ -563,6 +667,7 @@ class ScoreboardFrameRenderer {
       Size(size.width / base, size.height / base),
       drawText: tickerText,
     );
+    painter.sponsors(Size(size.width / base, size.height / base));
     canvas.restore();
     canvas.save();
     canvas.scale(k);
@@ -613,6 +718,49 @@ Color _color(Object? value, Color fallback) {
   return Color(int.parse('FF${text.substring(1)}', radix: 16));
 }
 
+class _Sponsors {
+  const _Sponsors({
+    required this.enabled,
+    required this.mode,
+    required this.position,
+    required this.scale,
+    required this.intervalSec,
+    required this.offsetX,
+    required this.offsetY,
+    required this.plate,
+    required this.items,
+  });
+
+  factory _Sponsors.fromJson(Map<String, dynamic> json) {
+    final scaleRaw = json['scale'];
+    final items = json['items'] is List
+        ? (json['items'] as List).map((e) => e.toString()).where((e) => e.isNotEmpty).toList()
+        : const <String>[];
+    final position = json['position']?.toString() ?? 'tr';
+    return _Sponsors(
+      enabled: json['enabled'] == true,
+      mode: json['mode']?.toString() == 'strip' ? 'strip' : 'rotate',
+      position: const ['tl', 'tr', 'bl', 'br', 'tc', 'bc'].contains(position) ? position : 'tr',
+      scale: (scaleRaw is num && scaleRaw.isFinite ? scaleRaw.toDouble() : 1.0).clamp(0.5, 2.0).toDouble(),
+      intervalSec: _int(json['interval']).clamp(3, 60),
+      offsetX: _int(json['offsetX']).toDouble(),
+      offsetY: _int(json['offsetY']).toDouble(),
+      plate: const ['light', 'dark', 'none'].contains(json['plate']) ? json['plate'] as String : 'none',
+      items: items,
+    );
+  }
+
+  final bool enabled;
+  final String mode;
+  final String position;
+  final double scale;
+  final int intervalSec;
+  final double offsetX;
+  final double offsetY;
+  final String plate;
+  final List<String> items;
+}
+
 class _ScoreView {
   _ScoreView(Map<String, dynamic> s, {required this.nowMs, required Map<String, ui.Image> logos})
     : sport = s['sport']?.toString() ?? 'pickleball',
@@ -633,7 +781,9 @@ class _ScoreView {
       sideout = _map(s['rules'])['scoring'] == 'sideout',
       timer = _map(s['timer']),
       teamA = _team(_map(s['teamA']), 'A', logos),
-      teamB = _team(_map(s['teamB']), 'B', logos);
+      teamB = _team(_map(s['teamB']), 'B', logos),
+      sponsors = _Sponsors.fromJson(_map(s['sponsors'])),
+      sponsorImages = logos;
 
   static _Team _team(Map<String, dynamic> json, String id, Map<String, ui.Image> logos) {
     final players = json['players'] is List
@@ -669,6 +819,10 @@ class _ScoreView {
   final Map<String, dynamic> timer;
   final _Team teamA;
   final _Team teamB;
+  final _Sponsors sponsors;
+
+  /// Ảnh đã giải mã theo id (logo đội và nhà tài trợ).
+  final Map<String, ui.Image> sponsorImages;
 
   bool get tennis => sport == 'tennis';
   bool get finished => status == 'finished';
@@ -678,7 +832,7 @@ class _ScoreView {
   bool get visible => overlay['visible'] != false;
   double get scale {
     final value = overlay['scale'];
-    final parsed = value is num ? value.toDouble() : 1.0;
+    final parsed = value is num ? value.toDouble() : 0.7;
     return parsed.clamp(0.5, 2.0).toDouble();
   }
 
@@ -1409,6 +1563,54 @@ class _Painter {
   }
 
   /// [size] theo khung thiết kế (không nhân "Kích thước").
+  /// Logo nhà tài trợ trong khung thiết kế [size] (đã nhân base, không theo
+  /// "Kích thước" của bảng tỉ số).
+  void sponsors(Size size) {
+    final sp = view.sponsors;
+    if (!sp.enabled || sp.items.isEmpty) return;
+    final available = <ui.Image>[
+      for (final id in sp.items)
+        if (view.sponsorImages[id] != null) view.sponsorImages[id]!,
+    ];
+    if (available.isEmpty) return;
+    final box = ScoreboardFrameRenderer._sponsorBox(view, size);
+    if (box == null) return;
+    final s = sp.scale;
+    if (sp.plate != 'none') {
+      final rrect = RRect.fromRectAndRadius(box, Radius.circular(12 * s));
+      canvas.drawRRect(
+        rrect.shift(Offset(0, 4 * s)),
+        Paint()
+          ..color = const Color(0x40000000)
+          ..maskFilter = MaskFilter.blur(BlurStyle.normal, 6 * s),
+      );
+      canvas.drawRRect(
+        rrect,
+        Paint()
+          ..color = sp.plate == 'dark'
+              ? const Color(0xE60A101C)
+              : const Color(0xF2FFFFFF),
+      );
+    }
+    final pad = sp.plate == 'none' ? 0.0 : ScoreboardFrameRenderer.sponsorPad * s;
+    if (sp.mode == 'strip') {
+      final cell = ScoreboardFrameRenderer.sponsorStripCell;
+      final gap = ScoreboardFrameRenderer.sponsorGap * s;
+      var x = box.left + pad;
+      // Mỗi nhà tài trợ giữ đúng ô của mình (ảnh chưa tải được: ô trống).
+      for (final id in sp.items) {
+        final image = view.sponsorImages[id];
+        if (image != null) {
+          _logo(image, Rect.fromLTWH(x, box.top + pad, cell.width * s, cell.height * s));
+        }
+        x += cell.width * s + gap;
+      }
+      return;
+    }
+    final slot = (view.nowMs ~/ (sp.intervalSec * 1000)) % available.length;
+    _logo(available[slot], box.deflate(pad));
+  }
+
   void ticker(Size size, {bool drawText = true}) {
     final text = view.tickerText();
     if (text.isEmpty) return;

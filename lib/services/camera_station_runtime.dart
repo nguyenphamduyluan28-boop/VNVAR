@@ -1661,7 +1661,7 @@ class CameraStationRuntime {
         _preselectLens(webRtc, savedLens, facingMode: 'environment');
         await webRtc.initializeCamera(facingMode: 'environment');
         if (await abortIfStale('microphone')) return;
-        // Camera Station always requests microphone audio. A denied permission
+        // SportO Cam always requests microphone audio. A denied permission
         // intentionally falls back to video-only recording.
         await webRtc.ensureMicrophoneEnabled();
         // Restore lens state và zoom HOÀN TẤT trước khi bắt đầu recording

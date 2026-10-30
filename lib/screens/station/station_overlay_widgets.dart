@@ -878,8 +878,8 @@ class _RetryCountdownTextState extends State<_RetryCountdownText> {
           : appText(context, 'Đang tự thử lại…', 'Retrying…'),
       tooltip: appText(
         context,
-        'Camera Station tự thử khởi động lại',
-        'Camera Station retries automatically',
+        'SportO Cam tự thử khởi động lại',
+        'SportO Cam retries automatically',
       ),
     );
   }
@@ -970,8 +970,8 @@ class _ApplyConfigDialog extends StatelessWidget {
           Text(
             appText(
               context,
-              'Camera Station sẽ khởi động lại.',
-              'Camera Station will restart.',
+              'SportO Cam sẽ khởi động lại.',
+              'SportO Cam will restart.',
             ),
             textAlign: TextAlign.center,
             style: BrandText.caption.copyWith(fontSize: 14),
@@ -1027,7 +1027,7 @@ class _ApplyConfigDialog extends StatelessWidget {
   }
 }
 
-/// Màn hình chờ khi Camera Station đang khởi động: logo, vòng xoay mảnh,
+/// Màn hình chờ khi SportO Cam đang khởi động: logo, vòng xoay mảnh,
 /// một dòng chữ.
 class _StationLoadingView extends StatelessWidget {
   const _StationLoadingView();

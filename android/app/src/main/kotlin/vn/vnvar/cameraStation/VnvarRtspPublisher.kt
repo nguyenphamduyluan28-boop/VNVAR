@@ -1854,7 +1854,7 @@ class VnvarRtspPublisher(
             }
             val sdp = "v=0\r\n" +
                 "o=- 0 0 IN IP4 0.0.0.0\r\n" +
-                "s=VNVAR Camera\r\n" +
+                "s=SportO Cam\r\n" +
                 "t=0 0\r\n" +
                 "a=control:*\r\n" +
                 "m=video 0 RTP/AVP 96\r\n" +

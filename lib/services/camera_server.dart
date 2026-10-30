@@ -311,7 +311,7 @@ bool isTransientRecorderStartError(Object error) =>
 /// 500 như trước.
 Map<String, dynamic> transientRequestErrorBody({required bool transient}) => {
   'error': transient ? 'Service Unavailable' : 'Internal Server Error',
-  'message': 'Camera Station không thể xử lý yêu cầu.',
+  'message': 'SportO Cam không thể xử lý yêu cầu.',
   if (transient) 'retryable': true,
 };
 
@@ -712,14 +712,14 @@ class CameraServer {
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
-  <title>VNVAR - $cameraId</title>
+  <title>SportO Cam - $cameraId</title>
   <style>
     *{box-sizing:border-box}body{margin:0;background:#050b16;color:#fff;font-family:Arial,sans-serif}
     main{width:100vw;height:100vh;display:flex;flex-direction:column}header{padding:10px 16px;background:#09254b;font-weight:700}
     video{width:100%;height:calc(100vh - 42px);object-fit:contain;background:#000}.state{position:fixed;right:14px;top:11px;color:#b9d7ff;font-size:13px}
   </style>
 </head>
-<body><main><header>VNVAR · $courtId · $cameraId</header><span class="state" id="state">Đang kết nối...</span><video id="video" autoplay playsinline muted></video></main>
+<body><main><header>SportO Cam · $courtId · $cameraId</header><span class="state" id="state">Đang kết nối...</span><video id="video" autoplay playsinline muted></video></main>
 <script>
 (()=>{
   const state=document.getElementById('state'), video=document.getElementById('video');
@@ -968,7 +968,7 @@ class CameraServer {
             'success': false,
             'status': 'LIFECYCLE_SUSPENDED',
             'retryable': true,
-            'message': 'Camera Station is entering the iOS background.',
+            'message': 'SportO Cam is entering the iOS background.',
           });
           return;
         }
@@ -2623,7 +2623,7 @@ class CameraServer {
         request.response,
         HttpStatus.unauthorized,
         'invalid_key',
-        'Mã điều khiển không đúng. Quét lại mã QR trên app Camera Station.',
+        'Mã điều khiển không đúng. Quét lại mã QR trên app SportO Cam.',
       );
       return;
     }

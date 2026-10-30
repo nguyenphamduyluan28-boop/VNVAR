@@ -73,7 +73,8 @@ class ScoreboardService {
   ScoreboardService({
     this.storageKey = 'scoreboard_state_v1',
     this.controlKeyStorageKey = 'scoreboard_control_key',
-    this._logoDirectoryProvider,
+    this.scaleMigrationKey = 'scoreboard_scale_default_v2',
+    this.logoDirectoryProvider,
     int Function()? clock,
   }) : _clock = clock ?? (() => DateTime.now().millisecondsSinceEpoch);
 
@@ -86,7 +87,11 @@ class ScoreboardService {
 
   final String storageKey;
   final String controlKeyStorageKey;
-  final Future<Directory> Function()? _logoDirectoryProvider;
+
+  /// Đánh dấu đã chuyển "Kích thước" mặc định cũ (100%) sang mặc định mới.
+  final String scaleMigrationKey;
+  /// Thư mục lưu logo (test dùng thư mục tạm); null = thư mục hỗ trợ của app.
+  final Future<Directory> Function()? logoDirectoryProvider;
   final int Function() _clock;
 
   /// Đổi mỗi lần service được tạo: client nhận ra app đã khởi động lại và
@@ -133,6 +138,15 @@ class ScoreboardService {
         if (decoded is Map<String, dynamic>) {
           _state = ScoreboardState.fromJson(decoded, nowMs: nowMs);
         }
+      }
+      // Một lần: máy đang để "Kích thước" mặc định cũ 100% (bảng quá to) thì
+      // chuyển sang mặc định mới. Ai đã chọn mức khác thì giữ nguyên.
+      if (prefs.getBool(scaleMigrationKey) != true) {
+        if (raw != null && raw.isNotEmpty && _state.overlay.scale == 1.0) {
+          _state.overlay.scale = ScoreOverlayConfig.defaultScale;
+          await prefs.setString(storageKey, jsonEncode(_state.toJson(nowMs: nowMs)));
+        }
+        await prefs.setBool(scaleMigrationKey, true);
       }
     } catch (error, stackTrace) {
       developer.log(
@@ -215,11 +229,12 @@ class ScoreboardService {
       );
       final before = _state.core.copy();
       final namesBefore = (a: _state.teamA.name, b: _state.teamB.name);
-      final logosBefore = {_state.teamA.logoId, _state.teamB.logoId};
+      final logosBefore = _imageIds(_state);
       final change = applyScoreboardAction(working, action, nowMs: now);
       _state = working;
-      // Logo không còn đội nào dùng (gỡ logo / trận mới đặt lại đội): xoá file.
-      final logosAfter = {_state.teamA.logoId, _state.teamB.logoId};
+      // Logo không còn đội/nhà tài trợ nào dùng (gỡ logo, trận mới đặt lại
+      // đội, xoá nhà tài trợ): xoá file.
+      final logosAfter = _imageIds(_state);
       for (final id in logosBefore) {
         if (id != null && !logosAfter.contains(id)) unawaited(_deleteLogo(id));
       }
@@ -250,6 +265,13 @@ class ScoreboardService {
     }
     return _commit(now);
   }
+
+  /// Mọi ảnh đang được trạng thái dùng (logo hai đội + nhà tài trợ).
+  static Set<String?> _imageIds(ScoreboardState state) => {
+    state.teamA.logoId,
+    state.teamB.logoId,
+    ...state.sponsors.items,
+  };
 
   Map<String, dynamic> _commit(int now) {
     _state.rev += 1;
@@ -313,7 +335,7 @@ class ScoreboardService {
   // ============================================================
 
   Future<Directory> _logoDirectory() async {
-    final provider = _logoDirectoryProvider;
+    final provider = logoDirectoryProvider;
     final Directory base;
     if (provider != null) {
       base = await provider();
@@ -325,8 +347,9 @@ class ScoreboardService {
     return base;
   }
 
-  /// Lưu logo cho [team] ('A' | 'B') và gắn vào đội. Ảnh nên được thu nhỏ
-  /// ở trình duyệt trước khi gửi (tối đa [maximumLogoBytes]).
+  /// Lưu logo cho [team] ('A' | 'B') và gắn vào đội, hoặc thêm logo nhà tài
+  /// trợ ([team] = 'S', tối đa [ScoreSponsors.maximumItems]). Ảnh nên được thu
+  /// nhỏ ở trình duyệt trước khi gửi (tối đa [maximumLogoBytes]).
   Future<Map<String, dynamic>> saveLogo(String team, List<int> bytes) {
     final completer = Completer<Map<String, dynamic>>();
     _logoTail = _logoTail.then((_) async {
@@ -343,7 +366,7 @@ class ScoreboardService {
     String team,
     List<int> bytes,
   ) async {
-    if (team != 'A' && team != 'B') {
+    if (team != 'A' && team != 'B' && team != 'S') {
       throw const ScoreboardException(422, 'invalid_team', 'Đội phải là "A" hoặc "B".');
     }
     if (bytes.isEmpty || bytes.length > maximumLogoBytes) {
@@ -362,11 +385,30 @@ class ScoreboardService {
       );
     }
     await load();
+    final sponsor = team == 'S';
+    if (sponsor && _state.sponsors.items.length >= ScoreSponsors.maximumItems) {
+      throw const ScoreboardException(
+        422,
+        'too_many_sponsors',
+        'Tối đa 8 logo nhà tài trợ. Xoá bớt logo cũ trước.',
+      );
+    }
     final directory = await _logoDirectory();
-    final id = '${team}_$nowMs.$extension';
-    final file = File('${directory.path}${Platform.pathSeparator}$id');
+    // Hai ảnh lưu cùng mili giây (tải nhanh liên tiếp): tăng số để không đè.
+    var stamp = nowMs;
+    var id = '${team}_$stamp.$extension';
+    var file = File('${directory.path}${Platform.pathSeparator}$id');
+    while (await file.exists()) {
+      stamp++;
+      id = '${team}_$stamp.$extension';
+      file = File('${directory.path}${Platform.pathSeparator}$id');
+    }
     await file.writeAsBytes(bytes, flush: true);
 
+    if (sponsor) {
+      _state.sponsors.items.add(id);
+      return _commit(nowMs);
+    }
     final previous = _state.team(team).logoId;
     _state.team(team).logoId = id;
     final json = _commit(nowMs);

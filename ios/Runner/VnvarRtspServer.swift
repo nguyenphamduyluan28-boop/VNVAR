@@ -534,7 +534,7 @@ final class VnvarRtspServer {
     let sdp =
       "v=0\r\n" +
       "o=- 0 0 IN IP4 0.0.0.0\r\n" +
-      "s=VNVAR Camera\r\n" +
+      "s=SportO Cam\r\n" +
       "c=IN IP4 0.0.0.0\r\n" +
       "t=0 0\r\n" +
       "a=control:*\r\n" +

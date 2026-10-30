@@ -2,7 +2,7 @@ import 'dart:io' show FileSystemException, SocketException;
 
 import 'package:flutter/services.dart';
 
-/// Mã lỗi của Camera Station runtime để UI phân biệt và hiển thị đúng ngôn
+/// Mã lỗi của SportO Cam runtime để UI phân biệt và hiển thị đúng ngôn
 /// ngữ, thay vì dò chuỗi trong thông báo lỗi.
 enum StationErrorCode {
   /// Runtime chưa khởi tạo xong (chưa có camera/server).
@@ -105,7 +105,7 @@ class BilingualFileSystemException extends FileSystemException
   final String messageEn;
 }
 
-/// Lỗi có mã của Camera Station. [toString] trả câu tiếng Việt để giữ tương
+/// Lỗi có mã của SportO Cam. [toString] trả câu tiếng Việt để giữ tương
 /// thích với các chỗ đang hiển thị `error.toString()`.
 class StationException implements Exception, BilingualMessage {
   const StationException(
@@ -148,8 +148,8 @@ class StationException implements Exception, BilingualMessage {
 ({String vi, String en}) _defaultMessages(StationErrorCode code) {
   return switch (code) {
     StationErrorCode.notInitialized => (
-      vi: 'Camera Station chưa khởi tạo xong.',
-      en: 'Camera Station has not finished initializing.',
+      vi: 'SportO Cam chưa khởi tạo xong.',
+      en: 'SportO Cam has not finished initializing.',
     ),
     StationErrorCode.cameraDisabled => (
       vi: 'Camera đang tắt.',
@@ -200,8 +200,8 @@ class StationException implements Exception, BilingualMessage {
       en: 'No camera is available on this device.',
     ),
     StationErrorCode.networkServerNotRunning => (
-      vi: 'Máy chủ mạng của Camera Station chưa chạy.',
-      en: 'Camera Station network server is not running.',
+      vi: 'Máy chủ mạng của SportO Cam chưa chạy.',
+      en: 'SportO Cam network server is not running.',
     ),
     StationErrorCode.operationTimeout => (
       vi: 'Thao tác camera quá thời gian cho phép.',

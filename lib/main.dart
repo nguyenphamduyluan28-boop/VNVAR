@@ -97,8 +97,8 @@ class _VnvarCameraStationAppState extends State<VnvarCameraStationApp> {
       confirmed = await showAppConfirm(
         dialogContext,
         icon: Icons.power_settings_new_rounded,
-        titleVi: 'Thoát Camera Station?',
-        titleEn: 'Exit Camera Station?',
+        titleVi: 'Thoát SportO Cam?',
+        titleEn: 'Exit SportO Cam?',
         messageVi: 'Camera sẽ ngừng ghi và ngừng phát cho Tablet.',
         messageEn: 'Recording and tablet streaming will stop.',
         confirmVi: 'Thoát',
@@ -133,7 +133,7 @@ class _VnvarCameraStationAppState extends State<VnvarCameraStationApp> {
       service: AppLanguageService.instance,
       child: MaterialApp(
         navigatorKey: _navigatorKey,
-        title: 'VNVAR Camera Station',
+        title: 'SportO Cam',
         debugShowCheckedModeBanner: false,
         theme: buildAppTheme(),
         darkTheme: buildAppTheme(),

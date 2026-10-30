@@ -115,7 +115,7 @@ import UIKit
         result(
           FlutterError(
             code: "IOS_SERVICE_UNAVAILABLE",
-            message: "Camera Station iOS service is unavailable.",
+            message: "SportO Cam iOS service is unavailable.",
             details: nil
           )
         )
