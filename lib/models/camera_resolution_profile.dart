@@ -84,16 +84,6 @@ class CameraResolutionProfile {
     CameraResolutionPreset.ultraHd4k => 8000000,
   };
 
-  /// Bitrate RTSP khi bật chế độ thể thao: bằng bitrate ghi hình chuẩn
-  /// (720p 4 Mbps, 1080p 8 Mbps) để bóng nhỏ bay nhanh không bị bộ nén xoá.
-  /// Livestream vẫn tự hạ khi upload không theo kịp.
-  int get sportsRtspBitrate =>
-      baseBitrate > rtspBitrate ? baseBitrate : rtspBitrate;
-
-  /// Bitrate RTSP theo chế độ đang dùng.
-  int rtspBitrateFor({required bool sportsMode}) =>
-      sportsMode ? sportsRtspBitrate : rtspBitrate;
-
   /// Bitrate chuẩn (30 FPS) của preset. withFps luôn tính từ mức này để gọi
   /// nhiều lần (60 → 30 → 60) không bị nhân dồn hoặc giữ nhầm mức 60 FPS.
   int get baseBitrate => switch (preset) {

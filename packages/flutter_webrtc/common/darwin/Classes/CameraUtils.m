@@ -274,30 +274,54 @@
 - (void)mediaStreamTrackSwitchCamera:(RTCMediaStreamTrack*)track result:(FlutterResult)result {
   if (!self.videoCapturer) {
     NSLog(@"Video capturer is null. Can't switch camera");
+    result([FlutterError errorWithCode:@"Error while switching camera"
+                               message:@"Video capturer is null"
+                               details:nil]);
+    return;
+  }
+  BOOL usingFrontCamera = !self._usingFrontCamera;
+  AVCaptureDevicePosition position =
+      usingFrontCamera ? AVCaptureDevicePositionFront : AVCaptureDevicePositionBack;
+  AVCaptureDevice* videoDevice = [self findDeviceForPosition:position];
+  // VNVAR: cùng quy tắc với lúc mở camera: chọn định dạng theo kích thước rồi
+  // FPS, chỉ dùng FPS hợp lệ của định dạng đó; không có thì báo lỗi (camera cũ
+  // vẫn chạy) thay vì mở với định dạng nil / FPS 0.
+  AVCaptureDeviceFormat* selectedFormat =
+      videoDevice == nil ? nil
+                         : [self selectFormatForDevice:videoDevice
+                                           targetWidth:self._lastTargetWidth
+                                          targetHeight:self._lastTargetHeight
+                                             targetFps:self._lastTargetFps];
+  NSInteger selectedFps = [self selectFpsForFormat:selectedFormat targetFps:self._lastTargetFps];
+  if (selectedFormat == nil || selectedFps <= 0) {
+    NSLog(@"[CAMERA_FPS] No usable capture format for %@ (target %ldx%ld@%ld)",
+          videoDevice.localizedName, (long)self._lastTargetWidth, (long)self._lastTargetHeight,
+          (long)self._lastTargetFps);
+    result([FlutterError errorWithCode:@"Error while switching camera"
+                               message:@"No usable capture format"
+                               details:nil]);
     return;
   }
 #if TARGET_OS_IPHONE
   [self.videoCapturer stopCapture];
 #endif
-  self._usingFrontCamera = !self._usingFrontCamera;
-  AVCaptureDevicePosition position =
-      self._usingFrontCamera ? AVCaptureDevicePositionFront : AVCaptureDevicePositionBack;
-  AVCaptureDevice* videoDevice = [self findDeviceForPosition:position];
-  AVCaptureDeviceFormat* selectedFormat = [self selectFormatForDevice:videoDevice
-                                                          targetWidth:self._lastTargetWidth
-                                                         targetHeight:self._lastTargetHeight
-                                                            targetFps:self._lastTargetFps];
+  self._usingFrontCamera = usingFrontCamera;
+  __weak FlutterWebRTCPlugin* weakSelf = self;
   [self.videoCapturer startCaptureWithDevice:videoDevice
                                       format:selectedFormat
-                                         fps:[self selectFpsForFormat:selectedFormat
-                                                            targetFps:self._lastTargetFps]
+                                         fps:selectedFps
                            completionHandler:^(NSError* error) {
                              if (error != nil) {
+                               // NSError không mã hoá được qua kênh Flutter: chỉ gửi mô tả.
                                result([FlutterError errorWithCode:@"Error while switching camera"
-                                                          message:@"Error while switching camera"
-                                                          details:error]);
+                                                          message:error.localizedDescription
+                                                          details:nil]);
                              } else {
-                               result([NSNumber numberWithBool:self._usingFrontCamera]);
+                               // VNVAR: chỉ khoá FPS khi camera đã chạy định dạng mới.
+                               [weakSelf lockFrameRate:selectedFps
+                                             forDevice:videoDevice
+                                        expectedFormat:selectedFormat];
+                               result([NSNumber numberWithBool:usingFrontCamera]);
                              }
                            }];
 }
@@ -398,13 +422,107 @@ static BOOL VnvarIs8Bit420(FourCharCode pixelFormat) {
   return best;
 }
 
-- (NSInteger)selectFpsForFormat:(AVCaptureDeviceFormat*)format targetFps:(NSInteger)targetFps {
-  Float64 maxSupportedFramerate = 0;
-  for (AVFrameRateRange* fpsRange in format.videoSupportedFrameRateRanges) {
-    maxSupportedFramerate = fmax(maxSupportedFramerate, fpsRange.maxFrameRate);
+// ---- VNVAR: FPS hợp lệ & khoá FPS an toàn ----
+// iOS ném NSInvalidArgumentException khi frame duration nằm ngoài khoảng của
+// activeFormat (vd. 1/60 s khi camera còn ở định dạng tối đa 30 FPS). Trên iOS
+// 26 lỗi có thể phát sinh trên luồng nội bộ của AVFoundation nên @try không
+// chặn được: phải kiểm tra trước, không dựa vào bắt lỗi.
+
+/// Khoảng FPS của [format] chứa khung 1/[fps] giây, nil nếu không có.
+static AVFrameRateRange* VnvarRangeForFps(AVCaptureDeviceFormat* format, NSInteger fps) {
+  if (format == nil || fps <= 0 || fps > INT32_MAX) return nil;
+  CMTime duration = CMTimeMake(1, (int32_t)fps);
+  for (AVFrameRateRange* range in format.videoSupportedFrameRateRanges) {
+    if (CMTimeCompare(duration, range.minFrameDuration) >= 0 &&
+        CMTimeCompare(duration, range.maxFrameDuration) <= 0) {
+      return range;
+    }
   }
-  return fmin(maxSupportedFramerate, targetFps);
+  return nil;
 }
 
+static BOOL VnvarSameFormat(AVCaptureDeviceFormat* a, AVCaptureDeviceFormat* b) {
+  if (a == nil || b == nil) return NO;
+  if (a == b || [a isEqual:b]) return YES;
+  return CMFormatDescriptionEqual(a.formatDescription, b.formatDescription) &&
+         fabs(VnvarFormatMaxFps(a) - VnvarFormatMaxFps(b)) < 0.5;
+}
+
+/// iOS 18+/macOS 15+: khi autoVideoFrameRateEnabled = YES, iOS ném lỗi nếu đặt
+/// frame duration. Tắt đi (gọi khi đã lockForConfiguration) để giữ FPS cố định.
+/// Dùng KVC để vẫn biên dịch được với SDK cũ.
+static void VnvarDisableAutoVideoFrameRate(AVCaptureDevice* device) {
+  if (![device respondsToSelector:NSSelectorFromString(@"isAutoVideoFrameRateEnabled")]) return;
+  if ([[device valueForKey:@"autoVideoFrameRateEnabled"] boolValue]) {
+    [device setValue:@NO forKey:@"autoVideoFrameRateEnabled"];
+  }
+}
+
+- (BOOL)isFps:(NSInteger)fps supportedByFormat:(AVCaptureDeviceFormat*)format {
+  return VnvarRangeForFps(format, fps) != nil;
+}
+
+- (NSInteger)selectFpsForFormat:(AVCaptureDeviceFormat*)format targetFps:(NSInteger)targetFps {
+  if (format == nil) return 0;
+  NSInteger wanted = targetFps > 0 ? targetFps : 30;
+  if (VnvarRangeForFps(format, wanted) != nil) return wanted;
+  // Không đạt đúng FPS yêu cầu: lấy FPS nguyên hợp lệ gần nhất (hoà thì lấy
+  // FPS thấp hơn).
+  NSInteger upper = (NSInteger)ceil(VnvarFormatMaxFps(format));
+  NSInteger best = 0;
+  for (NSInteger fps = 1; fps <= upper; fps++) {
+    if (VnvarRangeForFps(format, fps) == nil) continue;
+    if (best == 0 || labs(fps - wanted) < labs(best - wanted)) best = fps;
+  }
+  return best;
+}
+
+- (BOOL)lockFrameRate:(NSInteger)fps
+            forDevice:(AVCaptureDevice*)device
+       expectedFormat:(AVCaptureDeviceFormat*)expectedFormat {
+  if (device == nil || fps <= 0 || fps > INT32_MAX) {
+    NSLog(@"[CAMERA_FPS] Skip lock: device %@, fps %ld", device.localizedName, (long)fps);
+    return NO;
+  }
+  NSError* error = nil;
+  if (![device lockForConfiguration:&error]) {
+    NSLog(@"[CAMERA_FPS] lockForConfiguration failed: %@", error.localizedDescription);
+    return NO;
+  }
+  BOOL ok = NO;
+  AVCaptureDeviceFormat* activeFormat = device.activeFormat;
+  if (expectedFormat != nil && !VnvarSameFormat(activeFormat, expectedFormat)) {
+    NSLog(@"[CAMERA_FPS] Skip lock %ld fps: camera is not running the selected format "
+          @"(active %@, selected %@)",
+          (long)fps, activeFormat, expectedFormat);
+  } else if (VnvarRangeForFps(activeFormat, fps) == nil) {
+    NSLog(@"[CAMERA_FPS] Skip lock %ld fps: outside ranges %@ of active format",
+          (long)fps, activeFormat.videoSupportedFrameRateRanges);
+  } else {
+    @try {
+      VnvarDisableAutoVideoFrameRate(device);
+      CMTime target = CMTimeMake(1, (int32_t)fps);
+      CMTime currentMin = device.activeVideoMinFrameDuration;
+      CMTime currentMax = device.activeVideoMaxFrameDuration;
+      if (CMTimeCompare(currentMin, target) == 0 && CMTimeCompare(currentMax, target) == 0) {
+        // Đã khoá đúng FPS: không đặt lại (tránh làm iOS bỏ cấu hình phơi sáng).
+      } else if (CMTimeCompare(target, currentMin) < 0) {
+        // Tăng FPS (khung ngắn hơn): giới hạn dưới trước, rồi giới hạn trên.
+        device.activeVideoMinFrameDuration = target;
+        device.activeVideoMaxFrameDuration = target;
+      } else {
+        // Giảm FPS (khung dài hơn): giới hạn trên trước, rồi giới hạn dưới.
+        device.activeVideoMaxFrameDuration = target;
+        device.activeVideoMinFrameDuration = target;
+      }
+      ok = YES;
+      NSLog(@"[CAMERA_FPS] Locked %@ at %ld fps", device.localizedName, (long)fps);
+    } @catch (NSException* exception) {
+      NSLog(@"[CAMERA_FPS] Failed to lock %ld fps: %@", (long)fps, exception);
+    }
+  }
+  [device unlockForConfiguration];
+  return ok;
+}
 
 @end

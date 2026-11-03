@@ -507,6 +507,7 @@ typedef void (^NavigatorUserMediaSuccessCallback)(RTCMediaStream* mediaStream);
 #endif
       
     VideoProcessingAdapter *videoProcessingAdapter = [[VideoProcessingAdapter alloc] initWithRTCVideoSource:videoSource];
+    RTCCameraVideoCapturer* previousCapturer = self.videoCapturer;
     self.videoCapturer = VnvarCreateCameraCapturer(videoProcessingAdapter);
       
     // VNVAR: chọn định dạng theo kích thước VÀ FPS (trước đây chỉ theo kích
@@ -519,7 +520,19 @@ typedef void (^NavigatorUserMediaSuccessCallback)(RTCMediaStream* mediaStream);
     CMVideoDimensions selectedDimension = CMVideoFormatDescriptionGetDimensions(selectedFormat.formatDescription);
     NSInteger selectedWidth = (NSInteger) selectedDimension.width;
     NSInteger selectedHeight = (NSInteger) selectedDimension.height;
+    // VNVAR: FPS phải nằm trong khoảng của định dạng đã chọn; không có FPS
+    // yêu cầu thì mặc định 30, không bao giờ ra 0.
     NSInteger selectedFps = [self selectFpsForFormat:selectedFormat targetFps:targetFps];
+
+    if (selectedFormat == nil || selectedFps <= 0) {
+      // VNVAR: không có chế độ camera dùng được: báo lỗi thay vì mở camera với
+      // định dạng nil / FPS 0 (iOS ném lỗi làm tắt app).
+      NSLog(@"[CAMERA_FPS] No usable capture format for %@ (target %ldx%ld@%ld)",
+            videoDevice.localizedName, (long)targetWidth, (long)targetHeight, (long)targetFps);
+      self.videoCapturer = previousCapturer;
+      errorCallback(@"OverconstrainedError", @"No usable camera format");
+      return;
+    }
 
     self._lastTargetFps = selectedFps;
     self._lastTargetWidth = targetWidth;
@@ -527,23 +540,24 @@ typedef void (^NavigatorUserMediaSuccessCallback)(RTCMediaStream* mediaStream);
     
     NSLog(@"target format %ldx%ld, targetFps: %ld, selected format: %ldx%ld, selected fps %ld", targetWidth, targetHeight, targetFps, selectedWidth, selectedHeight, selectedFps);
 
-    if ([videoDevice lockForConfiguration:NULL]) {
-      @try {
-        videoDevice.activeVideoMaxFrameDuration = CMTimeMake(1, (int32_t)selectedFps);
-        videoDevice.activeVideoMinFrameDuration = CMTimeMake(1, (int32_t)selectedFps);
-      } @catch (NSException* exception) {
-        NSLog(@"Failed to set active frame rate!\n User info:%@", exception.userInfo);
-      }
-      [videoDevice unlockForConfiguration];
-    }
-
+    // VNVAR: KHÔNG đặt FPS trước khi mở camera. Lúc này camera còn ở định dạng
+    // cũ (có thể tối đa 30 FPS) nên đặt 1/60 s là FPS không hợp lệ; trên iOS 26
+    // lỗi phát sinh trong luồng nội bộ của iOS, @try không chặn được → tắt app.
+    // Capturer tự đổi activeFormat rồi đặt FPS; FPS chỉ được khoá cố định sau
+    // khi camera đã chạy đúng định dạng mới.
+    __weak FlutterWebRTCPlugin* weakSelf = self;
+    AVCaptureDevice* startedDevice = videoDevice;
     [self.videoCapturer startCaptureWithDevice:videoDevice
                                         format:selectedFormat
                                            fps:selectedFps
                              completionHandler:^(NSError* error) {
                                if (error) {
                                  NSLog(@"Start capture error: %@", [error localizedDescription]);
+                                 return;
                                }
+                               [weakSelf lockFrameRate:selectedFps
+                                             forDevice:startedDevice
+                                        expectedFormat:selectedFormat];
                              }];
 
     NSString* trackUUID = [[NSUUID UUID] UUIDString];

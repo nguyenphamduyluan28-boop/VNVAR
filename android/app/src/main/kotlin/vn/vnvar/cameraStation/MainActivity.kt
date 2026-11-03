@@ -276,14 +276,10 @@ class MainActivity : FlutterActivity() {
                 "setCameraExposureBoost" -> {
                     val trackId = call.argument<String>("trackId")
                     val targetEv = call.argument<Double>("targetEv") ?: 0.0
-                    // Màn trập thể thao 1/N s (0 = tắt); null (Dart cũ không gửi) =
-                    // giữ nguyên chế độ hiện tại.
-                    val sportsShutter = call.argument<Int>("sportsShutter")
-                        ?: call.argument<Boolean>("sportsMode")?.let { if (it) 500 else 0 }
                     if (trackId.isNullOrBlank()) {
                         result.error("INVALID_TRACK", "Thiếu video track để chỉnh exposure.", null)
                     } else {
-                        CameraExposureController.apply(trackId, targetEv, sportsShutter) { response ->
+                        CameraExposureController.apply(trackId, targetEv) { response ->
                             runOnUiThread { result.success(response) }
                         }
                     }
@@ -397,7 +393,6 @@ class MainActivity : FlutterActivity() {
                     val bitrate = call.argument<Int>("bitrate") ?: 2_000_000
                     val fps = call.argument<Int>("fps") ?: 30
                     val remoteAudio = call.argument<Boolean>("remoteAudio") ?: false
-                    val sportsTuning = call.argument<Boolean>("sportsTuning") ?: false
                     val track = trackId?.let {
                         FlutterWebRTCPlugin.sharedSingleton?.getTrackForId(it, null)
                     }
@@ -417,7 +412,6 @@ class MainActivity : FlutterActivity() {
                                 bitrate = bitrate,
                                 fps = fps,
                                 remoteAudioEnabled = remoteAudio,
-                                sportsTuning = sportsTuning,
                                 onEncoderConfigured = { publisherId ->
                                     mainHandler.post {
                                         if (rtspPublisher?.publisherId == publisherId &&

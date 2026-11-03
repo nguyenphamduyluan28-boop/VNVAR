@@ -31,7 +31,26 @@
 
 - (void)mediaStreamTrackSwitchCamera:(nonnull RTCMediaStreamTrack*)track result:(nonnull FlutterResult)result;
 
-- (NSInteger)selectFpsForFormat:(nonnull AVCaptureDeviceFormat*)format targetFps:(NSInteger)targetFps;
+/// VNVAR: FPS hợp lệ cho [format]: [targetFps] (<= 0 thì mặc định 30) nếu khung
+/// 1/targetFps giây nằm trong một khoảng FPS định dạng hỗ trợ; nếu không thì FPS
+/// nguyên hợp lệ gần nhất. Trả 0 khi [format] nil hoặc không có FPS hợp lệ nào
+/// (người gọi phải báo lỗi, không được mở camera với FPS 0).
+- (NSInteger)selectFpsForFormat:(nullable AVCaptureDeviceFormat*)format targetFps:(NSInteger)targetFps;
+
+/// VNVAR: YES nếu khung 1/[fps] giây nằm trong một khoảng FPS mà [format] hỗ trợ
+/// (so bằng CMTime giống cách iOS kiểm tra).
+- (BOOL)isFps:(NSInteger)fps supportedByFormat:(nullable AVCaptureDeviceFormat*)format;
+
+/// VNVAR: khoá FPS cố định (min = max frame duration = 1/[fps] giây) để camera
+/// không tự giảm FPS khi thiếu sáng. Chỉ gọi SAU KHI capturer đã chạy định dạng
+/// mới (trong completionHandler của startCaptureWithDevice). Bỏ qua và trả NO,
+/// không ném lỗi, khi: camera chưa chạy đúng [expectedFormat] (nil = không kiểm
+/// tra), [fps] ngoài khoảng của định dạng đang chạy, hoặc không khoá được cấu
+/// hình. Tăng FPS thì đặt activeVideoMinFrameDuration trước, giảm FPS thì đặt
+/// activeVideoMaxFrameDuration trước để luôn giữ min <= max.
+- (BOOL)lockFrameRate:(NSInteger)fps
+            forDevice:(nullable AVCaptureDevice*)device
+       expectedFormat:(nullable AVCaptureDeviceFormat*)expectedFormat;
 
 - (nullable AVCaptureDeviceFormat*)selectFormatForDevice:(nonnull AVCaptureDevice*)device
                                     targetWidth:(NSInteger)targetWidth

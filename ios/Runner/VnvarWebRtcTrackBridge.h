@@ -41,15 +41,6 @@ NS_ASSUME_NONNULL_BEGIN
                          locked:(BOOL)locked
     NS_SWIFT_NAME(setCameraLock(forTrackId:locked:));
 
-/// Chế độ thể thao: giới hạn thời gian phơi sáng tối đa 1/[shutterDenominator] s
-/// (0 = tắt). AE vẫn tự động và tăng ISO bù sáng; ISO đã kịch trần mà hình
-/// vẫn tối thì tự nới dần giới hạn (không chậm hơn một khung hình), đủ sáng thì
-/// siết lại. Dart gửi lại cùng lệnh EV sau mỗi lần mở / đổi camera (activeFormat
-/// đổi thì iOS tự bỏ giới hạn). Trả NO khi lỗi.
-+ (BOOL)setSportsModeForTrackId:(NSString *)trackId
-             shutterDenominator:(NSInteger)shutterDenominator
-    NS_SWIFT_NAME(setSportsMode(forTrackId:shutterDenominator:));
-
 @end
 
 typedef void (^VnvarAudioPcmHandler)(NSData *pcm, NSInteger sampleRate,

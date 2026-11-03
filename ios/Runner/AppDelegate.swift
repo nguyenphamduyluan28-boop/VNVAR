@@ -240,16 +240,6 @@ import UIKit
         }
         let target = (arguments["targetEv"] as? NSNumber)?.floatValue ?? 0
         let applied = VnvarWebRtcTrackBridge.setExposureBias(forTrackId: trackId, bias: target)
-        // Chế độ thể thao áp lại cùng lúc với EV: lệnh này chạy sau mỗi lần mở /
-        // đổi camera, mà iOS tự bỏ giới hạn màn trập khi activeFormat đổi.
-        let sportsShutter = (arguments["sportsShutter"] as? NSNumber)?.intValue
-          ?? ((arguments["sportsMode"] as? Bool).map { $0 ? 500 : 0 })
-        if let sportsShutter = sportsShutter {
-          _ = VnvarWebRtcTrackBridge.setSportsMode(
-            forTrackId: trackId,
-            shutterDenominator: sportsShutter
-          )
-        }
         if applied.isNaN {
           result(["applied": false, "reason": "unsupported_capturer"])
         } else {

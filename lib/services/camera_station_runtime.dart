@@ -1580,12 +1580,6 @@ class CameraStationRuntime {
       }
     } catch (_) {}
     try {
-      // Trước khi mở camera: lần đo sáng và encoder RTSP đầu tiên đã đúng chế độ.
-      await webRtc.setSportsShutter(
-        await StationConfigService().loadSportsShutter(),
-      );
-    } catch (_) {}
-    try {
       await webRtc.setRtspTabletAudio(
         await StationConfigService().loadRtspTabletAudio(),
       );
@@ -3505,24 +3499,6 @@ class CameraStationRuntime {
   bool get rtspTabletAudio => _webRtcService?.rtspTabletAudio ?? false;
 
   double get exposureBiasEv => _webRtcService?.exposureBiasEv ?? 0;
-
-  bool get sportsMode => _webRtcService?.sportsMode ?? false;
-
-  /// Mức màn trập chế độ thể thao (1/N s); 0 = tắt.
-  int get sportsShutter => _webRtcService?.sportsShutter ?? 0;
-
-  /// Bitrate cao của chế độ thể thao chưa áp cho RTSP đang chạy.
-  bool get sportsBitratePending => _webRtcService?.rtspBitratePending ?? false;
-
-  /// Chế độ thể thao (0 = tắt, 250/500 = màn trập 1/N s): lưu lại; màn
-  /// trập/khử nhiễu áp ngay, bitrate RTSP áp từ lần mở camera kế tiếp (không
-  /// ngắt ghi hình/livestream đang chạy).
-  Future<void> setSportsShutter(int denominator) async {
-    final normalized = StationConfigService.normalizeSportsShutter(denominator);
-    await StationConfigService().saveSportsShutter(normalized);
-    await _webRtcService?.setSportsShutter(normalized);
-    _emitState();
-  }
 
   /// Người dùng chỉnh độ sáng hình: lưu lại và áp ngay cho camera đang mở.
   Future<void> setExposureBias(double ev) async {

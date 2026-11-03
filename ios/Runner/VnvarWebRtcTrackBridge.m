@@ -4,6 +4,7 @@
 #import <ImageIO/ImageIO.h>
 #import <flutter_webrtc/FlutterWebRTCPlugin.h>
 #import <flutter_webrtc/FlutterRTCAudioSink.h>
+#import <flutter_webrtc/CameraUtils.h>
 #import <math.h>
 
 @implementation VnvarWebRtcTrackBridge
@@ -561,9 +562,15 @@ static AVCaptureDeviceFormat *VnvarBestFormat(AVCaptureDevice *device, NSInteger
     if (completion) completion(NO, @"No usable capture format");
     return;
   }
-  Float64 maxSupportedFps = VnvarFormatMaxFps(selectedFormat);
-  NSInteger fps = MIN(targetFps, (NSInteger)maxSupportedFps);
-  if (fps <= 0) fps = 30;
+  // Cùng quy tắc FPS với lúc mở camera (flutter_webrtc CameraUtils): chỉ dùng
+  // FPS nằm trong khoảng định dạng hỗ trợ; không có thì báo lỗi, giữ camera cũ.
+  NSInteger fps = [plugin selectFpsForFormat:selectedFormat targetFps:targetFps];
+  if (fps <= 0) {
+    NSLog(@"[CAMERA] No valid frame rate for format %@ (target %ld)", selectedFormat,
+          (long)targetFps);
+    if (completion) completion(NO, @"No valid frame rate for capture format");
+    return;
+  }
   NSLog(@"[CAMERA] Switch format %@ fps %ld (target %ldx%ld@%ld, multiCam %d)",
         selectedFormat, (long)fps, (long)targetWidth, (long)targetHeight, (long)targetFps, multiCam);
 
@@ -580,6 +587,8 @@ static AVCaptureDeviceFormat *VnvarBestFormat(AVCaptureDevice *device, NSInteger
       if (completion) completion(NO, error.localizedDescription);
     } else {
       NSLog(@"[CAMERA] Successfully switched iOS camera to device %@", targetDevice.localizedName);
+      // Chỉ khoá FPS cố định sau khi camera đã chạy đúng định dạng mới.
+      [plugin lockFrameRate:fps forDevice:targetDevice expectedFormat:selectedFormat];
       plugin._usingFrontCamera = (targetDevice.position == AVCaptureDevicePositionFront);
       if (completion) completion(YES, nil);
     }
@@ -607,132 +616,6 @@ static AVCaptureDeviceFormat *VnvarBestFormat(AVCaptureDevice *device, NSInteger
   }
   [device unlockForConfiguration];
   return clamped;
-}
-
-// ---- Chế độ thể thao (main queue) ----
-/// Màn trập mục tiêu (giây); 0 = tắt.
-static double gVnvarSportsTargetSeconds = 0;
-/// Giới hạn đang áp (có thể đã nới khi thiếu sáng).
-static double gVnvarSportsCurrentSeconds = 0;
-static NSString *gVnvarSportsTrackId = nil;
-static dispatch_source_t gVnvarSportsTimer = nil;
-
-/// Thời lượng một khung hình của định dạng đang chạy (giới hạn nới tối đa).
-static double VnvarFrameSeconds(AVCaptureDevice *device) {
-  CMTime frame = device.activeVideoMinFrameDuration;
-  double seconds = CMTIME_IS_VALID(frame) ? CMTimeGetSeconds(frame) : 0;
-  return seconds > 0 ? seconds : 1.0 / 30.0;
-}
-
-/// Đặt activeMaxExposureDuration (đã kẹp vào [min, max] của activeFormat, nếu
-/// không iOS ném NSRangeException). Gọi khi device đã lockForConfiguration.
-static double VnvarApplyMaxExposure(AVCaptureDevice *device, double seconds) {
-  CMTime target = CMTimeMakeWithSeconds(seconds, 1000000);
-  CMTime minimum = device.activeFormat.minExposureDuration;
-  CMTime maximum = device.activeFormat.maxExposureDuration;
-  if (CMTIME_IS_VALID(minimum) && CMTimeCompare(target, minimum) < 0) target = minimum;
-  if (CMTIME_IS_VALID(maximum) && CMTimeCompare(target, maximum) > 0) target = maximum;
-  device.activeMaxExposureDuration = target;
-  return CMTimeGetSeconds(target);
-}
-
-+ (void)sportsTick {
-  if (gVnvarSportsTargetSeconds <= 0 || gVnvarSportsTrackId == nil) return;
-  AVCaptureDevice *device = [self activeVideoDeviceForTrackId:gVnvarSportsTrackId];
-  if (device == nil) return;
-  float maxIso = device.activeFormat.maxISO;
-  if (maxIso <= 0) return;
-  float offset = device.exposureTargetOffset;  // EV; âm = tối hơn mức AE muốn
-  float iso = device.ISO;
-  double exposure = CMTimeGetSeconds(device.exposureDuration);
-  double current = gVnvarSportsCurrentSeconds > 0 ? gVnvarSportsCurrentSeconds
-                                                  : gVnvarSportsTargetSeconds;
-  double next = current;
-  if (offset < -0.5f && iso >= maxIso * 0.95f) {
-    // ISO kịch trần mà vẫn thiếu sáng: nới màn trập (tối đa một khung hình).
-    next = MIN(current * 1.5, MAX(gVnvarSportsTargetSeconds, VnvarFrameSeconds(device)));
-  } else if (current > gVnvarSportsTargetSeconds * 1.01 && offset > -0.2f && exposure > 0) {
-    // Đủ sáng trở lại: siết dần về mục tiêu nếu ISO cần thiết vẫn còn dư địa.
-    double tighter = MAX(gVnvarSportsTargetSeconds, current / 1.5);
-    double requiredIso = iso * exposure / tighter;
-    if (requiredIso < maxIso * 0.7) next = tighter;
-  }
-  if (fabs(next - current) < current * 0.01) return;
-  NSError *error = nil;
-  if (![device lockForConfiguration:&error]) return;
-  @try {
-    gVnvarSportsCurrentSeconds = VnvarApplyMaxExposure(device, next);
-    NSLog(@"[CAMERA_SPORTS] Max exposure %.5f s (ISO %.0f/%.0f, offset %.2f EV)",
-          gVnvarSportsCurrentSeconds, iso, maxIso, offset);
-  } @catch (NSException *exception) {
-    NSLog(@"[CAMERA_SPORTS] Exception while adapting max exposure: %@", exception);
-  }
-  [device unlockForConfiguration];
-}
-
-+ (void)updateSportsTimer {
-  if (gVnvarSportsTargetSeconds > 0) {
-    if (gVnvarSportsTimer != nil) return;
-    gVnvarSportsTimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0,
-                                               dispatch_get_main_queue());
-    dispatch_source_set_timer(gVnvarSportsTimer,
-                              dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2 * NSEC_PER_SEC)),
-                              (uint64_t)(1 * NSEC_PER_SEC), (uint64_t)(200 * NSEC_PER_MSEC));
-    dispatch_source_set_event_handler(gVnvarSportsTimer, ^{
-      [VnvarWebRtcTrackBridge sportsTick];
-    });
-    dispatch_resume(gVnvarSportsTimer);
-  } else if (gVnvarSportsTimer != nil) {
-    dispatch_source_cancel(gVnvarSportsTimer);
-    gVnvarSportsTimer = nil;
-  }
-}
-
-+ (BOOL)setSportsModeForTrackId:(NSString *)trackId
-             shutterDenominator:(NSInteger)shutterDenominator {
-  if (![NSThread isMainThread]) {
-    __block BOOL result = NO;
-    dispatch_sync(dispatch_get_main_queue(), ^{
-      result = [self setSportsModeForTrackId:trackId shutterDenominator:shutterDenominator];
-    });
-    return result;
-  }
-  double target = shutterDenominator > 0 ? 1.0 / (double)shutterDenominator : 0;
-  if (fabs(target - gVnvarSportsTargetSeconds) > 1e-9) {
-    // Đổi mức: bắt đầu lại từ màn trập mục tiêu.
-    gVnvarSportsCurrentSeconds = target;
-  }
-  gVnvarSportsTargetSeconds = target;
-  gVnvarSportsTrackId = target > 0 ? [trackId copy] : nil;
-  [self updateSportsTimer];
-
-  AVCaptureDevice *device = [self activeVideoDeviceForTrackId:trackId];
-  if (device == nil) {
-    NSLog(@"[CAMERA_SPORTS] No active AVCaptureDevice found for trackId %@", trackId);
-    return NO;
-  }
-  NSError *error = nil;
-  if (![device lockForConfiguration:&error]) {
-    NSLog(@"[CAMERA_SPORTS] lockForConfiguration failed: %@", error);
-    return NO;
-  }
-  BOOL ok = YES;
-  @try {
-    if (target > 0) {
-      // Áp lại mức đang dùng (giữ phần đã nới khi thiếu sáng) cho camera vừa mở.
-      double seconds = gVnvarSportsCurrentSeconds > 0 ? gVnvarSportsCurrentSeconds : target;
-      gVnvarSportsCurrentSeconds = VnvarApplyMaxExposure(device, seconds);
-      NSLog(@"[CAMERA_SPORTS] Max exposure limited to %.5f s", gVnvarSportsCurrentSeconds);
-    } else {
-      // kCMTimeInvalid: trả về giới hạn mặc định của iOS.
-      device.activeMaxExposureDuration = kCMTimeInvalid;
-    }
-  } @catch (NSException *exception) {
-    NSLog(@"[CAMERA_SPORTS] Exception while setting max exposure: %@", exception);
-    ok = NO;
-  }
-  [device unlockForConfiguration];
-  return ok;
 }
 
 + (BOOL)setCameraLockForTrackId:(NSString *)trackId locked:(BOOL)locked {
