@@ -368,8 +368,8 @@ static BOOL VnvarIs8Bit420(FourCharCode pixelFormat) {
                                       targetFps:(NSInteger)targetFps {
   NSArray<AVCaptureDeviceFormat*>* formats =
       [RTCCameraVideoCapturer supportedFormatsForDevice:device];
-  BOOL multiCamSession = NO;
 #if TARGET_OS_IPHONE
+  BOOL multiCamSession = NO;
   if (@available(iOS 13.0, *)) {
     multiCamSession =
         [self.videoCapturer.captureSession isKindOfClass:[AVCaptureMultiCamSession class]];

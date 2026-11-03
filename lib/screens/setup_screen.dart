@@ -218,17 +218,18 @@ class _SetupScreenState extends State<SetupScreen> {
     return (number ?? 1).toString();
   }
 
-  /// Khối nhận diện đầu trang: icon camera + "Sân X · Camera Y" + mã thiết bị.
+  /// Đầu trang: "Sân X · Camera Y" + các mã kỹ thuật tablet/server dùng
+  /// (Court ID · Camera ID · mã thiết bị) trên một dòng phụ.
   Widget _buildIdentityHeader() {
     final title =
         '${appText(context, 'Sân', 'Court')} $_selectedCourtNumber'
         ' · Camera $_cameraNumberLabel';
     return Container(
       padding: const EdgeInsets.fromLTRB(
-        BrandSpace.lg,
         BrandSpace.md,
+        BrandSpace.sm,
         BrandSpace.xs,
-        BrandSpace.md,
+        BrandSpace.sm,
       ),
       decoration: BoxDecoration(
         color: BrandColors.surface,
@@ -238,8 +239,8 @@ class _SetupScreenState extends State<SetupScreen> {
       child: Row(
         children: [
           Container(
-            width: 52,
-            height: 52,
+            width: 44,
+            height: 44,
             decoration: BoxDecoration(
               color: BrandColors.primary.withValues(alpha: 0.18),
               borderRadius: BorderRadius.circular(BrandRadius.medium),
@@ -250,7 +251,7 @@ class _SetupScreenState extends State<SetupScreen> {
             child: const Icon(
               Icons.videocam_rounded,
               color: BrandColors.primaryBright,
-              size: 28,
+              size: 24,
             ),
           ),
           const SizedBox(width: BrandSpace.md),
@@ -263,16 +264,16 @@ class _SetupScreenState extends State<SetupScreen> {
                   title,
                   maxLines: 1,
                   overflow: TextOverflow.ellipsis,
-                  style: BrandText.title.copyWith(fontSize: 20),
+                  style: BrandText.title.copyWith(fontSize: 18),
                 ),
                 const SizedBox(height: 2),
                 Text(
-                  _deviceId,
+                  '$_courtId · $_cameraId · $_deviceId',
                   maxLines: 1,
                   overflow: TextOverflow.ellipsis,
                   style: BrandText.caption.copyWith(
                     fontFamily: 'monospace',
-                    letterSpacing: 0.4,
+                    letterSpacing: 0.2,
                   ),
                 ),
               ],
@@ -292,51 +293,93 @@ class _SetupScreenState extends State<SetupScreen> {
     );
   }
 
-  /// Bộ đếm sân: [−]  số lớn (chạm để nhập)  [+], từ 1 tới _maxCourtNumber.
-  Widget _buildCourtSection() {
-    final courtNumber = _selectedCourtNumber;
+  /// Một khối "Vị trí": hàng Sân (bộ đếm) + hàng Camera (3 ô). Màn rộng
+  /// (ngang) đặt hai hàng cạnh nhau để vừa một màn hình.
+  Widget _buildPositionSection({required bool wide}) {
+    final court = _buildLabeledRow(
+      appText(context, 'Sân', 'Court'),
+      _buildCourtStepper(),
+    );
+    final camera = _buildLabeledRow('Camera', _buildCameraChips());
     return BrandSection(
-      title: appText(context, 'Sân', 'Court'),
+      title: appText(context, 'Vị trí', 'Position'),
       padding: const EdgeInsets.symmetric(
         horizontal: BrandSpace.md,
-        vertical: BrandSpace.md,
+        vertical: BrandSpace.xs,
       ),
-      children: [
-        Row(
-          children: [
-            BrandIconButton(
-              icon: Icons.remove_rounded,
-              glass: false,
-              tooltip: appText(context, 'Giảm sân', 'Decrease court'),
-              onPressed: courtNumber > 1
-                  ? () => _selectCourtNumber(courtNumber - 1)
-                  : null,
+      children: wide
+          ? [
+              Row(
+                children: [
+                  Expanded(flex: 4, child: court),
+                  const SizedBox(width: BrandSpace.lg),
+                  Expanded(flex: 5, child: camera),
+                ],
+              ),
+            ]
+          : [court, camera],
+    );
+  }
+
+  Widget _buildLabeledRow(String label, Widget child) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: BrandSpace.sm),
+      child: Row(
+        children: [
+          SizedBox(
+            width: 64,
+            child: Text(
+              label,
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: BrandText.caption.copyWith(
+                color: BrandColors.textSecondary,
+                fontWeight: FontWeight.w700,
+              ),
             ),
-            const SizedBox(width: BrandSpace.sm),
-            Expanded(
-              child: Tooltip(
-                message: appText(context, 'Nhập số sân', 'Enter court number'),
-                // Material trong suốt: nền BrandSection (DecoratedBox) che
-                // hiệu ứng chạm vẽ trên Material của Scaffold.
-                child: Material(
-                  type: MaterialType.transparency,
-                  child: InkWell(
-                    onTap: () => _showCourtNumberInputDialog(courtNumber),
-                    borderRadius: BorderRadius.circular(BrandRadius.small),
-                    child: ConstrainedBox(
-                      constraints: const BoxConstraints(minHeight: 64),
-                      child: Center(
-                        child: FittedBox(
-                          fit: BoxFit.scaleDown,
-                          child: Text(
-                            courtNumber.toString().padLeft(2, '0'),
-                            style: const TextStyle(
-                              color: BrandColors.textPrimary,
-                              fontSize: 40,
-                              fontWeight: FontWeight.w800,
-                              letterSpacing: 1,
-                            ),
-                          ),
+          ),
+          Expanded(child: child),
+        ],
+      ),
+    );
+  }
+
+  /// Bộ đếm sân: [−]  số (chạm để nhập)  [+], từ 1 tới _maxCourtNumber.
+  Widget _buildCourtStepper() {
+    final courtNumber = _selectedCourtNumber;
+    return Row(
+      children: [
+        BrandIconButton(
+          icon: Icons.remove_rounded,
+          glass: false,
+          size: 44,
+          tooltip: appText(context, 'Giảm sân', 'Decrease court'),
+          onPressed: courtNumber > 1
+              ? () => _selectCourtNumber(courtNumber - 1)
+              : null,
+        ),
+        Expanded(
+          child: Tooltip(
+            message: appText(context, 'Nhập số sân', 'Enter court number'),
+            // Material trong suốt: nền BrandSection (DecoratedBox) che
+            // hiệu ứng chạm vẽ trên Material của Scaffold.
+            child: Material(
+              type: MaterialType.transparency,
+              child: InkWell(
+                onTap: () => _showCourtNumberInputDialog(courtNumber),
+                borderRadius: BorderRadius.circular(BrandRadius.small),
+                child: ConstrainedBox(
+                  constraints: const BoxConstraints(minHeight: 48),
+                  child: Center(
+                    child: FittedBox(
+                      fit: BoxFit.scaleDown,
+                      child: Text(
+                        courtNumber.toString().padLeft(2, '0'),
+                        style: const TextStyle(
+                          color: BrandColors.textPrimary,
+                          fontSize: 30,
+                          fontWeight: FontWeight.w800,
+                          letterSpacing: 1,
                         ),
                       ),
                     ),
@@ -344,35 +387,29 @@ class _SetupScreenState extends State<SetupScreen> {
                 ),
               ),
             ),
-            const SizedBox(width: BrandSpace.sm),
-            BrandIconButton(
-              icon: Icons.add_rounded,
-              glass: false,
-              tooltip: appText(context, 'Tăng sân', 'Increase court'),
-              onPressed: courtNumber < _maxCourtNumber
-                  ? () => _selectCourtNumber(courtNumber + 1)
-                  : null,
-            ),
-          ],
+          ),
+        ),
+        BrandIconButton(
+          icon: Icons.add_rounded,
+          glass: false,
+          size: 44,
+          tooltip: appText(context, 'Tăng sân', 'Increase court'),
+          onPressed: courtNumber < _maxCourtNumber
+              ? () => _selectCourtNumber(courtNumber + 1)
+              : null,
         ),
       ],
     );
   }
 
-  /// Chọn camera: lưới 3 ô đồng kích thước (số lớn + vị trí ngắn).
-  Widget _buildCameraSection() {
-    return BrandSection(
-      title: 'Camera',
-      padding: const EdgeInsets.all(BrandSpace.sm),
+  /// Chọn camera: 3 ô đồng kích thước (số + vị trí ngắn).
+  Widget _buildCameraChips() {
+    return Row(
       children: [
-        Row(
-          children: [
-            for (var i = 0; i < _cameraIds.length; i++) ...[
-              if (i > 0) const SizedBox(width: BrandSpace.sm),
-              Expanded(child: _buildCameraChip(_cameraIds[i])),
-            ],
-          ],
-        ),
+        for (var i = 0; i < _cameraIds.length; i++) ...[
+          if (i > 0) const SizedBox(width: BrandSpace.xs),
+          Expanded(child: _buildCameraChip(_cameraIds[i])),
+        ],
       ],
     );
   }
@@ -380,9 +417,9 @@ class _SetupScreenState extends State<SetupScreen> {
   Widget _buildCameraChip(String id) {
     final isSelected = id == _cameraId;
     final position = switch (id) {
-      'CAM-01' => appText(context, 'Góc trái', 'Left'),
-      'CAM-02' => appText(context, 'Góc phải', 'Right'),
-      'CAM-03' => appText(context, 'Giữa sân', 'Center'),
+      'CAM-01' => appText(context, 'Trái', 'Left'),
+      'CAM-02' => appText(context, 'Phải', 'Right'),
+      'CAM-03' => appText(context, 'Giữa', 'Center'),
       _ => id,
     };
     final number = id.replaceAll('CAM-', '');
@@ -400,11 +437,11 @@ class _SetupScreenState extends State<SetupScreen> {
         child: InkWell(
           onTap: () => _onCameraIdSelected(id),
           child: ConstrainedBox(
-            constraints: const BoxConstraints(minHeight: 72),
+            constraints: const BoxConstraints(minHeight: 48),
             child: Padding(
               padding: const EdgeInsets.symmetric(
                 horizontal: BrandSpace.xs,
-                vertical: BrandSpace.sm,
+                vertical: BrandSpace.xs,
               ),
               child: Column(
                 mainAxisSize: MainAxisSize.min,
@@ -415,11 +452,10 @@ class _SetupScreenState extends State<SetupScreen> {
                     maxLines: 1,
                     style: TextStyle(
                       color: isSelected ? Colors.white : BrandColors.textPrimary,
-                      fontSize: 22,
+                      fontSize: 18,
                       fontWeight: FontWeight.w800,
                     ),
                   ),
-                  const SizedBox(height: 2),
                   Text(
                     position,
                     maxLines: 1,
@@ -436,41 +472,6 @@ class _SetupScreenState extends State<SetupScreen> {
           ),
         ),
       ),
-    );
-  }
-
-  /// Mã kỹ thuật (tablet/server dùng): chỉ hiển thị.
-  Widget _buildIdsSection() {
-    const valueStyle = TextStyle(
-      color: BrandColors.textSecondary,
-      fontFamily: 'monospace',
-      fontSize: 13,
-      fontWeight: FontWeight.w600,
-    );
-    return BrandSection(
-      title: appText(context, 'Mã', 'IDs'),
-      children: [
-        BrandTile(
-          icon: Icons.stadium_rounded,
-          title: 'Court ID',
-          trailing: Text(
-            _courtId,
-            maxLines: 1,
-            overflow: TextOverflow.ellipsis,
-            style: valueStyle,
-          ),
-        ),
-        BrandTile(
-          icon: Icons.videocam_rounded,
-          title: 'Camera ID',
-          trailing: Text(
-            _cameraId,
-            maxLines: 1,
-            overflow: TextOverflow.ellipsis,
-            style: valueStyle,
-          ),
-        ),
-      ],
     );
   }
 
@@ -582,7 +583,7 @@ class _SetupScreenState extends State<SetupScreen> {
                   return SingleChildScrollView(
                     padding: EdgeInsets.symmetric(
                       horizontal: wide ? BrandSpace.xl : BrandSpace.lg,
-                      vertical: BrandSpace.lg,
+                      vertical: BrandSpace.md,
                     ),
                     child: Center(
                       child: ConstrainedBox(
@@ -591,9 +592,7 @@ class _SetupScreenState extends State<SetupScreen> {
                         ),
                         child: Form(
                           key: _formKey,
-                          child: wide
-                              ? _buildWideLayout()
-                              : _buildNarrowLayout(),
+                          child: _buildContent(wide: wide),
                         ),
                       ),
                     ),
@@ -608,44 +607,13 @@ class _SetupScreenState extends State<SetupScreen> {
     );
   }
 
-  Widget _buildNarrowLayout() {
+  Widget _buildContent({required bool wide}) {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
         _buildIdentityHeader(),
-        const SizedBox(height: BrandSpace.xl),
-        _buildCourtSection(),
-        const SizedBox(height: BrandSpace.xl),
-        _buildCameraSection(),
-        const SizedBox(height: BrandSpace.xl),
-        _buildIdsSection(),
-      ],
-    );
-  }
-
-  Widget _buildWideLayout() {
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.stretch,
-      children: [
-        _buildIdentityHeader(),
-        const SizedBox(height: BrandSpace.xl),
-        Row(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Expanded(child: _buildCourtSection()),
-            const SizedBox(width: BrandSpace.xl),
-            Expanded(
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.stretch,
-                children: [
-                  _buildCameraSection(),
-                  const SizedBox(height: BrandSpace.xl),
-                  _buildIdsSection(),
-                ],
-              ),
-            ),
-          ],
-        ),
+        const SizedBox(height: BrandSpace.lg),
+        _buildPositionSection(wide: wide),
       ],
     );
   }

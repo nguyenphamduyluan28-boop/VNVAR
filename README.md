@@ -32,6 +32,17 @@ Ký Android: Gradle đọc biến môi trường `VNVAR_KEYSTORE_PATH`, `VNVAR_K
 `VNVAR_KEY_PASSWORD`, nếu không có thì đọc `android/key.properties` (không commit file này).
 Bản thử nghiệm ký debug key: đặt `VNVAR_ALLOW_DEBUG_SIGNING=true`.
 
+## Plugin flutter_webrtc (đã vá) trên iOS/macOS
+
+iOS và macOS **không** build `packages/flutter_webrtc/common/darwin/Classes/` mà build bản sao trong
+`packages/flutter_webrtc/<ios|macos>/flutter_webrtc/Sources/flutter_webrtc/` (theo podspec và `Package.swift`).
+Ở plugin gốc đó là symlink, trong repo này là file thật.
+
+- Chỉ sửa code Objective-C trong `common/darwin/Classes/`.
+- Sửa xong chạy `dart run tool/sync_flutter_webrtc_darwin.dart` để chép sang bản iOS/macOS.
+- `dart run tool/sync_flutter_webrtc_darwin.dart --check` (và `flutter test`) báo lỗi nếu hai nơi lệch nhau.
+- File riêng của từng nền tảng (iOS `Broadcast/`, macOS `FlutterScreenCaptureKitCapturer`) khai báo trong script.
+
 ## Tài liệu
 
 - `DAC_TA_KY_THUAT_NANG_CAP_VNVAR.md` — đặc tả nâng cấp 2.1.0

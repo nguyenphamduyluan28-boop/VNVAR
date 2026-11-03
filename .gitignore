@@ -1,6 +1,8 @@
 # Miscellaneous
 *.class
 *.log
+*_log.txt
+camera_log.txt
 *.pyc
 *.swp
 .DS_Store

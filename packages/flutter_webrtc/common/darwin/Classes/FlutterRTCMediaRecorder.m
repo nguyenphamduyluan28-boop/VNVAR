@@ -31,8 +31,17 @@
 
 - (void)initialize:(CGSize)size {
     _renderSize = size;
+    // VNVAR patch: bitrate theo độ phân giải (bản gốc cố định ~6 Mbps) và
+    // profile H.264 High để video thể thao rõ nét hơn.
+    double pixels = size.width * size.height;
+    NSInteger bitrate = pixels >= 2560.0 * 1440.0
+        ? 14000000
+        : (pixels >= 1920.0 * 1080.0 ? 10000000 : 6000000);
     NSDictionary *videoSettings = @{
-        AVVideoCompressionPropertiesKey: @{AVVideoAverageBitRateKey: @(6*1024*1024)},
+        AVVideoCompressionPropertiesKey: @{
+            AVVideoAverageBitRateKey: @(bitrate),
+            AVVideoProfileLevelKey: AVVideoProfileLevelH264HighAutoLevel,
+        },
         AVVideoCodecKey: AVVideoCodecTypeH264,
         AVVideoHeightKey: @(size.height),
         AVVideoWidthKey: @(size.width),

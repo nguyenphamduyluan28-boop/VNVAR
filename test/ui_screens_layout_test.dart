@@ -60,9 +60,12 @@ void main() {
         await tester.pump();
 
         expect(find.byType(CircularProgressIndicator), findsNothing);
-        expect(find.text('Court ID'), findsOneWidget);
-        expect(find.text('Camera ID'), findsOneWidget);
-        expect(find.byType(BrandTile), findsNWidgets(2));
+        // Mã kỹ thuật gộp vào dòng phụ đầu trang (không còn khối "Mã").
+        expect(find.textContaining('COURT-01 · CAM-01 · PHONE-'), findsOneWidget);
+        expect(find.byType(BrandTile), findsNothing);
+        // Một khối "Vị trí": bộ đếm sân [−][+] + 3 ô camera.
+        expect(find.byType(BrandSection), findsOneWidget);
+        expect(find.byType(BrandIconButton), findsNWidgets(2));
         expect(tester.takeException(), isNull);
       }
     });
