@@ -13,6 +13,7 @@ import 'audio_cleanup.dart';
 import 'cellular_uplink_service.dart';
 import 'scoreboard_burn_in.dart';
 import 'station_platform_events.dart';
+import 'tls_stream_relay.dart';
 
 /// Cổng luồng RTSP overlay native iOS (chỉ loopback, hợp đồng C5).
 const int nativeOverlayRtspPort = 8555;
@@ -976,6 +977,9 @@ class RtspPublisherService {
   static const Duration routeProbeInterval = Duration(seconds: 60);
   bool _preferCellular = false;
   bool _cellularActive = false;
+  // RTMPS qua mạng mặc định: FFmpeg của app (ffmpeg_kit "video") không có TLS,
+  // nên đẩy RTMP thường tới bộ chuyển tiếp này, nó mở TLS tới server thật.
+  TlsStreamRelay? _tlsRelay;
   int _routeFailures = 0;
   Timer? _routeProbeTimer;
   bool _routeProbeRunning = false;
@@ -1219,6 +1223,31 @@ class RtspPublisherService {
     }
     if (wasCellular && !_cellularActive) {
       unawaited(CellularUplinkService.closeTunnel());
+    }
+    // RTMPS (Facebook…) qua Wi-Fi/mạng mặc định: đi qua bộ chuyển tiếp TLS cục
+    // bộ. Đường 4G/5G đã tự mở TLS (outputUrl lúc đó là rtmp://127.0.0.1).
+    final tlsEndpoint = rtmpsRelayEndpoint(outputUrl);
+    if (tlsEndpoint == null) {
+      if (_tlsRelay != null) unawaited(_closeTlsRelay());
+    } else {
+      final relay = await _ensureTlsRelay(tlsEndpoint);
+      if (aborted()) {
+        if (_intentionalStop) {
+          unawaited(_closeTlsRelay());
+          abandonAfterStop();
+        }
+        return;
+      }
+      if (relay != null) {
+        final target = buildCellularRelayTarget(outputUrl, relay.localPort);
+        outputUrl = target.url;
+        outputRouteArgs.addAll(target.args);
+        stationLog(
+          '[RTSP_PUSH] RTMPS via local TLS relay 127.0.0.1:${relay.localPort} '
+          '-> ${tlsEndpoint.host}:${tlsEndpoint.port}',
+          name: 'RtspPublisherService',
+        );
+      }
     }
     // Bảng tỉ số in vào video: cần mã hoá lại hình (thay vì copy nguyên luồng).
     LivestreamOverlay? overlay;
@@ -1539,12 +1568,21 @@ class RtspPublisherService {
             });
             return;
           }
-          final failureReason = isSuccess
+          var failureReason = isSuccess
               ? (
                   vi: 'Nguồn camera cục bộ đã đóng; đang kết nối lại.',
                   en: 'The local camera feed closed; reconnecting.',
                 )
               : _extractFailureReason(output, relayUrl: outputUrl);
+          // Chưa phát được khung nào và bộ chuyển tiếp TLS không mở được kết
+          // nối tới server: báo lỗi mạng/TLS thay cho lỗi chung của FFmpeg.
+          final tlsError = !isSuccess && !sawOutput ? _tlsRelay?.lastError : null;
+          if (tlsError != null) {
+            failureReason = (
+              vi: 'Không mở được kết nối bảo mật (RTMPS) tới máy chủ phát: $tlsError',
+              en: 'Could not open a secure (RTMPS) connection to the streaming server: $tlsError',
+            );
+          }
           if (!isSuccess && isPermanentRelayRejection(output)) {
             // Sai stream key / không có quyền / không có luồng: thử lại vô
             // ích (và có thể bị server chặn). Dừng hẳn, giữ thông báo lỗi.
@@ -1850,6 +1888,7 @@ class RtspPublisherService {
       _cellularActive = false;
       unawaited(CellularUplinkService.closeTunnel());
     }
+    unawaited(_closeTlsRelay());
     _bitrate.reset();
     _applyTargetBitrate();
     _setError(reason.vi, reason.en);
@@ -1994,6 +2033,42 @@ class RtspPublisherService {
     }
   }
 
+  /// Bộ chuyển tiếp TLS cho [endpoint]: dùng lại cái đang mở (các lần kết nối
+  /// lại cùng server), hoặc mở mới. null nếu không mở được cổng cục bộ (khi đó
+  /// FFmpeg thử thẳng rtmps:// và báo lỗi như cũ).
+  Future<TlsStreamRelay?> _ensureTlsRelay(TlsRelayEndpoint endpoint) async {
+    final current = _tlsRelay;
+    if (current != null &&
+        !current.isClosed &&
+        current.host == endpoint.host &&
+        current.port == endpoint.port) {
+      return current;
+    }
+    await _closeTlsRelay();
+    try {
+      final relay = await TlsStreamRelay.start(
+        endpoint.host,
+        endpoint.port,
+        log: (message) =>
+            stationLog('[RTSP_PUSH] $message', name: 'RtspPublisherService'),
+      );
+      _tlsRelay = relay;
+      return relay;
+    } catch (error) {
+      stationLog(
+        '[RTSP_PUSH] Cannot start TLS relay: $error',
+        name: 'RtspPublisherService',
+      );
+      return null;
+    }
+  }
+
+  Future<void> _closeTlsRelay() async {
+    final relay = _tlsRelay;
+    _tlsRelay = null;
+    await relay?.close();
+  }
+
   Future<void> stopPublish() async {
     _intentionalStop = true;
     _reconnectTimer?.cancel();
@@ -2008,6 +2083,7 @@ class RtspPublisherService {
       _cellularActive = false;
       unawaited(CellularUplinkService.closeTunnel());
     }
+    unawaited(_closeTlsRelay());
     // Hết livestream: trả encoder về chất lượng đầy đủ cho Tablet.
     _bitrate.reset();
     _applyTargetBitrate();
@@ -2106,6 +2182,7 @@ class RtspPublisherService {
       _preferCellular = false;
       unawaited(CellularUplinkService.closeTunnel());
     }
+    unawaited(_closeTlsRelay());
     _stateController.close();
     if (!_disposed) {
       _disposed = true;

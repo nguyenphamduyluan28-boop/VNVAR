@@ -49,6 +49,26 @@ jobs:
           name: app-release-apk
           path: build/app/outputs/flutter-apk/app-release.apk
 
+      - name: Check APK for Google Play (targetSdk, permissions, 16 KB pages)
+        run: |
+          APK=build/app/outputs/flutter-apk/app-release.apk
+          BT=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)
+          "$BT/aapt2" dump badging "$APK" | grep -E "^package:|^sdkVersion|^targetSdkVersion|^uses-permission"
+          python3 tool/check_16kb_page_size.py "$APK"
+
+      - name: Build App Bundle (Google Play)
+        # Google Play nhận .aab. Bản này chỉ hợp lệ để tải lên khi ký bằng upload
+        # key thật (android/key.properties hoặc VNVAR_KEYSTORE_* qua secrets).
+        env:
+          VNVAR_ALLOW_DEBUG_SIGNING: 'true'
+        run: flutter build appbundle --release
+
+      - name: Upload Android App Bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-release-aab
+          path: build/app/outputs/bundle/release/app-release.aab
+
   build-ios:
     name: Build iOS IPA
     runs-on: macos-latest
