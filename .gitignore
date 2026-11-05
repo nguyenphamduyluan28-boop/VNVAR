@@ -33,6 +33,9 @@ migrate_working_dir/
 .pub-cache/
 .pub/
 /build/
+# Thư mục build của Gradle/Xcode ở mọi cấp (vd android/build,
+# packages/flutter_webrtc/android/build chứa problems-report.html).
+build/
 /coverage/
 .gradle-work/
 

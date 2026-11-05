@@ -45,9 +45,14 @@ jobs:
 
       - name: Upload Android APK
         uses: actions/upload-artifact@v4
+        # Hết dung lượng lưu artifact thì vẫn chạy tiếp các bước kiểm tra.
+        continue-on-error: true
         with:
           name: app-release-apk
           path: build/app/outputs/flutter-apk/app-release.apk
+          # APK đã nén sẵn; giữ ngắn để không đầy hạn mức lưu trữ của GitHub.
+          compression-level: 0
+          retention-days: 3
 
       - name: Check APK for Google Play (targetSdk, permissions, 16 KB pages)
         run: |
@@ -62,12 +67,9 @@ jobs:
         env:
           VNVAR_ALLOW_DEBUG_SIGNING: 'true'
         run: flutter build appbundle --release
-
-      - name: Upload Android App Bundle
-        uses: actions/upload-artifact@v4
-        with:
-          name: app-release-aab
-          path: build/app/outputs/bundle/release/app-release.aab
+      # Chưa tải .aab lên artifact: bản này ký debug key nên Play không nhận,
+      # chỉ build để chắc chắn bundle hợp lệ. Khi có keystore qua secrets thì
+      # thêm bước upload-artifact cho build/app/outputs/bundle/release/app-release.aab.
 
   build-ios:
     name: Build iOS IPA
@@ -102,6 +104,9 @@ jobs:
 
       - name: Upload iOS IPA
         uses: actions/upload-artifact@v4
+        continue-on-error: true
         with:
           name: SportO-Cam-iOS-ipa
           path: SportO-Cam-iOS.ipa
+          compression-level: 0
+          retention-days: 3
