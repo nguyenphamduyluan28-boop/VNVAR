@@ -48,7 +48,9 @@ class VideoFileRenderer implements VideoSink, SamplesReadyCallback {
     // TODO: these ought to be configurable as well
     private static final String MIME_TYPE = "video/avc";    // H.264 Advanced Video Coding
     private static final int FRAME_RATE = 30;               // 30fps
-    private static final int IFRAME_INTERVAL = 5;           // 5 seconds between I-frames
+    // VNVAR patch: 1 giây một khung hình chính (bản gốc 5 giây) để tablet tua
+    // và lùi từng khung nhanh, dừng đúng khung khi soi VAR.
+    private static final int IFRAME_INTERVAL = 1;           // 1 second between I-frames
 
     private final MediaMuxer mediaMuxer;
     private MediaCodec encoder;

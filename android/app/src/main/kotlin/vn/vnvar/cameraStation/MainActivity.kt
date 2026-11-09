@@ -224,6 +224,25 @@ class MainActivity : FlutterActivity() {
                     }
                 }
 
+                // Chuyển segment không gián đoạn: đổi file WAV mà không dừng mic.
+                "rotateNativeAudioSegment" -> {
+                    val path = call.argument<String>("path")
+                    if (path.isNullOrBlank()) {
+                        result.error("AUDIO_PATH_REQUIRED", "Audio path is required", null)
+                    } else {
+                        runInBackground(audioExecutor, "rotateNativeAudioSegment") {
+                            try {
+                                val response = nativeAudioRecorder.rotate(path)
+                                mainHandler.post { result.success(response) }
+                            } catch (error: Throwable) {
+                                mainHandler.post {
+                                    result.error("AUDIO_ROTATE_FAILED", error.message, null)
+                                }
+                            }
+                        }
+                    }
+                }
+
                 "getNativeAudioSegmentStatus" -> {
                     result.success(nativeAudioRecorder.status())
                 }
@@ -392,7 +411,8 @@ class MainActivity : FlutterActivity() {
                     val port = call.argument<Int>("port") ?: 8554
                     val bitrate = call.argument<Int>("bitrate") ?: 2_000_000
                     val fps = call.argument<Int>("fps") ?: 30
-                    val remoteAudio = call.argument<Boolean>("remoteAudio") ?: false
+                    // Tablet (client RTSP qua mạng) luôn nhận tiếng.
+                    val remoteAudio = call.argument<Boolean>("remoteAudio") ?: true
                     val track = trackId?.let {
                         FlutterWebRTCPlugin.sharedSingleton?.getTrackForId(it, null)
                     }

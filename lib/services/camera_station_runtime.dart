@@ -1579,11 +1579,6 @@ class CameraStationRuntime {
         await webRtc.setExposureBias(ev);
       }
     } catch (_) {}
-    try {
-      await webRtc.setRtspTabletAudio(
-        await StationConfigService().loadRtspTabletAudio(),
-      );
-    } catch (_) {}
     _recordingService = recording;
     _cameraId = cameraId;
     _courtId = courtId;
@@ -3496,8 +3491,6 @@ class CameraStationRuntime {
     }
   }
 
-  bool get rtspTabletAudio => _webRtcService?.rtspTabletAudio ?? false;
-
   double get exposureBiasEv => _webRtcService?.exposureBiasEv ?? 0;
 
   /// Người dùng chỉnh độ sáng hình: lưu lại và áp ngay cho camera đang mở.
@@ -3513,13 +3506,6 @@ class CameraStationRuntime {
         (entry) => lanInterfacePriority(entry.split('|').first) == 0,
       ) ??
       false;
-
-  /// Bật/tắt tiếng cho Tablet xem RTSP. Tablet đang xem cần kết nối lại.
-  Future<void> setRtspTabletAudio(bool enabled) async {
-    await StationConfigService().saveRtspTabletAudio(enabled);
-    await _webRtcService?.setRtspTabletAudio(enabled);
-    _emitState();
-  }
 
   void _emitState() {
     // Chỉ báo FPS bị giới hạn khi giới hạn đã thật sự áp lên camera (Android);

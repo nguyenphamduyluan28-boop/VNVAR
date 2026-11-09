@@ -474,9 +474,6 @@ class WebRtcService {
 
   bool _rtspRunning = false;
   Completer<void>? _rtspReadyCompleter;
-  // Tablet (client RTSP qua mạng) có nhận tiếng không. Relay livestream cục bộ
-  // luôn nhận tiếng.
-  bool _rtspTabletAudio = false;
   bool _rtspAudio = false;
   bool _rtspServerStarted = false;
   String? _rtspError;
@@ -501,24 +498,6 @@ class WebRtcService {
   String? get rtspError => _rtspError;
 
   bool get rtspRunning => _rtspRunning;
-
-  bool get rtspTabletAudio => _rtspTabletAudio;
-
-  /// Bật/tắt tiếng cho Tablet xem RTSP. Áp dụng cho kết nối RTSP mới.
-  Future<void> setRtspTabletAudio(bool enabled) async {
-    _rtspTabletAudio = enabled;
-    if (!rtspSupported || !_rtspServerStarted) return;
-    try {
-      await _platformChannel.invokeMethod<void>('setRtspRemoteAudio', {
-        'enabled': enabled,
-      });
-    } catch (error) {
-      developer.log(
-        '[RTSP] Unable to update tablet audio: $error',
-        name: 'WebRtcService',
-      );
-    }
-  }
 
   /// Chờ encoder RTSP cục bộ sẵn sàng (tối đa [timeout]).
   Future<bool> waitForRtspReady({
@@ -1498,7 +1477,8 @@ class WebRtcService {
           'port': 8554,
           'bitrate': rtspBitrate,
           'fps': _resolutionProfile.fps,
-          'remoteAudio': _rtspTabletAudio,
+          // Tablet (client RTSP qua mạng) luôn nhận tiếng.
+          'remoteAudio': true,
         },
       // Native có thể không trả lời (ví dụ iOS bị dừng trước khi server sẵn
       // sàng); không để _rtspStarting kẹt true mãi.

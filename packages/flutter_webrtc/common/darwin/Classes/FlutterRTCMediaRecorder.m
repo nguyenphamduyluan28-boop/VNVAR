@@ -41,6 +41,9 @@
         AVVideoCompressionPropertiesKey: @{
             AVVideoAverageBitRateKey: @(bitrate),
             AVVideoProfileLevelKey: AVVideoProfileLevelH264HighAutoLevel,
+            // VNVAR patch: khung hình chính mỗi 1 giây để tablet tua và lùi
+            // từng khung nhanh, dừng đúng khung (VAR).
+            AVVideoMaxKeyFrameIntervalDurationKey: @1.0,
         },
         AVVideoCodecKey: AVVideoCodecTypeH264,
         AVVideoHeightKey: @(size.height),
@@ -176,6 +179,12 @@
         [_audioSink close];
     }
     [self.videoTrack removeRenderer:self];
+    if (self.assetWriter == nil) {
+        // VNVAR patch: chưa nhận khung hình nào nên chưa có AVAssetWriter;
+        // bản gốc gọi finishWriting trên nil và không bao giờ trả result.
+        result(nil);
+        return;
+    }
     [self.writerInput markAsFinished];
     [_audioWriter markAsFinished];
     dispatch_async(dispatch_get_main_queue(), ^{

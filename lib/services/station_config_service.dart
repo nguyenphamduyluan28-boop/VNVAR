@@ -237,7 +237,6 @@ class StationConfigService {
     return profile;
   }
 
-  static const _rtspTabletAudioKey = 'rtsp_tablet_audio_enabled';
   static const _exposureBiasKey = 'camera_exposure_bias_ev';
 
   /// Độ sáng người dùng chọn (EV, −2…+2; 0 = tự động).
@@ -249,18 +248,6 @@ class StationConfigService {
   Future<double> loadExposureBias() async {
     final prefs = await SharedPreferences.getInstance();
     return (prefs.getDouble(_exposureBiasKey) ?? 0).clamp(-2.0, 2.0).toDouble();
-  }
-
-  /// Tablet xem RTSP có nhận tiếng không (mặc định tắt: tiết kiệm ~0,77 Mbps
-  /// sóng Wi-Fi mỗi Tablet; file ghi và livestream vẫn có tiếng).
-  Future<void> saveRtspTabletAudio(bool enabled) async {
-    final prefs = await SharedPreferences.getInstance();
-    await prefs.setBool(_rtspTabletAudioKey, enabled);
-  }
-
-  Future<bool> loadRtspTabletAudio() async {
-    final prefs = await SharedPreferences.getInstance();
-    return prefs.getBool(_rtspTabletAudioKey) ?? false;
   }
 
   Future<void> saveResolutionLocked(bool locked) async {

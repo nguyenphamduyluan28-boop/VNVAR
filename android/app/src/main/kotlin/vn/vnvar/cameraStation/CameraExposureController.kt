@@ -17,10 +17,10 @@ import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
 import android.util.Log
-import android.util.Range
 import android.view.Surface
 import com.cloudwebrtc.webrtc.FlutterWebRTCPlugin
 import com.cloudwebrtc.webrtc.GetUserMediaImpl
+import com.cloudwebrtc.webrtc.video.camera.CameraUtils
 import org.webrtc.Camera1Capturer
 import org.webrtc.Camera2Capturer
 import org.webrtc.CameraEnumerationAndroid
@@ -72,10 +72,66 @@ object CameraExposureController {
     private const val FOCUS_SWEEP_AFTER_MS = 5_000L
     /** Số bước quét thô (đều theo diopter, từ vô cực tới tiêu cự gần nhất). */
     private const val FOCUS_SWEEP_COARSE_STEPS = 12
-    /** Chờ ống kính tới tiêu cự mới trước khi đo độ nét. */
-    private const val FOCUS_SWEEP_SETTLE_MS = 250L
-    /** Số khung đo độ nét mỗi bước (lấy trung bình). */
-    private const val FOCUS_SWEEP_SAMPLES = 2
+    /**
+     * Tiêu cự gần nhất khi tự tìm nét (diopter; 2 dpt = 0,5 m). Camera sân
+     * không cần nét gần hơn. Trước đây quét tới sát ống kính (vd 18 dpt ≈ 5 cm)
+     * nên lúc dựng máy chĩa vào vật ở gần (mặt bàn, tay) là khoá nhầm ở 5 cm,
+     * quay ra sân thì mờ hẳn. Thu hẹp dải còn giúp 12 bước dày hơn ở vùng xa.
+     */
+    private const val FOCUS_SWEEP_MAX_DIOPTER = 2.0f
+    /**
+     * Chờ ống kính tới tiêu cự mới trước khi đo độ nét. Vài máy MediaTek xử lý
+     * lấy nét chậm ("AF execute too long") nên 250 ms đôi khi chưa đủ.
+     */
+    private const val FOCUS_SWEEP_SETTLE_MS = 400L
+    /**
+     * Ống kính phải báo đứng yên (LENS_STATE) liên tục chừng này mới đo: máy
+     * MediaTek dịch ống kính chậm, còn báo MOVING sau 400 ms; đo lúc ống kính
+     * đang chạy cho số đo nhảy loạn (972 → 37 → 1063 ở hai bước sát nhau).
+     */
+    private const val FOCUS_SWEEP_LENS_STILL_MS = 200L
+    /** Chờ ống kính đứng yên tối đa chừng này (HAL không báo thì vẫn đo). */
+    private const val FOCUS_SWEEP_MAX_SETTLE_MS = 1_500L
+    /**
+     * Ống kính điện thoại có độ sâu trường ảnh rộng (~1 diopter) nên vùng nét là
+     * một "cao nguyên" nhiều bước. Khoá ở GIỮA vùng có độ nét ≥ tỉ lệ này so với
+     * đỉnh, thay vì ở một số đo lẻ (dễ là số đo lệch, nằm sát mép vùng nét).
+     */
+    private const val FOCUS_SWEEP_PLATEAU_RATIO = 0.85
+    /**
+     * Lấy nét MỘT LẦN bằng AF của chính camera (AF_MODE_AUTO + AF_TRIGGER_START,
+     * như chạm để lấy nét trong app Camera) rồi giữ nguyên ống kính. Ưu tiên
+     * hơn tự quét: vài máy (Samsung A07 MediaTek) báo nhận LENS_FOCUS_DISTANCE
+     * nhưng ống kính không hề di chuyển (độ nét đo được phẳng 74–77 ở mọi tiêu
+     * cự), nên tự quét không bao giờ lấy được nét. Hết chừng này mà AF chưa
+     * báo xong thì mới chuyển sang tự quét.
+     */
+    private const val ONE_SHOT_FOCUS_TIMEOUT_MS = 4_000L
+    /** Lấy nét một lần không xong thì chờ chừng này mới thử lại cách đó. */
+    private const val ONE_SHOT_FOCUS_RETRY_MS = 30_000L
+    /** Sau khi khoá nét, cứ chừng này đo lại độ nét một lần. */
+    private const val FOCUS_WATCH_INTERVAL_MS = 3_000L
+    /** Độ nét tụt dưới tỉ lệ này so với lúc khoá... */
+    private const val FOCUS_WATCH_DROP_RATIO = 0.5
+    /**
+     * ...chừng này lần đo liên tiếp (~9 s, không phải người đi ngang) thì tìm
+     * nét lại: máy bị xoay/dời sang cảnh khác sau khi đã khoá.
+     */
+    private const val FOCUS_WATCH_DROPS = 3
+    /** Số khung đo độ nét mỗi bước (lấy trung vị: một khung rung/lệch không làm sai). */
+    private const val FOCUS_SWEEP_SAMPLES = 3
+    /**
+     * Điểm nét nhất phải cao hơn trung vị cả lượt quét ít nhất chừng này lần thì
+     * mới tin. Cảnh ít chi tiết (tường trơn, vật một màu ở giữa khung) cho đường
+     * độ nét gần phẳng: số đo chỉ còn là nhiễu hạt, chọn "đỉnh" là chọn bừa.
+     */
+    private const val FOCUS_SWEEP_MIN_PEAK_RATIO = 1.2
+    /**
+     * Không tin được lượt quét thì khoá ở tiêu cự này (diopter ≈ 1/khoảng cách
+     * m): gần khoảng siêu tiêu cự của camera điện thoại, nét từ khoảng 1 m tới
+     * vô cực, hợp với camera sân.
+     */
+    private const val FOCUS_FALLBACK_DIOPTER = 0.45f
     /** Quét thất bại (không đo được) thì chờ chừng này mới thử lại. */
     private const val FOCUS_SWEEP_RETRY_MS = 30_000L
     /** Khoảng cách giữa hai dòng log chẩn đoán lấy nét ("AF diag"). */
@@ -193,6 +249,27 @@ object CameraExposureController {
     private var sweepDistance: Float? = null
     @Volatile
     private var focusSweepFailedAtMs = 0L
+    /** Độ nét lúc khoá tiêu cự (null = lấy lần đo đầu tiên sau khi khoá). */
+    private var lockedSharpness: Double? = null
+    private var focusWatchDrops = 0
+    /** Lượt lấy nét một lần đang chạy: mốc bắt đầu (0 = không chạy). */
+    @Volatile
+    private var oneShotFocusStartedAt = 0L
+    /** Đã thấy AF rời trạng thái khoá cũ trong lượt lấy nét một lần này. */
+    @Volatile
+    private var oneShotSawScan = false
+    @Volatile
+    private var oneShotFocusFailedAtMs = 0L
+    /** Tiêu cự đang được AF của camera giữ (AF_MODE_AUTO, không chỉnh tay). */
+    @Volatile
+    private var focusHeldByAf = false
+    /** Ống kính đang mở có CONTROL_AF_MODE_AUTO (lấy nét một lần được). */
+    @Volatile
+    private var activeAfAutoAvailable = false
+    /** Lần gần nhất HAL báo ống kính đang di chuyển (camera thread ghi). */
+    @Volatile
+    private var lastLensMovingAtMs = 0L
+    private val focusWatch: Runnable = Runnable { checkFocusSharpness() }
     /** LENS_INFO_MINIMUM_FOCUS_DISTANCE của ống kính đang mở (diopter). */
     @Volatile
     private var activeMinFocusDistance = 0f
@@ -539,6 +616,11 @@ object CameraExposureController {
             camera1FocusLocked = false
             camera1FocusPending = false
             lifecycleHandler.removeCallbacks(camera1FocusTimer)
+            lifecycleHandler.removeCallbacks(focusWatch)
+            oneShotFocusStartedAt = 0L
+            focusHeldByAf = false
+            lockedSharpness = null
+            focusWatchDrops = 0
             lockedFocusDistance = null
             resetFocusSearch()
             afScanSeen = false
@@ -574,45 +656,114 @@ object CameraExposureController {
                 "dist=${result.get(CaptureResult.LENS_FOCUS_DISTANCE)} " +
                 "locked=$lockedFocusDistance lastFocused=$lastFocusedDistance " +
                 "sweep=${if (focusSweep != null) sweepDistance else null} " +
+                "oneShot=${oneShotFocusStartedAt != 0L} heldByAf=$focusHeldByAf " +
                 "scans=$afScanStarts scanSeen=$afScanSeen " +
                 "focusedFor=${if (focusedSinceMs > 0L) now - focusedSinceMs else 0L}ms " +
                 "sinceRelease=${min(sinceSession, sinceRelease)}ms " +
                 "hasAf=$activeHasAutoFocus manual=$activeManualFocus " +
-                "stable=$stableExposureEnabled camLock=$activeCameraLock aeLocked=$autoLocked",
+                "stable=$stableExposureEnabled camLock=$activeCameraLock aeLocked=$autoLocked " +
+                // FPS thật và thời gian phơi sáng: FPS tụt khi thiếu sáng thì
+                // exposure/frame dài hơn 1000/FPS ms.
+                "fpsRange=${result.get(CaptureResult.CONTROL_AE_TARGET_FPS_RANGE)} " +
+                "exposureMs=${result.get(CaptureResult.SENSOR_EXPOSURE_TIME)?.let { it / 1_000_000.0 }} " +
+                "frameMs=${result.get(CaptureResult.SENSOR_FRAME_DURATION)?.let { it / 1_000_000.0 }} " +
+                "iso=${result.get(CaptureResult.SENSOR_SENSITIVITY)} " +
+                "measuredFps=${measuredCaptureFps()?.let { "%.1f".format(it) }}",
         )
     }
 
     // ---- Tự tìm nét (contrast AF của app) ----
 
-    /** Main thread: bắt đầu quét tiêu cự 0 (vô cực) → [minFocus] diopter. */
+    /**
+     * Main thread: tìm nét. Ưu tiên lấy nét một lần bằng AF của camera; máy
+     * không có AF_MODE_AUTO, hoặc lần đó vừa thất bại, thì tự quét.
+     */
+    private fun startFocusSearch(trackId: String, minFocus: Float, why: String) {
+        val now = SystemClock.elapsedRealtime()
+        if (activeAfAutoAvailable && now - oneShotFocusFailedAtMs >= ONE_SHOT_FOCUS_RETRY_MS) {
+            oneShotSawScan = false
+            focusHeldByAf = false
+            oneShotFocusStartedAt = now
+            afRestartPending = true
+            Log.i(TAG, "One-shot autofocus started: $why")
+            apply(trackId, activeTargetEv) {}
+            return
+        }
+        startFocusSweep(trackId, minFocus, why)
+    }
+
+    /** Camera thread: theo dõi lượt lấy nét một lần tới khi AF khoá hoặc hết giờ. */
+    private fun observeOneShotFocus(trackId: String, startedAt: Long, result: TotalCaptureResult) {
+        val state = result.get(CaptureResult.CONTROL_AF_STATE)
+        val locked = state == CaptureResult.CONTROL_AF_STATE_FOCUSED_LOCKED ||
+            state == CaptureResult.CONTROL_AF_STATE_NOT_FOCUSED_LOCKED
+        // Bỏ kết quả của request trước trigger (còn trạng thái khoá cũ).
+        if (!locked) oneShotSawScan = true
+        val elapsed = SystemClock.elapsedRealtime() - startedAt
+        val done = locked && (oneShotSawScan || elapsed >= 1_500L)
+        if (!done && elapsed < ONE_SHOT_FOCUS_TIMEOUT_MS) return
+        val focused = state == CaptureResult.CONTROL_AF_STATE_FOCUSED_LOCKED
+        val distance = result.get(CaptureResult.LENS_FOCUS_DISTANCE)
+        lifecycleHandler.post { finishOneShotFocus(trackId, startedAt, done, focused, distance) }
+    }
+
+    /** Main thread: kết thúc lượt lấy nét một lần (bỏ qua các lần gọi trùng). */
+    private fun finishOneShotFocus(
+        trackId: String,
+        startedAt: Long,
+        locked: Boolean,
+        focused: Boolean,
+        distance: Float?,
+    ) {
+        if (oneShotFocusStartedAt != startedAt || activeTrackId != trackId) return
+        oneShotFocusStartedAt = 0L
+        if (!locked) {
+            oneShotFocusFailedAtMs = SystemClock.elapsedRealtime()
+            Log.w(TAG, "One-shot autofocus did not finish in ${ONE_SHOT_FOCUS_TIMEOUT_MS}ms")
+            if (activeManualFocus && activeMinFocusDistance > 0f && lumaMeter.isAttachedTo(trackId)) {
+                startFocusSweep(trackId, activeMinFocusDistance, "one-shot autofocus timed out")
+            } else {
+                apply(trackId, activeTargetEv) {}
+            }
+            return
+        }
+        // Giữ ống kính đúng chỗ AF vừa chọn (AF_MODE_AUTO không trigger), kể cả
+        // khi AF báo không nét được: đó vẫn là vị trí tốt nhất camera tìm được.
+        focusHeldByAf = true
+        lockedFocusDistance = distance ?: 0f
+        Log.i(
+            TAG,
+            "One-shot autofocus ${if (focused) "focused" else "could not confirm focus"}; " +
+                "holding lens at ${distance ?: "?"} dpt",
+        )
+        apply(trackId, activeTargetEv) {}
+        startFocusWatch(null)
+    }
+
+    /**
+     * Main thread: bắt đầu quét tiêu cự 0 (vô cực) → min([minFocus],
+     * [FOCUS_SWEEP_MAX_DIOPTER]) diopter.
+     */
     private fun startFocusSweep(trackId: String, minFocus: Float, why: String) {
-        val sweep = FocusSweep(trackId, minFocus)
+        val nearest = min(minFocus, FOCUS_SWEEP_MAX_DIOPTER)
+        val sweep = FocusSweep(trackId, nearest)
         val steps = FOCUS_SWEEP_COARSE_STEPS
-        for (i in 0 until steps) sweep.candidates.add(minFocus * i / (steps - 1))
+        for (i in 0 until steps) sweep.candidates.add(nearest * i / (steps - 1))
         focusSweep = sweep
-        Log.i(TAG, "Focus sweep started: $why; 0..$minFocus dpt in $steps steps")
+        Log.i(
+            TAG,
+            "Focus sweep started: $why; 0..$nearest dpt in $steps steps " +
+                "(lens closest $minFocus dpt)",
+        )
         nextSweepStep(sweep)
     }
 
     private fun nextSweepStep(sweep: FocusSweep) {
         if (focusSweep !== sweep || activeTrackId != sweep.trackId) return
-        var next = sweep.candidates.removeFirstOrNull()
-        if (next == null && !sweep.fine && sweep.results.size >= 2) {
-            // Bước tinh quanh điểm nét nhất của lượt thô.
-            sweep.fine = true
-            val best = sweep.results.maxByOrNull { it.second }!!.first
-            val step = sweep.minFocus / (FOCUS_SWEEP_COARSE_STEPS - 1)
-            val tried = sweep.results.map { it.first }
-            for (offset in floatArrayOf(-0.5f, -0.25f, 0.25f, 0.5f)) {
-                val d = (best + offset * step).coerceIn(0f, sweep.minFocus)
-                if (tried.none { abs(it - d) < step * 0.1f } &&
-                    sweep.candidates.none { abs(it - d) < step * 0.1f }
-                ) {
-                    sweep.candidates.add(d)
-                }
-            }
-            next = sweep.candidates.removeFirstOrNull()
-        }
+        // Không còn bước tinh: độ sâu trường ảnh (~1 diopter) rộng hơn nhiều
+        // bước thô (0,18 diopter), và nhảy ngược ống kính về giữa dải chỉ làm
+        // thêm số đo lúc ống kính đang chạy.
+        val next = sweep.candidates.removeFirstOrNull()
         if (next == null) {
             finishFocusSweep(sweep)
             return
@@ -620,21 +771,52 @@ object CameraExposureController {
         val distance = next
         sweepDistance = distance
         apply(sweep.trackId, activeTargetEv) {}
+        val requestedAt = SystemClock.elapsedRealtime()
         lifecycleHandler.postDelayed(
-            { measureSweepStep(sweep, distance, 0, 0.0) },
+            { measureWhenLensSettled(sweep, distance, requestedAt) },
             FOCUS_SWEEP_SETTLE_MS,
         )
     }
 
-    /** Đo độ nét [FOCUS_SWEEP_SAMPLES] khung ở tiêu cự [distance] rồi sang bước kế. */
-    private fun measureSweepStep(sweep: FocusSweep, distance: Float, count: Int, sum: Double) {
+    /** Đợi ống kính báo đứng yên [FOCUS_SWEEP_LENS_STILL_MS] rồi mới đo. */
+    private fun measureWhenLensSettled(sweep: FocusSweep, distance: Float, requestedAt: Long) {
+        if (focusSweep !== sweep) return
+        val now = SystemClock.elapsedRealtime()
+        val stillFor = now - lastLensMovingAtMs
+        if (stillFor < FOCUS_SWEEP_LENS_STILL_MS &&
+            now - requestedAt < FOCUS_SWEEP_MAX_SETTLE_MS
+        ) {
+            lifecycleHandler.postDelayed(
+                { measureWhenLensSettled(sweep, distance, requestedAt) },
+                50L,
+            )
+            return
+        }
+        measureSweepStep(sweep, distance)
+    }
+
+    /**
+     * Đo độ nét [FOCUS_SWEEP_SAMPLES] khung ở tiêu cự [distance] (lấy trung vị)
+     * rồi sang bước kế.
+     */
+    private fun measureSweepStep(
+        sweep: FocusSweep,
+        distance: Float,
+        samples: MutableList<Double> = mutableListOf(),
+    ) {
         if (focusSweep !== sweep) return
         var done = false
+        val record = {
+            if (samples.isNotEmpty()) {
+                val sorted = samples.sorted()
+                sweep.results.add(distance to sorted[sorted.size / 2])
+            }
+            nextSweepStep(sweep)
+        }
         val timeout = Runnable {
             if (done) return@Runnable
             done = true
-            if (count > 0) sweep.results.add(distance to sum / count)
-            nextSweepStep(sweep)
+            record()
         }
         lifecycleHandler.postDelayed(timeout, 1_000L)
         lumaMeter.measureSharpness { value ->
@@ -642,13 +824,11 @@ object CameraExposureController {
                 if (done || focusSweep !== sweep) return@post
                 done = true
                 lifecycleHandler.removeCallbacks(timeout)
-                val newCount = if (value != null) count + 1 else count
-                val newSum = if (value != null) sum + value else sum
-                if (newCount < FOCUS_SWEEP_SAMPLES && value != null) {
-                    measureSweepStep(sweep, distance, newCount, newSum)
+                if (value != null) samples.add(value)
+                if (samples.size < FOCUS_SWEEP_SAMPLES && value != null) {
+                    measureSweepStep(sweep, distance, samples)
                 } else {
-                    if (newCount > 0) sweep.results.add(distance to newSum / newCount)
-                    nextSweepStep(sweep)
+                    record()
                 }
             }
         }
@@ -665,16 +845,98 @@ object CameraExposureController {
             apply(sweep.trackId, activeTargetEv) {}
             return
         }
-        val worst = sweep.results.minOf { it.second }
-        lockedFocusDistance = best.first
+        val sorted = sweep.results.sortedBy { it.first }
+        val readings = sorted
+            .joinToString(" ") { "%.2f=%d".format(it.first, it.second.roundToInt()) }
+        // Lọc trung vị 3 điểm liền kề: một số đo lẻ vọt lên/tụt xuống (đo lệch)
+        // không thể tạo đỉnh giả; vùng nét thật rộng nhiều bước nên vẫn giữ.
+        val values = sorted.map { it.second }
+        val filtered = values.indices.map { i ->
+            val window = listOfNotNull(values.getOrNull(i - 1), values[i], values.getOrNull(i + 1))
+                .sorted()
+            if (window.size == 3) window[1] else window.first()
+        }
+        val peakIndex = filtered.indices.maxByOrNull { filtered[it] }!!
+        val peak = filtered[peakIndex]
+        val median = filtered.sorted()[filtered.size / 2]
+        if (peak < median * FOCUS_SWEEP_MIN_PEAK_RATIO) {
+            // Đường độ nét gần phẳng (cảnh ít chi tiết): không chọn bừa, khoá ở
+            // tiêu cự an toàn cho camera sân và không theo dõi độ nét (không có
+            // mốc tin được để so).
+            val fallback = min(FOCUS_FALLBACK_DIOPTER, sweep.minFocus)
+            lockedFocusDistance = fallback
+            Log.i(
+                TAG,
+                "Focus sweep inconclusive (peak ${peak.roundToInt()} vs median " +
+                    "${median.roundToInt()}); locking at fallback $fallback dpt: $readings",
+            )
+            apply(sweep.trackId, activeTargetEv) {}
+            return
+        }
+        // Giữa vùng nét quanh đỉnh: nét đều cho cả vật gần lẫn xa trong vùng.
+        var low = peakIndex
+        while (low > 0 && filtered[low - 1] >= peak * FOCUS_SWEEP_PLATEAU_RATIO) low--
+        var high = peakIndex
+        while (high < filtered.lastIndex && filtered[high + 1] >= peak * FOCUS_SWEEP_PLATEAU_RATIO) high++
+        val chosen = (sorted[low].first + sorted[high].first) / 2f
+        lockedFocusDistance = chosen
         Log.i(
             TAG,
-            "Focus sweep: locking at ${best.first} dpt (sharpness ${best.second.roundToInt()}, " +
-                "worst ${worst.roundToInt()}, ${sweep.results.size} readings): " +
-                sweep.results.sortedBy { it.first }
-                    .joinToString(" ") { "%.2f=%d".format(it.first, it.second.roundToInt()) },
+            "Focus sweep: locking at $chosen dpt (in-focus band ${sorted[low].first}.." +
+                "${sorted[high].first} dpt, filtered peak ${peak.roundToInt()}, " +
+                "median ${median.roundToInt()}, ${sweep.results.size} readings): $readings",
         )
         apply(sweep.trackId, activeTargetEv) {}
+        // Mốc so độ nét đo lại ở chính tiêu cự đã khoá (không lấy số đo lúc quét).
+        startFocusWatch(null)
+    }
+
+    /** Main thread: theo dõi độ nét sau khi khoá tiêu cự ([baseline] null = đo lần đầu). */
+    private fun startFocusWatch(baseline: Double?) {
+        lockedSharpness = baseline
+        focusWatchDrops = 0
+        lifecycleHandler.removeCallbacks(focusWatch)
+        lifecycleHandler.postDelayed(focusWatch, FOCUS_WATCH_INTERVAL_MS)
+    }
+
+    /**
+     * Main thread: độ nét tụt mạnh và kéo dài so với lúc khoá (máy bị xoay
+     * sang cảnh khác, hoặc lúc khoá ống kính đang chĩa vào vật ở gần) thì nhả
+     * khoá để tự tìm nét lại.
+     */
+    private fun checkFocusSharpness() {
+        val trackId = activeTrackId ?: return
+        if (lockedFocusDistance == null || focusSweep != null || activeCameraLock ||
+            !lumaMeter.isAttachedTo(trackId)
+        ) return
+        // Hẹn lần sau trước: camera không ra khung (callback không về) vẫn đo tiếp.
+        lifecycleHandler.postDelayed(focusWatch, FOCUS_WATCH_INTERVAL_MS)
+        lumaMeter.measureSharpness { value ->
+            lifecycleHandler.post {
+                if (value == null || activeTrackId != trackId ||
+                    lockedFocusDistance == null || focusSweep != null
+                ) return@post
+                val baseline = lockedSharpness
+                if (baseline == null || baseline <= 0.0) {
+                    lockedSharpness = value
+                    focusWatchDrops = 0
+                    return@post
+                }
+                if (value >= baseline * FOCUS_WATCH_DROP_RATIO) {
+                    focusWatchDrops = 0
+                    return@post
+                }
+                focusWatchDrops++
+                if (focusWatchDrops < FOCUS_WATCH_DROPS) return@post
+                Log.i(
+                    TAG,
+                    "Sharpness dropped (${value.roundToInt()} < ${baseline.roundToInt()} " +
+                        "at lock) for ${FOCUS_WATCH_DROPS} checks; refocusing",
+                )
+                releaseAutoLock(reason = "sharpness dropped")
+                apply(trackId, activeTargetEv) {}
+            }
+        }
     }
 
     /** Bắt đầu lại việc theo dõi một lượt tìm nét mới (phiên mới / nhả khoá). */
@@ -699,7 +961,15 @@ object CameraExposureController {
      */
     private fun observeConvergence(trackId: String, generation: Int, result: TotalCaptureResult) {
         logAfDiagnostics(result)
+        if (result.get(CaptureResult.LENS_STATE) == CaptureResult.LENS_STATE_MOVING) {
+            lastLensMovingAtMs = SystemClock.elapsedRealtime()
+        }
         if (!stableExposureEnabled || activeCameraLock) return
+        val oneShotStartedAt = oneShotFocusStartedAt
+        if (oneShotStartedAt != 0L) {
+            observeOneShotFocus(trackId, oneShotStartedAt, result)
+            return
+        }
         val now = SystemClock.elapsedRealtime()
         val af = result.get(CaptureResult.CONTROL_AF_STATE)
         // Chỉ coi là "đã nét" khi AF thật sự báo nét SAU khi đã quét: INACTIVE lúc
@@ -719,8 +989,8 @@ object CameraExposureController {
         val afTimedOut = min(sinceSessionMs, sinceFocusReleaseMs) >= AF_FOCUS_TIMEOUT_MS
 
         // ---- 1. Khoá tiêu cự ----
-        if (lockedFocusDistance == null && focusSweep == null && activeHasAutoFocus &&
-            !focusLockPending && sinceSessionMs >= MIN_LOCK_AFTER_SESSION_MS
+        if (lockedFocusDistance == null && focusSweep == null && oneShotFocusStartedAt == 0L &&
+            activeHasAutoFocus && !focusLockPending && sinceSessionMs >= MIN_LOCK_AFTER_SESSION_MS
         ) {
             val lensStill = result.get(CaptureResult.LENS_STATE) !=
                 CaptureResult.LENS_STATE_MOVING
@@ -757,14 +1027,15 @@ object CameraExposureController {
                     focusLockPending = false
                     if (activeTrackId != trackId || requestGeneration != generation ||
                         activeCameraLock || !stableExposureEnabled ||
-                        lockedFocusDistance != null || focusSweep != null
+                        lockedFocusDistance != null || focusSweep != null ||
+                        oneShotFocusStartedAt != 0L
                     ) return@post
                     val why = when {
                         afScanStarts >= AF_HUNT_SCANS -> "AF hunting ($afScanStarts scans)"
                         !afScanSeen -> "AF never reported scanning"
                         else -> "AF not settled"
                     }
-                    startFocusSweep(trackId, minFocus, why)
+                    startFocusSearch(trackId, minFocus, why)
                 }
                 return
             }
@@ -791,6 +1062,7 @@ object CameraExposureController {
                     lockedFocusDistance = lockDistance
                     Log.i(TAG, "Focus $why; locking focus at $lockDistance dpt")
                     apply(trackId, activeTargetEv) {}
+                    startFocusWatch(null)
                 }
                 return
             }
@@ -1277,12 +1549,14 @@ object CameraExposureController {
             resetFocusSearch()
             focusSweep = null
             sweepDistance = null
+            oneShotFocusStartedAt = 0L
             // Phiên chụp mới (đổi ống kính/độ phân giải, camera dựng lại): tiêu
             // cự đã khoá thuộc phiên cũ, có thể của ống kính khác → lấy nét lại.
             // (Trước đây chỉ nhả khi AE cũng đang khoá.)
             if (lockedFocusDistance != null) {
                 Log.i(TAG, "Focus lock released (new capture session); refocusing")
                 lockedFocusDistance = null
+                focusHeldByAf = false
                 focusLockPending = false
                 focusReleasedAtMs = sessionStartedMs
             }
@@ -1313,6 +1587,7 @@ object CameraExposureController {
         activeManualFocus = (characteristics.get(
             CameraCharacteristics.LENS_INFO_MINIMUM_FOCUS_DISTANCE,
         ) ?: 0f) > 0f && availableAfModes?.contains(CaptureRequest.CONTROL_AF_MODE_OFF) == true
+        activeAfAutoAvailable = availableAfModes?.contains(CaptureRequest.CONTROL_AF_MODE_AUTO) == true
         activeMinFocusDistance = characteristics.get(
             CameraCharacteristics.LENS_INFO_MINIMUM_FOCUS_DISTANCE,
         ) ?: 0f
@@ -1336,6 +1611,8 @@ object CameraExposureController {
             autoLocked,
             lockedFocusDistance,
             sweepDistance,
+            oneShotFocusStartedAt != 0L,
+            focusHeldByAf,
             activeZoom,
             activeMeteringPoint,
             activeRotationDegrees,
@@ -1364,14 +1641,21 @@ object CameraExposureController {
                     if (compensationRange != null && compensationStep > 0.0) {
                         set(CaptureRequest.CONTROL_AE_EXPOSURE_COMPENSATION, compensation)
                     }
+                    // Giữ đủ FPS đã chọn (ví dụ 30–30) thay vì dải WebRTC chọn
+                    // (ví dụ 10–30): thiếu sáng camera không được tự hạ FPS
+                    // (đã gặp 12,5 FPS). Đánh đổi: hình tối/nhiễu hơn khi tối.
                     set(
                         CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE,
-                        Range(
+                        CameraUtils.preferredAeFpsRange(
+                            characteristics,
                             captureFormat.framerate.min / fpsUnitFactor,
                             captureFormat.framerate.max / fpsUnitFactor,
                         ),
                     )
-                    val locked = activeCameraLock || autoLocked
+                    // Đang tự tìm nét: giữ nguyên phơi sáng để số đo độ nét
+                    // giữa các tiêu cự so được với nhau (AE đổi ISO làm nhiễu
+                    // hạt đổi theo, số đo nhảy loạn dù tiêu cự không đổi).
+                    val locked = activeCameraLock || autoLocked || focusSweep != null
                     val aeLockAvailable = characteristics.get(CameraCharacteristics.CONTROL_AE_LOCK_AVAILABLE) == true
                     if (aeLockAvailable) {
                         set(CaptureRequest.CONTROL_AE_LOCK, locked)
@@ -1388,7 +1672,16 @@ object CameraExposureController {
                     ) ?: 0f) > 0f && afModes?.contains(CaptureRequest.CONTROL_AF_MODE_OFF) == true
                     // Giữ tiêu cự cả khi đang đo lại độ sáng (lockedFocusDistance
                     // còn giữ sau releaseAutoLock(keepFocus = true)).
-                    if (focusDistance != null && manualFocus && !activeCameraLock) {
+                    if (oneShotFocusStartedAt != 0L && !activeCameraLock &&
+                        afModes?.contains(CaptureRequest.CONTROL_AF_MODE_AUTO) == true
+                    ) {
+                        // Lấy nét một lần: AUTO + CANCEL/START (gửi ở afRestartPending
+                        // bên dưới), camera tự tìm nét rồi giữ ống kính (LOCKED).
+                        set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_AUTO)
+                        afAutoScanMode = true
+                    } else if (focusDistance != null && manualFocus && !activeCameraLock &&
+                        !focusHeldByAf
+                    ) {
                         // Giữ ống kính đúng tiêu cự đã hội tụ: không "săn nét" khi
                         // người chơi đi gần/xa (máy đặt cố định trên chân).
                         set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_OFF)
@@ -1962,16 +2255,18 @@ private class LumaMeter(private val onLuma: (String, Double) -> Unit) : VideoSin
 
     /**
      * Độ nét = trung bình bình phương gradient ngang + dọc của kênh Y, trên vùng
-     * giữa 50% × 50% khung (thu về 320×180). Càng nét càng lớn; chỉ dùng để so
-     * sánh các tiêu cự của cùng một cảnh.
+     * giữa 80% × 80% khung thu về 320×180. Vùng rộng để có đủ chi tiết (vùng
+     * giữa nhỏ dễ chỉ có tường/vật trơn); thu nhỏ ~5 lần làm mịn nhiễu hạt để
+     * số đo phản ánh cạnh thật. Càng nét càng lớn; chỉ dùng để so sánh các
+     * tiêu cự của cùng một cảnh.
      */
     private fun sharpness(frame: VideoFrame): Double? {
         val buffer = frame.buffer
         val w: Int = buffer.width
         val h: Int = buffer.height
         if (w < 64 || h < 64) return null
-        val cropW = (w / 2) and 1.inv()
-        val cropH = (h / 2) and 1.inv()
+        val cropW = (w * 4 / 5) and 1.inv()
+        val cropH = (h * 4 / 5) and 1.inv()
         val outW = minOf(320, cropW)
         val outH = minOf(180, cropH)
         val scaled = buffer.cropAndScale(

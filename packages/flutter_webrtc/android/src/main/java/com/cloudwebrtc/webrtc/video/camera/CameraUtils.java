@@ -122,7 +122,8 @@ public class CameraUtils {
 
         captureRequestBuilder.set(
                 CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE,
-                new Range<>(
+                preferredAeFpsRange(
+                        cameraDevice,
                         captureFormat.framerate.min / fpsUnitFactor,
                         captureFormat.framerate.max / fpsUnitFactor));
 
@@ -497,7 +498,8 @@ public class CameraUtils {
                 isTorchOn ? CaptureRequest.FLASH_MODE_TORCH : CaptureRequest.FLASH_MODE_OFF);
         captureRequestBuilder.set(
                 CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE,
-                new Range<>(
+                preferredAeFpsRange(
+                        cameraDevice,
                         captureFormat.framerate.min / fpsUnitFactor,
                         captureFormat.framerate.max / fpsUnitFactor));
         captureRequestBuilder.set(
@@ -590,7 +592,8 @@ public class CameraUtils {
                 torch ? CaptureRequest.FLASH_MODE_TORCH : CaptureRequest.FLASH_MODE_OFF);
         captureRequestBuilder.set(
                 CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE,
-                new Range<>(
+                preferredAeFpsRange(
+                        cameraDevice,
                         captureFormat.framerate.min / fpsUnitFactor,
                         captureFormat.framerate.max / fpsUnitFactor));
         captureRequestBuilder.set(
@@ -646,6 +649,45 @@ public class CameraUtils {
       this.fieldName = fieldName;
     }
   }
+  /**
+   * VNVAR patch: dải FPS cho AE giữ đủ FPS đã chọn (xem [CameraFpsRangePolicy]).
+   * Không đọc được khả năng của máy thì giữ nguyên dải WebRTC đã chọn.
+   */
+  private Range<Integer> preferredAeFpsRange(CameraDevice device, int min, int max) {
+    CameraCharacteristics characteristics = null;
+    try {
+      if (activity != null && device != null) {
+        CameraManager manager =
+                (CameraManager) activity.getSystemService(android.content.Context.CAMERA_SERVICE);
+        if (manager != null) characteristics = manager.getCameraCharacteristics(device.getId());
+      }
+    } catch (Exception ignored) {
+    }
+    return preferredAeFpsRange(characteristics, min, max);
+  }
+
+  /** VNVAR patch: dùng chung cho CameraExposureController của app. */
+  public static Range<Integer> preferredAeFpsRange(
+          CameraCharacteristics characteristics, int min, int max) {
+    Range<Integer>[] ranges = null;
+    try {
+      if (characteristics != null) {
+        ranges = characteristics.get(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES);
+      }
+    } catch (Exception ignored) {
+    }
+    int[][] raw = null;
+    if (ranges != null) {
+      raw = new int[ranges.length][];
+      for (int i = 0; i < ranges.length; i++) {
+        Range<Integer> range = ranges[i];
+        raw[i] = range == null ? null : new int[] {range.getLower(), range.getUpper()};
+      }
+    }
+    int[] chosen = CameraFpsRangePolicy.choose(raw, min, max);
+    return new Range<>(chosen[0], chosen[1]);
+  }
+
   static private void resultError(String method, String error, MethodChannel.Result result) {
     String errorMsg = method + "(): " + error;
     result.error(method, errorMsg, null);

@@ -16,6 +16,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'audio_cleanup.dart';
 import 'station_errors.dart';
 import 'station_platform_events.dart';
+import 'streaming_audio_encoder.dart';
 import 'video_storage_service.dart';
 
 bool isPublishableVideoProbe({
@@ -527,6 +528,33 @@ List<String> audioOffsetInputArguments(int? offsetMs) {
       : <String>['-ss', seconds];
 }
 
+/// Tham số đầu vào cho file AAC đã lọc + nén sẵn trong lúc quay (ghép bằng
+/// stream copy): cùng độ lệch tiếng/hình như [audioOffsetInputArguments] với
+/// WAV, cộng bù độ trễ mồi 1024 mẫu của bộ nén AAC (ADTS không lưu thông tin
+/// này nên khi copy tiếng sẽ trễ ~21 ms nếu không bù; đã đo khớp cách cũ
+/// trong 1 ms).
+List<String> preEncodedAudioOffsetArguments(
+  int? offsetMs, {
+  required int sampleRate,
+}) {
+  final primingSeconds = 1024 / (sampleRate <= 0 ? 48000 : sampleRate);
+  final effectiveMs = audioOffsetInputArguments(offsetMs).isEmpty
+      ? 0
+      : offsetMs!;
+  if (effectiveMs >= 0) {
+    return <String>[
+      '-itsoffset',
+      (effectiveMs / 1000 - primingSeconds).toStringAsFixed(6),
+    ];
+  }
+  return <String>[
+    '-ss',
+    (-effectiveMs / 1000).toStringAsFixed(3),
+    '-itsoffset',
+    (-primingSeconds).toStringAsFixed(6),
+  ];
+}
+
 /// Đọc `firstSampleEpochMs` từ kết quả `stopNativeAudioSegment`. Native cũ
 /// có thể trả null/bool thay vì map: khi đó không biết mốc mẫu đầu tiên.
 num? firstSampleEpochMsFromStopResult(Object? result) {
@@ -534,6 +562,104 @@ num? firstSampleEpochMsFromStopResult(Object? result) {
   final value = result['firstSampleEpochMs'];
   if (value is num && value.isFinite && value > 0) return value;
   return null;
+}
+
+/// Phần giữ thêm ở cuối segment cũ khi chuyển segment không gián đoạn: bù sai
+/// số giữa mốc wall-clock và khung hình thật (thà lặp vài khung hình ở chỗ
+/// nối còn hơn mất hình).
+const Duration gaplessHandoffKeepMargin = Duration(milliseconds: 120);
+
+/// Thời gian tối đa chờ recorder mới ghi ra dữ liệu trước khi dừng recorder
+/// cũ. Quá thời gian thì quay về cách cũ (dừng đoạn cũ rồi mới mở đoạn mới).
+const Duration gaplessHandoffReadyTimeout = Duration(seconds: 3);
+
+/// Thời lượng (giây) giữ lại của segment cũ khi chuyển segment không gián
+/// đoạn: recorder mới mở từ [nextStartedAt] trong lúc recorder cũ còn ghi tới
+/// [recorderStoppedAt]; phần ghi chồng ở cuối file cũ được cắt khi đóng gói
+/// TS. Tính lùi từ cuối file nên không lệch khi timeline WebRTC có bước nhảy.
+/// null = không cần cắt.
+double? gaplessHandoffOutputDurationSeconds({
+  required double mediaDurationSeconds,
+  required DateTime nextStartedAt,
+  required DateTime recorderStoppedAt,
+  Duration keepMargin = gaplessHandoffKeepMargin,
+}) {
+  final overlap = recorderStoppedAt.difference(nextStartedAt) - keepMargin;
+  if (overlap < const Duration(milliseconds: 40)) return null;
+  final keep = mediaDurationSeconds - overlap.inMicroseconds / 1e6;
+  if (!keep.isFinite || keep < 1) return null;
+  return keep;
+}
+
+/// Chờ recorder vừa mở ghi ra dữ liệu (file > 0 byte), tức bộ mã hoá đã chạy
+/// thật. false khi hết [timeout].
+Future<bool> waitForRecorderOutput(
+  File file, {
+  Duration timeout = gaplessHandoffReadyTimeout,
+  Duration pollInterval = const Duration(milliseconds: 50),
+}) async {
+  final deadline = DateTime.now().add(timeout);
+  while (true) {
+    try {
+      if (await file.exists() && await file.length() > 0) return true;
+    } on FileSystemException {
+      // File đang được tạo: thử lại nhịp sau.
+    }
+    if (!DateTime.now().isBefore(deadline)) return false;
+    await Future<void>.delayed(pollInterval);
+  }
+}
+
+/// Kết quả chốt WAV của segment cũ trong kết quả `rotateNativeAudioSegment`
+/// (cùng dạng kết quả `stopNativeAudioSegment`).
+Object? previousAudioResultFromRotate(Object? result) =>
+    result is Map ? result['previous'] : null;
+
+/// Recorder hình vừa mở, chưa gắn làm segment hiện tại.
+class _OpenedRecorder {
+  _OpenedRecorder(this.recorder, this.path, this.startedAt);
+
+  final MediaRecorder recorder;
+  final String path;
+  final DateTime startedAt;
+}
+
+/// Segment cũ được bàn giao khi chuyển segment không gián đoạn: segment mới
+/// đã ghi song song, đoạn này chỉ còn phải dừng và chốt.
+class _GaplessHandoff {
+  _GaplessHandoff({
+    required this.recorder,
+    required this.path,
+    required this.startedAt,
+    required this.audioPath,
+    required this.journal,
+    required this.videoStartEpochMs,
+    required this.facingMode,
+    required this.quarterTurns,
+    required this.nextStartedAt,
+    required this.audioHandedOff,
+    required this.audioStopResult,
+    required this.audioEncoder,
+  });
+
+  final MediaRecorder recorder;
+  final String path;
+  final DateTime startedAt;
+  final String? audioPath;
+  final File? journal;
+  final int? videoStartEpochMs;
+  final String facingMode;
+  final int quarterTurns;
+
+  /// Mốc bắt đầu của segment mới (= mốc kết thúc của đoạn này).
+  final DateTime nextStartedAt;
+
+  /// Micro đã chuyển sang file WAV của segment mới; WAV của đoạn này đã chốt.
+  final bool audioHandedOff;
+  final Object? audioStopResult;
+
+  /// Bộ xử lý tiếng chạy nền của đoạn này (null khi không có).
+  final StreamingAudioEncoder? audioEncoder;
 }
 
 /// Nhịp thử mở lại recorder khi phiên ghi đang bị treo vì không mở được
@@ -1105,6 +1231,9 @@ class RecordingService {
 
   String? _currentPath;
   String? _currentAudioPath;
+  // Lọc + nén AAC tiếng của segment đang ghi ngay trong lúc quay (null khi
+  // không ghi tiếng); lúc chốt segment chỉ còn ghép bằng stream copy.
+  StreamingAudioEncoder? _currentAudioEncoder;
   File? _currentJournal;
   bool _currentSegmentHasAudio = false;
 
@@ -1310,6 +1439,7 @@ class RecordingService {
     String? precedingSegmentId,
     String? owner,
     bool priority = false,
+    int? reservedTimestampMs,
   }) {
     final key = [
       segmentId,
@@ -1319,6 +1449,7 @@ class RecordingService {
       minimumOutputDurationMs,
       precedingSegmentId,
       owner,
+      reservedTimestampMs,
     ].join('|');
     final duplicate = _pendingTrims[key];
     if (duplicate != null) return duplicate;
@@ -1339,6 +1470,7 @@ class RecordingService {
         minimumOutputDurationMs: minimumOutputDurationMs,
         precedingSegmentId: precedingSegmentId,
         owner: owner,
+        reservedTimestampMs: reservedTimestampMs,
       ),
     );
     final operation = job.completer.future;
@@ -1418,6 +1550,7 @@ class RecordingService {
     required int? minimumOutputDurationMs,
     String? precedingSegmentId,
     String? owner,
+    int? reservedTimestampMs,
   }) async {
     if (endMs <= startMs ||
         endMs - startMs < 500 ||
@@ -1449,6 +1582,7 @@ class RecordingService {
         precedingSegmentId: precedingSegmentId,
         owner: owner,
         leasedPaths: leasedPaths,
+        reservedTimestampMs: reservedTimestampMs,
       );
     } finally {
       for (final path in leasedPaths) {
@@ -1466,6 +1600,7 @@ class RecordingService {
     required String? precedingSegmentId,
     required String? owner,
     required List<String> leasedPaths,
+    int? reservedTimestampMs,
   }) async {
     if (endMs > source.duration.inMilliseconds + 1000) {
       throw const InvalidTrimRangeException(
@@ -1525,7 +1660,9 @@ class RecordingService {
     try {
       final now = DateTime.now();
       final directory = await _exportDownloadDirectory();
-      var timestampMs = now.millisecondsSinceEpoch;
+      // Check VAR báo trước tên clip cho tablet rồi mới cắt nền: dùng đúng
+      // mốc đã hẹn (chỉ đổi khi trùng file, khi đó server phục vụ theo clip).
+      var timestampMs = reservedTimestampMs ?? now.millisecondsSinceEpoch;
       var fileName = buildTrimmedClipFileName(cameraId, timestampMs);
       output = File('${directory.path}${Platform.pathSeparator}$fileName');
       while (await output!.exists()) {
@@ -2361,6 +2498,9 @@ class RecordingService {
     int? audioOffsetMs,
     String? replaceFallbackPath,
     File? fallbackJournal,
+    double? maxDurationSeconds,
+    File? preEncodedAudio,
+    int preEncodedAudioSampleRate = 48000,
   }) async {
     final effectiveRotation = calculateEffectiveVideoRotation(
       isIos: Platform.isIOS,
@@ -2425,12 +2565,68 @@ class RecordingService {
         ? const ['-af', outdoorAudioCleanupFilter]
         : const <String>[];
 
+    // Cắt phần ghi chồng ở cuối khi bàn giao segment không gián đoạn.
+    final durationArgs = maxDurationSeconds == null
+        ? const <String>[]
+        : <String>['-t', maxDurationSeconds.toStringAsFixed(3)];
+
     ReturnCode? code;
     Session? session;
     final hardwareEncoder = _hardwareH264Encoder;
 
+    // Nhanh nhất: tiếng đã được lọc + nén AAC trong lúc quay, chỉ còn ghép
+    // hình và tiếng bằng stream copy. Lỗi thì làm lại theo cách cũ từ WAV.
+    if (filterArgs.isEmpty &&
+        preEncodedAudio != null &&
+        await preEncodedAudio.exists() &&
+        await preEncodedAudio.length() > 0) {
+      session = await FFmpegKit.executeWithArguments([
+        '-y',
+        '-fflags',
+        '+genpts+discardcorrupt',
+        '-i',
+        source.path,
+        ...preEncodedAudioOffsetArguments(
+          audioOffsetMs,
+          sampleRate: preEncodedAudioSampleRate,
+        ),
+        '-i',
+        preEncodedAudio.path,
+        '-map',
+        '0:v:0',
+        '-map',
+        '1:a:0',
+        '-threads',
+        '1',
+        '-c:v',
+        'copy',
+        '-c:a',
+        'copy',
+        '-avoid_negative_ts',
+        'make_zero',
+        '-muxdelay',
+        '0.5',
+        '-muxpreload',
+        '0.5',
+        '-mpegts_flags',
+        '+resend_headers+pat_pmt_at_frames',
+        ...durationArgs,
+        '-f',
+        'mpegts',
+        tsOutput.path,
+      ]);
+      code = await session.getReturnCode();
+      if (!ReturnCode.isSuccess(code)) {
+        developer.log(
+          'Fast TS mux with streamed audio failed; using full conversion.',
+          name: 'RecordingService',
+        );
+        if (await tsOutput.exists()) await tsOutput.delete();
+      }
+    }
+
     // Stream copy chỉ dùng được khi video không cần xoay hoặc biến đổi khung hình.
-    if (filterArgs.isEmpty) {
+    if (filterArgs.isEmpty && (code == null || !ReturnCode.isSuccess(code))) {
       session = await FFmpegKit.executeWithArguments([
         '-y',
         '-fflags',
@@ -2459,6 +2655,7 @@ class RecordingService {
         '0.5',
         '-mpegts_flags',
         '+resend_headers+pat_pmt_at_frames',
+        ...durationArgs,
         '-f',
         'mpegts',
         tsOutput.path,
@@ -2500,6 +2697,7 @@ class RecordingService {
           '0.5',
           '-mpegts_flags',
           '+resend_headers+pat_pmt_at_frames',
+          ...durationArgs,
           '-f',
           'mpegts',
           tsOutput.path,
@@ -2540,6 +2738,7 @@ class RecordingService {
         '0.5',
         '-mpegts_flags',
         '+resend_headers+pat_pmt_at_frames',
+        ...durationArgs,
         '-f',
         'mpegts',
         tsOutput.path,
@@ -3137,8 +3336,16 @@ class RecordingService {
   // ============================================================
 
   Future<void> _startNewSegment() async {
+    final opened = await _openSegmentRecorder();
+    if (opened == null) return;
+    await _activateSegment(opened);
+  }
+
+  /// Mở MediaRecorder cho segment mới nhưng CHƯA gắn làm segment hiện tại.
+  /// null khi phiên ghi đã tắt.
+  Future<_OpenedRecorder?> _openSegmentRecorder() async {
     if (!_recording) {
-      return;
+      return null;
     }
 
     final videoTrack = _videoTrack;
@@ -3199,6 +3406,32 @@ class RecordingService {
     // successfully. Using the timestamp captured before recorder.start() made
     // the displayed/file-name start earlier than the first writable frame.
     final recorderStartedAt = DateTime.now();
+    return _OpenedRecorder(recorder, path, recorderStartedAt);
+  }
+
+  /// Dừng và xoá recorder đã mở nhưng không dùng tới.
+  Future<void> _discardOpenedRecorder(_OpenedRecorder opened) async {
+    try {
+      // Recorder chưa nhận khung hình nào có thể không bao giờ trả lời stop
+      // (bản native cũ): không được treo lượt chuyển segment.
+      await opened.recorder.stop().timeout(const Duration(seconds: 5));
+    } catch (_) {}
+    try {
+      final partial = File(opened.path);
+      if (await partial.exists()) await partial.delete();
+    } catch (_) {}
+  }
+
+  /// Gắn recorder đã mở làm segment hiện tại (journal, micro).
+  /// [audioStarted]: micro đã được chuyển sang file WAV của segment này
+  /// (bàn giao không gián đoạn), không mở lại.
+  Future<void> _activateSegment(
+    _OpenedRecorder opened, {
+    bool audioStarted = false,
+  }) async {
+    final recorder = opened.recorder;
+    final path = opened.path;
+    final recorderStartedAt = opened.startedAt;
 
     _recorder = recorder;
     // C2: mốc bắt đầu hình của segment, ghi ngay sau khi recorder.start xong.
@@ -3240,12 +3473,20 @@ class RecordingService {
     if (_recordAudio && (Platform.isAndroid || Platform.isIOS)) {
       final audioPath = path.replaceFirst(RegExp(r'\.mp4$'), '.wav');
       try {
-        await _platformChannel.invokeMethod<void>('startNativeAudioSegment', {
-          'path': audioPath,
-        });
+        if (!audioStarted) {
+          await _platformChannel.invokeMethod<void>('startNativeAudioSegment', {
+            'path': audioPath,
+          });
+        }
         _currentAudioPath = audioPath;
         _currentSegmentHasAudio = true;
         debugPrint('[VNVAR] NATIVE AUDIO STARTED: $audioPath');
+        // Chạy nền, không chờ: lỗi chỉ làm lúc chốt quay về cách chuyển TS cũ.
+        _currentAudioEncoder = StreamingAudioEncoder.launch(
+          wavPath: audioPath,
+          aacPath: path.replaceFirst(RegExp(r'\.mp4$'), '.aac'),
+          filter: outdoorAudioCleanupFilter,
+        );
       } catch (error, stackTrace) {
         _currentAudioPath = null;
         _currentSegmentHasAudio = false;
@@ -3425,13 +3666,15 @@ class RecordingService {
   // ============================================================
   // ROTATE SEGMENT
   //
-  // 3 phút:
+  // 3 phút / Check VAR (không gián đoạn):
   //
-  // segment A
-  //     ↓ stop
+  // segment A đang ghi
+  //     ↓ mở segment B song song, chờ B ghi ra dữ liệu
+  //     ↓ chuyển micro sang file WAV của B (không hở mẫu)
+  //     ↓ dừng A, cắt phần ghi chồng ở cuối A khi đóng gói TS
   // add completed list
-  //     ↓
-  // segment B
+  //
+  // Đổi nguồn camera hoặc B không mở được: dừng A rồi mới mở B (cách cũ).
   // ============================================================
 
   Future<void> _rotateSegment() async {
@@ -3586,10 +3829,27 @@ class RecordingService {
     }
 
     try {
+      // Hết thời lượng segment / Check VAR: mở recorder mới TRƯỚC khi dừng
+      // recorder cũ để không mất khung hình nào giữa hai segment. Đổi nguồn
+      // (có onRecorderStopped) vẫn phải dừng đoạn cũ trước khi đổi.
+      if (onRecorderStopped == null && _recorder != null && !_stopping) {
+        final attempt = await _openNextSegmentGapless();
+        final handoff = attempt.handoff;
+        if (handoff != null) {
+          openAttempted = true;
+          openError = null;
+          return await _finishHandedOffSegment(handoff);
+        }
+        if (attempt.error != null) {
+          openAttempted = true;
+          openError = attempt.error;
+        }
+      }
       final segment = await _finishCurrentSegment(
         onRecorderStopped: () async {
           if (onRecorderStopped != null) await onRecorderStopped();
-          await tryOpenNextSegment();
+          // Bàn giao vừa lỗi vì thiếu dung lượng: không thử mở lại ngay.
+          if (openError is! StorageSafetyException) await tryOpenNextSegment();
         },
       );
       // Fallback khi hand-off chưa thử mở (onRecorderStopped của caller lỗi)
@@ -3621,6 +3881,136 @@ class RecordingService {
         }
         _scheduleNextRotation();
       }
+    }
+  }
+
+  /// Mở segment mới song song với segment đang ghi (không hở hình lẫn tiếng).
+  /// Thành công: segment mới đã là segment hiện tại, trả về đoạn cũ để chốt.
+  /// Không thành: đoạn cũ vẫn ghi nguyên vẹn; [error] là lý do (caller quay
+  /// về cách dừng đoạn cũ rồi mới mở đoạn mới).
+  Future<({_GaplessHandoff? handoff, Object? error})>
+  _openNextSegmentGapless() async {
+    final previousRecorder = _recorder;
+    final previousPath = _currentPath;
+    final previousStartedAt = _segmentStartedAt;
+    if (previousRecorder == null ||
+        previousPath == null ||
+        previousStartedAt == null) {
+      return (handoff: null, error: null);
+    }
+    final _OpenedRecorder? next;
+    try {
+      next = await _openSegmentRecorder();
+    } catch (error, stackTrace) {
+      developer.log(
+        'Gapless handoff: unable to open the next recorder; falling back.',
+        error: error,
+        stackTrace: stackTrace,
+        name: 'RecordingService',
+      );
+      return (handoff: null, error: error);
+    }
+    if (next == null) return (handoff: null, error: null);
+
+    // Chỉ dừng đoạn cũ khi đoạn mới đã ghi ra dữ liệu thật (bộ mã hoá chạy
+    // được, ví dụ máy không giới hạn số bộ mã hoá chạy cùng lúc).
+    final ready = await waitForRecorderOutput(File(next.path));
+    if (!ready ||
+        !_recording ||
+        _stopping ||
+        !identical(_recorder, previousRecorder)) {
+      await _discardOpenedRecorder(next);
+      developer.log(
+        'Gapless handoff aborted (ready=$ready); falling back to stop-then-start.',
+        name: 'RecordingService',
+      );
+      debugPrint('[VNVAR] GAPLESS HANDOFF ABORTED: ready=$ready');
+      return (
+        handoff: null,
+        error: ready
+            ? null
+            : BilingualStateError(
+                'Recorder mới không ghi ra dữ liệu.',
+                'The new recorder produced no data.',
+              ),
+      );
+    }
+
+    final previousAudioPath = _currentAudioPath;
+    var audioHandedOff = false;
+    Object? previousAudioResult;
+    if (previousAudioPath != null &&
+        _recordAudio &&
+        (Platform.isAndroid || Platform.isIOS)) {
+      final nextAudioPath = next.path.replaceFirst(RegExp(r'\.mp4$'), '.wav');
+      try {
+        // Native chuyển file WAV liền mạch: mẫu trước điểm chuyển vào file
+        // cũ, mẫu sau vào file mới.
+        final result = await _platformChannel.invokeMethod<Object?>(
+          'rotateNativeAudioSegment',
+          {'path': nextAudioPath},
+        );
+        previousAudioResult = previousAudioResultFromRotate(result);
+        audioHandedOff = true;
+        debugPrint(
+          '[VNVAR] NATIVE AUDIO ROTATED: $previousAudioPath -> $nextAudioPath',
+        );
+      } catch (error, stackTrace) {
+        await _discardOpenedRecorder(next);
+        try {
+          final partialAudio = File(nextAudioPath);
+          if (await partialAudio.exists()) await partialAudio.delete();
+        } catch (_) {}
+        developer.log(
+          'Gapless handoff: native audio rotation failed; falling back.',
+          error: error,
+          stackTrace: stackTrace,
+          name: 'RecordingService',
+        );
+        return (handoff: null, error: error);
+      }
+    }
+
+    final handoff = _GaplessHandoff(
+      recorder: previousRecorder,
+      path: previousPath,
+      startedAt: previousStartedAt,
+      audioPath: previousAudioPath,
+      journal: _currentJournal,
+      videoStartEpochMs: _currentVideoStartEpochMs,
+      facingMode: _currentSegmentFacingMode,
+      quarterTurns: _currentSegmentQuarterTurns,
+      nextStartedAt: next.startedAt,
+      audioHandedOff: audioHandedOff,
+      audioStopResult: previousAudioResult,
+      audioEncoder: _currentAudioEncoder,
+    );
+    // Đoạn mới sẽ có bộ xử lý tiếng riêng (mở trong _activateSegment).
+    _currentAudioEncoder = null;
+    // Đánh dấu trước khi _currentPath trỏ sang đoạn mới, để dọn staging không
+    // coi file cũ là file mồ côi.
+    _finalizingPaths.add(previousPath);
+    await _activateSegment(next, audioStarted: audioHandedOff);
+    debugPrint(
+      '[VNVAR] GAPLESS HANDOFF: ${next.path} opened before stopping '
+      '$previousPath',
+    );
+    return (handoff: handoff, error: null);
+  }
+
+  Future<RecordedSegment?> _finishHandedOffSegment(
+    _GaplessHandoff handoff,
+  ) async {
+    try {
+      return await _finishSegment(
+        segmentFacingMode: handoff.facingMode,
+        segmentQuarterTurns: handoff.quarterTurns,
+        handoff: handoff,
+        audioEncoder: handoff.audioEncoder,
+      );
+    } finally {
+      _finalizingPaths.remove(handoff.path);
+      await handoff.audioEncoder?.dispose();
     }
   }
 
@@ -3691,15 +4081,19 @@ class RecordingService {
     final path = _currentPath;
     final segmentFacingMode = _currentSegmentFacingMode;
     final segmentQuarterTurns = _currentSegmentQuarterTurns;
+    final audioEncoder = _currentAudioEncoder;
+    _currentAudioEncoder = null;
     if (path != null) _finalizingPaths.add(path);
     try {
       return await _finishSegment(
         onRecorderStopped: onRecorderStopped,
         segmentFacingMode: segmentFacingMode,
         segmentQuarterTurns: segmentQuarterTurns,
+        audioEncoder: audioEncoder,
       );
     } finally {
       if (path != null) _finalizingPaths.remove(path);
+      await audioEncoder?.dispose();
     }
   }
 
@@ -3707,27 +4101,42 @@ class RecordingService {
     Future<void> Function()? onRecorderStopped,
     required String segmentFacingMode,
     required int segmentQuarterTurns,
+    _GaplessHandoff? handoff,
+    StreamingAudioEncoder? audioEncoder,
   }) async {
-    final recorder = _recorder;
+    // Bàn giao không gián đoạn: segment mới đã là segment hiện tại, đoạn cần
+    // chốt là đoạn cũ trong [handoff].
+    final MediaRecorder? recorder;
+    final String? path;
+    final DateTime? startedAt;
+    final String? audioPath;
+    final File? journal;
+    final int? videoStartEpochMs;
+    if (handoff != null) {
+      recorder = handoff.recorder;
+      path = handoff.path;
+      startedAt = handoff.startedAt;
+      audioPath = handoff.audioPath;
+      journal = handoff.journal;
+      videoStartEpochMs = handoff.videoStartEpochMs;
+    } else {
+      recorder = _recorder;
+      path = _currentPath;
+      startedAt = _segmentStartedAt;
+      audioPath = _currentAudioPath;
+      journal = _currentJournal;
+      videoStartEpochMs = _currentVideoStartEpochMs;
 
-    final path = _currentPath;
-
-    final startedAt = _segmentStartedAt;
-    final audioPath = _currentAudioPath;
-    final journal = _currentJournal;
-    final videoStartEpochMs = _currentVideoStartEpochMs;
-
-    // Clear trước để tránh stop gọi hai lần.
-    _recorder = null;
-
-    _currentPath = null;
-
-    _segmentStartedAt = null;
-    _currentAudioPath = null;
-    _currentJournal = null;
-    _currentSegmentHasAudio = false;
-    _currentVideoStartEpochMs = null;
-    _notifyVideoChanges();
+      // Clear trước để tránh stop gọi hai lần.
+      _recorder = null;
+      _currentPath = null;
+      _segmentStartedAt = null;
+      _currentAudioPath = null;
+      _currentJournal = null;
+      _currentSegmentHasAudio = false;
+      _currentVideoStartEpochMs = null;
+      _notifyVideoChanges();
+    }
 
     if (recorder == null || path == null || startedAt == null) {
       // Không có recorder (đang treo ghi): vẫn LUÔN gọi onRecorderStopped để
@@ -3748,17 +4157,22 @@ class RecordingService {
       return null;
     }
 
+    // Biến không-null để dùng trong closure bên dưới (Dart không giữ phép
+    // kiểm tra null của biến khai báo trước rồi gán theo nhánh).
+    final activeRecorder = recorder;
     developer.log('Finishing segment: $path', name: 'RecordingService');
     // Capture the boundary and ask both recorders to stop before awaiting any
     // journal/filesystem work. Previously WAV finalization ran first, so the
     // video recorder kept accepting frames for several extra seconds and a
     // configured 3-minute file could become 3:05 or 3:06.
     var endedAt = DateTime.now();
+    // Đo thời gian từng bước chốt segment (log [VNVAR-TIMING]).
+    final finalizeWatch = Stopwatch()..start();
     Object? capturedRecorderStopError;
     StackTrace? capturedRecorderStopStack;
     final videoStopFuture = Future<void>.sync(() async {
       try {
-        await recorder.stop();
+        await activeRecorder.stop();
       } catch (error, stackTrace) {
         capturedRecorderStopError = error;
         capturedRecorderStopStack = stackTrace;
@@ -3774,6 +4188,15 @@ class RecordingService {
     num? firstSampleEpochMs;
     final audioStopFuture = Future<void>.sync(() async {
       if (!(Platform.isAndroid || Platform.isIOS) || audioPath == null) return;
+      final handedOff = handoff;
+      if (handedOff != null && handedOff.audioHandedOff) {
+        // Micro đã chuyển sang file của segment mới: WAV này đã được chốt.
+        firstSampleEpochMs = firstSampleEpochMsFromStopResult(
+          handedOff.audioStopResult,
+        );
+        debugPrint('[VNVAR] NATIVE AUDIO HANDED OFF: $audioPath');
+        return;
+      }
       try {
         // C2: native trả map (có `firstSampleEpochMs`); bản native cũ có thể
         // trả null/kiểu khác nên không ép kiểu Map ở tầng kênh.
@@ -3805,6 +4228,10 @@ class RecordingService {
     }
 
     await Future.wait<void>([videoStopFuture, audioStopFuture]);
+    final stopMs = finalizeWatch.elapsedMilliseconds;
+    // WAV đã chốt: bơm nốt phần tiếng cuối cho FFmpeg chạy nền (song song
+    // với các bước kiểm tra file bên dưới).
+    final streamedAudioFuture = audioEncoder?.finish();
 
     final audioOffsetMs = audioSyncOffsetMs(
       firstSampleEpochMs: firstSampleEpochMs,
@@ -3890,7 +4317,9 @@ class RecordingService {
       return null;
     }
 
+    final probeStartMs = finalizeWatch.elapsedMilliseconds;
     final videoProbe = await _probeVideo(file);
+    final probeMs = finalizeWatch.elapsedMilliseconds - probeStartMs;
     if (videoProbe == null ||
         !isDecodableVideoProbe(
           hasVideo: videoProbe.hasVideo,
@@ -3916,10 +4345,26 @@ class RecordingService {
     );
     final recorderStoppedAt = endedAt;
     final wallDuration = recorderStoppedAt.difference(startedAt);
+    // Bàn giao không gián đoạn: đoạn cũ kết thúc đúng lúc đoạn mới bắt đầu;
+    // phần ghi chồng ở cuối file được cắt khi đóng gói TS.
     endedAt = segmentBoundaryEndedAt(
       startedAt: startedAt,
-      recorderStoppedAt: recorderStoppedAt,
+      recorderStoppedAt: handoff?.nextStartedAt ?? recorderStoppedAt,
     );
+    final handoffOutputSeconds = handoff == null
+        ? null
+        : gaplessHandoffOutputDurationSeconds(
+            mediaDurationSeconds: videoProbe.durationSeconds!,
+            nextStartedAt: handoff.nextStartedAt,
+            recorderStoppedAt: recorderStoppedAt,
+          );
+    if (handoffOutputSeconds != null) {
+      developer.log(
+        'Gapless handoff: keeping ${handoffOutputSeconds.toStringAsFixed(3)}s '
+        'of ${videoProbe.durationSeconds!.toStringAsFixed(3)}s ($path)',
+        name: 'RecordingService',
+      );
+    }
     if ((mediaDuration - wallDuration).abs() > const Duration(seconds: 2)) {
       developer.log(
         'MEDIA TIMELINE MISMATCH: wall=${wallDuration.inMilliseconds}ms, '
@@ -3957,6 +4402,10 @@ class RecordingService {
       debugPrint('[VNVAR] RECORDER FILE RECOVERED: $path | $fileSize bytes');
     }
 
+    final streamedAudio = streamedAudioFuture == null
+        ? null
+        : await streamedAudioFuture;
+    final convertStartMs = finalizeWatch.elapsedMilliseconds;
     final converted = await _convertRecordingToTs(
       file,
       startedAt,
@@ -3965,8 +4414,21 @@ class RecordingService {
       facingMode: segmentFacingMode,
       quarterTurns: segmentQuarterTurns,
       audioOffsetMs: audioOffsetMs,
+      maxDurationSeconds: handoffOutputSeconds,
+      preEncodedAudio: streamedAudio,
+      preEncodedAudioSampleRate: audioEncoder?.sampleRate ?? 48000,
     );
     file = converted.file;
+    debugPrint(
+      '[VNVAR-TIMING] segment finalize: stop=${stopMs}ms '
+      'probe=${probeMs}ms '
+      'convert=${finalizeWatch.elapsedMilliseconds - convertStartMs}ms '
+      'total=${finalizeWatch.elapsedMilliseconds}ms '
+      'media=${videoProbe.durationSeconds!.toStringAsFixed(1)}s '
+      'size=${(fileSize / 1048576).toStringAsFixed(1)}MB '
+      'handoff=${handoff != null} '
+      'streamedAudio=${streamedAudio != null}',
+    );
 
     // Lấy kích thước trước cleanup. Một RecordingService khác dùng chung thư
     // mục hoặc chính cơ chế giới hạn 20 GB có thể xóa file trong lúc cleanup.
@@ -5163,6 +5625,25 @@ class RecordingService {
       } catch (error, stackTrace) {
         developer.log(
           '[STORAGE] Unable to remove stale recording journal: ${entity.path}',
+          error: error,
+          stackTrace: stackTrace,
+          name: 'RecordingService',
+        );
+      }
+    }
+    // AAC tạm của bộ xử lý tiếng chạy nền (bình thường bị xoá ngay sau khi
+    // chốt segment; chỉ còn lại sau crash).
+    await for (final entity in directory.list()) {
+      if (entity is! File || !entity.path.toLowerCase().endsWith('.aac')) {
+        continue;
+      }
+      if (_currentAudioEncoder?.aacPath == entity.path) continue;
+      try {
+        final stat = await entity.stat();
+        if (now.difference(stat.modified) >= maxAge) await entity.delete();
+      } catch (error, stackTrace) {
+        developer.log(
+          '[STORAGE] Unable to remove stale streamed audio: ${entity.path}',
           error: error,
           stackTrace: stackTrace,
           name: 'RecordingService',

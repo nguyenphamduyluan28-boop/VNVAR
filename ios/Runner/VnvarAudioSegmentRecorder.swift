@@ -77,13 +77,90 @@ final class VnvarAudioSegmentRecorder {
 
   private func startLocked(path: String) throws -> [String: Any] {
     guard recorder == nil else { throw VnvarAudioSegmentError.alreadyRecording }
-    let session = AVAudioSession.sharedInstance()
-    try session.setCategory(
-      .playAndRecord,
-      mode: .videoRecording,
-      options: [.defaultToSpeaker, .allowBluetooth]
+    let (newRecorder, firstSampleMs) = try beginRecording(path: path)
+    // Chỉ gán ở đây (bắt đầu segment). Ghi tiếp sau gián đoạn (record() trong
+    // handleInterruption) KHÔNG được ghi đè mốc này.
+    firstSampleEpochMs = firstSampleMs
+    recorder = newRecorder
+    self.path = path
+    interrupted = false
+    pcmGeneration &+= 1
+    startPcmTail(path: path)
+    observeInterruptions()
+    return ["path": path, "active": true, "bytes": fileSize(path)]
+  }
+
+  /// Chuyển sang file WAV mới mà không hở tiếng: recorder mới bắt đầu ghi
+  /// (hẹn giờ trên đồng hồ thiết bị) TRƯỚC khi recorder cũ dừng. Trả về như
+  /// start(path:) kèm "previous" = kết quả chốt file cũ (như stop()). Lỗi mở
+  /// file mới thì ném lỗi, file cũ vẫn ghi tiếp như chưa có gì.
+  func rotate(path: String) throws -> [String: Any] {
+    try onQueue { try rotateLocked(path: path) }
+  }
+
+  private func rotateLocked(path: String) throws -> [String: Any] {
+    guard let previousRecorder = recorder, let previousPath = self.path else {
+      return try startLocked(path: path)
+    }
+    let (newRecorder, firstSampleMs) = try beginRecording(
+      path: path,
+      configureSession: false
     )
-    try session.setActive(true)
+    // Giữ recorder cũ tới khi recorder mới thật sự bắt đầu ghi (đã hẹn sau
+    // scheduledStartDelay), để hai file chồng nhau vài chục ms thay vì hở.
+    Thread.sleep(forTimeInterval: Self.scheduledStartDelay + 0.03)
+
+    let previousFirstSample = firstSampleEpochMs
+    let previousDuration = previousRecorder.currentTime
+    pcmTimer?.cancel()
+    pcmTimer = nil
+    previousRecorder.stop()
+
+    firstSampleEpochMs = firstSampleMs
+    recorder = newRecorder
+    self.path = path
+    interrupted = false
+    pcmGeneration &+= 1
+    startPcmTail(path: path)
+    observeInterruptions()
+
+    var previous: [String: Any] = ["path": previousPath, "active": false]
+    let previousBytes = fileSize(previousPath)
+    if previousBytes > 44, previousDuration > 0 {
+      previous["bytes"] = previousBytes
+      if let previousFirstSample = previousFirstSample {
+        previous["firstSampleEpochMs"] = previousFirstSample
+      }
+    } else {
+      try? FileManager.default.removeItem(atPath: previousPath)
+      previous["bytes"] = 0
+    }
+    return [
+      "path": path,
+      "active": true,
+      "bytes": fileSize(path),
+      "previous": previous,
+    ]
+  }
+
+  /// Bật audio session, tạo AVAudioRecorder ghi WAV vào [path] và bắt đầu ghi
+  /// (hẹn giờ trên đồng hồ thiết bị). Trả về recorder và mốc epoch (ms) của
+  /// mẫu đầu tiên. Không đụng tới trạng thái của segment đang ghi.
+  /// [configureSession] = false khi đang ghi (đổi file): session đã bật sẵn,
+  /// đặt lại category giữa chừng có thể làm hệ thống đổi tuyến âm thanh.
+  private func beginRecording(
+    path: String,
+    configureSession: Bool = true
+  ) throws -> (AVAudioRecorder, Double) {
+    let session = AVAudioSession.sharedInstance()
+    if configureSession {
+      try session.setCategory(
+        .playAndRecord,
+        mode: .videoRecording,
+        options: [.defaultToSpeaker, .allowBluetooth]
+      )
+      try session.setActive(true)
+    }
 
     let url = URL(fileURLWithPath: path)
     try FileManager.default.createDirectory(
@@ -132,16 +209,7 @@ final class VnvarAudioSegmentRecorder {
       try? FileManager.default.removeItem(at: url)
       throw VnvarAudioSegmentError.cannotStart
     }
-    // Chỉ gán ở đây (bắt đầu segment). Ghi tiếp sau gián đoạn (record() trong
-    // handleInterruption) KHÔNG được ghi đè mốc này.
-    firstSampleEpochMs = firstSampleMs
-    recorder = newRecorder
-    self.path = path
-    interrupted = false
-    pcmGeneration &+= 1
-    startPcmTail(path: path)
-    observeInterruptions()
-    return ["path": path, "active": true, "bytes": fileSize(path)]
+    return (newRecorder, firstSampleMs)
   }
 
   func stop() throws -> [String: Any]? {

@@ -267,6 +267,16 @@ Duration checkVarFollowUpTimeout({
   return recorded + checkVarMinimumActiveSegmentAge + margin;
 }
 
+/// Có ghi log `[VNVAR-API]` cho yêu cầu này không: bỏ các lệnh gọi lặp liên
+/// tục (trạng thái, WebRTC, bảng tỉ số) để log chỉ còn các thao tác xem lại.
+bool shouldLogApiRequest(String path) {
+  const noisyPrefixes = ['/status', '/webrtc/', '/api/score'];
+  for (final prefix in noisyPrefixes) {
+    if (path == prefix || path.startsWith(prefix)) return false;
+  }
+  return true;
+}
+
 /// Độ dài tối đa của một clip cắt thủ công qua `/trim`. Clip dài hơn chiếm
 /// hàng đợi FFmpeg lâu và làm chậm Check VAR.
 const int maximumManualTrimDurationMs = 10 * 60 * 1000;
@@ -452,6 +462,11 @@ class CameraServer {
   bool _iosLifecycleSuspended = false;
   final Map<String, Future<Map<String, dynamic>>> _checkVarJobs = {};
   final Map<String, Map<String, dynamic>> _checkVarResults = {};
+  // Clip Check VAR đã báo tên cho tablet nhưng có thể còn đang cắt nền
+  // (tên file → clip, null khi cắt lỗi). /download chờ clip xong; lỗi thì
+  // chuyển sang segment gốc.
+  final Map<String, ({Future<RecordedSegment?> clip, String sourceFileName})>
+  _announcedCheckVarClips = {};
   Future<void> _checkVarProcessingTail = Future<void>.value();
   final RequestRateLimiter _rateLimiter = RequestRateLimiter();
   Future<void> _webRtcOfferTail = Future<void>.value();
@@ -857,6 +872,16 @@ class CameraServer {
     final method = request.method;
 
     developer.log('$method $path', name: 'CameraServer');
+    // Ghi lại tablet gọi API nào (kèm tham số, Range) để biết chính xác các
+    // chức năng xem lại đang dùng gì. Bỏ qua các lệnh gọi lặp liên tục.
+    if (shouldLogApiRequest(path)) {
+      final range = request.headers.value(HttpHeaders.rangeHeader);
+      debugPrint(
+        '[VNVAR-API] $method ${request.uri}'
+        '${range == null ? '' : ' range=$range'}'
+        ' from=${request.connectionInfo?.remoteAddress.address ?? '?'}',
+      );
+    }
 
     try {
       if (_stopping) {
@@ -1621,6 +1646,7 @@ class CameraServer {
     required DateTime receivedAt,
   }) async {
     final owner = _exportOwnerFor(request);
+    final checkVarWatch = Stopwatch()..start();
     int? requestedLookback = int.tryParse(
       request.uri.queryParameters['lookbackSeconds'] ??
           request.uri.queryParameters['lookback'] ??
@@ -1650,7 +1676,12 @@ class CameraServer {
       }
     }
     final lookbackSeconds = (requestedLookback ?? 15).clamp(5, 60).toInt();
-    return _serializeCheckVarProcessing(
+    debugPrint(
+      '[VNVAR-API] checkvar requestedLookback=$requestedLookback '
+      'lookbackSeconds=$lookbackSeconds',
+    );
+    final checkpointMs = checkVarWatch.elapsedMilliseconds;
+    final result = await _serializeCheckVarProcessing(
       () => _finishCheckVar(
         requestId: requestId,
         requestedAt: requestedAt,
@@ -1659,6 +1690,13 @@ class CameraServer {
         owner: owner,
       ),
     );
+    debugPrint(
+      '[VNVAR-TIMING] checkvar: checkpoint=${checkpointMs}ms '
+      'clip=${checkVarWatch.elapsedMilliseconds - checkpointMs}ms '
+      'total=${checkVarWatch.elapsedMilliseconds}ms '
+      'source=${source.segment.fileName}',
+    );
+    return result;
   }
 
   Future<({RecordedSegment segment, bool usedPrevious})> _checkpointCheckVar(
@@ -1832,45 +1870,57 @@ class CameraServer {
     final clipStartMs = preceding == null
         ? range.startMs
         : range.endMs - requestedWindowMs;
+    // Clip ngắn được cắt NỀN sau khi trả lời (tablet đang dùng không tải clip
+    // này, chỉ mở segment vừa chốt): báo trước tên clip, /download/<clip>
+    // chờ clip cắt xong; cắt lỗi thì chuyển sang segment gốc.
+    Future<RecordedSegment>? clipFuture;
+    String? announcedClipFileName;
+    String? announcedClipId;
+    var predictedClipDurationMs = 0;
     if (range.endMs - clipStartMs >= 500) {
-      try {
-        Future<RecordedSegment> trim() => recordingService.trimSegment(
-          segmentId: segment.id,
-          startMs: clipStartMs,
-          endMs: range.endMs,
-          streamCopy: true,
-          minimumOutputDurationMs: 500,
-          precedingSegmentId: preceding?.id,
-          owner: owner,
-          // Check VAR chen trước các lệnh /trim thủ công đang chờ.
-          priority: true,
-        );
+      final reservedMs = DateTime.now().millisecondsSinceEpoch;
+      announcedClipFileName = buildTrimmedClipFileName(
+        recordingService.cameraId,
+        reservedMs,
+      );
+      announcedClipId = 'CLIP_${recordingService.cameraId}_$reservedMs';
+      predictedClipDurationMs = range.endMs - clipStartMs;
+      Future<RecordedSegment> trim() => recordingService.trimSegment(
+        segmentId: segment.id,
+        startMs: clipStartMs,
+        endMs: range.endMs,
+        streamCopy: true,
+        minimumOutputDurationMs: 500,
+        precedingSegmentId: preceding?.id,
+        owner: owner,
+        // Check VAR chen trước các lệnh /trim thủ công đang chờ.
+        priority: true,
+        reservedTimestampMs: reservedMs,
+      );
+      clipFuture = () async {
         try {
-          checkpoint = await trim();
+          return await trim();
         } on TrimInProgressException {
           // Dự phòng (job ưu tiên không bị giới hạn hàng đợi): chờ xong rồi
           // cắt, không bỏ clip Check VAR.
           await recordingService.waitForTrimIdle();
-          checkpoint = await trim();
+          return await trim();
         }
-        autoTrimmed = true;
-        developer.log(
-          '[CHECKVAR] Clip ready: ${checkpoint.fileName} '
-          '(${checkpoint.durationMs}ms)',
-          name: 'CameraServer',
-        );
-      } catch (error, stackTrace) {
-        trimError = userFacingError(error);
-        developer.log(
-          'Unable to create automatic Check VAR clip; returning source segment',
-          error: error,
-          stackTrace: stackTrace,
-          name: 'CameraServer',
-        );
+      }();
+      autoTrimmed = true;
+      _announcedCheckVarClips[announcedClipFileName] = (
+        clip: clipFuture.then<RecordedSegment?>(
+          (clip) => clip,
+          onError: (Object _) => null,
+        ),
+        sourceFileName: segment.fileName,
+      );
+      while (_announcedCheckVarClips.length > 50) {
+        _announcedCheckVarClips.remove(_announcedCheckVarClips.keys.first);
       }
     }
     final checkpointDownloadUrl = autoTrimmed
-        ? '/download/${checkpoint.fileName}'
+        ? '/download/$announcedClipFileName'
         : '/video/${checkpoint.fileName}';
     final now = DateTime.now().millisecondsSinceEpoch;
     final result = <String, dynamic>{
@@ -1883,8 +1933,9 @@ class CameraServer {
       'usedPreviousSegment': source.usedPrevious,
       // Clip đã nối thêm phần cuối segment liền trước (false nếu không cần
       // hoặc hai file khác codec/kích thước/góc xoay nên không nối được).
-      'joinedPrecedingSegment':
-          autoTrimmed && checkpoint.joinedPrecedingSegment,
+      // Dự đoán lúc trả lời; cập nhật theo clip thật khi cắt xong (tra lại
+      // qua /checkvar/jobs/{requestId}).
+      'joinedPrecedingSegment': autoTrimmed && preceding != null,
       'autoTrimmed': autoTrimmed,
       'lookbackSeconds': lookbackSeconds,
       'trimError': trimError,
@@ -1896,11 +1947,11 @@ class CameraServer {
       },
       'checkVarClip': autoTrimmed
           ? {
-              'id': checkpoint.id,
-              'fileName': checkpoint.fileName,
-              'durationMs': checkpoint.durationMs,
+              'id': announcedClipId,
+              'fileName': announcedClipFileName,
+              'durationMs': predictedClipDurationMs,
               'downloadUrl': checkpointDownloadUrl,
-              'eventOffsetMs': checkpoint.durationMs,
+              'eventOffsetMs': predictedClipDurationMs,
             }
           : null,
       'preferredDownloadUrl': checkpointDownloadUrl,
@@ -1910,6 +1961,46 @@ class CameraServer {
       'url=$checkpointDownloadUrl',
       name: 'CameraServer',
     );
+    if (clipFuture != null) {
+      final clipWatch = Stopwatch()..start();
+      unawaited(
+        clipFuture.then(
+          (clip) {
+            // Cập nhật kết quả đã lưu theo clip thật (cùng một Map).
+            final clipJson = result['checkVarClip'];
+            if (clipJson is Map<String, dynamic>) {
+              clipJson['durationMs'] = clip.durationMs;
+              clipJson['eventOffsetMs'] = clip.durationMs;
+            }
+            result['joinedPrecedingSegment'] = clip.joinedPrecedingSegment;
+            developer.log(
+              '[CHECKVAR] Clip ready: ${clip.fileName} '
+              '(${clip.durationMs}ms)',
+              name: 'CameraServer',
+            );
+            debugPrint(
+              '[VNVAR-TIMING] checkvar clip ready in background: '
+              '${clipWatch.elapsedMilliseconds}ms ${clip.fileName}',
+            );
+          },
+          onError: (Object error, StackTrace stackTrace) {
+            result['autoTrimmed'] = false;
+            result['trimError'] = userFacingError(error);
+            result['checkVarClip'] = null;
+            result['joinedPrecedingSegment'] = false;
+            result['preferredDownloadUrl'] = '/video/${segment.fileName}';
+            developer.log(
+              'Unable to create automatic Check VAR clip; '
+              '/download falls back to the source segment',
+              error: error,
+              stackTrace: stackTrace,
+              name: 'CameraServer',
+            );
+            debugPrint('[VNVAR-TIMING] checkvar clip failed: $error');
+          },
+        ),
+      );
+    }
     return result;
   }
 
@@ -2104,6 +2195,31 @@ class CameraServer {
 
     final fileName = request.uri.pathSegments.last;
 
+    // Clip Check VAR đã báo tên nhưng có thể còn đang cắt nền.
+    final announced = _announcedCheckVarClips[fileName];
+    if (announced != null) {
+      RecordedSegment? clip;
+      try {
+        clip = await announced.clip.timeout(const Duration(seconds: 60));
+      } catch (_) {
+        clip = null;
+      }
+      if (clip == null) {
+        // Cắt lỗi: giống trước đây (Check VAR trả segment gốc khi cắt lỗi).
+        await request.response.redirect(
+          Uri(path: '/video/${announced.sourceFileName}'),
+          status: HttpStatus.temporaryRedirect,
+        );
+        return;
+      }
+      final ready = recordingService.findExportByFileName(clip.fileName) ?? clip;
+      final clipFile = File(ready.path);
+      if (await clipFile.exists()) {
+        await _sendVideoFile(request, clipFile, attachment: true);
+        return;
+      }
+    }
+
     final segment =
         recordingService.findExportByFileName(fileName) ?? _findVideo(fileName);
 
@@ -2177,6 +2293,10 @@ class CameraServer {
       });
       return;
     }
+    debugPrint(
+      '[VNVAR-API] trim segmentId=${segmentId.trim()} '
+      'startMs=$startMs endMs=$endMs',
+    );
     late final RecordedSegment clip;
     try {
       clip = await recordingService.trimSegment(

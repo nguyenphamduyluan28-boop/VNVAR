@@ -200,6 +200,8 @@ import UIKit
         } catch {
           result(FlutterError(code: "AUDIO_STOP_FAILED", message: error.localizedDescription, details: nil))
         }
+      case "rotateNativeAudioSegment":
+        self.rotateNativeAudioSegment(call, result)
       case "getNativeAudioSegmentStatus":
         result(self.audioSegmentRecorder.status())
       case "getAvailableStorageBytes":
@@ -413,7 +415,8 @@ import UIKit
     let bitrate = (arguments["bitrate"] as? NSNumber)?.intValue ?? 2_000_000
     let fps = (arguments["fps"] as? NSNumber)?.intValue ?? 30
     let audioTrackId = arguments["audioTrackId"] as? String
-    let remoteAudio = arguments["remoteAudio"] as? Bool ?? false
+    // Tablet (client RTSP qua mạng) luôn nhận tiếng.
+    let remoteAudio = arguments["remoteAudio"] as? Bool ?? true
     guard (1...65_535).contains(port) else {
       result(
         FlutterError(
@@ -1027,6 +1030,28 @@ import UIKit
     case .undetermined:
       requestRecordAccess { granted in
         DispatchQueue.main.async { result(granted) }
+      }
+    }
+  }
+
+  /// Chuyển segment không gián đoạn: đổi file WAV mà không dừng micro. Chạy
+  /// nền vì recorder cũ được giữ thêm vài chục ms cho tới khi recorder mới ghi.
+  private func rotateNativeAudioSegment(_ call: FlutterMethodCall, _ result: @escaping FlutterResult) {
+    guard let arguments = call.arguments as? [String: Any],
+          let path = arguments["path"] as? String, !path.isEmpty else {
+      result(FlutterError(code: "AUDIO_PATH_REQUIRED", message: "Audio path is required.", details: nil))
+      return
+    }
+    let recorder = audioSegmentRecorder
+    DispatchQueue.global(qos: .userInitiated).async {
+      do {
+        let response = try recorder.rotate(path: path)
+        DispatchQueue.main.async { result(response) }
+      } catch {
+        let message = error.localizedDescription
+        DispatchQueue.main.async {
+          result(FlutterError(code: "AUDIO_ROTATE_FAILED", message: message, details: nil))
+        }
       }
     }
   }

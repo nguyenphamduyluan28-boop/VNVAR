@@ -44,6 +44,16 @@ class NativeAudioSegmentRecorder(private val context: Context) {
     /** Một chunk PCM kèm thời điểm (epoch ms) mẫu đầu tiên của nó được thu. */
     private class PcmChunk(val data: ByteArray, val captureEpochMs: Double)
 
+    /**
+     * Lệnh đổi file cho luồng ghi (chuyển segment không gián đoạn): mọi chunk
+     * xếp hàng trước lệnh vào file cũ, mọi chunk sau vào file mới, nên không
+     * mất hay lặp mẫu nào ở chỗ nối.
+     */
+    private class SwitchFile(val file: File, val writer: RandomAccessFile) {
+        val done = CountDownLatch(1)
+        @Volatile var previous: Map<String, Any?>? = null
+    }
+
     // Ghi file chạy trên luồng riêng. Luồng thu âm chỉ đọc AudioRecord và đẩy
     // dữ liệu đi, nên một lần ghi/fsync chậm của bộ nhớ (FFmpeg đóng gói
     // segment, dọn dung lượng) không còn làm tràn bộ đệm AudioRecord và gây
@@ -69,6 +79,33 @@ class NativeAudioSegmentRecorder(private val context: Context) {
                             dataBytes.addAndGet(item.data.size.toLong())
                         }
                     } catch (_: Exception) {}
+                }
+                is SwitchFile -> {
+                    synchronized(fileLock) {
+                        val bytes = dataBytes.get()
+                        val previousFile = outputFile
+                        val firstSample = segmentFirstSampleEpochMs
+                        try {
+                            output?.let {
+                                writeWavHeader(it, SAMPLE_RATE, 1, 16, bytes)
+                                it.fd.sync()
+                                it.close()
+                            }
+                        } catch (error: Exception) {
+                            android.util.Log.w(LOG_TAG, "Unable to finalize WAV on switch", error)
+                        }
+                        item.previous = mapOf(
+                            "path" to previousFile?.absolutePath,
+                            "bytes" to bytes,
+                            "firstSampleEpochMs" to firstSample,
+                        )
+                        output = item.writer
+                        outputFile = item.file
+                        dataBytes.set(0L)
+                        segmentFirstSampleEpochMs = null
+                        lastProgressElapsedMs.set(android.os.SystemClock.elapsedRealtime())
+                    }
+                    item.done.countDown()
                 }
                 is CountDownLatch -> item.countDown()
             }
@@ -351,6 +388,49 @@ class NativeAudioSegmentRecorder(private val context: Context) {
         }
 
         return mapOf("path" to path, "sampleRate" to sampleRate, "channels" to 1)
+    }
+
+    /**
+     * Chuyển sang file WAV mới mà không ngắt tiếng (AudioRecord vẫn chạy). Trả
+     * về như [start] kèm "previous" = kết quả chốt file cũ (như [stop]). Lỗi
+     * mở file mới thì ném lỗi và file cũ vẫn ghi tiếp như chưa có gì.
+     */
+    @Synchronized
+    fun rotate(path: String): Map<String, Any?> {
+        val active = synchronized(fileLock) { output != null } && recordingFileActive.get()
+        if (!active) {
+            return start(path) + ("previous" to null)
+        }
+        val file = File(path)
+        file.parentFile?.mkdirs()
+        val writer = RandomAccessFile(file, "rw")
+        try {
+            writer.setLength(0)
+            writeWavHeader(writer, SAMPLE_RATE, 1, 16, 0)
+        } catch (error: Exception) {
+            try { writer.close() } catch (_: Exception) {}
+            try { file.delete() } catch (_: Exception) {}
+            throw error
+        }
+        val switch = SwitchFile(file, writer)
+        // Chunk đầu tiên của file mới cần mốc thời gian chính xác (C2).
+        firstSampleStampNeeded = true
+        writeQueue.put(switch)
+        val switched = try {
+            switch.done.await(5, TimeUnit.SECONDS)
+        } catch (_: InterruptedException) {
+            Thread.currentThread().interrupt()
+            false
+        }
+        if (!switched) {
+            android.util.Log.w(LOG_TAG, "WAV switch still pending after 5 s: $path")
+        }
+        return mapOf(
+            "path" to path,
+            "sampleRate" to SAMPLE_RATE,
+            "channels" to 1,
+            "previous" to switch.previous,
+        )
     }
 
     @Synchronized

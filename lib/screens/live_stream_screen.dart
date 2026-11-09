@@ -1863,7 +1863,7 @@ class _LiveStreamScreenState extends State<LiveStreamScreen> {
   }
 
   // ============================================================
-  // KHỐI TUỲ CHỌN — bảng tỉ số, âm thanh Tablet, chất lượng, nâng cao
+  // KHỐI TUỲ CHỌN — bảng tỉ số, chất lượng, nâng cao
   // ============================================================
   Widget _buildOptionsSection() {
     final webRtc = widget.runtime.webRtcService;
@@ -1876,14 +1876,6 @@ class _LiveStreamScreenState extends State<LiveStreamScreen> {
         ListenableBuilder(
           listenable: _liveTicker,
           builder: (context, _) => _buildScoreboardTile(),
-        ),
-        BrandTile(
-          icon: Icons.volume_up_rounded,
-          title: appText(context, 'Âm thanh Tablet', 'Tablet audio'),
-          trailing: Switch.adaptive(
-            value: widget.runtime.rtspTabletAudio,
-            onChanged: _setTabletAudio,
-          ),
         ),
         BrandTile(
           icon: Icons.hd_rounded,
@@ -1995,21 +1987,6 @@ class _LiveStreamScreenState extends State<LiveStreamScreen> {
         ),
       ],
     );
-  }
-
-  Future<void> _setTabletAudio(bool value) async {
-    try {
-      await widget.runtime.setRtspTabletAudio(value);
-    } catch (error) {
-      if (!mounted) return;
-      showAppNotice(
-        context,
-        vi: 'Không đổi được âm thanh Tablet: ${_streamErrorText(error, english: false)}',
-        en: 'Could not change tablet audio: ${_streamErrorText(error, english: true)}',
-        kind: NoticeKind.error,
-      );
-    }
-    if (mounted) setState(() {});
   }
 
   /// Mục "Nâng cao" thu gọn: RTSP nội bộ + WHIP.
