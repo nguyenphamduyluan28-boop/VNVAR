@@ -53,7 +53,9 @@
             initWithMediaType:AVMediaTypeVideo
                outputSettings:videoSettings];
     self.writerInput.expectsMediaDataInRealTime = true;
-    self.writerInput.mediaTimeScale = 30;
+    // VNVAR patch: 600 chia hết cho 24/25/30/60 nên giữ đúng nhịp khung khi
+    // quay 60 FPS (timescale 30 làm tròn PTS 60 FPS, gây trùng/rớt khung).
+    self.writerInput.mediaTimeScale = 600;
 
     if (_audioSink != nil) {
         AudioChannelLayout acl;
