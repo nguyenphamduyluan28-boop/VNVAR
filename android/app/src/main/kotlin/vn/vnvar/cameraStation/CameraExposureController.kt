@@ -6,6 +6,7 @@ import android.hardware.camera2.CameraCaptureSession
 import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CameraDevice
 import android.hardware.camera2.CameraManager
+import android.hardware.camera2.CameraMetadata
 import android.hardware.camera2.CaptureRequest
 import android.hardware.camera2.CaptureResult
 import android.hardware.camera2.TotalCaptureResult
@@ -17,6 +18,7 @@ import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
 import android.util.Log
+import android.util.Range
 import android.view.Surface
 import com.cloudwebrtc.webrtc.FlutterWebRTCPlugin
 import com.cloudwebrtc.webrtc.GetUserMediaImpl
@@ -56,6 +58,16 @@ object CameraExposureController {
     private const val AF_FOCUS_TIMEOUT_MS = 8_000L
     /** AF báo nét (sau khi đã quét) liên tục chừng này thì khoá tiêu cự. */
     private const val FOCUS_LOCK_AFTER_MS = 1_000L
+    /**
+     * Lấy nét theo chuẩn camera: để AF liên tục của chính camera
+     * (CONTROL_AF_MODE_CONTINUOUS_VIDEO, như app Camera khi quay video) tự lo.
+     * App KHÔNG tự khoá ống kính ở một cự ly (AF_MODE_OFF + LENS_FOCUS_DISTANCE),
+     * không tự quét tiêu cự, không lấy nét một lần. Lý do: khoá cự ly từng khoá
+     * nhầm ở 11,48 dpt (~9 cm) khi lúc mở camera có vật sát ống kính, cả khung
+     * mờ suốt buổi mà cơ chế canh độ nét không phát hiện ra.
+     * Đặt false để bật lại cơ chế khoá cự ly cũ (chống săn nét).
+     */
+    private const val USE_NATIVE_CONTINUOUS_AF = true
     /**
      * AF bắt đầu quét lại chừng này lần mà chưa lần nào giữ nét đủ
      * [FOCUS_LOCK_AFTER_MS] = đang "săn nét" (màn hình/đèn LED, cảnh phẳng):
@@ -334,6 +346,55 @@ object CameraExposureController {
     private var lastActivePhysicalId: String? = null
     @Volatile
     private var activeCameraDeviceId: String? = null
+
+    // ---- Tăng sáng khi thiếu sáng (xem LowLightBoostPolicy) ----
+    // App khoá cứng 30 FPS nên AE chỉ phơi tối đa ~30 ms; trong chỗ tối, EV
+    // dương không sáng thêm được vì vài máy không tự tăng ISO. Khi AE đã hết
+    // đường mà hình còn tối hơn mức EV yêu cầu: tự đặt ISO (phơi 30 ms, giữ
+    // 30 FPS); máy không cho chỉnh tay cảm biến thì nới dải FPS của AE (≥ 24).
+    private enum class LowLightMode { OFF, MANUAL_ISO, FPS_RELAX }
+
+    /** Khả năng của camera đang mở, dùng cho chế độ tăng sáng. */
+    private class LowLightCaps(
+        val cameraId: String,
+        val manualSensor: Boolean,
+        val isoMin: Int,
+        val isoMax: Int,
+        val exposureMinNs: Long,
+        val exposureMaxNs: Long,
+        /** Thời lượng một khung ở FPS cố định (vd 33,3 ms ở 30 FPS). */
+        val frameDurationNs: Long,
+        val maxFps: Int,
+        /** Dải FPS AE nới ra (giá trị thô của máy), null = không có. */
+        val relaxedRange: Pair<Int, Int>?,
+    )
+
+    /** Main thread ghi; camera thread đọc khi dựng request. */
+    @Volatile
+    private var lowLightMode = LowLightMode.OFF
+    @Volatile
+    private var lowLightIso = LowLightBoostPolicy.START_ISO
+    @Volatile
+    private var lowLightCaps: LowLightCaps? = null
+    /** Camera đã biết là ISO chỉnh tay không làm hình sáng hơn (chỉ còn nới FPS). */
+    @Volatile
+    private var manualIsoIneffectiveCameraId: String? = null
+    private var lowLightUnavailableLoggedFor: String? = null
+    /** Số liệu kết quả chụp gần nhất (camera thread ghi). */
+    @Volatile
+    private var lastResultExposureNs: Long? = null
+    @Volatile
+    private var lastResultFrameNs: Long? = null
+    @Volatile
+    private var lastResultIso: Int? = null
+    // Bộ đếm giờ của chế độ tăng sáng (chỉ main thread).
+    private var lowLightDarkSinceMs = 0L
+    private var lowLightBrightSinceMs = 0L
+    private var lowLightEnteredAtMs = 0L
+    private var lowLightLastStepMs = 0L
+    private var lowLightAtCapSinceMs = 0L
+    private var lowLightEntryLuma = 0.0
+
     private val lumaMeter = LumaMeter { trackId, luma ->
         lifecycleHandler.post { onLuma(trackId, luma) }
     }
@@ -407,6 +468,11 @@ object CameraExposureController {
         }
         activeTrackId = trackId
         activeTargetEv = targetEv
+        if (targetEv <= 0.0 && lowLightMode != LowLightMode.OFF) {
+            // Người dùng hạ EV về ≤ 0: không cần tăng sáng nữa, request dựng
+            // ngay dưới đây quay lại AE tự động.
+            exitLowLight(null, "EV $targetEv", reapply = false)
+        }
         startWatchdog()
         try {
             val plugin = FlutterWebRTCPlugin.sharedSingleton
@@ -564,6 +630,10 @@ object CameraExposureController {
         lastActivePhysicalId = null
         releaseAutoLock(reason = "camera cleared")
         lumaMeter.detach()
+        lowLightCaps = null
+        lastResultExposureNs = null
+        lastResultFrameNs = null
+        lastResultIso = null
         lastCaptureHeartbeatMs = 0L
         requestGeneration++
         watchdogFailures = 0
@@ -628,6 +698,8 @@ object CameraExposureController {
             focusLockPending = false
             focusedSinceMs = 0L
             focusReleasedAtMs = now
+            // Người gọi luôn apply() lại ngay sau đó (hoặc đang xoá camera).
+            exitLowLight(null, reason.ifEmpty { "released" }, reapply = false)
         }
         aeReleasedAtMs = now
         convergedSinceMs = 0L
@@ -668,7 +740,9 @@ object CameraExposureController {
                 "exposureMs=${result.get(CaptureResult.SENSOR_EXPOSURE_TIME)?.let { it / 1_000_000.0 }} " +
                 "frameMs=${result.get(CaptureResult.SENSOR_FRAME_DURATION)?.let { it / 1_000_000.0 }} " +
                 "iso=${result.get(CaptureResult.SENSOR_SENSITIVITY)} " +
-                "measuredFps=${measuredCaptureFps()?.let { "%.1f".format(it) }}",
+                "measuredFps=${measuredCaptureFps()?.let { "%.1f".format(it) }} " +
+                "lowLight=$lowLightMode" +
+                (if (lowLightMode == LowLightMode.MANUAL_ISO) "(iso=$lowLightIso)" else ""),
         )
     }
 
@@ -989,7 +1063,11 @@ object CameraExposureController {
         val afTimedOut = min(sinceSessionMs, sinceFocusReleaseMs) >= AF_FOCUS_TIMEOUT_MS
 
         // ---- 1. Khoá tiêu cự ----
-        if (lockedFocusDistance == null && focusSweep == null && oneShotFocusStartedAt == 0L &&
+        // Lấy nét theo chuẩn camera (USE_NATIVE_CONTINUOUS_AF): bỏ qua toàn bộ
+        // bước khoá cự ly; request giữ CONTINUOUS_VIDEO vì lockedFocusDistance,
+        // sweepDistance luôn null và không có lượt lấy nét một lần nào.
+        if (!USE_NATIVE_CONTINUOUS_AF &&
+            lockedFocusDistance == null && focusSweep == null && oneShotFocusStartedAt == 0L &&
             activeHasAutoFocus && !focusLockPending && sinceSessionMs >= MIN_LOCK_AFTER_SESSION_MS
         ) {
             val lensStill = result.get(CaptureResult.LENS_STATE) !=
@@ -1069,6 +1147,11 @@ object CameraExposureController {
         }
 
         // ---- 2. Khoá AE/AWB ----
+        // Đang tăng sáng: app tự điều khiển phơi sáng (hoặc dải FPS), không khoá AE.
+        if (lowLightMode != LowLightMode.OFF) {
+            convergedSinceMs = 0L
+            return
+        }
         if (autoLocked || lockPending) return
         // Không có bộ đo sáng thì không phát hiện được ánh sáng đổi để mở khoá:
         // giữ AE/AWB tự động (khoá tiêu cự ở trên không cần bộ đo sáng).
@@ -1082,8 +1165,10 @@ object CameraExposureController {
             (timedOut && ae != CaptureResult.CONTROL_AE_STATE_PRECAPTURE)
         // Chờ tiêu cự khoá trước (hoặc hết hạn) để lần khoá AE không bị request
         // khoá tiêu cự thay ngay sau đó.
+        // AF liên tục chuẩn camera không bao giờ khoá tiêu cự: không chờ.
         val focusReady = focusSweep == null && (
-            !activeHasAutoFocus || af == null || lockedFocusDistance != null || afTimedOut
+            USE_NATIVE_CONTINUOUS_AF ||
+                !activeHasAutoFocus || af == null || lockedFocusDistance != null || afTimedOut
             )
         if (!aeSettled || !focusReady || sinceSessionMs < MIN_LOCK_AFTER_SESSION_MS) {
             convergedSinceMs = 0L
@@ -1112,6 +1197,7 @@ object CameraExposureController {
 
     /** Main thread: độ sáng trung bình khung hình (0..255, đã làm mượt). */
     private fun onLuma(trackId: String, luma: Double) {
+        if (activeTrackId == trackId && updateLowLightBoost(trackId, luma)) return
         if (activeTrackId != trackId || !autoLocked) {
             lumaDriftSinceMs = 0L
             return
@@ -1597,6 +1683,18 @@ object CameraExposureController {
         val compensationStep = characteristics.get(
             CameraCharacteristics.CONTROL_AE_COMPENSATION_STEP,
         )?.toDouble() ?: 0.0
+        val rawMaxFps = captureFormat.framerate.max / fpsUnitFactor
+        updateLowLightCaps(
+            cameraDevice.id,
+            characteristics,
+            if (rawMaxFps >= 1000) rawMaxFps / 1000 else rawMaxFps,
+        )
+        // Chụp trạng thái một lần: request và appliedKey dùng cùng giá trị.
+        val lowLight = lowLightMode
+        val lowLightCapsNow = lowLightCaps
+        val manualIso = lowLight == LowLightMode.MANUAL_ISO && lowLightCapsNow?.manualSensor == true
+        val manualIsoValue = lowLightIso
+        val relaxedFps = if (lowLight == LowLightMode.FPS_RELAX) lowLightCapsNow?.relaxedRange else null
         val compensation = if (compensationRange != null && compensationStep > 0.0) {
             (targetEv / compensationStep).roundToInt().coerceIn(
                 compensationRange.lower,
@@ -1616,6 +1714,9 @@ object CameraExposureController {
             activeZoom,
             activeMeteringPoint,
             activeRotationDegrees,
+            lowLight,
+            if (manualIso) manualIsoValue else 0,
+            relaxedFps,
         ).joinToString("|")
         if (appliedKey == lastAppliedKey &&
             SystemClock.elapsedRealtime() - lastCaptureHeartbeatMs < CAPTURE_HEARTBEAT_TIMEOUT_MS
@@ -1637,25 +1738,48 @@ object CameraExposureController {
                 val request = cameraDevice.createCaptureRequest(CameraDevice.TEMPLATE_RECORD).apply {
                     addTarget(surface)
                     set(CaptureRequest.CONTROL_MODE, CaptureRequest.CONTROL_MODE_AUTO)
-                    set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_ON)
-                    if (compensationRange != null && compensationStep > 0.0) {
-                        set(CaptureRequest.CONTROL_AE_EXPOSURE_COMPENSATION, compensation)
+                    if (manualIso && lowLightCapsNow != null) {
+                        // Tăng sáng khi thiếu sáng: app tự đặt cảm biến. Phơi 30 ms
+                        // (3 chu kỳ đèn 50 Hz: không nhấp nháy), khung giữ 30 FPS,
+                        // ISO theo vòng lặp độ sáng (updateLowLightBoost).
+                        val caps = lowLightCapsNow
+                        var exposureNs = min(LowLightBoostPolicy.MANUAL_EXPOSURE_NS, caps.frameDurationNs)
+                        if (caps.exposureMaxNs > 0L) exposureNs = min(exposureNs, caps.exposureMaxNs)
+                        exposureNs = max(exposureNs, caps.exposureMinNs)
+                        set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_OFF)
+                        set(CaptureRequest.SENSOR_EXPOSURE_TIME, exposureNs)
+                        set(CaptureRequest.SENSOR_FRAME_DURATION, caps.frameDurationNs)
+                        set(
+                            CaptureRequest.SENSOR_SENSITIVITY,
+                            manualIsoValue.coerceIn(caps.isoMin, max(caps.isoMin, caps.isoMax)),
+                        )
+                    } else {
+                        set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_ON)
+                        if (compensationRange != null && compensationStep > 0.0) {
+                            set(CaptureRequest.CONTROL_AE_EXPOSURE_COMPENSATION, compensation)
+                        }
                     }
                     // Giữ đủ FPS đã chọn (ví dụ 30–30) thay vì dải WebRTC chọn
                     // (ví dụ 10–30): thiếu sáng camera không được tự hạ FPS
                     // (đã gặp 12,5 FPS). Đánh đổi: hình tối/nhiễu hơn khi tối.
+                    // Thiếu sáng mà máy không chỉnh tay được cảm biến: nới dải FPS
+                    // (vd 24–30) để AE phơi lâu hơn; hết tối thì trả về dải cố định.
                     set(
                         CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE,
-                        CameraUtils.preferredAeFpsRange(
-                            characteristics,
-                            captureFormat.framerate.min / fpsUnitFactor,
-                            captureFormat.framerate.max / fpsUnitFactor,
-                        ),
+                        if (relaxedFps != null) {
+                            Range(relaxedFps.first, relaxedFps.second)
+                        } else {
+                            CameraUtils.preferredAeFpsRange(
+                                characteristics,
+                                captureFormat.framerate.min / fpsUnitFactor,
+                                captureFormat.framerate.max / fpsUnitFactor,
+                            )
+                        },
                     )
                     // Đang tự tìm nét: giữ nguyên phơi sáng để số đo độ nét
                     // giữa các tiêu cự so được với nhau (AE đổi ISO làm nhiễu
                     // hạt đổi theo, số đo nhảy loạn dù tiêu cự không đổi).
-                    val locked = activeCameraLock || autoLocked || focusSweep != null
+                    val locked = !manualIso && (activeCameraLock || autoLocked || focusSweep != null)
                     val aeLockAvailable = characteristics.get(CameraCharacteristics.CONTROL_AE_LOCK_AVAILABLE) == true
                     if (aeLockAvailable) {
                         set(CaptureRequest.CONTROL_AE_LOCK, locked)
@@ -1805,6 +1929,7 @@ object CameraExposureController {
                             if (activeTrackId == trackId && requestGeneration == generation) {
                                 lastCaptureHeartbeatMs = SystemClock.elapsedRealtime()
                                 recordLensState(result)
+                                recordExposureResult(result)
                                 observeConvergence(trackId, generation, result)
                             }
                         }
@@ -1902,7 +2027,8 @@ object CameraExposureController {
             camera1FocusLocked = false
             camera1FocusPending = false
         }
-        val canLockFocus = stableExposureEnabled &&
+        // Lấy nét theo chuẩn camera: không khoá nét, giữ CONTINUOUS_VIDEO.
+        val canLockFocus = !USE_NATIVE_CONTINUOUS_AF && stableExposureEnabled &&
             supportedFocus.contains(Camera.Parameters.FOCUS_MODE_AUTO)
         var startAutoFocus = false
         if (activeCameraLock) {
@@ -2007,6 +2133,241 @@ object CameraExposureController {
     }
 
     /** Camera thread: zoom thực áp dụng + ống vật lý đang chạy (nếu máy báo). */
+    /** Camera thread: số liệu phơi sáng thật của khung vừa chụp (cho tăng sáng). */
+    private fun recordExposureResult(result: TotalCaptureResult) {
+        lastResultExposureNs = result.get(CaptureResult.SENSOR_EXPOSURE_TIME)
+        lastResultFrameNs = result.get(CaptureResult.SENSOR_FRAME_DURATION)
+        lastResultIso = result.get(CaptureResult.SENSOR_SENSITIVITY)
+    }
+
+    /**
+     * Main thread (từ applyCamera2): đọc khả năng camera cho chế độ tăng sáng
+     * và ghi một dòng log "Camera caps" mỗi khi đổi camera/FPS.
+     */
+    private fun updateLowLightCaps(cameraId: String, characteristics: CameraCharacteristics, maxFps: Int) {
+        val current = lowLightCaps
+        if (current != null && current.cameraId == cameraId && current.maxFps == maxFps) return
+        val fps = maxFps.coerceAtLeast(1)
+        val capabilities = characteristics.get(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES)
+        val manualSensor =
+            capabilities?.contains(CameraMetadata.REQUEST_AVAILABLE_CAPABILITIES_MANUAL_SENSOR) == true
+        val isoRange = characteristics.get(CameraCharacteristics.SENSOR_INFO_SENSITIVITY_RANGE)
+        val exposureRange = characteristics.get(CameraCharacteristics.SENSOR_INFO_EXPOSURE_TIME_RANGE)
+        val analogMax = characteristics.get(CameraCharacteristics.SENSOR_MAX_ANALOG_SENSITIVITY)
+        val aeRanges = characteristics.get(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES)
+            ?.map { it.lower to it.upper }
+            ?: emptyList()
+        val caps = LowLightCaps(
+            cameraId = cameraId,
+            manualSensor = manualSensor && isoRange != null && exposureRange != null,
+            isoMin = isoRange?.lower ?: 0,
+            isoMax = isoRange?.upper ?: 0,
+            exposureMinNs = exposureRange?.lower ?: 0L,
+            exposureMaxNs = exposureRange?.upper ?: 0L,
+            frameDurationNs = 1_000_000_000L / fps,
+            maxFps = fps,
+            relaxedRange = LowLightBoostPolicy.chooseRelaxedFpsRange(aeRanges, fps),
+        )
+        if (current != null && lowLightMode != LowLightMode.OFF) {
+            // Đổi camera/FPS giữa chừng: trạng thái tăng sáng thuộc camera cũ.
+            exitLowLight(null, "camera changed", reapply = false)
+        }
+        lowLightCaps = caps
+        Log.i(
+            TAG,
+            "Camera caps ($cameraId): manualSensor=$manualSensor iso=$isoRange analogMax=$analogMax " +
+                "exposureMs=[${exposureRange?.lower?.let { "%.3f".format(it / 1e6) }}, " +
+                "${exposureRange?.upper?.let { "%.1f".format(it / 1e6) }}] maxFps=$fps " +
+                "aeFpsRanges=${aeRanges.joinToString { "[${it.first},${it.second}]" }} " +
+                "relaxedFps=${caps.relaxedRange}",
+        )
+    }
+
+    /**
+     * Main thread, mỗi lần bộ đo sáng có số mới (~500 ms): bật/tắt và điều
+     * chỉnh chế độ tăng sáng. Trả true khi đang tăng sáng (bỏ logic khoá AE).
+     */
+    private fun updateLowLightBoost(trackId: String, luma: Double): Boolean {
+        val caps = lowLightCaps
+        if (caps == null || !activeCamera2 || activeCameraLock || !lumaMeter.isAttachedTo(trackId)) {
+            lowLightDarkSinceMs = 0L
+            if (lowLightMode != LowLightMode.OFF) exitLowLight(trackId, "unavailable")
+            return false
+        }
+        return when (lowLightMode) {
+            LowLightMode.OFF -> {
+                maybeEnterLowLight(trackId, caps, luma)
+                lowLightMode != LowLightMode.OFF
+            }
+            LowLightMode.MANUAL_ISO -> updateManualIso(trackId, caps, luma)
+            LowLightMode.FPS_RELAX -> updateFpsRelax(trackId, caps)
+        }
+    }
+
+    private fun maybeEnterLowLight(trackId: String, caps: LowLightCaps, luma: Double) {
+        val now = SystemClock.elapsedRealtime()
+        val ev = activeTargetEv
+        val saturated = LowLightBoostPolicy.isExposureSaturated(
+            lastResultExposureNs,
+            lastResultFrameNs ?: caps.frameDurationNs,
+        )
+        if (!LowLightBoostPolicy.wantsBoost(ev, saturated, luma)) {
+            lowLightDarkSinceMs = 0L
+            return
+        }
+        if (lowLightDarkSinceMs == 0L) {
+            lowLightDarkSinceMs = now
+            return
+        }
+        if (now - lowLightDarkSinceMs < LowLightBoostPolicy.ENTER_AFTER_MS) return
+        lowLightDarkSinceMs = 0L
+        val target = LowLightBoostPolicy.targetLuma(ev)
+        val mode = when {
+            caps.manualSensor && manualIsoIneffectiveCameraId != caps.cameraId -> LowLightMode.MANUAL_ISO
+            caps.relaxedRange != null -> LowLightMode.FPS_RELAX
+            else -> null
+        }
+        if (mode == null) {
+            if (lowLightUnavailableLoggedFor != caps.cameraId) {
+                lowLightUnavailableLoggedFor = caps.cameraId
+                Log.i(
+                    TAG,
+                    "Low-light boost unavailable on camera ${caps.cameraId}: no manual sensor " +
+                        "control and no AE FPS range >= ${LowLightBoostPolicy.MIN_RELAXED_FPS}",
+                )
+            }
+            return
+        }
+        // Bỏ khoá AE: từ đây app tự điều khiển phơi sáng / dải FPS.
+        releaseAutoLock(keepFocus = true)
+        lowLightMode = mode
+        lowLightEnteredAtMs = now
+        lowLightLastStepMs = now
+        lowLightBrightSinceMs = 0L
+        lowLightAtCapSinceMs = 0L
+        lowLightEntryLuma = luma
+        if (mode == LowLightMode.MANUAL_ISO) {
+            lowLightIso = LowLightBoostPolicy.startIso(
+                lastResultIso,
+                caps.isoMin,
+                LowLightBoostPolicy.isoCap(caps.isoMin, caps.isoMax),
+            )
+            Log.i(
+                TAG,
+                "Low-light ISO boost ON (exp=${LowLightBoostPolicy.MANUAL_EXPOSURE_NS / 1_000_000}ms " +
+                    "iso=$lowLightIso luma=${luma.roundToInt()}->${target.roundToInt()} EV=$ev)",
+            )
+        } else {
+            Log.i(
+                TAG,
+                "Low-light FPS relax ON (AE fps ${caps.relaxedRange}, " +
+                    "luma=${luma.roundToInt()}->${target.roundToInt()} EV=$ev)",
+            )
+        }
+        apply(trackId, activeTargetEv) {}
+    }
+
+    private fun updateManualIso(trackId: String, caps: LowLightCaps, luma: Double): Boolean {
+        val now = SystemClock.elapsedRealtime()
+        val ev = activeTargetEv
+        if (ev <= 0.0) {
+            exitLowLight(trackId, "EV $ev")
+            return false
+        }
+        val target = LowLightBoostPolicy.targetLuma(ev)
+        val cap = LowLightBoostPolicy.isoCap(caps.isoMin, caps.isoMax)
+        // Máy báo hỗ trợ chỉnh tay nhưng bỏ qua ISO: ở trần đủ lâu mà hình
+        // không sáng hơn lúc bật → chuyển hẳn sang nới FPS cho camera này.
+        if (lowLightIso >= cap) {
+            if (lowLightAtCapSinceMs == 0L) {
+                lowLightAtCapSinceMs = now
+            } else if (now - lowLightAtCapSinceMs >= LowLightBoostPolicy.INEFFECTIVE_AFTER_MS &&
+                LowLightBoostPolicy.manualIneffective(lowLightEntryLuma, luma)
+            ) {
+                manualIsoIneffectiveCameraId = caps.cameraId
+                Log.w(
+                    TAG,
+                    "Low-light ISO boost gave no gain on camera ${caps.cameraId} " +
+                        "(luma ${lowLightEntryLuma.roundToInt()}->${luma.roundToInt()} at iso $lowLightIso); " +
+                        "using FPS relax next time",
+                )
+                exitLowLight(trackId, "no gain")
+                return false
+            }
+        } else {
+            lowLightAtCapSinceMs = 0L
+        }
+        if (LowLightBoostPolicy.manualSceneBright(lowLightIso, caps.isoMin, luma, target)) {
+            if (lowLightBrightSinceMs == 0L) lowLightBrightSinceMs = now
+            if (now - lowLightBrightSinceMs >= LowLightBoostPolicy.EXIT_AFTER_MS &&
+                now - lowLightEnteredAtMs >= LowLightBoostPolicy.MIN_DWELL_MS
+            ) {
+                exitLowLight(trackId, "scene brighter")
+                return false
+            }
+        } else {
+            lowLightBrightSinceMs = 0L
+        }
+        if (now - lowLightLastStepMs >= LowLightBoostPolicy.ISO_STEP_INTERVAL_MS) {
+            lowLightLastStepMs = now
+            val next = LowLightBoostPolicy.nextIso(lowLightIso, luma, target, caps.isoMin, cap)
+            if (next != lowLightIso) {
+                Log.i(
+                    TAG,
+                    "Low-light ISO boost iso=$lowLightIso->$next " +
+                        "(luma ${luma.roundToInt()} target ${target.roundToInt()})",
+                )
+                lowLightIso = next
+                apply(trackId, activeTargetEv) {}
+            }
+        }
+        return true
+    }
+
+    private fun updateFpsRelax(trackId: String, caps: LowLightCaps): Boolean {
+        val now = SystemClock.elapsedRealtime()
+        val ev = activeTargetEv
+        if (ev <= 0.0) {
+            exitLowLight(trackId, "EV $ev")
+            return false
+        }
+        if (LowLightBoostPolicy.relaxedSceneBright(lastResultExposureNs, caps.frameDurationNs)) {
+            if (lowLightBrightSinceMs == 0L) lowLightBrightSinceMs = now
+            if (now - lowLightBrightSinceMs >= LowLightBoostPolicy.EXIT_AFTER_MS &&
+                now - lowLightEnteredAtMs >= LowLightBoostPolicy.MIN_DWELL_MS
+            ) {
+                exitLowLight(trackId, "scene brighter")
+                return false
+            }
+        } else {
+            lowLightBrightSinceMs = 0L
+        }
+        return true
+    }
+
+    /**
+     * Thoát chế độ tăng sáng. [reapply]: tự mở khoá AE và gửi lại request (AE
+     * đo lại rồi khoá như thường); false khi người gọi sẽ tự apply() ngay.
+     */
+    private fun exitLowLight(trackId: String?, reason: String, reapply: Boolean = true) {
+        val was = lowLightMode
+        lowLightDarkSinceMs = 0L
+        if (was == LowLightMode.OFF) return
+        lowLightMode = LowLightMode.OFF
+        lowLightBrightSinceMs = 0L
+        lowLightAtCapSinceMs = 0L
+        lowLightEnteredAtMs = 0L
+        Log.i(
+            TAG,
+            (if (was == LowLightMode.MANUAL_ISO) "Low-light ISO boost OFF" else "Low-light FPS relax OFF") +
+                " ($reason)",
+        )
+        if (reapply && trackId != null && activeTrackId == trackId) {
+            releaseAutoLock(keepFocus = true)
+            apply(trackId, activeTargetEv) {}
+        }
+    }
+
     private fun recordLensState(result: TotalCaptureResult) {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
             result.get(CaptureResult.CONTROL_ZOOM_RATIO)?.let { lastAppliedZoomRatio = it }

@@ -109,4 +109,7 @@ dependencies {
     // Keep this version exactly aligned with flutter_webrtc 1.6.0. The app
     // module needs it directly because the VNVAR RTSP sink uses VideoTrack.
     implementation("io.github.webrtc-sdk:android:144.7559.09")
+    // Kiểm thử JVM cho các lớp quy tắc thuần Kotlin (vd LowLightBoostPolicy):
+    // ./gradlew :app:testDebugUnitTest
+    testImplementation("junit:junit:4.13.2")
 }
