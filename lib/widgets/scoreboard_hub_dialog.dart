@@ -217,7 +217,11 @@ class _ScoreboardHubSheetState extends State<ScoreboardHubSheet> {
     final base = _baseUrl;
     final key = widget.service.controlKey;
     final message = _message;
-    final controlUrl = base == null ? null : '$base/control?k=$key';
+    // Trang điều khiển mở theo ngôn ngữ app (trang vẫn có nút đổi). Chữ trên
+    // overlay theo cài đặt "Ngôn ngữ trên overlay" lưu trong bảng tỉ số.
+    final english = AppLanguageScope.of(context).isEnglish;
+    final controlUrl =
+        base == null ? null : '$base/control?k=$key&lang=${english ? 'en' : 'vi'}';
 
     // Mã QR giữ nền trắng + viền trắng để mọi máy quét được.
     final qr = controlUrl == null

@@ -64,6 +64,9 @@ const List<String> scoreboardScenes = [
 ];
 
 const List<String> scoreboardThemes = ['dark', 'light', 'glass'];
+
+/// Ngôn ngữ chữ trên overlay (OBS và bảng tỉ số in vào livestream).
+const List<String> scoreboardOverlayLanguages = ['vi', 'en'];
 const List<String> scoreboardPositions = ['tl', 'tr', 'bl', 'br', 'tc', 'bc'];
 
 String scoreboardOtherTeam(String team) => team == 'A' ? 'B' : 'A';
@@ -639,6 +642,11 @@ class ScoreOverlayConfig {
   /// In bảng tỉ số thẳng vào video livestream RTMP/RTSP (Android).
   bool burnIn;
 
+  /// Ngôn ngữ các nhãn cố định người xem thấy ("THẮNG"/"WINS", "KẾT QUẢ"/
+  /// "RESULT"...) trên overlay OBS và bảng tỉ số in vào livestream. Dùng
+  /// chung để hai nơi luôn giống nhau; không đổi ngôn ngữ giao diện điều khiển.
+  String lang;
+
   /// Hiện/ẩn toàn bộ overlay (bảng tỉ số, thông báo, chữ chạy) mà vẫn giữ
   /// nguyên cảnh và cấu hình. Ẩn không làm gián đoạn livestream. Mặc định
   /// ẩn: người vận hành bật trong Hub (khi đó mới hiện mã QR điều khiển).
@@ -662,6 +670,7 @@ class ScoreOverlayConfig {
     this.showTournament = true,
     this.showTimer = false,
     this.burnIn = true,
+    this.lang = 'vi',
     this.visible = false,
     this.tickerEnabled = false,
     this.tickerText = '',
@@ -732,6 +741,13 @@ class ScoreOverlayConfig {
     if (json.containsKey('burnIn')) {
       burnIn = _readBool(json['burnIn'], burnIn);
     }
+    if (json.containsKey('lang')) {
+      final value = json['lang']?.toString() ?? '';
+      if (!scoreboardOverlayLanguages.contains(value)) {
+        fail('Ngôn ngữ overlay không hợp lệ.');
+      }
+      lang = value;
+    }
     if (json.containsKey('visible')) {
       visible = _readBool(json['visible'], visible);
     }
@@ -755,6 +771,7 @@ class ScoreOverlayConfig {
     'position': position,
     'scale': scale,
     'burnIn': burnIn,
+    'lang': lang,
     'visible': visible,
     'show': {
       'sets': showSets,

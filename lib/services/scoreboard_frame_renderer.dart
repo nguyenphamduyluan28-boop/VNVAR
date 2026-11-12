@@ -102,6 +102,17 @@ class ScoreboardFrameRenderer {
   }
 
   /// Ô lần lượt hiện tại (logo nào đang hiện) tại [nowMs]; -1 khi không xoay.
+  /// Dòng chữ dưới thanh tỉ số ("EAG THẮNG", "LỢI THẾ EAG"...) theo ngôn ngữ
+  /// overlay; dùng cho kiểm thử và nơi cần đúng chữ đang in vào video.
+  static String footerText(Map<String, dynamic> state) =>
+      _ScoreView(state, nowMs: 0, logos: const {}).footer();
+
+  /// Tên đội hiển thị trên video ([team]: 'A' hoặc 'B').
+  static String teamName(Map<String, dynamic> state, String team) {
+    final view = _ScoreView(state, nowMs: 0, logos: const {});
+    return team == 'B' ? view.teamB.name : view.teamA.name;
+  }
+
   static int sponsorSlot(Map<String, dynamic> state, int nowMs) {
     final view = _ScoreView(state, nowMs: nowMs, logos: const {});
     final sp = view.sponsors;
@@ -765,6 +776,7 @@ class _ScoreView {
   _ScoreView(Map<String, dynamic> s, {required this.nowMs, required Map<String, ui.Image> logos})
     : sport = s['sport']?.toString() ?? 'pickleball',
       overlay = _map(s['overlay']),
+      lang = _lang(s),
       match = _map(s['match']),
       display = _map(s['display']),
       points = _map(s['points']),
@@ -780,18 +792,32 @@ class _ScoreView {
       doubles = _map(s['rules'])['doubles'] == true,
       sideout = _map(s['rules'])['scoring'] == 'sideout',
       timer = _map(s['timer']),
-      teamA = _team(_map(s['teamA']), 'A', logos),
-      teamB = _team(_map(s['teamB']), 'B', logos),
+      teamA = _team(_map(s['teamA']), 'A', logos, _lang(s)),
+      teamB = _team(_map(s['teamB']), 'B', logos, _lang(s)),
       sponsors = _Sponsors.fromJson(_map(s['sponsors'])),
       sponsorImages = logos;
 
-  static _Team _team(Map<String, dynamic> json, String id, Map<String, ui.Image> logos) {
+  /// Ngôn ngữ nhãn cố định (state.overlay.lang): 'en' hoặc 'vi' (mặc định).
+  static String _lang(Map<String, dynamic> s) => _map(s['overlay'])['lang'] == 'en' ? 'en' : 'vi';
+
+  /// Nhãn theo ngôn ngữ overlay (giống bảng EN của trang /overlay).
+  String t(String vi, String en) => lang == 'en' ? en : vi;
+
+  static _Team _team(
+    Map<String, dynamic> json,
+    String id,
+    Map<String, ui.Image> logos,
+    String lang,
+  ) {
     final players = json['players'] is List
         ? (json['players'] as List).map((e) => e.toString()).where((e) => e.isNotEmpty).toList()
         : <String>[];
     final logoId = json['logoId']?.toString();
+    // Tên mặc định "Đội A/B" là chữ của app, không phải tên người dùng đặt.
+    var name = json['name']?.toString() ?? 'Đội $id';
+    if (lang == 'en' && name == 'Đội $id') name = 'Team $id';
     return _Team(
-      json['name']?.toString() ?? 'Đội $id',
+      name,
       json['short']?.toString() ?? id,
       _color(json['color'], id == 'A' ? const Color(0xFF1565C0) : const Color(0xFFC62828)),
       players,
@@ -802,6 +828,7 @@ class _ScoreView {
   final int nowMs;
   final String sport;
   final Map<String, dynamic> overlay;
+  final String lang;
   final Map<String, dynamic> match;
   final Map<String, dynamic> display;
   final Map<String, dynamic> points;
@@ -873,17 +900,17 @@ class _ScoreView {
 
   String footer() {
     if (finished) {
-      if (winner == 'A') return '${teamA.short} THẮNG';
-      if (winner == 'B') return '${teamB.short} THẮNG';
-      return 'KẾT THÚC';
+      if (winner == 'A') return t('${teamA.short} THẮNG', '${teamA.short} WINS');
+      if (winner == 'B') return t('${teamB.short} THẮNG', '${teamB.short} WINS');
+      return t('KẾT THÚC', 'FINAL');
     }
     final kind = display['kind']?.toString();
     if (kind == 'deuce') return 'DEUCE';
     if (kind == 'advantage') {
       final adv = display['advantage']?.toString();
-      if (adv == 'A') return 'LỢI THẾ ${teamA.short}';
-      if (adv == 'B') return 'LỢI THẾ ${teamB.short}';
-      return 'LỢI THẾ';
+      if (adv == 'A') return t('LỢI THẾ ${teamA.short}', 'ADVANTAGE ${teamA.short}');
+      if (adv == 'B') return t('LỢI THẾ ${teamB.short}', 'ADVANTAGE ${teamB.short}');
+      return t('LỢI THẾ', 'ADVANTAGE');
     }
     if (kind == 'tiebreak') return 'TIE-BREAK';
     if (kind == 'sideout' && doubles) return display['callout']?.toString() ?? '';
@@ -1359,9 +1386,9 @@ class _Painter {
     final panel = rrect.outerRect;
     final sub = [
       v.subtitle(),
-      v.finished ? 'Hết trận' : 'Set ${v.currentSet}',
+      v.finished ? v.t('Hết trận', 'Final') : 'Set ${v.currentSet}',
     ].where((e) => e.isNotEmpty).join(' · ');
-    var y = _panelHeader(panel, v.title().isEmpty ? 'BẢNG TỈ SỐ' : v.title(), sub);
+    var y = _panelHeader(panel, v.title().isEmpty ? v.t('BẢNG TỈ SỐ', 'SCOREBOARD') : v.title(), sub);
     final colStart = panel.left + 18 + nameW;
     for (var i = 0; i < cols; i++) {
       _centerText(
@@ -1373,7 +1400,7 @@ class _Painter {
       );
     }
     _centerText(
-      'ĐIỂM',
+      v.t('ĐIỂM', 'POINTS'),
       Rect.fromLTWH(panel.right - ptsW, y, ptsW, 44),
       20,
       palette.muted,
@@ -1457,7 +1484,7 @@ class _Painter {
     final panel = rrect.outerRect;
     final top = _panelHeader(
       panel,
-      v.title().isEmpty ? 'TRẬN ĐẤU' : v.title(),
+      v.title().isEmpty ? v.t('TRẬN ĐẤU', 'MATCH') : v.title(),
       v.subtitle(),
     ) + 36;
     final vs = _text('VS', 64, v.accent, weight: FontWeight.w900);
@@ -1504,7 +1531,7 @@ class _Painter {
     final panel = rrect.outerRect;
     final y = _panelHeader(
       panel,
-      v.title().isEmpty ? 'KẾT QUẢ TRẬN ĐẤU' : v.title(),
+      v.title().isEmpty ? v.t('KẾT QUẢ TRẬN ĐẤU', 'MATCH RESULT') : v.title(),
       v.subtitle(),
     );
     final setsA = _int(v.setsWon['a']);
@@ -1513,7 +1540,7 @@ class _Painter {
         ? v.winner
         : (setsA == setsB ? null : (setsA > setsB ? 'A' : 'B'));
     _centerText(
-      v.finished ? 'CHIẾN THẮNG' : 'TỈ SỐ HIỆN TẠI',
+      v.finished ? v.t('CHIẾN THẮNG', 'WINNER') : v.t('TỈ SỐ HIỆN TẠI', 'CURRENT SCORE'),
       Rect.fromLTWH(panel.left, y + 24, width, 34),
       26,
       palette.muted,

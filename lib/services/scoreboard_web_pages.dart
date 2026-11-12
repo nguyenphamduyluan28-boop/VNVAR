@@ -1,5 +1,9 @@
 // GENERATED từ web/control.html và web/overlay.html — trang chạy offline,
 // không dùng CDN. Sửa nội dung HTML/JS ở đây nếu cần.
+//
+// Song ngữ: chữ tiếng Việt là bản gốc; bản tiếng Anh nằm trong từ điển EN
+// (khoá là đúng câu tiếng Việt) và ERR_EN (theo mã lỗi API). Thêm/sửa chữ
+// trên trang thì thêm câu tương ứng vào EN, nếu không chữ đó giữ tiếng Việt.
 
 /// Trang điều khiển bảng tỉ số cho trọng tài (`GET /control`).
 const String scoreboardControlPageHtml = r'''<!doctype html>
@@ -36,6 +40,7 @@ header .title small{display:block;color:var(--muted);font-size:12px;white-space:
 .conn.on{color:var(--green)}.conn.on i{box-shadow:0 0 0 3px rgba(0,200,83,.22)}
 .conn.off{color:#FF8A86}.conn.off i{animation:blink 1s infinite}
 @keyframes blink{50%{opacity:.25}}
+.lang{flex:none;min-height:32px;padding:4px 10px;font-size:12px;font-weight:800;letter-spacing:.5px;border-radius:999px;background:var(--p1);color:var(--text);box-shadow:inset 0 0 0 1px var(--line)}
 
 /* ---------- OVERLAY DOCK (luôn thấy) ---------- */
 .dock{grid-area:dock;display:flex;gap:8px;padding:2px var(--sr) 8px var(--sl);min-width:0}
@@ -218,6 +223,7 @@ body.offline .needs-conn,body.wait .needs-conn{opacity:.4;pointer-events:none;fi
 <header>
   <div class="title"><b id="hTitle">Bảng điểm</b><small id="hSub">SportO Cam</small></div>
   <div class="conn" id="conn" role="status"><i></i><span id="connText">Đang kết nối…</span></div>
+  <button class="lang" id="langBtn" type="button" title="Ngôn ngữ" aria-label="Ngôn ngữ">EN</button>
 </header>
 
 <!-- Điều khiển overlay nhanh: luôn thấy ở mọi tab -->
@@ -319,6 +325,13 @@ body.offline .needs-conn,body.wait .needs-conn{opacity:.4;pointer-events:none;fi
         <button data-theme="dark">Tối</button><button data-theme="light">Sáng</button><button data-theme="glass">Kính mờ</button>
       </div>
       <label class="f">Màu nhấn<input type="color" id="oAccent"></label>
+    </div>
+    <div class="card needs-conn" data-sub="look">
+      <h3>Ngôn ngữ trên overlay</h3>
+      <div class="seg" id="olangs" style="grid-template-columns:minmax(0,1fr) minmax(0,1fr)">
+        <button data-olang="vi">Tiếng Việt</button><button data-olang="en">English</button>
+      </div>
+      <div class="muted">Chữ cố định người xem thấy (THẮNG, KẾT QUẢ…) trên overlay OBS và bảng tỉ số in vào livestream.</div>
     </div>
     <div class="card needs-conn" data-sub="look">
       <h3>Thông tin hiển thị</h3>
@@ -516,6 +529,335 @@ var $=function(id){return document.getElementById(id);};
 var qsa=function(sel,root){return Array.prototype.slice.call((root||document).querySelectorAll(sel));};
 function buzz(ms){try{if(navigator.vibrate)navigator.vibrate(ms);}catch(e){}}
 
+// ---------- ngôn ngữ (VI/EN) ----------
+// Chọn theo ?lang=vi|en, rồi lựa chọn đã lưu, rồi ngôn ngữ trình duyệt.
+// Chữ tĩnh trong HTML được dịch theo câu tiếng Việt gốc (khoá của EN);
+// chữ do JavaScript tạo đi qua T().
+var LANG_STORE='vnvar_score_lang';
+var EN={
+  "Bảng điểm · SportO Cam":"Scoreboard · SportO Cam",
+  "Bảng điểm":"Scoreboard",
+  "Đang kết nối…":"Connecting…",
+  "Hiện/ẩn overlay trên OBS và livestream":"Show/hide overlay on OBS and livestream",
+  "HIỆN":"ON",
+  "ẨN":"OFF",
+  "Cảnh overlay":"Overlay scenes",
+  "Thanh tỉ số":"Score bar",
+  "Bảng lớn":"Full board",
+  "Giới thiệu":"Intro",
+  "Kết quả":"Result",
+  "Đội A":"Team A",
+  "Đội B":"Team B",
+  "GIAO":"SERVE",
+  "Giữ để trừ 1 điểm":"Hold to subtract 1 point",
+  "giữ":"hold",
+  "Hoàn tác":"Undo",
+  "Giao":"Serve",
+  "Thêm":"More",
+  "Xem trước overlay":"Overlay preview",
+  "Trực tiếp":"Live",
+  "Giao diện":"Style",
+  "Chữ chạy":"Ticker",
+  "Nhà tài trợ":"Sponsors",
+  "Cảnh đang phát":"On-air scene",
+  "Hiện overlay":"Show overlay",
+  "Ẩn tất cả":"Hide all",
+  "Thông báo nhanh":"Quick banners",
+  "Nghỉ giữa set":"Set break",
+  "Kiểm tra VAR":"VAR check",
+  "Đổi sân":"Change ends",
+  "TẠM DỪNG · TIMEOUT":"TIMEOUT",
+  "NGHỈ GIỮA SET":"SET BREAK",
+  "ĐANG KIỂM TRA VAR":"VAR CHECK",
+  "ĐỔI SÂN":"CHANGE OF ENDS",
+  "Nội dung khác":"Custom text",
+  "Nhập thông báo":"Type a message",
+  "Hiển thị":"Show for",
+  "5 giây":"5 seconds",
+  "8 giây":"8 seconds",
+  "10 giây":"10 seconds",
+  "15 giây":"15 seconds",
+  "30 giây":"30 seconds",
+  "1 phút":"1 minute",
+  "Đến khi tắt":"Until turned off",
+  "Hiện":"Show",
+  "Tắt":"Turn off",
+  "Đồng hồ trận":"Match clock",
+  "Bắt đầu":"Start",
+  "Tạm dừng":"Pause",
+  "Đặt lại":"Reset",
+  "Vị trí & kích thước":"Position & size",
+  "↖ Trên trái":"↖ Top left",
+  "↑ Trên giữa":"↑ Top center",
+  "↗ Trên phải":"↗ Top right",
+  "↙ Dưới trái":"↙ Bottom left",
+  "↓ Dưới giữa":"↓ Bottom center",
+  "↘ Dưới phải":"↘ Bottom right",
+  "Kích thước:":"Size:",
+  "Màu sắc":"Colors",
+  "Tối":"Dark",
+  "Sáng":"Light",
+  "Kính mờ":"Frosted glass",
+  "Màu nhấn":"Accent color",
+  "Thông tin hiển thị":"Displayed info",
+  "Điểm các set":"Set scores",
+  "Đội giao bóng":"Serving team",
+  "Tên giải / sân":"Tournament / court",
+  "Bật chữ chạy":"Enable ticker",
+  "Nội dung":"Text",
+  "VD: Tài trợ bởi ...":"e.g. Sponsored by ...",
+  "Tốc độ":"Speed",
+  "Chậm":"Slow",
+  "Vừa":"Medium",
+  "Nhanh":"Fast",
+  "Cập nhật chữ chạy":"Update ticker",
+  "Livestream từ điện thoại: nội dung đổi ngay; tốc độ mới áp dụng từ lần phát hoặc kết nối lại sau.":"Phone livestream: text changes immediately; a new speed applies from the next stream start or reconnect.",
+  "Logo nhà tài trợ":"Sponsor logos",
+  "Hiện logo nhà tài trợ":"Show sponsor logos",
+  "+ Thêm logo":"+ Add logo",
+  "Nhận PNG nền trong suốt (giữ nguyên phần trong suốt), WebP hoặc JPG. Tối đa 8 logo. Logo hiện cùng bảng tỉ số (theo nút Hiện/Ẩn overlay).":"Accepts transparent PNG (transparency is kept), WebP or JPG. Up to 8 logos. Logos appear with the scoreboard (they follow the overlay Show/Hide button).",
+  "Cách hiển thị":"Display mode",
+  "Lần lượt từng logo":"One logo at a time",
+  "Dải tất cả logo":"All logos in a strip",
+  "Đổi logo sau":"Switch logo every",
+  "Không nền":"No background",
+  "Nền trắng":"White background",
+  "Nền tối":"Dark background",
+  "Vị trí & kích thước logo":"Logo position & size",
+  "Dịch ngang:":"Horizontal offset:",
+  "Dịch dọc:":"Vertical offset:",
+  "Về vị trí chuẩn":"Reset position",
+  "Chung góc với bảng tỉ số thì logo tự xếp bên dưới (hoặc bên trên) bảng. Đổi vị trí khi đang livestream có thể làm luồng khởi động lại vài giây.":"In the same corner as the scoreboard, logos stack below (or above) it. Changing position while live may restart the stream for a few seconds.",
+  "Livestream từ điện thoại":"Phone livestream",
+  "In bảng tỉ số vào video":"Burn scoreboard into video",
+  "Cho phát RTMP/RTSP trên Android và iPhone, không cần OBS. Bật/tắt khi đang phát sẽ khởi động lại luồng vài giây. Video ghi và Tablet không bị ảnh hưởng.":"For RTMP/RTSP streaming from Android and iPhone, no OBS needed. Toggling while live restarts the stream for a few seconds. Recordings and the tablet are not affected.",
+  "Trận":"Match",
+  "Hai đội":"Teams",
+  "Luật":"Rules",
+  "Hệ thống":"System",
+  "Thông tin trận":"Match info",
+  "Tên giải":"Tournament",
+  "VD: Giải Pickleball Mở rộng":"e.g. Pickleball Open",
+  "Vòng":"Round",
+  "VD: Bán kết":"e.g. Semifinal",
+  "Sân":"Court",
+  "VD: Sân 2":"e.g. Court 2",
+  "Lưu":"Save",
+  "Tên đội":"Team name",
+  "Tên ngắn":"Short name",
+  "≤ 6 ký tự":"≤ 6 characters",
+  "VĐV 1":"Player 1",
+  "VĐV 2":"Player 2",
+  "Màu":"Color",
+  "Chọn logo":"Choose logo",
+  "Gỡ logo":"Remove logo",
+  "Lưu Đội A":"Save Team A",
+  "Lưu Đội B":"Save Team B",
+  "Môn & luật":"Sport & rules",
+  "Môn":"Sport",
+  "Cầu lông":"Badminton",
+  "Tùy chỉnh":"Custom",
+  "Điểm thắng set":"Points to win a set",
+  "Cách biệt":"Win by",
+  "Điểm trần":"Point cap",
+  "Không":"None",
+  "Tính điểm":"Scoring",
+  "Chỉ đội giao":"Side-out",
+  "Mọi pha bóng":"Rally",
+  "Game/set":"Games/set",
+  "Tie-break khi":"Tie-break at",
+  "Điểm TB":"TB points",
+  "Số set":"Sets",
+  "Thắng 2/3":"Best of 3",
+  "Thắng 3/5":"Best of 5",
+  "Thắng 4/7":"Best of 7",
+  "Đánh đôi":"Doubles",
+  "Luật chuẩn":"Standard rules",
+  "Áp dụng":"Apply",
+  "Đổi luật khi trận đang có điểm sẽ bắt đầu lại trận.":"Changing rules during a match restarts it.",
+  "Link overlay cho OBS":"Overlay link for OBS",
+  "Sao chép link overlay":"Copy overlay link",
+  "OBS → Sources → + → Browser → dán link, 1920 × 1080. Nền trong suốt.":"OBS → Sources → + → Browser → paste the link, 1920 × 1080. Transparent background.",
+  "Link điều khiển (có mã)":"Control link (with code)",
+  "Sao chép link điều khiển":"Copy control link",
+  "Ai có link này đều chỉnh được tỉ số. Đổi mã trong app SportO Cam nếu bị lộ.":"Anyone with this link can change the score. Change the code in the SportO Cam app if it leaks.",
+  "Kết nối":"Connection",
+  "Nhập mã điều khiển khác":"Enter another control code",
+  "Tải lại trang":"Reload page",
+  "Tỉ số":"Score",
+  "Cài đặt":"Settings",
+  "Mất kết nối với camera · đang thử lại… Thao tác tạm khoá.":"Lost connection to the camera · retrying… Controls are locked.",
+  "Thao tác":"Actions",
+  "Người giao bóng":"Server",
+  "Trận đấu":"Match",
+  "Đổi bên sân":"Swap sides",
+  "Kết thúc set hiện tại":"End current set",
+  "Mở lại trận":"Reopen match",
+  "Kết thúc trận":"End match",
+  "Trận mới (về 0)":"New match (reset to 0)",
+  "Đóng":"Close",
+  "Xác nhận":"Confirm",
+  "Hủy":"Cancel",
+  "Đồng ý":"OK",
+  "Mã điều khiển":"Control code",
+  "Mã không đúng hoặc đã được đổi. Quét lại mã QR trên app SportO Cam hoặc nhập mã 6 ký tự.":"The code is wrong or has been changed. Rescan the QR code in the SportO Cam app or enter the 6-character code.",
+  "VD: AB12CD":"e.g. AB12CD",
+  "Lưu mã":"Save code",
+  "Ngôn ngữ":"Language",
+  "Ngôn ngữ trên overlay":"Overlay language",
+  "Tiếng Việt":"Vietnamese",
+  "Chữ cố định người xem thấy (THẮNG, KẾT QUẢ…) trên overlay OBS và bảng tỉ số in vào livestream.":"Fixed labels viewers see (WINS, RESULT…) on the OBS overlay and the scoreboard burned into the livestream.",
+  "Bấm quá nhanh, chờ một chút rồi thử lại":"Tapping too fast, wait a moment and try again",
+  "Camera báo lỗi {0}, thử lại":"Camera error {0}, try again",
+  "Không gửi được lệnh — kiểm tra Wi-Fi với camera":"Command not sent — check the Wi-Fi connection to the camera",
+  "Đã kết nối":"Connected",
+  "Mất kết nối":"Disconnected",
+  "GIAO {0}":"SERVE {0}",
+  "HẾT TRẬN":"FINAL",
+  "Chạm vào đội thắng pha bóng":"Tap the team that won the rally",
+  "Chạm vào người thắng điểm":"Tap the point winner",
+  "Chạm ô đội để +1 điểm":"Tap a team to add 1 point",
+  "🏆 {0} thắng {1}–{2}":"🏆 {0} wins {1}–{2}",
+  "Trận đã kết thúc":"Match finished",
+  "{0} · người {1}":"{0} · player {1}",
+  "Trận đã kết thúc — mở lại trong \"Thêm\"":"Match finished — reopen it under \"More\"",
+  "Đã trừ 1 điểm":"1 point subtracted",
+  "Giữ nút −1 để trừ điểm":"Hold the −1 button to subtract a point",
+  "Đã hoàn tác":"Undone",
+  "Kết thúc set?":"End set?",
+  "Set hiện tại sẽ được chốt theo tỉ số đang có.":"The current set will be closed at the current score.",
+  "Kết thúc set":"End set",
+  "Kết thúc trận?":"End match?",
+  "Trận sẽ được chốt theo số set đã thắng.":"The match will be decided by sets won.",
+  "Bắt đầu trận mới?":"Start a new match?",
+  "Điểm, set và đồng hồ về 0. Tên đội và giao diện được giữ nguyên.":"Points, sets and the clock reset to 0. Team names and style are kept.",
+  "Trận mới":"New match",
+  "Đã lưu thông tin trận":"Match info saved",
+  "Tên đội không được để trống":"Team name cannot be empty",
+  "Đã lưu {0}":"Saved {0}",
+  "Đội chưa có logo":"This team has no logo",
+  "Gỡ logo?":"Remove logo?",
+  "Logo của {0} sẽ bị xoá khỏi bảng tỉ số.":"{0}'s logo will be removed from the scoreboard.",
+  "Đang xử lý logo…":"Processing logo…",
+  "Không đọc được ảnh":"Cannot read the image",
+  "Đã thêm logo nhà tài trợ":"Sponsor logo added",
+  "Đã cập nhật logo":"Logo updated",
+  "Lỗi {0}":"Error {0}",
+  "Không tải được logo lên":"Logo upload failed",
+  "File không phải ảnh":"The file is not an image",
+  "Đã áp dụng luật":"Rules applied",
+  "Đổi luật và bắt đầu lại?":"Change rules and restart?",
+  "Trận đang có điểm. Áp dụng luật mới sẽ đưa tỉ số về 0.":"The match has points. Applying new rules resets the score to 0.",
+  "Bắt đầu lại":"Restart",
+  "Cảnh: {0}":"Scene: {0}",
+  " (overlay đang ẩn)":" (overlay is hidden)",
+  "Đã ẩn overlay":"Overlay hidden",
+  "Đã hiện overlay":"Overlay shown",
+  "Đã cập nhật chữ chạy":"Ticker updated",
+  "Chưa có logo nào.":"No logos yet.",
+  "Đưa lên trước":"Move earlier",
+  "Đưa ra sau":"Move later",
+  "Xoá logo":"Delete logo",
+  "Xoá logo này?":"Delete this logo?",
+  "Logo nhà tài trợ sẽ bị xoá khỏi overlay.":"The sponsor logo will be removed from the overlay.",
+  "Xoá":"Delete",
+  "Thêm ít nhất một logo trước":"Add at least one logo first",
+  "Đã bật logo (overlay đang ẩn)":"Logos on (overlay is hidden)",
+  "Đã hiện logo nhà tài trợ":"Sponsor logos shown",
+  "Đã ẩn logo nhà tài trợ":"Sponsor logos hidden",
+  "Tối đa 8 logo":"Up to 8 logos",
+  "Đã về vị trí chuẩn":"Position reset",
+  "Nhập nội dung thông báo":"Enter the banner text",
+  "Đang hiện: {0}":"Showing: {0}",
+  "Đặt lại đồng hồ?":"Reset the clock?",
+  "Đồng hồ trận về 00:00.":"The match clock returns to 00:00.",
+  "Trận: {0} · phiên bản dữ liệu {1}":"Match: {0} · data version {1}",
+  " · CHƯA CÓ MÃ ĐIỀU KHIỂN":" · NO CONTROL CODE",
+  "Đã sao chép":"Copied",
+  "Hãy nhấn giữ để sao chép thủ công":"Press and hold to copy manually",
+  "Mã gồm 6 ký tự chữ/số":"The code has 6 letters or digits",
+  "Đã lưu mã":"Code saved"
+};
+var ERR_EN={
+  "nothing_to_undo":"Nothing to undo.",
+  "invalid_number":"Invalid number.",
+  "invalid_team":"Team must be \"A\" or \"B\".",
+  "invalid_rules":"Invalid scoring rules.",
+  "invalid_name":"Team name cannot be empty.",
+  "invalid_color":"Color must be in #RRGGBB format.",
+  "invalid_players":"Invalid player list.",
+  "invalid_overlay":"Invalid overlay setting.",
+  "invalid_delta":"Score change must be from -5 to 5.",
+  "invalid_score":"Invalid score value.",
+  "invalid_server":"Server must be 1 or 2.",
+  "invalid_sport":"Invalid sport.",
+  "invalid_seconds":"Display time must be 0-3600 seconds.",
+  "invalid_timer_op":"Timer command must be start, pause or reset.",
+  "unknown_action":"Unsupported command.",
+  "invalid_logo_size":"Logo must be smaller than 512 KB.",
+  "invalid_logo_type":"Logo must be a PNG, JPG or WebP image.",
+  "invalid_sponsors":"Invalid sponsor setting.",
+  "too_many_sponsors":"Up to 8 sponsor logos.",
+  "sponsor_not_found":"Sponsor logo not found.",
+  "match_finished":"Match finished. Tap \"New match\" to restart.",
+  "match_decided":"Match already decided. Use Undo to fix scores.",
+  "match_in_progress":"Match in progress. Reset to change rules.",
+  "set_tied":"Scores are tied; cannot end the set yet.",
+  "invalid_key":"Wrong control code. Rescan the QR code in the SportO Cam app.",
+  "invalid_json":"The request is not valid JSON.",
+  "logo_too_large":"Logo must be smaller than 512 KB.",
+  "logo_not_found":"Logo not found.",
+  "too_many_streams":"Too many screens are connected to the scoreboard."
+};
+function pickLang(){
+  var l='';
+  try{l=(new URL(location.href).searchParams.get('lang')||'').toLowerCase();}catch(e){}
+  if(l==='vi'||l==='en'){try{localStorage.setItem(LANG_STORE,l);}catch(e){}return l;}
+  try{l=localStorage.getItem(LANG_STORE)||'';}catch(e){}
+  if(l==='vi'||l==='en')return l;
+  var nav=((navigator.languages&&navigator.languages[0])||navigator.language||'vi').toLowerCase();
+  return nav.indexOf('vi')===0?'vi':'en';
+}
+var lang=pickLang();
+function T(vi){
+  var s=(lang==='en'&&Object.prototype.hasOwnProperty.call(EN,vi))?EN[vi]:vi;
+  var args=arguments;
+  return s.replace(/\{(\d+)\}/g,function(m,i){var v=args[Number(i)+1];return v===undefined?m:String(v);});
+}
+function errText(d){if(!d)return '';if(lang==='en'&&d.error&&ERR_EN[d.error])return ERR_EN[d.error];return d.message||'';}
+var I18N_ATTRS=['title','aria-label','placeholder','data-banner'];
+var i18nItems=[];
+function i18nKey(v){return String(v).replace(/\s+/g,' ').trim();}
+function hasEn(k){return k!==''&&Object.prototype.hasOwnProperty.call(EN,k);}
+function collectI18n(root){
+  var w=document.createTreeWalker(root,NodeFilter.SHOW_TEXT,null),n;
+  while((n=w.nextNode())){
+    var p=n.parentNode&&n.parentNode.nodeName;
+    if(p==='SCRIPT'||p==='STYLE')continue;
+    var k=i18nKey(n.nodeValue);
+    if(hasEn(k))i18nItems.push({n:n,raw:n.nodeValue,k:k});
+  }
+  qsa('['+I18N_ATTRS.join('],[')+']',root).forEach(function(el){
+    I18N_ATTRS.forEach(function(a){var v=el.getAttribute(a);if(v==null)return;var k=i18nKey(v);if(hasEn(k))i18nItems.push({el:el,a:a,raw:v,k:k});});
+  });
+}
+function applyI18n(){
+  i18nItems.forEach(function(x){
+    var v=lang==='en'?x.raw.replace(x.k,EN[x.k]):x.raw;
+    if(x.a){if(x.el.getAttribute(x.a)!==v)x.el.setAttribute(x.a,v);}
+    else if(x.n.nodeValue!==v)x.n.nodeValue=v;
+  });
+  document.documentElement.lang=lang;
+  document.title=T('Bảng điểm · SportO Cam');
+  var b=$('langBtn');b.textContent=lang==='en'?'VI':'EN';
+  b.title=lang==='en'?'Tiếng Việt':'English';b.setAttribute('aria-label',b.title);
+}
+/** Đường dẫn overlay. Chữ trên overlay theo cài đặt "Ngôn ngữ trên overlay"
+ *  lưu trong bảng tỉ số (không theo ngôn ngữ trang điều khiển). */
+function overlayPath(q){return '/overlay'+(q||'');}
+collectI18n(document.body);
+applyI18n();
+
 // ---------- key ----------
 function readKey(){
   var k='';
@@ -535,7 +877,7 @@ function openSheet(id){$(id).classList.add('on');}
 function closeSheets(){qsa('.shade').forEach(function(s){s.classList.remove('on');});}
 qsa('.shade').forEach(function(s){s.addEventListener('click',function(e){if(e.target===s||e.target.hasAttribute('data-close'))s.classList.remove('on');});});
 var confirmCb=null;
-function confirmBox(title,text,yes,cb){$('cTitle').textContent=title;$('cText').textContent=text;$('cYes').textContent=yes||'Đồng ý';confirmCb=cb;closeSheets();openSheet('confirmSheet');}
+function confirmBox(title,text,yes,cb){$('cTitle').textContent=title;$('cText').textContent=text;$('cYes').textContent=yes||T('Đồng ý');confirmCb=cb;closeSheets();openSheet('confirmSheet');}
 $('cNo').onclick=function(){confirmCb=null;closeSheets();};
 $('cYes').onclick=function(){var cb=confirmCb;confirmCb=null;closeSheets();if(cb)cb();};
 function setText(id,v){var el=$(id);if(el&&el.textContent!==v)el.textContent=v;}
@@ -582,12 +924,12 @@ function send(action){
     .then(function(x){
       if(x.r.ok){if(x.d&&x.d.state)applyState(x.d.state);return true;}
       if(x.r.status===401){openKey();return false;}
-      if(x.r.status===429){toast('Bấm quá nhanh, chờ một chút rồi thử lại',true);return false;}
+      if(x.r.status===429){toast(T('Bấm quá nhanh, chờ một chút rồi thử lại'),true);return false;}
       if(x.r.status===503&&attempt<3){attempt+=1;return sleep(600*attempt).then(once);}
-      toast((x.d&&x.d.message)||('Camera báo lỗi '+x.r.status+', thử lại'),true);return false;
+      toast(errText(x.d)||T('Camera báo lỗi {0}, thử lại',x.r.status),true);return false;
     },function(){
       if(attempt<3){attempt+=1;return sleep(500*attempt).then(once);}
-      toast('Không gửi được lệnh — kiểm tra Wi-Fi với camera',true);return false;
+      toast(T('Không gửi được lệnh — kiểm tra Wi-Fi với camera'),true);return false;
     });
   }
   return once();
@@ -602,7 +944,7 @@ function setConn(on){
   connected=on;
   $('conn').classList.toggle('on',on);
   $('conn').classList.toggle('off',!on);
-  setText('connText',on?'Đã kết nối':'Mất kết nối');
+  setText('connText',on?T('Đã kết nối'):T('Mất kết nối'));
   document.body.classList.toggle('offline',!on&&state!==null);
 }
 function connect(){
@@ -631,7 +973,7 @@ function setLabelOf(st){
 function render(){
   var s=state, sport=s.sport, tennis=sport==='tennis';
   var m=s.match||{};
-  setText('hTitle',m.tournament||'Bảng điểm');
+  setText('hTitle',m.tournament||T('Bảng điểm'));
   var sub=[m.round,m.court].filter(Boolean).join(' · ');
   setText('hSub',sub||'SportO Cam');
   // panels order
@@ -651,25 +993,25 @@ function render(){
     var ptsEl=$('pts'+id);
     if(ptsEl.textContent!==pts){ptsEl.textContent=pts;ptsEl.classList.remove('bump');void ptsEl.offsetWidth;ptsEl.classList.add('bump');}
     $('serve'+id).classList.toggle('on',s.serving===id);
-    $('serve'+id).textContent=(s.rules.doubles&&s.rules.scoring==='sideout'&&!tennis)?('GIAO '+s.serverNumber):'GIAO';
+    $('serve'+id).textContent=(s.rules.doubles&&s.rules.scoring==='sideout'&&!tennis)?T('GIAO {0}',s.serverNumber):T('GIAO');
     var chips=$('chips'+id);chips.textContent='';
     var won=s.setsWon[low];
     var c=document.createElement('span');c.className='chip';c.textContent='Set: '+won;chips.appendChild(c);
     if(tennis){var g=document.createElement('span');g.className='chip';g.textContent='Game: '+s.games[low];chips.appendChild(g);}
     $('dot'+id).style.background=t.color;
   });
-  setText('setLabel',s.status==='finished'?'HẾT TRẬN':('SET '+s.currentSet+(tennis&&s.tiebreak?' · TB':'')));
+  setText('setLabel',s.status==='finished'?T('HẾT TRẬN'):('SET '+s.currentSet+(tennis&&s.tiebreak?' · TB':'')));
   var hist=(s.sets||[]).map(function(st,i){return 'S'+(i+1)+' '+setLabelOf(st);}).join(' · ');
   if(tennis&&s.status!=='finished')hist=(hist?hist+' · ':'')+'Game '+s.games.a+'-'+s.games.b;
   setText('setHist',hist);
   setText('callout',s.display.callout);
   var hint='';
-  if(sport==='pickleball'&&s.rules.scoring==='sideout')hint='Chạm vào đội thắng pha bóng';
-  else if(tennis)hint='Chạm vào người thắng điểm';
-  else hint='Chạm ô đội để +1 điểm';
+  if(sport==='pickleball'&&s.rules.scoring==='sideout')hint=T('Chạm vào đội thắng pha bóng');
+  else if(tennis)hint=T('Chạm vào người thắng điểm');
+  else hint=T('Chạm ô đội để +1 điểm');
   setText('ruleHint',hint);
   var fb=$('finishedBox');
-  if(s.status==='finished'){var w=s.winner?teamOf(s.winner).name:'';fb.textContent=w?('🏆 '+w+' thắng '+s.setsWon.a+'–'+s.setsWon.b):'Trận đã kết thúc';fb.classList.add('on');}
+  if(s.status==='finished'){var w=s.winner?teamOf(s.winner).name:'';fb.textContent=w?T('🏆 {0} thắng {1}–{2}',w,s.setsWon.a,s.setsWon.b):T('Trận đã kết thúc');fb.classList.add('on');}
   else fb.classList.remove('on');
   $('mReopen').style.display=s.status==='finished'?'':'none';
   renderServeButtons();
@@ -685,7 +1027,7 @@ function renderServeButtons(){
     var nums=doubles?[1,2]:[null];
     nums.forEach(function(n){
       var b=document.createElement('button');
-      b.textContent=teamOf(id).short+(n?(' · người '+n):'');
+      b.textContent=n?T('{0} · người {1}',teamOf(id).short,n):teamOf(id).short;
       if(s.serving===id&&(!n||s.serverNumber===n))b.className='primary';
       b.onclick=function(){closeSheets();var a={action:'setServe',team:id};if(n)a.serverNumber=n;send(a);};
       box.appendChild(b);
@@ -700,7 +1042,7 @@ var lastTap={A:0,B:0};
   el.addEventListener('click',function(e){
     if(e.target.closest('.minus'))return;
     var now=Date.now();if(now-lastTap[id]<350)return;lastTap[id]=now;
-    if(!state||state.status==='finished'){if(state)toast('Trận đã kết thúc — mở lại trong "Thêm"',true);return;}
+    if(!state||state.status==='finished'){if(state)toast(T('Trận đã kết thúc — mở lại trong "Thêm"'),true);return;}
     el.classList.remove('flash');void el.offsetWidth;el.classList.add('flash');
     var p=document.createElement('span');p.className='plus';p.textContent='+1';el.appendChild(p);setTimeout(function(){if(p.parentNode)p.parentNode.removeChild(p);},750);
     buzz(25);
@@ -711,19 +1053,19 @@ qsa('.minus').forEach(function(btn){
   var timer=0, fired=0;
   function cancel(){clearTimeout(timer);timer=0;btn.classList.remove('holding');}
   btn.addEventListener('pointerdown',function(e){e.preventDefault();e.stopPropagation();cancel();btn.classList.add('holding');buzz(10);
-    timer=setTimeout(function(){cancel();fired=Date.now();buzz([30,40,30]);send({action:'adjust',team:btn.dataset.minus,delta:-1});toast('Đã trừ 1 điểm');},600);});
+    timer=setTimeout(function(){cancel();fired=Date.now();buzz([30,40,30]);send({action:'adjust',team:btn.dataset.minus,delta:-1});toast(T('Đã trừ 1 điểm'));},600);});
   ['pointerup','pointerleave','pointercancel'].forEach(function(ev){btn.addEventListener(ev,cancel);});
-  btn.addEventListener('click',function(e){e.stopPropagation();if(Date.now()-fired>1000)toast('Giữ nút −1 để trừ điểm');});
+  btn.addEventListener('click',function(e){e.stopPropagation();if(Date.now()-fired>1000)toast(T('Giữ nút −1 để trừ điểm'));});
   btn.addEventListener('contextmenu',function(e){e.preventDefault();});
 });
-$('btnUndo').onclick=function(){buzz(20);send({action:'undo'}).then(function(ok){if(ok)toast('Đã hoàn tác');});};
+$('btnUndo').onclick=function(){buzz(20);send({action:'undo'}).then(function(ok){if(ok)toast(T('Đã hoàn tác'));});};
 $('btnServe').onclick=function(){buzz(15);send({action:'swapServe'});};
 $('btnMore').onclick=function(){openSheet('moreSheet');};
 $('mSwapSides').onclick=function(){closeSheets();send({action:'swapSides'});};
-$('mEndSet').onclick=function(){confirmBox('Kết thúc set?','Set hiện tại sẽ được chốt theo tỉ số đang có.','Kết thúc set',function(){send({action:'endSet'});});};
-$('mFinish').onclick=function(){confirmBox('Kết thúc trận?','Trận sẽ được chốt theo số set đã thắng.','Kết thúc trận',function(){send({action:'finish'});});};
+$('mEndSet').onclick=function(){confirmBox(T('Kết thúc set?'),T('Set hiện tại sẽ được chốt theo tỉ số đang có.'),T('Kết thúc set'),function(){send({action:'endSet'});});};
+$('mFinish').onclick=function(){confirmBox(T('Kết thúc trận?'),T('Trận sẽ được chốt theo số set đã thắng.'),T('Kết thúc trận'),function(){send({action:'finish'});});};
 $('mReopen').onclick=function(){closeSheets();send({action:'reopen'});};
-$('mNew').onclick=function(){confirmBox('Bắt đầu trận mới?','Điểm, set và đồng hồ về 0. Tên đội và giao diện được giữ nguyên.','Trận mới',function(){send({action:'newMatch'});});};
+$('mNew').onclick=function(){confirmBox(T('Bắt đầu trận mới?'),T('Điểm, set và đồng hồ về 0. Tên đội và giao diện được giữ nguyên.'),T('Trận mới'),function(){send({action:'newMatch'});});};
 
 // ---------- forms ----------
 function markDirty(form,name){form.addEventListener('input',function(){dirty[name]=true;});form.addEventListener('change',function(){dirty[name]=true;});}
@@ -759,25 +1101,25 @@ function toggleRuleFields(){
   qsa('.r-tennis').forEach(function(e){e.style.display=tennis?'':'none';});
 }
 $('rSport').addEventListener('change',toggleRuleFields);
-$('saveMatch').onclick=function(){send({action:'setMatchInfo',tournament:$('fTournament').value,round:$('fRound').value,court:$('fCourt').value}).then(function(ok){if(ok){dirty.match=false;toast('Đã lưu thông tin trận');render();}});};
+$('saveMatch').onclick=function(){send({action:'setMatchInfo',tournament:$('fTournament').value,round:$('fRound').value,court:$('fCourt').value}).then(function(ok){if(ok){dirty.match=false;toast(T('Đã lưu thông tin trận'));render();}});};
 ['A','B'].forEach(function(id){
   var form=$('formTeam'+id);
   form.querySelector('[data-save]').onclick=function(){
     var g=function(k){return form.querySelector('[data-k='+k+']').value;};
-    var name=g('name').trim();if(!name){toast('Tên đội không được để trống',true);return;}
+    var name=g('name').trim();if(!name){toast(T('Tên đội không được để trống'),true);return;}
     send({action:'setTeam',team:id,name:name,short:g('short').trim(),color:g('color').toUpperCase(),players:[g('p1'),g('p2')]})
-    .then(function(ok){if(ok){dirty[id]=false;toast('Đã lưu '+name);render();}});
+    .then(function(ok){if(ok){dirty[id]=false;toast(T('Đã lưu {0}',name));render();}});
   };
   var file=form.querySelector('[data-file]');
   form.querySelector('[data-pick]').onclick=function(){file.click();};
   form.querySelector('[data-remove]').onclick=function(){
-    if(!state||!teamOf(id).logoId){toast('Đội chưa có logo');return;}
-    confirmBox('Gỡ logo?','Logo của '+teamOf(id).name+' sẽ bị xoá khỏi bảng tỉ số.','Gỡ logo',function(){send({action:'removeLogo',team:id});});
+    if(!state||!teamOf(id).logoId){toast(T('Đội chưa có logo'));return;}
+    confirmBox(T('Gỡ logo?'),T('Logo của {0} sẽ bị xoá khỏi bảng tỉ số.',teamOf(id).name),T('Gỡ logo'),function(){send({action:'removeLogo',team:id});});
   };
   file.onchange=function(){var f=file.files&&file.files[0];file.value='';if(f)uploadLogo(id,f);};
 });
 function uploadLogo(team,f){
-  toast('Đang xử lý logo…');
+  toast(T('Đang xử lý logo…'));
   var url=URL.createObjectURL(f), img=new Image();
   img.onload=function(){
     URL.revokeObjectURL(url);
@@ -789,19 +1131,19 @@ function uploadLogo(team,f){
       var c=document.createElement('canvas');c.width=Math.max(1,Math.round(w*k));c.height=Math.max(1,Math.round(h*k));
       var g=c.getContext('2d');g.clearRect(0,0,c.width,c.height);g.drawImage(img,0,0,c.width,c.height);
       c.toBlob(function(blob){
-        if(!blob){toast('Không đọc được ảnh',true);return;}
+        if(!blob){toast(T('Không đọc được ảnh'),true);return;}
         if(blob.size>500*1024&&i+1<sizes.length){attempt(i+1);return;}
         fetch('/api/score/logo?team='+team,{method:'POST',headers:{'Content-Type':'image/png','X-Score-Key':key},body:blob})
         .then(function(r){return r.json().catch(function(){return null;}).then(function(d){
-          if(r.ok){if(d&&d.state)applyState(d.state);toast(team==='S'?'Đã thêm logo nhà tài trợ':'Đã cập nhật logo');}
+          if(r.ok){if(d&&d.state)applyState(d.state);toast(team==='S'?T('Đã thêm logo nhà tài trợ'):T('Đã cập nhật logo'));}
           else if(r.status===401)openKey();
-          else toast((d&&d.message)||('Lỗi '+r.status),true);
-        });}).catch(function(){toast('Không tải được logo lên',true);});
+          else toast(errText(d)||T('Lỗi {0}',r.status),true);
+        });}).catch(function(){toast(T('Không tải được logo lên'),true);});
       },'image/png');
     }
     attempt(0);
   };
-  img.onerror=function(){URL.revokeObjectURL(url);toast('File không phải ảnh',true);};
+  img.onerror=function(){URL.revokeObjectURL(url);toast(T('File không phải ảnh'),true);};
   img.src=url;
 }
 function readRules(){
@@ -811,9 +1153,9 @@ function readRules(){
 function pristine(){var s=state;return s.points.a===0&&s.points.b===0&&s.games.a===0&&s.games.b===0&&s.sets.length===0&&s.status!=='finished';}
 function sendConfig(extra){
   var a=Object.assign({action:'config',sport:$('rSport').value},extra);
-  var go=function(reset){if(reset)a.reset=true;send(a).then(function(ok){if(ok){dirty.rules=false;toast('Đã áp dụng luật');render();}});};
+  var go=function(reset){if(reset)a.reset=true;send(a).then(function(ok){if(ok){dirty.rules=false;toast(T('Đã áp dụng luật'));render();}});};
   if(pristine())go(false);
-  else confirmBox('Đổi luật và bắt đầu lại?','Trận đang có điểm. Áp dụng luật mới sẽ đưa tỉ số về 0.','Bắt đầu lại',function(){go(true);});
+  else confirmBox(T('Đổi luật và bắt đầu lại?'),T('Trận đang có điểm. Áp dụng luật mới sẽ đưa tỉ số về 0.'),T('Bắt đầu lại'),function(){go(true);});
 }
 $('rApply').onclick=function(){
   var r=readRules();
@@ -825,7 +1167,7 @@ $('rPreset').onclick=function(){sendConfig({preset:true});};
 // ---------- overlay ----------
 var previewLoaded=false;
 function ensurePreview(){
-  if(!previewLoaded){previewLoaded=true;$('previewFrame').src='/overlay?preview=1';}
+  if(!previewLoaded){previewLoaded=true;$('previewFrame').src=overlayPath('?preview=1');}
   fitPreview();
 }
 function fitPreview(){var box=$('preview');var k=box.clientWidth/1920;$('previewFrame').style.transform='scale('+k+')';}
@@ -835,6 +1177,7 @@ function renderOverlayTab(){
   var o=state.overlay, hid=o.visible===false;
   qsa('[data-scene]').forEach(function(b){b.classList.toggle('on',b.dataset.scene===o.scene);});
   qsa('#themes button').forEach(function(b){b.classList.toggle('on',b.dataset.theme===o.theme);});
+  qsa('[data-olang]').forEach(function(b){b.classList.toggle('on',b.dataset.olang===(o.lang==='en'?'en':'vi'));});
   qsa('#positions button').forEach(function(b){b.classList.toggle('on',b.dataset.pos===o.position);});
   if(document.activeElement!==$('oAccent'))val($('oAccent'),o.accent.toLowerCase());
   if(document.activeElement!==$('oScale'))val($('oScale'),o.scale);
@@ -845,19 +1188,20 @@ function renderOverlayTab(){
   $('hVisible').classList.toggle('off',hid);
   $('hVisible').setAttribute('aria-pressed',hid?'false':'true');
   $('dock').classList.toggle('hid',hid);
-  setText('hVisibleText',hid?'ẨN':'HIỆN');
+  setText('hVisibleText',hid?T('ẨN'):T('HIỆN'));
 }
-qsa('[data-scene]').forEach(function(b){b.onclick=function(){buzz(15);var sc=b.dataset.scene;send({action:'overlay',scene:sc}).then(function(ok){if(ok&&b.closest('#quickScenes')){toast('Cảnh: '+SCENE_NAMES[sc]+(state&&state.overlay.visible===false?' (overlay đang ẩn)':''));}});};});
+qsa('[data-scene]').forEach(function(b){b.onclick=function(){buzz(15);var sc=b.dataset.scene;send({action:'overlay',scene:sc}).then(function(ok){if(ok&&b.closest('#quickScenes')){toast(T('Cảnh: {0}',T(SCENE_NAMES[sc]))+(state&&state.overlay.visible===false?T(' (overlay đang ẩn)'):''));}});};});
 qsa('#themes button').forEach(function(b){b.onclick=function(){send({action:'overlay',theme:b.dataset.theme});};});
+qsa('[data-olang]').forEach(function(b){b.onclick=function(){send({action:'overlay',lang:b.dataset.olang});};});
 qsa('#positions button').forEach(function(b){b.onclick=function(){send({action:'overlay',position:b.dataset.pos});};});
 $('oAccent').addEventListener('change',function(){send({action:'overlay',accent:$('oAccent').value.toUpperCase()});});
 $('oScale').addEventListener('input',function(){setText('oScaleV',Math.round(Number($('oScale').value)*100)+'%');});
 $('oScale').addEventListener('change',function(){send({action:'overlay',scale:Number($('oScale').value)});});
 $('oBurnIn').addEventListener('change',function(){send({action:'overlay',burnIn:$('oBurnIn').checked});});
 $('oVisible').addEventListener('change',function(){send({action:'overlay',visible:$('oVisible').checked});});
-$('hVisible').onclick=function(){buzz(20);var hide=!(state&&state.overlay&&state.overlay.visible===false);send({action:'overlay',visible:!hide}).then(function(ok){if(ok)toast(hide?'Đã ẩn overlay':'Đã hiện overlay');});};
+$('hVisible').onclick=function(){buzz(20);var hide=!(state&&state.overlay&&state.overlay.visible===false);send({action:'overlay',visible:!hide}).then(function(ok){if(ok)toast(hide?T('Đã ẩn overlay'):T('Đã hiện overlay'));});};
 qsa('[data-show]').forEach(function(c){c.addEventListener('change',function(){var show={};show[c.dataset.show]=c.checked;send({action:'overlay',show:show});});});
-$('tSave').onclick=function(){send({action:'overlay',ticker:{enabled:$('tEnabled').checked,text:$('tText').value,speed:Number($('tSpeed').value)}}).then(function(ok){if(ok){dirty.ticker=false;toast('Đã cập nhật chữ chạy');render();}});};
+$('tSave').onclick=function(){send({action:'overlay',ticker:{enabled:$('tEnabled').checked,text:$('tText').value,speed:Number($('tSpeed').value)}}).then(function(ok){if(ok){dirty.ticker=false;toast(T('Đã cập nhật chữ chạy'));render();}});};
 // ---------- nhà tài trợ ----------
 function sponsorsOf(){return (state&&state.sponsors)||{enabled:false,mode:'rotate',position:'tr',scale:1,interval:8,offsetX:0,offsetY:0,plate:'none',items:[]};}
 function sendSponsors(patch){return send(Object.assign({action:'sponsors'},patch));}
@@ -880,15 +1224,15 @@ function renderSponsorsTab(){
   if(sig===spListSig)return;
   spListSig=sig;
   var list=$('spList');list.textContent='';
-  if(!items.length){var e=document.createElement('div');e.className='sp-empty';e.textContent='Chưa có logo nào.';list.appendChild(e);return;}
+  if(!items.length){var e=document.createElement('div');e.className='sp-empty';e.textContent=T('Chưa có logo nào.');list.appendChild(e);return;}
   items.forEach(function(id,i){
     var box=document.createElement('div');box.className='sp-item';
     var img=document.createElement('img');img.alt='';img.src='/api/score/logo/'+encodeURIComponent(id);box.appendChild(img);
     var row=document.createElement('div');row.className='row';
     var mk=function(label,title,fn,dis){var b=document.createElement('button');b.textContent=label;b.title=title;b.setAttribute('aria-label',title);b.disabled=!!dis;b.onclick=fn;row.appendChild(b);return b;};
-    mk('◀','Đưa lên trước',function(){moveSponsor(i,-1);},i===0);
-    mk('▶','Đưa ra sau',function(){moveSponsor(i,1);},i===items.length-1);
-    var del=mk('✕','Xoá logo',function(){confirmBox('Xoá logo này?','Logo nhà tài trợ sẽ bị xoá khỏi overlay.','Xoá',function(){send({action:'removeSponsor',logo:id});});});
+    mk('◀',T('Đưa lên trước'),function(){moveSponsor(i,-1);},i===0);
+    mk('▶',T('Đưa ra sau'),function(){moveSponsor(i,1);},i===items.length-1);
+    var del=mk('✕',T('Xoá logo'),function(){confirmBox(T('Xoá logo này?'),T('Logo nhà tài trợ sẽ bị xoá khỏi overlay.'),T('Xoá'),function(){send({action:'removeSponsor',logo:id});});});
     del.className='danger';
     box.appendChild(row);list.appendChild(box);
   });
@@ -901,10 +1245,10 @@ function moveSponsor(i,d){
 }
 $('spEnabled').addEventListener('change',function(){
   var on=$('spEnabled').checked;
-  if(on&&!(sponsorsOf().items||[]).length){$('spEnabled').checked=false;toast('Thêm ít nhất một logo trước',true);return;}
-  sendSponsors({enabled:on}).then(function(ok){if(ok)toast(on?(state&&state.overlay.visible===false?'Đã bật logo (overlay đang ẩn)':'Đã hiện logo nhà tài trợ'):'Đã ẩn logo nhà tài trợ');});
+  if(on&&!(sponsorsOf().items||[]).length){$('spEnabled').checked=false;toast(T('Thêm ít nhất một logo trước'),true);return;}
+  sendSponsors({enabled:on}).then(function(ok){if(ok)toast(on?(state&&state.overlay.visible===false?T('Đã bật logo (overlay đang ẩn)'):T('Đã hiện logo nhà tài trợ')):T('Đã ẩn logo nhà tài trợ'));});
 });
-$('spAdd').onclick=function(){if((sponsorsOf().items||[]).length>=8){toast('Tối đa 8 logo',true);return;}$('spFile').click();};
+$('spAdd').onclick=function(){if((sponsorsOf().items||[]).length>=8){toast(T('Tối đa 8 logo'),true);return;}$('spFile').click();};
 $('spFile').onchange=function(){var f=$('spFile').files&&$('spFile').files[0];$('spFile').value='';if(f)uploadLogo('S',f);};
 qsa('[data-spmode]').forEach(function(b){b.onclick=function(){sendSponsors({mode:b.dataset.spmode});};});
 qsa('[data-spplate]').forEach(function(b){b.onclick=function(){sendSponsors({plate:b.dataset.spplate});};});
@@ -917,14 +1261,14 @@ $('spScale').addEventListener('change',function(){sendSponsors({scale:Number($('
   el.addEventListener('input',function(){setText('sp'+a+'V',el.value);});
   el.addEventListener('change',function(){var p={};p['offset'+a]=Number(el.value);sendSponsors(p);});
 });
-$('spReset').onclick=function(){sendSponsors({offsetX:0,offsetY:0,scale:1}).then(function(ok){if(ok)toast('Đã về vị trí chuẩn');});};
-function showBanner(text){text=(text||'').trim();if(!text){toast('Nhập nội dung thông báo',true);return;}send({action:'banner',text:text,seconds:Number($('bSeconds').value)}).then(function(ok){if(ok)toast('Đang hiện: '+text);});}
+$('spReset').onclick=function(){sendSponsors({offsetX:0,offsetY:0,scale:1}).then(function(ok){if(ok)toast(T('Đã về vị trí chuẩn'));});};
+function showBanner(text){text=(text||'').trim();if(!text){toast(T('Nhập nội dung thông báo'),true);return;}send({action:'banner',text:text,seconds:Number($('bSeconds').value)}).then(function(ok){if(ok)toast(T('Đang hiện: {0}',text));});}
 qsa('[data-banner]').forEach(function(b){b.onclick=function(){showBanner(b.dataset.banner);};});
 $('bShow').onclick=function(){showBanner($('bText').value);};
 $('bClear').onclick=function(){send({action:'banner',text:''});};
 qsa('[data-timer]').forEach(function(b){b.onclick=function(){
   var op=b.dataset.timer;
-  if(op==='reset')confirmBox('Đặt lại đồng hồ?','Đồng hồ trận về 00:00.','Đặt lại',function(){send({action:'timer',op:'reset'});});
+  if(op==='reset')confirmBox(T('Đặt lại đồng hồ?'),T('Đồng hồ trận về 00:00.'),T('Đặt lại'),function(){send({action:'timer',op:'reset'});});
   else send({action:'timer',op:op});
 };});
 function fmt(ms){var t=Math.max(0,Math.floor(ms/1000)),h=Math.floor(t/3600),m=Math.floor(t%3600/60),s=t%60;var p=function(x){return(x<10?'0':'')+x;};return(h?h+':'+p(m):p(m))+':'+p(s);}
@@ -932,22 +1276,31 @@ setInterval(function(){if(!state)return;var tm=state.timer;var ms=tm.accumulated
 
 // ---------- system ----------
 function renderSystem(){
-  setText('sOverlay',location.origin+'/overlay');
+  setText('sOverlay',location.origin+overlayPath(''));
   setText('sControl',location.origin+'/control?k='+(key||'??????'));
-  setText('sInfo','Trận: '+state.matchId+' · phiên bản dữ liệu '+state.rev+(key?'':' · CHƯA CÓ MÃ ĐIỀU KHIỂN'));
+  setText('sInfo',T('Trận: {0} · phiên bản dữ liệu {1}',state.matchId,state.rev)+(key?'':T(' · CHƯA CÓ MÃ ĐIỀU KHIỂN')));
 }
 function copyText(text){
   if(navigator.clipboard&&window.isSecureContext){return navigator.clipboard.writeText(text).then(function(){return true;},function(){return fallbackCopy(text);});}
   return Promise.resolve(fallbackCopy(text));
 }
 function fallbackCopy(text){var t=document.createElement('textarea');t.value=text;t.setAttribute('readonly','');t.style.position='fixed';t.style.opacity='0';document.body.appendChild(t);t.select();t.setSelectionRange(0,text.length);var ok=false;try{ok=document.execCommand('copy');}catch(e){}document.body.removeChild(t);return ok;}
-qsa('[data-copy]').forEach(function(b){b.onclick=function(){var text=$(b.dataset.copy).textContent;copyText(text).then(function(ok){toast(ok?'Đã sao chép':'Hãy nhấn giữ để sao chép thủ công',!ok);});};});
+qsa('[data-copy]').forEach(function(b){b.onclick=function(){var text=$(b.dataset.copy).textContent;copyText(text).then(function(ok){toast(ok?T('Đã sao chép'):T('Hãy nhấn giữ để sao chép thủ công'),!ok);});};});
 function openKey(){$('keyInput').value=key;closeSheets();openSheet('keySheet');}
 $('sKey').onclick=openKey;
 $('sReload').onclick=function(){location.reload();};
-$('keySave').onclick=function(){var k=$('keyInput').value.trim().toUpperCase();if(!/^[A-Z0-9]{6}$/.test(k)){toast('Mã gồm 6 ký tự chữ/số',true);return;}key=k;try{localStorage.setItem(KEY_STORE,k);}catch(e){}closeSheets();toast('Đã lưu mã');if(state)renderSystem();};
+$('keySave').onclick=function(){var k=$('keyInput').value.trim().toUpperCase();if(!/^[A-Z0-9]{6}$/.test(k)){toast(T('Mã gồm 6 ký tự chữ/số'),true);return;}key=k;try{localStorage.setItem(KEY_STORE,k);}catch(e){}closeSheets();toast(T('Đã lưu mã'));if(state)renderSystem();};
 ['logoA','logoB'].forEach(function(id){$(id).addEventListener('error',function(){$(id).hidden=true;});});
 qsa('[data-logo]').forEach(function(img){img.addEventListener('error',function(){img.style.visibility='hidden';});});
+function setLang(l){
+  lang=l==='en'?'en':'vi';
+  try{localStorage.setItem(LANG_STORE,lang);}catch(e){}
+  applyI18n();
+  if(lastSeen)setConn(connected);
+  spListSig='';
+  if(state)render();
+}
+$('langBtn').onclick=function(){setLang(lang==='en'?'vi':'en');};
 var savedTab=null;try{savedTab=sessionStorage.getItem(TAB_STORE);}catch(e){}
 if(savedTab&&savedTab!=='score')showTab(savedTab);
 if(!key)setTimeout(openKey,600);
@@ -1096,13 +1449,43 @@ var ov={scene:params.get('scene'),theme:params.get('theme'),pos:params.get('pos'
 var stage=document.getElementById('stage');
 var state=null, offset=0, es=null, lastSeen=0;
 var $=function(id){return document.getElementById(id);};
+// Ngôn ngữ chữ trên overlay: theo cài đặt "Ngôn ngữ trên overlay" trong bảng
+// tỉ số (giống chữ in vào video livestream); ?lang=vi|en trên link OBS ép riêng.
+var forcedLang=(params.get('lang')||'').toLowerCase();
+if(forcedLang!=='vi'&&forcedLang!=='en')forcedLang='';
+var lang=forcedLang||'vi';
+var EN={
+  "BẢNG TỈ SỐ":"SCOREBOARD",
+  "Hết trận":"Final",
+  "SET {0}":"SET {0}",
+  "ĐIỂM":"POINTS",
+  "TRẬN ĐẤU":"MATCH",
+  "KẾT QUẢ TRẬN ĐẤU":"MATCH RESULT",
+  "KẾT QUẢ":"RESULT",
+  "CHIẾN THẮNG":"WINNER",
+  "TỈ SỐ HIỆN TẠI":"CURRENT SCORE",
+  "{0} THẮNG":"{0} WINS",
+  "KẾT THÚC":"FINAL",
+  "LỢI THẾ {0}":"ADVANTAGE {0}"
+};
+function T(vi){
+  var s=(lang==='en'&&Object.prototype.hasOwnProperty.call(EN,vi))?EN[vi]:vi;
+  var args=arguments;
+  return s.replace(/\{(\d+)\}/g,function(m,i){var v=args[Number(i)+1];return v===undefined?m:String(v);});
+}
+document.documentElement.lang=lang;
 
 function fit(){var k=Math.min(window.innerWidth/1920,window.innerHeight/1080)||1;stage.style.transform='scale('+k+')';}
 window.addEventListener('resize',fit);fit();
 
 function setText(el,v){if(el.textContent!==v)el.textContent=v;}
 function setNum(el,v){if(el.textContent!==v){el.textContent=v;el.classList.remove('bump');void el.offsetWidth;el.classList.add('bump');}}
-function teamOf(id){return id==='A'?state.teamA:state.teamB;}
+function teamOf(id){
+  var t=id==='A'?state.teamA:state.teamB;
+  // Tên mặc định "Đội A/B" là chữ của app: dịch cùng ngôn ngữ overlay.
+  if(lang==='en'&&t&&t.name==='Đội '+id)return Object.assign({},t,{name:'Team '+id});
+  return t;
+}
 function now(){return Date.now()+offset;}
 function fmt(ms){var t=Math.max(0,Math.floor(ms/1000)),h=Math.floor(t/3600),m=Math.floor(t%3600/60),s=t%60;var p=function(x){return(x<10?'0':'')+x;};return(h?h+':'+p(m):p(m))+':'+p(s);}
 function logoSrc(t){return t.logoId?'/api/score/logo/'+encodeURIComponent(t.logoId):'';}
@@ -1119,6 +1502,8 @@ function apply(s){
 
 function render(){
   var s=state, o=s.overlay;
+  lang=forcedLang||(o.lang==='en'?'en':'vi');
+  if(document.documentElement.lang!==lang){document.documentElement.lang=lang;$('rLbl').textContent=T('KẾT QUẢ');}
   var theme=['dark','light','glass'].indexOf(ov.theme)>=0?ov.theme:o.theme;
   stage.className='theme-'+theme;
   stage.style.setProperty('--accent',o.accent||'#FFC107');
@@ -1223,9 +1608,9 @@ function renderScorebar(pos){
     setNum(row.querySelector('.sb-pts span'),s.status==='finished'?String(s.setsWon[low]):s.display[low]);
   });
   var foot=$('sbFoot'), kind=s.display.kind, txt='';
-  if(s.status==='finished'){txt=s.winner?(teamOf(s.winner).short+' THẮNG'):'KẾT THÚC';}
+  if(s.status==='finished'){txt=s.winner?T('{0} THẮNG',teamOf(s.winner).short):T('KẾT THÚC');}
   else if(kind==='deuce')txt='DEUCE';
-  else if(kind==='advantage')txt='LỢI THẾ '+teamOf(s.display.advantage).short;
+  else if(kind==='advantage')txt=T('LỢI THẾ {0}',teamOf(s.display.advantage).short);
   else if(kind==='tiebreak')txt='TIE-BREAK';
   else if(kind==='sideout'&&s.rules.doubles)txt=s.display.callout;
   setText(foot,txt);foot.classList.toggle('on',!!txt);
@@ -1233,12 +1618,12 @@ function renderScorebar(pos){
 
 function renderFull(){
   var s=state, tennis=s.sport==='tennis';
-  setText($('fTitle'),titleLine()||'BẢNG TỈ SỐ');
-  setText($('fSub'),[subLine(),s.status==='finished'?'Hết trận':('Set '+s.currentSet)].filter(Boolean).join(' · '));
+  setText($('fTitle'),titleLine()||T('BẢNG TỈ SỐ'));
+  setText($('fSub'),[subLine(),s.status==='finished'?T('Hết trận'):('Set '+s.currentSet)].filter(Boolean).join(' · '));
   var cols=Math.max(s.rules.bestOf,s.sets.length);
   var head=$('fHead');head.textContent='';
   var th=function(t){var e=document.createElement('th');e.textContent=t;head.appendChild(e);};
-  th('');for(var i=0;i<cols;i++)th('SET '+(i+1));th('ĐIỂM');
+  th('');for(var i=0;i<cols;i++)th(T('SET {0}',i+1));th(T('ĐIỂM'));
   var body=$('fBody');body.textContent='';
   rowsOrder().forEach(function(id){
     var t=teamOf(id), low=id.toLowerCase(), other=low==='a'?'b':'a', tr=document.createElement('tr');
@@ -1263,7 +1648,7 @@ function renderFull(){
 
 function renderIntro(){
   var s=state;
-  setText($('iTitle'),titleLine()||'TRẬN ĐẤU');
+  setText($('iTitle'),titleLine()||T('TRẬN ĐẤU'));
   setText($('iSub'),subLine());
   ['A','B'].forEach(function(id){
     var t=teamOf(id), box=$('i'+id);
@@ -1279,9 +1664,9 @@ function renderIntro(){
 
 function renderResult(){
   var s=state;
-  setText($('rTitle'),titleLine()||'KẾT QUẢ TRẬN ĐẤU');
+  setText($('rTitle'),titleLine()||T('KẾT QUẢ TRẬN ĐẤU'));
   setText($('rSub'),subLine());
-  setText($('rLbl'),s.status==='finished'?'CHIẾN THẮNG':'TỈ SỐ HIỆN TẠI');
+  setText($('rLbl'),s.status==='finished'?T('CHIẾN THẮNG'):T('TỈ SỐ HIỆN TẠI'));
   var leader=s.winner||(s.setsWon.a===s.setsWon.b?null:(s.setsWon.a>s.setsWon.b?'A':'B'));
   setText($('rWin'),leader?teamOf(leader).name:(teamOf('A').short+' – '+teamOf('B').short));
   var box=$('rSets');box.textContent='';
